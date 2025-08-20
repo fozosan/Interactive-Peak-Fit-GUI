@@ -1,0 +1,12 @@
+../.idea/
+__pycache__/
+*.pyc
+.DS_Store
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+*_trace.csv
