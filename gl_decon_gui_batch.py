@@ -20,7 +20,7 @@ An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
 • Choose/clear a fit x-range by typing limits or dragging on the plot. Shaded region indicates the active window.
 • Thin line rendering and “Toggle components” for clarity during inspection.
 • Peak templates: save as new, save changes, apply, delete; optional auto-apply on file open.
-• Batch (mapping) processing over folders with patterns (*.csv;*.txt;*.dat). Seed from current/template/auto. Optional re-height per file. Optional per-spectrum trace exports. One summary CSV.
+• Batch processing over folders with patterns (*.csv;*.txt;*.dat). Seed from current/template/auto. Optional re-height per file. Optional per-spectrum trace exports. One summary CSV.
 • Configuration persisted in ~/.gl_peakfit_config.json (baseline defaults, batch defaults, templates, auto-apply).
 
 Data Exports
@@ -510,7 +510,7 @@ class PeakFitApp:
                         command=self.toggle_auto_apply).pack(anchor="w", pady=(4,0))
 
         # Batch
-        batch = ttk.Labelframe(right, text="Batch (Mapping)"); batch.pack(fill=tk.X, pady=8)
+        batch = ttk.Labelframe(right, text="Batch"); batch.pack(fill=tk.X, pady=8)
         rowb1 = ttk.Frame(batch); rowb1.pack(fill=tk.X, pady=2)
         ttk.Label(rowb1, text="Pattern").pack(side=tk.LEFT)
         ttk.Entry(rowb1, width=22, textvariable=self.batch_pattern).pack(side=tk.LEFT, padx=4)
@@ -1540,7 +1540,7 @@ class PeakFitApp:
             "   • Apply        : load the selected template (optionally auto-apply on file open).\n"
             "   • Delete       : remove the selected template.\n\n"
 
-            "7) Batch (mapping) processing\n"
+            "7) Batch processing\n"
             "   • Choose a folder and one or more patterns (semicolon-separated), e.g. *.csv;*.txt;*.dat\n"
             "   • Peaks source:\n"
             "       - Current peaks     : use the GUI’s current peaks (optionally re-height per file).\n"
