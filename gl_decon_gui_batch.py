@@ -4,13 +4,16 @@
 Interactive peak fit GUI for spectra (Gaussian–Lorentzian / pseudo-Voigt)
 Designed by Farhan Zahin
 
-Build: v2.6 (unified single/batch peak table schema)
+Build: v2.7 (scrollable Help, custom X-axis label, ALS iterations/threshold)
 
 Overview
 ========
 An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
 • Load 2-column spectra from CSV/TXT/DAT (x, y). Delimiters auto-detected; lines with #, %, // and text headers are ignored.
-• Estimate a baseline with ALS (λ smoothing, p asymmetry). Fit either:
+• Estimate a baseline with ALS (λ smoothing, p asymmetry), now with:
+    - Iterations: stop after N passes (stability).
+    - Threshold: optional early-stop if the baseline changes less than a tolerance (speed).
+• Fit either:
     - Add to fit  : model = baseline + Σ(peaks) against raw data (WYSIWYG plotting).
     - Subtract    : model = Σ(peaks) against (raw − baseline).
 • Optionally compute the ALS baseline **only inside** the selected fit range, then interpolate across the full x.
@@ -19,9 +22,11 @@ An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
 • Choose Gaussian–Lorentzian mix (η, 0..1). “Apply to all” copies η to every peak.
 • Choose/clear a fit x-range by typing limits or dragging on the plot. Shaded region indicates the active window.
 • Thin line rendering and “Toggle components” for clarity during inspection.
+• **Axes/Labels:** set a custom X-axis label and save it as default (persists in ~/.gl_peakfit_config.json).
 • Peak templates: save as new, save changes, apply, delete; optional auto-apply on file open.
 • Batch processing over folders with patterns (*.csv;*.txt;*.dat). Seed from current/template/auto. Optional re-height per file. Optional per-spectrum trace exports. One summary CSV.
-• Configuration persisted in ~/.gl_peakfit_config.json (baseline defaults, batch defaults, templates, auto-apply).
+• Scrollable right-side control panel (mouse-wheel works anywhere on the panel).
+• Configuration persisted in ~/.gl_peakfit_config.json (baseline defaults, batch defaults, templates, auto-apply, x-label).
 
 Data Exports
 ============
@@ -46,6 +51,7 @@ Keyboard/Mouse Tips
 
 Version History (high-level)
 ============================
+v2.7  – Scrollable Help dialog; custom X-axis label with persistence; ALS baseline exposes Iterations and Threshold; mouse-wheel scrolling works anywhere on the right panel.
 v2.6  – Unified single/batch **peak table** schema and metadata via shared builder; identical column order everywhere.
 v2.5  – Trace CSV contains **both sections** (added & subtracted) in fixed order: y_target_add/y_fit_add/peakN + y_target_sub/y_fit_sub/peakN_sub.
 v2.4  – Single export & batch use a unified **trace builder** so formats can’t drift.
@@ -83,7 +89,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.widgets import SpanSelector
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext
 
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
@@ -109,7 +115,9 @@ class ScrollableFrame(ttk.Frame):
         self.interior.bind("<Configure>", self._on_interior_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Mouse wheel support (Windows/Mac/Linux)
+        # Wheel control
+        self._wheel_accum = 0
+        self._wheel_bound = False
         self.interior.bind("<Enter>", self._bind_mousewheel)
         self.interior.bind("<Leave>", self._unbind_mousewheel)
 
@@ -120,31 +128,72 @@ class ScrollableFrame(ttk.Frame):
     def _on_canvas_configure(self, _event=None):
         self.canvas.itemconfigure(self._win, width=self.canvas.winfo_width())
 
+    # ---------- wheel binding/unbinding ----------
     def _bind_mousewheel(self, _event=None):
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)          # Windows / macOS
-        self.canvas.bind_all("<Shift-MouseWheel>", self._on_shift_wheel)
-        self.canvas.bind_all("<Button-4>", self._on_button4)               # Linux
-        self.canvas.bind_all("<Button-5>", self._on_button5)
+        if self._wheel_bound:
+            return
+        self._wheel_bound = True
+        root = self.winfo_toplevel()
+        # Bind globally so wheel events from child widgets are caught,
+        # but we gate them so only this ScrollableFrame responds.
+        root.bind_all("<MouseWheel>", self._on_mousewheel)
+        root.bind_all("<Shift-MouseWheel>", self._on_shift_wheel)
+        root.bind_all("<Button-4>", self._on_button4)  # Linux up
+        root.bind_all("<Button-5>", self._on_button5)  # Linux down
 
     def _unbind_mousewheel(self, _event=None):
-        self.canvas.unbind_all("<MouseWheel>")
-        self.canvas.unbind_all("<Shift-MouseWheel>")
-        self.canvas.unbind_all("<Button-4>")
-        self.canvas.unbind_all("<Button-5>")
+        if not self._wheel_bound:
+            return
+        self._wheel_bound = False
+        root = self.winfo_toplevel()
+        root.unbind_all("<MouseWheel>")
+        root.unbind_all("<Shift-MouseWheel>")
+        root.unbind_all("<Button-4>")
+        root.unbind_all("<Button-5>")
 
+    # ---------- helpers ----------
+    def _pointer_inside_me(self) -> bool:
+        """Return True if the mouse pointer is inside this ScrollableFrame (canvas or interior descendants)."""
+        x, y = self.canvas.winfo_pointerxy()
+        w = self.canvas.winfo_containing(x, y)
+        while w is not None:
+            if w is self.canvas or w is self.interior:
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    # ---------- wheel handlers ----------
     def _on_mousewheel(self, event):
-        delta = -1 * int(event.delta / 120) if event.delta != 0 else 0
-        self.canvas.yview_scroll(delta, "units")
+        if not self._pointer_inside_me():
+            return
+        # Normalize deltas (Windows gives ±120*n; trackpads/mac give smaller steps)
+        self._wheel_accum += event.delta
+        step = 0
+        while abs(self._wheel_accum) >= 120:
+            step += -1 if self._wheel_accum > 0 else 1
+            self._wheel_accum -= 120 * (1 if self._wheel_accum > 0 else -1)
+        if step != 0:
+            self.canvas.yview_scroll(step, "units")
+        return "break"
 
     def _on_shift_wheel(self, event):
-        delta = -1 * int(event.delta / 120) if event.delta != 0 else 0
-        self.canvas.xview_scroll(delta, "units")
+        if not self._pointer_inside_me():
+            return
+        direction = -1 if event.delta > 0 else 1
+        self.canvas.xview_scroll(direction, "units")
+        return "break"
 
     def _on_button4(self, _event):
-        self.canvas.yview_scroll(-3, "units")
+        if not self._pointer_inside_me():
+            return
+        self.canvas.yview_scroll(-1, "units")
+        return "break"
 
     def _on_button5(self, _event):
-        self.canvas.yview_scroll(3, "units")
+        if not self._pointer_inside_me():
+            return
+        self.canvas.yview_scroll(1, "units")
+        return "break"
 
 
 # ---------- Math ----------
@@ -164,15 +213,24 @@ def pseudo_voigt_area(height, fwhm, eta):
     eta = np.clip(eta, 0.0, 1.0)
     return (1.0 - eta) * ga_area + eta * lo_area
 
-def als_baseline(y, lam=1e5, p=0.001, niter=10, eps=1e-9):
-    """Sparse ALS baseline (Eilers & Boelens) with tiny ridge for stability."""
+def als_baseline(y, lam=1e5, p=0.001, niter=10, thresh=0.0, eps=1e-9):
+    """
+    Sparse ALS baseline (Eilers & Boelens) with:
+      - niter : maximum iterations
+      - thresh: relative convergence threshold on baseline update
+                (0 disables early stopping). We stop when
+                max|z - z_prev| / (max|z_prev| + 1e-12) <= thresh
+    """
     y = np.asarray(y, dtype=float)
     L = y.size
     if L < 3:
         return np.zeros_like(y)
+
     D = sp.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(L - 2, L), format="csc")
     w = np.ones(L, dtype=float)
-    for _ in range(niter):
+    z_prev = None
+
+    for _ in range(int(max(1, niter))):
         W = sp.diags(w, 0, shape=(L, L), format="csc")
         Z = W + lam * (D.T @ D) + eps * sp.eye(L, format="csc")
         rhs = w * y
@@ -180,7 +238,17 @@ def als_baseline(y, lam=1e5, p=0.001, niter=10, eps=1e-9):
             z = spla.spsolve(Z, rhs)
         except Exception:
             z = np.linalg.solve(Z.toarray(), rhs)
+
+        # update weights
         w = p * (y > z) + (1.0 - p) * (y < z)
+
+        # early stop if threshold set
+        if z_prev is not None and thresh and thresh > 0:
+            denom = np.max(np.abs(z_prev)) + 1e-12
+            if np.max(np.abs(z - z_prev)) / denom <= float(thresh):
+                break
+        z_prev = z
+
     return z
 
 
@@ -210,7 +278,10 @@ DEFAULTS = {
     "batch_pattern": "*.csv;*.txt;*.dat",
     "batch_save_traces": True,
     "batch_reheight": True,
-    "batch_source_mode": "current"  # current | template | auto
+    "batch_source_mode": "current",  # current | template | auto
+    "x_label": "x",
+    "als_niter": 10,
+    "als_thresh": 0.0,  # 0 disables early stop; try 1e-4 .. 1e-6
 }
 
 def load_config():
@@ -346,9 +417,12 @@ class PeakFitApp:
         self.cfg = load_config()
         self.als_lam = tk.DoubleVar(value=self.cfg["als_lam"])
         self.als_asym = tk.DoubleVar(value=self.cfg["als_asym"])
+        self.als_iter = tk.IntVar(value=int(self.cfg.get("als_niter", 10)))
+        self.als_thresh = tk.DoubleVar(value=float(self.cfg.get("als_thresh", 0.0)))
         self.global_eta = tk.DoubleVar(value=0.5)
         self.auto_apply_template = tk.BooleanVar(value=bool(self.cfg.get("auto_apply_template", False)))
         self.auto_apply_template_name = tk.StringVar(value=self.cfg.get("auto_apply_template_name", ""))
+        self.x_label_var = tk.StringVar(value=str(self.cfg.get("x_label", "x")))
 
         # Interaction
         self.add_peaks_mode = tk.BooleanVar(value=True)  # click-to-add toggle
@@ -392,21 +466,29 @@ class PeakFitApp:
         ttk.Button(top, text="Help", command=self.show_help).pack(side=tk.LEFT, padx=(6,0))
         self.file_label = ttk.Label(top, text="No file loaded"); self.file_label.pack(side=tk.LEFT, padx=10)
 
-        mid = ttk.Frame(self.root); mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # Splitter so user can resize plot vs. right panel
+        mid = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        # Left: plot
-        left = ttk.Frame(mid); left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.fig = plt.Figure(figsize=(7,5), dpi=100)
+        # Left pane: plot area
+        left = ttk.Frame(mid)
+        mid.add(left, weight=3)  # give plot more stretch by default
+
+        self.fig = plt.Figure(figsize=(7, 5), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_xlabel("x"); self.ax.set_ylabel("Intensity")
+        self.ax.set_xlabel("x");
+        self.ax.set_ylabel("Intensity")
         self.canvas = FigureCanvasTkAgg(self.fig, master=left)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.nav = NavigationToolbar2Tk(self.canvas, left)
         self.cid = self.canvas.mpl_connect("button_press_event", self.on_click_plot)
 
-        # Right: scrollable panel
-        right_scroll = ScrollableFrame(mid)
-        right_scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=6, pady=6)
+        # Right pane: wrapper + scrollable panel
+        right_wrapper = ttk.Frame(mid)
+        mid.add(right_wrapper, weight=1)  # smaller stretch; user can drag the sash
+
+        right_scroll = ScrollableFrame(right_wrapper)
+        right_scroll.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         right = right_scroll.interior  # all controls attach here
 
         # Baseline box
@@ -426,6 +508,11 @@ class PeakFitApp:
         ttk.Entry(row, width=10, textvariable=self.als_lam).pack(side=tk.LEFT, padx=4)
         ttk.Label(row, text="p (asym):").pack(side=tk.LEFT)
         ttk.Entry(row, width=10, textvariable=self.als_asym).pack(side=tk.LEFT, padx=4)
+        row2 = ttk.Frame(baseline_box); row2.pack(fill=tk.X, pady=2)
+        ttk.Label(row2, text="Iterations:").pack(side=tk.LEFT)
+        ttk.Entry(row2, width=8, textvariable=self.als_iter).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row2, text="Threshold:").pack(side=tk.LEFT)
+        ttk.Entry(row2, width=10, textvariable=self.als_thresh).pack(side=tk.LEFT, padx=4)
         ttk.Button(baseline_box, text="Recompute baseline", command=self.compute_baseline).pack(side=tk.LEFT, pady=2)
         ttk.Button(baseline_box, text="Save as default", command=self.save_baseline_default).pack(side=tk.LEFT, padx=4)
 
@@ -491,6 +578,14 @@ class PeakFitApp:
         ttk.Button(fr, text="Select on plot", command=self.enable_span).grid(row=1, column=1, columnspan=2, pady=2)
         ttk.Button(fr, text="Full range", command=self.clear_fit_range).grid(row=1, column=3, pady=2)
 
+        # Axes / label controls
+        axes_box = ttk.Labelframe(right, text="Axes / Labels");
+        axes_box.pack(fill=tk.X, pady=6)
+        ttk.Label(axes_box, text="X-axis label:").pack(side=tk.LEFT)
+        ttk.Entry(axes_box, width=16, textvariable=self.x_label_var).pack(side=tk.LEFT, padx=4)
+        ttk.Button(axes_box, text="Apply", command=self.apply_x_label).pack(side=tk.LEFT, padx=2)
+        ttk.Button(axes_box, text="Save as default", command=self.save_x_label_default).pack(side=tk.LEFT, padx=2)
+
         # Templates
         tmpl = ttk.Labelframe(right, text="Peak Templates"); tmpl.pack(fill=tk.X, pady=6)
         self.template_info = ttk.Label(tmpl, text="Templates: 0")
@@ -540,7 +635,7 @@ class PeakFitApp:
 
     def _new_figure(self):
         self.ax.clear()
-        self.ax.set_xlabel("x"); self.ax.set_ylabel("Intensity")
+        self.ax.set_xlabel(self.x_label_var.get()); self.ax.set_ylabel("Intensity")
         self.ax.set_title("Open a data file to begin")
         self.canvas.draw_idle()
 
@@ -639,18 +734,22 @@ class PeakFitApp:
     def compute_baseline(self):
         if self.y_raw is None:
             return
+
         lam = float(self.als_lam.get())
         asym = float(self.als_asym.get())
         use_slice = bool(self.baseline_use_range.get())
         mask = self._range_mask() if use_slice else None
 
+        iters = int(self.als_iter.get())
+        thresh = float(self.als_thresh.get())
+
         try:
             if mask is None or not np.any(mask):
-                self.baseline = als_baseline(self.y_raw, lam=lam, p=asym, niter=10)
+                self.baseline = als_baseline(self.y_raw, lam=lam, p=asym, niter=iters, thresh=thresh)
             else:
                 x_sub = self.x[mask]
                 y_sub = self.y_raw[mask]
-                z_sub = als_baseline(y_sub, lam=lam, p=asym, niter=10)
+                z_sub = als_baseline(y_sub, lam=lam, p=asym, niter=iters, thresh=thresh)
                 # Interpolate/extrapolate to full x (constant beyond ends)
                 self.baseline = np.interp(self.x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
         except Exception as e:
@@ -662,6 +761,8 @@ class PeakFitApp:
     def save_baseline_default(self):
         self.cfg["als_lam"] = float(self.als_lam.get())
         self.cfg["als_asym"] = float(self.als_asym.get())
+        self.cfg["als_niter"] = int(self.als_iter.get())
+        self.cfg["als_thresh"] = float(self.als_thresh.get())
         # Batch defaults too
         self.cfg["batch_pattern"] = self.batch_pattern.get()
         self.cfg["batch_save_traces"] = bool(self.batch_save_traces.get())
@@ -669,6 +770,17 @@ class PeakFitApp:
         self.cfg["batch_source_mode"] = self.batch_source_mode.get()
         save_config(self.cfg)
         messagebox.showinfo("Baseline", "Saved as default (including batch defaults).")
+
+    # ----- Axes / label handlers -----
+    def apply_x_label(self):
+        # Re-render plot with the current label text
+        self.refresh_plot()
+
+    def save_x_label_default(self):
+        # Persist the chosen x-axis label to the config file
+        self.cfg["x_label"] = self.x_label_var.get()
+        save_config(self.cfg)
+        messagebox.showinfo("Axes", f'Saved default x-axis label: "{self.x_label_var.get()}"')
 
     # ----- Signals for seeding and fitting -----
     def get_seed_signal(self, y_raw=None, baseline=None):
@@ -1156,15 +1268,21 @@ class PeakFitApp:
         asym = float(self.als_asym.get())
         use_slice = bool(self.baseline_use_range.get())
         mask = self._range_mask(x) if use_slice else None
+
+        iters = int(self.als_iter.get())
+        thresh = float(self.als_thresh.get())
+
         try:
             if mask is None or not np.any(mask):
-                z = als_baseline(y, lam=lam, p=asym, niter=10)
+                z = als_baseline(y, lam=lam, p=asym, niter=iters, thresh=thresh)
             else:
-                x_sub = x[mask]; y_sub = y[mask]
-                z_sub = als_baseline(y_sub, lam=lam, p=asym, niter=10)
+                x_sub = x[mask]
+                y_sub = y[mask]
+                z_sub = als_baseline(y_sub, lam=lam, p=asym, niter=iters, thresh=thresh)
                 z = np.interp(x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
         except Exception:
             z = np.zeros_like(y)
+
         return z
 
     def _peaks_from_current_for(self, x, y, baseline, reheight=True) -> List[Peak]:
@@ -1491,37 +1609,40 @@ class PeakFitApp:
             lo, hi = sorted((self.fit_xmin, self.fit_xmax))
             self.ax.axvspan(lo, hi, color="0.8", alpha=0.25, lw=0)
 
-        self.ax.set_xlabel("x"); self.ax.set_ylabel("Intensity")
+        self.ax.set_xlabel(self.x_label_var.get()); self.ax.set_ylabel("Intensity")
         self.ax.legend(loc="best")
         self.canvas.draw_idle()
 
     # ----- Help -----
     def show_help(self):
-        message = (
+        # Build the help text
+        help_text = (
             "Interactive GL (pseudo-Voigt) Peak Fitting – Help\n"
             "==================================================\n\n"
 
             "1) Loading data\n"
             "   • Use ‘Open Data…’ to load a 2-column file (x, y).\n"
             "   • CSV/TXT/DAT are supported. Delimiters are auto-detected (comma, tab, space, semicolon).\n"
-            "   • Lines starting with #, %, // and text headers are ignored. The loader also tolerates extra columns and "
+            "   • Lines starting with #, %, // and text headers are ignored. The loader tolerates extra columns and\n"
             "     tries the first two numeric columns.\n\n"
 
             "2) Baseline (ALS)\n"
             "   • λ (smooth): larger values force a smoother baseline.\n"
             "   • p (asym): pushes the baseline to stay under peaks (smaller values usually under-fit peaks more).\n"
+            "   • Iterations: number of ALS passes (stability). Higher = slower but steadier.\n"
+            "   • Threshold: optional early stop if the baseline update is < threshold (speed).\n"
             "   • Mode:\n"
             "       - Add to fit : model = baseline + Σ(peaks) against raw y. Displayed components are baseline-added.\n"
             "       - Subtract   : model = Σ(peaks) against (y − baseline). Components are pure peak shapes.\n"
             "   • Baseline uses fit range: compute ALS on the selected x-window only, then interpolate across the full x.\n"
-            "   • ‘Recompute baseline’ applies current λ/p and range option; ‘Save as default’ persists λ/p and batch defaults.\n\n"
+            "   • ‘Recompute baseline’ applies current λ/p/(iterations/threshold) and range option; ‘Save as default’ persists.\n\n"
 
             "3) Fit range\n"
             "   • Enter Min/Max or click ‘Select on plot’ and drag to highlight the window. ‘Full range’ clears it.\n"
             "   • The shaded region indicates the active fitting window; ALS can also be restricted to this window.\n\n"
 
             "4) Managing peaks\n"
-            "   • ‘Add peaks on click’ toggle: click on the plot at the desired center to add a peak. "
+            "   • ‘Add peaks on click’ toggle: click on the plot at the desired center to add a peak.\n"
             "     Toolbar Zoom/Pan automatically prevents adding peaks, so you can safely zoom/pan.\n"
             "   • Select a peak in the table to edit its Center/Height/FWHM, and to toggle ‘Lock width’ / ‘Lock center’.\n"
             "     Locks are respected during fitting (locked params are held constant).\n"
@@ -1534,13 +1655,17 @@ class PeakFitApp:
             "   • In Add mode, the optimizer explicitly adds the baseline slice during fitting so components don’t absorb it.\n"
             "   • After fitting, vertical dotted lines mark fitted centers; ‘Toggle components’ declutters the view.\n\n"
 
-            "6) Templates\n"
+            "6) Axes / Labels\n"
+            "   • Set a custom X-axis label (e.g., Raman shift [cm⁻¹], 2θ [deg]) and click ‘Apply’.\n"
+            "   • ‘Save as default’ persists the label to ~/.gl_peakfit_config.json.\n\n"
+
+            "7) Templates\n"
             "   • Save as new… : store the current peak set as a named template.\n"
             "   • Save changes : overwrite the selected template with current peaks.\n"
             "   • Apply        : load the selected template (optionally auto-apply on file open).\n"
             "   • Delete       : remove the selected template.\n\n"
 
-            "7) Batch processing\n"
+            "8) Batch processing\n"
             "   • Choose a folder and one or more patterns (semicolon-separated), e.g. *.csv;*.txt;*.dat\n"
             "   • Peaks source:\n"
             "       - Current peaks     : use the GUI’s current peaks (optionally re-height per file).\n"
@@ -1549,7 +1674,7 @@ class PeakFitApp:
             "   • Batch respects your baseline settings, fit range, and ‘baseline uses fit range’ option.\n"
             "   • Writes one summary CSV and, if enabled, a *_trace.csv per spectrum.\n\n"
 
-            "8) Exports (schemas are fixed and identical for single and batch)\n"
+            "9) Exports (schemas are fixed and identical for single and batch)\n"
             "   A) Peak table CSV columns:\n"
             "      file, peak, center, height, fwhm, eta, lock_width, lock_center,\n"
             "      area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax\n"
@@ -1562,17 +1687,28 @@ class PeakFitApp:
             "      – peakN     = baseline-ADDED component (matches Add-mode display exactly)\n"
             "      – peakN_sub = baseline-SUBTRACTED pure component (use for calculations)\n\n"
 
-            "9) Troubleshooting & tips\n"
+            "10) Troubleshooting & tips\n"
             "   • If fits look too tall in Add mode, confirm you intended Add mode (baseline is already included in the model).\n"
             "   • If ALS ‘overshoots’ peaks, try increasing λ (smoother) and/or decreasing p (more under the peaks).\n"
+            "   • Increase Iterations for stability; use Threshold to speed up by early-stopping when changes are tiny.\n"
             "   • If nothing fits, check the fit range (shaded window) and that at least one peak is present.\n"
-            "   • TXT files with odd separators or headers are usually parsed; if not, ensure two numeric columns only.\n\n"
-
-            "10) Config & persistence\n"
-            "   • Baseline defaults, batch defaults, templates, and auto-apply are stored in ~/.gl_peakfit_config.json.\n"
-            "   • ‘Save as default’ writes the current baseline and batch defaults.\n"
+            "   • Mouse-wheel scrolling works anywhere over the right panel; Shift+wheel scrolls horizontally.\n"
         )
-        messagebox.showinfo("Help", message)
+
+        # Create a scrollable dialog
+        win = tk.Toplevel(self.root)
+        win.title("Help – Interactive GL Peak Fitting")
+        win.geometry("820x620")
+        win.transient(self.root)
+        win.grab_set()
+
+        txt = scrolledtext.ScrolledText(win, wrap="word")
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        txt.insert("1.0", help_text)
+        txt.config(state="disabled")  # read-only
+
+        btn = ttk.Button(win, text="Close", command=win.destroy)
+        btn.pack(pady=(0, 8))
 
 
 def main():
