@@ -1,5 +1,5 @@
 # Interactive-Peak-Fit-GUI
-Interactive peak fit GUI for spectra (Gaussian–Lorentzian / pseudo-Voigt)
+Interactive peak fit GUI for any spectroscopy (Gaussian–Lorentzian / pseudo-Voigt)
 
 Designed by Farhan Zahin, 
 built with ChatGPT
@@ -34,11 +34,11 @@ An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
 
 • Thin line rendering and “Toggle components” for clarity during inspection.
 
-• **Axes/Labels:** set a custom X-axis label and save it as default (persists in ~/.gl_peakfit_config.json).
+• Axes/Labels: set a custom X-axis label and save it as default (persists in ~/.gl_peakfit_config.json).
 
 • Peak templates: save as new, save changes, apply, delete; optional auto-apply on file open.
 
-• Batch processing over folders with patterns (*.csv;*.txt;*.dat). Seed from current/template/auto. Optional re-height per file. Optional per-spectrum trace exports. One summary CSV.
+• **Batch processing over folders with patterns (*.csv;*.txt;*.dat). Seed from current/template/auto. Optional re-height per file. Optional per-spectrum trace exports. One summary CSV.**
 
 • Scrollable right-side control panel (mouse-wheel works anywhere on the panel).
 
