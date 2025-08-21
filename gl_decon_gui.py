@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Origin-like interactive peak fit GUI (pseudo-Voigt: Gaussian–Lorentzian mix)
+Interactive peak fit GUI for spectra (Gaussian–Lorentzian / pseudo-Voigt)
+Designed by Farhan Zahin
+Built with ChatGPT
+
+Build: v1.9
 
 Features:
   • ALS baseline with saved defaults
