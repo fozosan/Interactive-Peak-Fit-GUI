@@ -1,8 +1,10 @@
 # Interactive-Peak-Fit-GUI
 Interactive peak fit GUI for spectra (Gaussian–Lorentzian / pseudo-Voigt)
-Designed by Farhan Zahin
 
-Build: v2.6 (unified single/batch peak table schema)
+Designed by Farhan Zahin, 
+built with ChatGPT
+
+Build: v2.7 (scrollable Help, custom X-axis label, ALS iterations/threshold)
 
 Overview
 ========
@@ -10,10 +12,12 @@ An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
 
 • Load 2-column spectra from CSV/TXT/DAT (x, y). Delimiters auto-detected; lines with #, %, // and text headers are ignored.
 
-• Estimate a baseline with ALS (λ smoothing, p asymmetry). Fit either:
+• Estimate a baseline with ALS (λ smoothing, p asymmetry), now with:
+    - Iterations: stop after N passes (stability).
+    - Threshold: optional early-stop if the baseline changes less than a tolerance (speed).
 
+• Fit either:
     - Add to fit  : model = baseline + Σ(peaks) against raw data (WYSIWYG plotting).
-
     - Subtract    : model = Σ(peaks) against (raw − baseline).
 
 • Optionally compute the ALS baseline **only inside** the selected fit range, then interpolate across the full x.
@@ -28,29 +32,36 @@ An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
 
 • Thin line rendering and “Toggle components” for clarity during inspection.
 
+• **Axes/Labels:** set a custom X-axis label and save it as default (persists in ~/.gl_peakfit_config.json).
+
 • Peak templates: save as new, save changes, apply, delete; optional auto-apply on file open.
 
-• Batch (mapping) processing over folders with patterns (*.csv;*.txt;*.dat). Seed from current/template/auto. Optional re-height per file. Optional per-spectrum trace exports. One summary CSV.
+• Batch processing over folders with patterns (*.csv;*.txt;*.dat). Seed from current/template/auto. Optional re-height per file. Optional per-spectrum trace exports. One summary CSV.
 
-• Configuration persisted in ~/.gl_peakfit_config.json (baseline defaults, batch defaults, templates, auto-apply).
+• Scrollable right-side control panel (mouse-wheel works anywhere on the panel).
+
+• Configuration persisted in ~/.gl_peakfit_config.json (baseline defaults, batch defaults, templates, auto-apply, x-label).
 
 Data Exports
 ============
 A) Peak table CSV (single export AND batch summary; identical columns/order):
 
   file, peak, center, height, fwhm, eta, lock_width, lock_center,
+
   area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax
 
 B) Trace CSV (per spectrum; identical schema for single and batch *_trace.csv):
-  
+
   x, y_raw, baseline,
+
   y_target_add, y_fit_add, peak1, peak2, …,
+
   y_target_sub, y_fit_sub, peak1_sub, peak2_sub, …
 
 Where:
 
   • peakN     = baseline-ADDED component (for plotting like “Add” mode)
-  
+
   • peakN_sub = baseline-SUBTRACTED pure component (for calculations)
 
 Keyboard/Mouse Tips
@@ -66,6 +77,8 @@ Keyboard/Mouse Tips
 
 Version History (high-level)
 ============================
+
+v2.7  – Scrollable Help dialog; custom X-axis label with persistence; ALS baseline exposes Iterations and Threshold; mouse-wheel scrolling works anywhere on the right panel.
 
 v2.6  – Unified single/batch **peak table** schema and metadata via shared builder; identical column order everywhere.
 
