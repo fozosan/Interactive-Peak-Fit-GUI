@@ -6,6 +6,8 @@ built with ChatGPT
 
 Build: v2.7 (scrollable Help, custom X-axis label, ALS iterations/threshold)
 
+<img width="1987" height="1289" alt="main-window png" src="https://github.com/user-attachments/assets/9c0b832c-3355-49e7-9bee-01be2abbad60" />
+
 Overview
 ========
 An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
