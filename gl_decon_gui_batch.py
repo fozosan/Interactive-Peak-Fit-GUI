@@ -3,6 +3,7 @@
 """
 Interactive peak fit GUI for spectra (Gaussian–Lorentzian / pseudo-Voigt)
 Designed by Farhan Zahin
+Built with ChatGPT
 
 Build: v2.7 (scrollable Help, custom X-axis label, ALS iterations/threshold)
 
