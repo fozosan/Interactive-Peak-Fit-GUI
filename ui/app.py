@@ -305,7 +305,8 @@ class PeakFitApp:
         ttk.Checkbutton(edit, text="Lock center", variable=self.lockc_var, command=self.on_lock_toggle).grid(row=3, column=1, sticky="w", pady=2)
 
         btns = ttk.Frame(peaks_box); btns.pack(fill=tk.X, pady=4)
-        ttk.Button(btns, text="Apply edits", command=self.apply_edits).pack(side=tk.LEFT)
+        ttk.Button(btns, text="➕ Add Peak", command=self.add_peak_from_fields).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Apply edits", command=self.apply_edits).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Delete selected", command=self.delete_selected).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Clear all", command=self.clear_peaks).pack(side=tk.LEFT, padx=4)
 
@@ -774,6 +775,21 @@ class PeakFitApp:
         pk.lock_width  = bool(self.lockw_var.get())
         pk.lock_center = bool(self.lockc_var.get())
         self.refresh_tree(keep_selection=True)
+        self.refresh_plot()
+
+    def add_peak_from_fields(self):
+        try:
+            c = float(self.center_var.get())
+            h = float(self.height_var.get())
+            w = max(float(self.fwhm_var.get()), 1e-6)
+        except ValueError:
+            messagebox.showwarning("Add Peak", "Center, Height, and FWHM must be numbers.")
+            return
+        pk = Peak(center=c, height=h, fwhm=w, eta=float(self.global_eta.get()),
+                  lock_center=bool(self.lockc_var.get()), lock_width=bool(self.lockw_var.get()))
+        self.peaks.append(pk)
+        self.peaks.sort(key=lambda p: p.center)
+        self.refresh_tree()
         self.refresh_plot()
 
     def apply_edits(self):
