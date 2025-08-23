@@ -9,42 +9,52 @@ from typing import Iterable, Tuple
 
 import csv
 import io
+import re
 import numpy as np
-
-
-def _detect_delimiter(sample: str) -> str | None:
-    """Heuristically guess a delimiter from *sample*.
-
-    Returns a delimiter character or ``None`` to indicate generic whitespace.
-    """
-
-    for delim in (",", "\t", ";"):
-        if delim in sample:
-            return delim
-    return None
 
 
 def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
     """Load two-column numeric data from ``path``.
 
-    Comments beginning with ``#`` and optional header lines are tolerated.
-    The delimiter is autodetected among comma, tab, semicolon and whitespace.
+    The function accepts ``.txt``, ``.csv`` or ``.dat`` files containing two
+    numeric columns. Delimiters (comma, tab, semicolon or whitespace) are
+    autodetected and lines beginning with common comment prefixes (``#``, ``%``,
+    ``//``) or header strings are ignored.
     """
 
-    with open(path, "r", encoding="utf-8") as fh:
+    xs, ys = [], []
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
         for line in fh:
             line = line.strip()
-            if not line or line.startswith("#"):
+            if not line:
                 continue
-            delim = _detect_delimiter(line)
-            break
-        else:  # pragma: no cover - empty file
-            raise ValueError("no numeric data found")
+            # strip out comments (full-line or inline)
+            for cc in ("#", "%", "//"):
+                if line.startswith(cc):
+                    line = ""
+                    break
+                if cc in line:
+                    line = line.split(cc, 1)[0].strip()
+            if not line:
+                continue
+            parts = re.split(r"[,\s;]+", line)
+            try:
+                x_val = float(parts[0])
+                y_val = float(parts[1])
+            except (IndexError, ValueError):
+                continue
+            xs.append(x_val)
+            ys.append(y_val)
 
-    data = np.loadtxt(path, comments="#", delimiter=delim, usecols=(0, 1))
-    if data.ndim != 2 or data.shape[1] < 2:  # pragma: no cover - malformed
-        raise ValueError("expected two numeric columns")
-    return data[:, 0], data[:, 1]
+    if len(xs) < 2:
+        raise ValueError("Could not parse a two-column numeric dataset from the file.")
+
+    x = np.asarray(xs, dtype=float)
+    y = np.asarray(ys, dtype=float)
+    if x.size >= 2 and x[1] < x[0]:
+        idx = np.argsort(x)
+        x, y = x[idx], y[idx]
+    return x, y
 
 
 def build_peak_table(records: Iterable[dict]) -> str:
