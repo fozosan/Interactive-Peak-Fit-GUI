@@ -1,15 +1,12 @@
 """LMFIT backend providing parameter constraints and alternative algorithms."""
 from __future__ import annotations
 
-
 from typing import Optional, Sequence, TypedDict
 
 import numpy as np
 
 from core.peaks import Peak
 from core.models import pv_sum
-
-
 
 class SolveResult(TypedDict):
     ok: bool
@@ -115,4 +112,3 @@ def solve(
         cov=res.covar,
         meta={"nfev": res.nfev},
     )
-

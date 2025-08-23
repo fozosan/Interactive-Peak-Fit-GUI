@@ -29,11 +29,14 @@ def step_once(
     damping: float,
     trust_radius: float,
     bounds: Sequence | None,
+    f_scale: float = 1.0,
 ) -> tuple[np.ndarray, float]:
     """Perform one Gauss-Newton/Levenberg-Marquardt step.
 
-    Returns the updated parameter vector and the new cost. Only a linear loss
-    is currently supported; bounds are applied via simple clipping.
+    ``loss`` can be ``linear``, ``soft_l1``, ``huber`` or ``cauchy`` and is
+    implemented via an iteratively reweighted least squares (IRLS) scheme. Any
+    ``weights`` provided are applied first, then the robust loss weights. Bounds
+    are enforced by simple clipping after the step.
     """
 
     x = np.asarray(x, dtype=float)
@@ -45,7 +48,27 @@ def step_once(
     theta0 = _theta_from_peaks(peaks)
     resid_fn = build_residual(x, y, peaks, mode, baseline, loss, weights)
     r0 = resid_fn(theta0)
+
+    # robust loss via IRLS
+    if loss != "linear":
+        rs = r0 / f_scale
+        if loss == "soft_l1":
+            w = 1.0 / np.sqrt(1.0 + rs**2)
+        elif loss == "huber":
+            w = np.where(np.abs(rs) <= 1.0, 1.0, 1.0 / np.abs(rs))
+        elif loss == "cauchy":
+            w = 1.0 / (1.0 + rs**2)
+        else:  # pragma: no cover - unknown loss
+            raise ValueError("unknown loss")
+        w_sqrt = np.sqrt(w)
+        r0 = w_sqrt * r0
+    else:
+        w_sqrt = None
+
     J = jacobian_fd(resid_fn, theta0)
+    if w_sqrt is not None:
+        J = J * w_sqrt[:, None]
+
     JTJ = J.T @ J
     if damping:
         JTJ = JTJ + np.eye(JTJ.shape[0]) * damping

@@ -1,13 +1,9 @@
 """Modern solver backend employing Trust Region Reflective algorithm
 with support for robust losses, weights and multi-start restarts."""
 from __future__ import annotations
-
-
 from typing import Optional, Sequence, TypedDict
-
 import numpy as np
 from scipy.optimize import least_squares
-
 from core.peaks import Peak
 from core.residuals import build_residual
 
@@ -127,4 +123,3 @@ def solve(
         cov=cov,
         meta={"nfev": best.nfev, "njev": getattr(best, "njev", None)},
     )
-

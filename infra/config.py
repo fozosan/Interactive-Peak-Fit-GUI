@@ -44,10 +44,7 @@ def load(path: str | Path) -> Dict[str, Any]:
 
 def save(path: str | Path, cfg: Dict[str, Any]) -> None:
     """Persist ``cfg`` to ``path``."""
-
-
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2, sort_keys=True)
-

@@ -80,3 +80,67 @@ def build_peak_table(records: Iterable[dict]) -> str:
         writer.writerow(rec)
     return buf.getvalue()
 
+def build_trace_table(
+    x: np.ndarray,
+    y_raw: np.ndarray,
+    baseline: np.ndarray | None,
+    peaks: Iterable,
+    mode: str = "add",
+) -> str:
+    """Return a CSV trace table for the current fit.
+
+    Parameters
+    ----------
+    x, y_raw:
+        Input data arrays.
+    baseline:
+        Baseline array or ``None``.
+    peaks:
+        Iterable of peak-like objects. Each contributes its own column.
+    mode:
+        ``"add"`` or ``"subtract"`` — controls how the fitted target and
+        model columns are formed.
+    """
+
+    x = np.asarray(x, dtype=float)
+    y_raw = np.asarray(y_raw, dtype=float)
+    base = np.asarray(baseline, dtype=float) if baseline is not None else 0.0
+
+    # per-peak contributions
+    comps = []
+    from .models import pv_sum  # local import to avoid cycles
+
+    for p in peaks:
+        comps.append(pv_sum(x, [p]))
+
+    comps_arr = np.vstack(comps) if comps else np.empty((0, x.size))
+    model = comps_arr.sum(axis=0) if comps else np.zeros_like(x)
+
+    if mode == "add":
+        y_target = y_raw
+        y_fit = model + base
+    elif mode == "subtract":
+        y_target = y_raw - base
+        y_fit = model
+    else:  # pragma: no cover - unknown mode
+        raise ValueError("unknown mode")
+
+    headers = ["x", "y_raw", "baseline", "y_target", "y_fit"] + [
+        f"peak{i+1}" for i in range(comps_arr.shape[0])
+    ]
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(headers)
+    for idx in range(x.size):
+        row = [
+            x[idx],
+            y_raw[idx],
+            base[idx] if baseline is not None else 0.0,
+            y_target[idx],
+            y_fit[idx],
+        ]
+        row.extend(comps_arr[:, idx])
+        writer.writerow(row)
+    return buf.getvalue()
+

@@ -1,8 +1,6 @@
 """Logging helpers for Peakfit 3.x."""
 from __future__ import annotations
-
 import logging
-
 from typing import Optional
 
 _configured = False
@@ -28,4 +26,3 @@ def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
 
     _ensure_configured(logging.INFO if level is None else level)
     return logging.getLogger(name)
-
