@@ -47,6 +47,8 @@ from scipy.signal import find_peaks
 
 from core import signals
 from fit import classic, lmfit_backend, modern, step_engine
+from core.residuals import build_residual
+from uncertainty import asymptotic, bootstrap, bayes
 
 
 # ---------- Math ----------
@@ -171,6 +173,12 @@ class PeakFitApp:
         # Solver selection and diagnostics
         self.solver_var = tk.StringVar(value="Classic")
         self.snr_text = tk.StringVar(value="S/N: --")
+
+        # Uncertainty estimation
+        self.unc_mode = tk.StringVar(value="Asymptotic")
+        self.unc_n = tk.IntVar(value=100)
+        self.unc_report = None
+        self.last_fit = None
 
         # UI
         self._build_ui()
@@ -320,6 +328,15 @@ class PeakFitApp:
         ttk.Button(actions, text="Step \u25B6", command=self.step_once).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Toggle components", command=self.toggle_components).pack(side=tk.LEFT, padx=4)
+
+        # Uncertainty
+        unc_box = ttk.Labelframe(right, text="Uncertainty"); unc_box.pack(fill=tk.X, pady=4)
+        ttk.Combobox(unc_box, textvariable=self.unc_mode, state="readonly",
+                     values=["Asymptotic", "Bootstrap", "Bayesian"], width=12).pack(side=tk.LEFT, padx=4)
+        ttk.Label(unc_box, text="N/steps:").pack(side=tk.LEFT)
+        ttk.Entry(unc_box, width=6, textvariable=self.unc_n).pack(side=tk.LEFT, padx=2)
+        ttk.Button(unc_box, text="Run", command=self.compute_uncertainty).pack(side=tk.LEFT, padx=4)
+        ttk.Button(unc_box, text="Export", command=self.export_uncertainty).pack(side=tk.LEFT, padx=4)
 
         # Status
         self.status = ttk.Label(self.root, text="Open CSV/TXT/DAT, set baseline/range, add peaks, set η, then Fit.")
@@ -928,6 +945,85 @@ class PeakFitApp:
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
         self.status.config(text="Fit complete. Edit/lock as needed; Fit again or Export.")
+        # store fit info for uncertainty estimation
+        self.last_fit = {
+            "x": x_fit,
+            "y": y_fit,
+            "mode": mode,
+            "baseline": base_fit,
+            "theta": theta,
+            "peaks": [Peak(p.center, p.height, p.fwhm, p.eta, p.lock_width, p.lock_center) for p in self.peaks],
+            "solver": solver,
+            "options": options,
+            "result": res,
+        }
+        self.unc_report = None
+
+    def compute_uncertainty(self):
+        if not self.last_fit:
+            messagebox.showinfo("Uncertainty", "Run a fit first.")
+            return
+        info = self.last_fit
+        mode = self.unc_mode.get().lower()
+        try:
+            resid = build_residual(info["x"], info["y"], info["peaks"], info["mode"], info["baseline"], "linear", None)
+            if mode == "asymptotic":
+                rep = asymptotic.asymptotic(info["result"], resid)
+                sigma = rep["params"].get("sigma")
+                self.status.config(text="Asymptotic σ: " + np.array2string(np.asarray(sigma), precision=3))
+            elif mode == "bootstrap":
+                resample_cfg = {
+                    "x": info["x"],
+                    "y": info["y"],
+                    "peaks": info["peaks"],
+                    "mode": info["mode"],
+                    "baseline": info["baseline"],
+                    "theta": info["theta"],
+                    "options": info.get("options", {}),
+                    "n": int(self.unc_n.get()),
+                }
+                rep = bootstrap.bootstrap(info["solver"], resample_cfg, resid)
+                sigma = np.sqrt(np.diag(rep["params"].get("cov", np.zeros((1,1)))))
+                self.status.config(text="Bootstrap σ: " + np.array2string(np.asarray(sigma), precision=3))
+            else:  # bayesian
+                init = {
+                    "x": info["x"],
+                    "y": info["y"],
+                    "peaks": info["peaks"],
+                    "mode": info["mode"],
+                    "baseline": info["baseline"],
+                    "theta": info["theta"],
+                }
+                sampler_cfg = {"nsteps": int(self.unc_n.get())}
+                rep = bayes.bayesian({}, "gaussian", init, sampler_cfg, None)
+                samples = np.asarray(rep["params"].get("samples"))
+                ci_lo = np.percentile(samples, 2.5, axis=0)
+                ci_hi = np.percentile(samples, 97.5, axis=0)
+                pairs = [f"({l:.3g},{h:.3g})" for l, h in zip(ci_lo, ci_hi)]
+                self.status.config(text="Bayesian 95% CI: " + ", ".join(pairs))
+        except Exception as exc:
+            messagebox.showerror("Uncertainty", str(exc))
+            return
+        self.unc_report = rep
+
+    def export_uncertainty(self):
+        if self.unc_report is None:
+            messagebox.showinfo("Uncertainty", "Compute uncertainty first.")
+            return
+        out_json = filedialog.asksaveasfilename(
+            title="Save uncertainty report", defaultextension=".json", filetypes=[("JSON","*.json")]
+        )
+        if not out_json:
+            return
+        try:
+            def _convert(obj):
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                raise TypeError
+            Path(out_json).write_text(json.dumps(self.unc_report, default=_convert, indent=2))
+            messagebox.showinfo("Uncertainty", f"Saved:\n{out_json}")
+        except Exception as exc:
+            messagebox.showerror("Uncertainty", f"Could not save report:\n{exc}")
 
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:
