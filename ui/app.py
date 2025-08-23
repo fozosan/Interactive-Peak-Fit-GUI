@@ -113,7 +113,6 @@ def save_config(cfg):
         messagebox.showwarning("Config", f"Could not save config: {e}")
 
 
-# ---------- Fitting utilities ----------
 # ---------- File loader (CSV/TXT/DAT) ----------
 def load_xy_any(path: str):
     """Wrapper around :func:`core.data_io.load_xy` for backwards compatibility."""
