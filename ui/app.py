@@ -5,6 +5,9 @@ is not yet implemented.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 
@@ -12,6 +15,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 import numpy as np
+
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from core import data_io, models, peaks, signals
 from fit import classic, modern, lmfit_backend, step_engine
