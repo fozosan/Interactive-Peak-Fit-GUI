@@ -8,7 +8,6 @@ import numpy as np
 from core.peaks import Peak
 from core.models import pv_sum
 
-
 class SolveResult(TypedDict):
     ok: bool
     theta: np.ndarray

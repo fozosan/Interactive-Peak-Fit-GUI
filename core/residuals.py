@@ -81,4 +81,6 @@ def jacobian_fd(residual_fn: Callable[[np.ndarray], np.ndarray],
         step[i] = eps
         r1 = residual_fn(theta + step)
         jac[:, i] = (r1 - r0) / eps
+
     return jac
+
