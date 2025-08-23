@@ -26,7 +26,6 @@ Features:
 
 import json
 import math
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -47,6 +46,8 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+
+from fit import step_engine
 
 
 # ---------- Math ----------
@@ -167,62 +168,11 @@ def pack_params(peaks: List[Peak]):
 
 # ---------- File loader (CSV/TXT/DAT) ----------
 def load_xy_any(path: str):
-    """
-    Robust loader for 2-column x,y data.
-    Tries pandas with auto-sep, then a manual parser that ignores comments/headers.
-    """
-    p = Path(path)
-    # 1) Try pandas with auto-sep (comma/tab/space/semicolon)
-    try:
-        df = pd.read_csv(p, engine="python", sep=None, header=None, comment="#")
-        df = df.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
-        if df.shape[1] >= 2:
-            x = df.iloc[:, 0].astype(float).to_numpy()
-            y = df.iloc[:, 1].astype(float).to_numpy()
-            mask = np.isfinite(x) & np.isfinite(y)
-            x, y = x[mask], y[mask]
-            if x.size >= 2 and y.size >= 2:
-                return x, y
-    except Exception:
-        pass
+    """Wrapper around :func:`core.data_io.load_xy` for backwards compatibility."""
 
-    # 2) Manual parser: ignore lines with comments or non-numeric tokens
-    xs, ys = [], []
-    with open(p, "r", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            # Remove comments (#, %, //) including inline
-            for cc in ("#", "%", "//"):
-                if line.startswith(cc):
-                    line = ""
-                    break
-                if cc in line:
-                    line = line.split(cc, 1)[0].strip()
-            if not line:
-                continue
-            parts = re.split(r"[,\s;]+", line)
-            nums = []
-            for tok in parts:
-                if tok == "":
-                    continue
-                try:
-                    nums.append(float(tok))
-                except ValueError:
-                    nums = []
-                    break
-            if len(nums) >= 2:
-                xs.append(nums[0]); ys.append(nums[1])
+    from core import data_io
 
-    if len(xs) >= 2:
-        x = np.asarray(xs, dtype=float)
-        y = np.asarray(ys, dtype=float)
-        if x[1] < x[0]:
-            idx = np.argsort(x); x, y = x[idx], y[idx]
-        return x, y
-
-    raise ValueError("Could not parse a two-column numeric dataset from the file.")
+    return data_io.load_xy(path)
 
 
 # ---------- Main GUI ----------
@@ -355,7 +305,8 @@ class PeakFitApp:
         ttk.Checkbutton(edit, text="Lock center", variable=self.lockc_var, command=self.on_lock_toggle).grid(row=3, column=1, sticky="w", pady=2)
 
         btns = ttk.Frame(peaks_box); btns.pack(fill=tk.X, pady=4)
-        ttk.Button(btns, text="Apply edits", command=self.apply_edits).pack(side=tk.LEFT)
+        ttk.Button(btns, text="➕ Add Peak", command=self.add_peak_from_fields).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Apply edits", command=self.apply_edits).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Delete selected", command=self.delete_selected).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Clear all", command=self.clear_peaks).pack(side=tk.LEFT, padx=4)
 
@@ -401,6 +352,7 @@ class PeakFitApp:
         # Actions
         actions = ttk.Labelframe(right, text="Actions"); actions.pack(fill=tk.X, pady=4)
         ttk.Button(actions, text="Auto-seed", command=self.auto_seed).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Step \u25B6", command=self.step_once).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Toggle components", command=self.toggle_components).pack(side=tk.LEFT, padx=4)
 
@@ -825,6 +777,21 @@ class PeakFitApp:
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
 
+    def add_peak_from_fields(self):
+        try:
+            c = float(self.center_var.get())
+            h = float(self.height_var.get())
+            w = max(float(self.fwhm_var.get()), 1e-6)
+        except ValueError:
+            messagebox.showwarning("Add Peak", "Center, Height, and FWHM must be numbers.")
+            return
+        pk = Peak(center=c, height=h, fwhm=w, eta=float(self.global_eta.get()),
+                  lock_center=bool(self.lockc_var.get()), lock_width=bool(self.lockw_var.get()))
+        self.peaks.append(pk)
+        self.peaks.sort(key=lambda p: p.center)
+        self.refresh_tree()
+        self.refresh_plot()
+
     def apply_edits(self):
         sel = self._selected_index()
         if sel is None:
@@ -896,6 +863,48 @@ class PeakFitApp:
             self.peaks.sort(key=lambda p: p.center)
         except Exception:
             pass
+
+    def step_once(self):
+        if self.x is None or self.y_raw is None or not self.peaks:
+            return
+        self._sync_selected_edits()
+
+        y_target = self.get_fit_target()
+        mask = self.current_fit_mask()
+        if mask is None or not np.any(mask):
+            messagebox.showwarning("Step", "Fit range is empty. Use 'Full range' or set a valid Min/Max.")
+            return
+        x_fit = self.x[mask]
+        y_fit = y_target[mask]
+
+        base_applied = self.use_baseline.get() and self.baseline is not None
+        add_mode = (self.baseline_mode.get() == "add")
+        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
+        mode = "add" if add_mode else "subtract"
+
+        try:
+            theta, _ = step_engine.step_once(
+                x_fit, y_fit, self.peaks, mode, base_fit,
+                loss="linear", weights=None, damping=0.0,
+                trust_radius=np.inf, bounds=None
+            )
+        except Exception as e:
+            messagebox.showerror("Step", f"Step failed:\n{e}")
+            return
+
+        j = 0
+        for pk in self.peaks:
+            c, h, w, eta = theta[j:j+4]; j += 4
+            if not pk.lock_center:
+                pk.center = float(c)
+            pk.height = float(h)
+            if not pk.lock_width:
+                pk.fwhm = float(abs(w))
+            pk.eta = float(eta)
+
+        self.refresh_tree(keep_selection=True)
+        self.refresh_plot()
+        self.status.config(text="Step complete. Fit again or Export.")
 
     def fit(self):
         if self.x is None or self.y_raw is None or not self.peaks:
