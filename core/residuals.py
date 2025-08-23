@@ -13,23 +13,26 @@ from .models import pv_sum
 from .peaks import Peak
 
 
-
-def build_residual(x: np.ndarray, y: np.ndarray, peaks: Sequence[Peak],
-                   mode: str, baseline: np.ndarray | None,
-                   loss: str, weights: np.ndarray | None) -> Callable[[np.ndarray], np.ndarray]:
+def build_residual(
+    x: np.ndarray,
+    y: np.ndarray,
+    peaks: Sequence[Peak],
+    mode: str,
+    baseline: np.ndarray | None,
+    loss: str,
+    weights: np.ndarray | None,
+) -> Callable[[np.ndarray], np.ndarray]:
     """Return a residual function ``r(theta)`` for the given data.
 
     ``theta`` is expected to contain ``4 * len(peaks)`` parameters ordered as
-    ``(center, height, fwhm, eta)`` for each peak. Only a linear loss is
-    currently supported. ``weights`` can provide per-point weighting.
+    ``(center, height, fwhm, eta)`` for each peak. ``loss`` is currently
+    accepted for API compatibility but only influences callers that apply a
+    robust loss externally. ``weights`` can provide per-point weighting.
     """
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
-
-    if loss != "linear":
-        raise NotImplementedError("only linear loss supported")
     w = np.asarray(weights, dtype=float) if weights is not None else None
 
     def residual(theta: np.ndarray) -> np.ndarray:
