@@ -8,12 +8,14 @@ import numpy as np
 from core.peaks import Peak
 
 
+
 class UncReport(TypedDict):
     type: str
     base_solver: str
     params: dict
     curve_band: dict
     meta: dict
+
 
 
 def _peaks_from_theta(theta: np.ndarray, template: Sequence[Peak]) -> list[Peak]:
@@ -94,3 +96,4 @@ def bootstrap(base_solver: str, resample_cfg: dict, residual_builder) -> UncRepo
         curve_band={},
         meta=meta,
     )
+

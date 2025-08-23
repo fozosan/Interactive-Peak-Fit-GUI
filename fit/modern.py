@@ -2,6 +2,7 @@
 with support for robust losses, weights and multi-start restarts."""
 from __future__ import annotations
 
+
 from typing import Optional, Sequence, TypedDict
 
 import numpy as np
@@ -126,3 +127,4 @@ def solve(
         cov=cov,
         meta={"nfev": best.nfev, "njev": getattr(best, "njev", None)},
     )
+

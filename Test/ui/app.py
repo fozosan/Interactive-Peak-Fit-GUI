@@ -14,9 +14,7 @@ from matplotlib.figure import Figure
 import numpy as np
 
 from core import data_io, models, peaks, signals
-
-from fit import classic, modern, lmfit_backend, step_engine
-
+from fit import classic, step_engine
 
 
 class App(tk.Tk):
@@ -42,12 +40,6 @@ class App(tk.Tk):
         tk.Button(control, text="Open", command=self.open_file).pack(fill=tk.X)
         tk.Button(control, text="Add Peak", command=self.add_peak).pack(fill=tk.X)
         tk.Button(control, text="Step", command=self.step_once).pack(fill=tk.X)
-
-
-        self.solver_var = tk.StringVar(value="classic")
-        tk.OptionMenu(control, self.solver_var, "classic", "modern", "lmfit").pack(fill=tk.X)
-
-
         tk.Button(control, text="Fit", command=self.run_fit).pack(fill=tk.X)
 
     # ------------------------------------------------------------------
@@ -80,30 +72,7 @@ class App(tk.Tk):
     def run_fit(self) -> None:
         if self.x is None or not self.peaks:
             return
-
-        solver = self.solver_var.get()
-        if solver == "classic":
-            res = classic.solve(self.x, self.y, self.peaks, "add", self.baseline, {})
-        elif solver == "modern":
-            res = modern.solve(
-                self.x,
-                self.y,
-                self.peaks,
-                "add",
-                self.baseline,
-                {"loss": "linear"},
-            )
-        else:  # lmfit
-            res = lmfit_backend.solve(
-                self.x,
-                self.y,
-                self.peaks,
-                "add",
-                self.baseline,
-                {},
-            )
-
-
+        res = classic.solve(self.x, self.y, self.peaks, "add", self.baseline, {})
         if res["ok"]:
             # update peaks with fitted heights
             new = []
