@@ -31,6 +31,12 @@ class App(tk.Tk):
         self.file_path: str | None = None
         self.last_result: dict | None = None
 
+        # baseline configuration
+        self.mode_var = tk.StringVar(value="add")
+        self.lam_var = tk.DoubleVar(value=1e5)
+        self.p_var = tk.DoubleVar(value=0.001)
+        self.niter_var = tk.IntVar(value=10)
+
         fig = Figure(figsize=(6, 4))
         self.ax = fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(fig, master=self)
@@ -45,6 +51,21 @@ class App(tk.Tk):
         tk.Button(control, text="Add Peak", command=self.add_peak).pack(fill=tk.X)
         tk.Button(control, text="Step", command=self.step_once).pack(fill=tk.X)
 
+        # baseline controls
+        base_frame = tk.LabelFrame(control, text="Baseline")
+        base_frame.pack(fill=tk.X, pady=4)
+        tk.OptionMenu(base_frame, self.mode_var, "add", "subtract").pack(fill=tk.X)
+        tk.Label(base_frame, text="λ").pack()
+        tk.Entry(base_frame, textvariable=self.lam_var).pack(fill=tk.X)
+        tk.Label(base_frame, text="p").pack()
+        tk.Entry(base_frame, textvariable=self.p_var).pack(fill=tk.X)
+        tk.Label(base_frame, text="iters").pack()
+        tk.Entry(base_frame, textvariable=self.niter_var).pack(fill=tk.X)
+        tk.Button(base_frame, text="Recompute", command=self.recompute_baseline).pack(fill=tk.X)
+
+        self.snr_label = tk.Label(control, text="S/N: -")
+        self.snr_label.pack(fill=tk.X)
+
         self.solver_var = tk.StringVar(value="classic")
         tk.OptionMenu(control, self.solver_var, "classic", "modern", "lmfit").pack(fill=tk.X)
 
@@ -57,7 +78,7 @@ class App(tk.Tk):
             return
         try:
             self.x, self.y = data_io.load_xy(path)
-            self.baseline = signals.als_baseline(self.y)
+            self.recompute_baseline()
         except Exception as exc:  # pragma: no cover - user feedback
             messagebox.showerror("Error", str(exc))
             return
@@ -79,18 +100,31 @@ class App(tk.Tk):
         self.peaks.append(peaks.Peak(center, height, fwhm, eta))
         self.refresh_plot()
 
+    def recompute_baseline(self) -> None:
+        """Recalculate baseline using ALS parameters."""
+        if self.y is None:
+            return
+        lam = self.lam_var.get()
+        p = self.p_var.get()
+        niter = self.niter_var.get()
+        self.baseline = signals.als_baseline(self.y, lam=lam, p=p, niter=niter)
+        sn = signals.snr_estimate(self.y - self.baseline)
+        self.snr_label.config(text=f"S/N: {sn:.2f}")
+        self.refresh_plot()
+
     def run_fit(self) -> None:
         if self.x is None or not self.peaks:
             return
         solver = self.solver_var.get()
+        mode = self.mode_var.get()
         if solver == "classic":
-            res = classic.solve(self.x, self.y, self.peaks, "add", self.baseline, {})
+            res = classic.solve(self.x, self.y, self.peaks, mode, self.baseline, {})
         elif solver == "modern":
             res = modern.solve(
                 self.x,
                 self.y,
                 self.peaks,
-                "add",
+                mode,
                 self.baseline,
                 {"loss": "linear"},
             )
@@ -99,7 +133,7 @@ class App(tk.Tk):
                 self.x,
                 self.y,
                 self.peaks,
-                "add",
+                mode,
                 self.baseline,
                 {},
             )
@@ -121,11 +155,12 @@ class App(tk.Tk):
         """Perform a single Gauss-Newton step and update the plot."""
         if self.x is None or not self.peaks:
             return
+        mode = self.mode_var.get()
         theta, _cost = step_engine.step_once(
             self.x,
             self.y,
             self.peaks,
-            "add",
+            mode,
             self.baseline,
             "linear",
             None,
@@ -145,9 +180,13 @@ class App(tk.Tk):
         """Export fitted peaks to a CSV peak table."""
         if self.x is None or not self.peaks:
             return
+        mode = self.mode_var.get()
         model = models.pv_sum(self.x, self.peaks)
         base = self.baseline if self.baseline is not None else 0.0
-        resid = model + base - self.y
+        if mode == "add":
+            resid = model + base - self.y
+        else:
+            resid = model - (self.y - base)
         rmse = float(np.sqrt(np.mean(resid**2))) if self.y is not None else 0.0
         areas = [models.pv_area(p.height, p.fwhm, p.eta) for p in self.peaks]
         total = sum(areas) if areas else 1.0
@@ -167,7 +206,7 @@ class App(tk.Tk):
                     "area_pct": 100.0 * area / total,
                     "rmse": rmse,
                     "fit_ok": True,
-                    "mode": "add",
+                    "mode": mode,
                     "als_lam": "",
                     "als_p": "",
                     "fit_xmin": float(self.x[0]),
@@ -186,8 +225,9 @@ class App(tk.Tk):
         """Export a trace table capturing baseline, model and peaks."""
         if self.x is None or self.y is None:
             return
+        mode = self.mode_var.get()
         csv_text = data_io.build_trace_table(
-            self.x, self.y, self.baseline, self.peaks, mode="add"
+            self.x, self.y, self.baseline, self.peaks, mode=mode
         )
         path = filedialog.asksaveasfilename(defaultextension=".csv")
         if not path:
@@ -203,7 +243,11 @@ class App(tk.Tk):
             self.ax.plot(self.x, self.baseline, label="baseline")
         if self.peaks:
             model = models.pv_sum(self.x, self.peaks)
-            self.ax.plot(self.x, model + (self.baseline or 0), label="model")
+            base = self.baseline if self.baseline is not None else 0.0
+            if self.mode_var.get() == "add":
+                self.ax.plot(self.x, model + base, label="model")
+            else:
+                self.ax.plot(self.x, model, label="model")
         self.ax.legend()
         self.canvas.draw()
 
