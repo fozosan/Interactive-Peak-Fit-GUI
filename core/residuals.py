@@ -13,6 +13,7 @@ from .models import pv_sum
 from .peaks import Peak
 
 
+
 def build_residual(x: np.ndarray, y: np.ndarray, peaks: Sequence[Peak],
                    mode: str, baseline: np.ndarray | None,
                    loss: str, weights: np.ndarray | None) -> Callable[[np.ndarray], np.ndarray]:
@@ -26,6 +27,7 @@ def build_residual(x: np.ndarray, y: np.ndarray, peaks: Sequence[Peak],
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
+
     if loss != "linear":
         raise NotImplementedError("only linear loss supported")
     w = np.asarray(weights, dtype=float) if weights is not None else None
