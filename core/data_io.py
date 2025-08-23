@@ -153,4 +153,3 @@ def build_trace_table(
         row.extend(comps_arr[:, idx])
         writer.writerow(row)
     return buf.getvalue()
-

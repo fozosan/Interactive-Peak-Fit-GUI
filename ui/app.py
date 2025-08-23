@@ -5,23 +5,24 @@ Interactive peak fit GUI for spectra (Gaussian–Lorentzian / pseudo-Voigt)
 Designed by Farhan Zahin
 Built with ChatGPT
 
-Build: v1.9
+Build: v2.7+
 
 Features:
   • ALS baseline with saved defaults
   • Baseline modes: "Add to fit" (baseline + peaks) or "Subtract" (peaks on y - baseline)
   • Option: compute ALS baseline only within a chosen x-range, then interpolate across full x
+  • Iteration/threshold controls with S/N readout
   • Thin plot lines; components drawn on top of baseline in "Add to fit" mode
   • Click to add peaks (toggleable); ignores clicks while Zoom/Pan is active
   • Lock width and/or center per-peak (applies instantly)
   • Global η (Gaussian–Lorentzian shape factor) with "Apply to all"
   • Auto-seed peaks (respects fit range)
   • Choose a fit x-range (type Min/Max or drag with a SpanSelector); shaded on plot
-  • Fit optimizes height + any unlocked centers/widths
+  • Solver selection (Classic, Modern, LMFIT) plus Step ▶ single iteration
   • Multiple peak templates (save as new, save changes, select/apply, delete); optional auto-apply on open
   • Zoom out & Reset view buttons
   • Supports CSV, TXT, DAT (auto delimiter detection; skips headers/comments)
-  • Export peaks (incl. area %) and a full trace CSV (raw, baseline, y_target, components, etc.)
+  • Export peak table with metadata and full trace CSV (raw, baseline, components)
 """
 
 import json
@@ -42,12 +43,10 @@ from matplotlib.widgets import SpanSelector
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
-from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
-import scipy.sparse as sp
-import scipy.sparse.linalg as spla
 
-from fit import step_engine
+from core import signals
+from fit import classic, lmfit_backend, modern, step_engine
 
 
 # ---------- Math ----------
@@ -67,25 +66,6 @@ def pseudo_voigt_area(height, fwhm, eta):
     eta = np.clip(eta, 0.0, 1.0)
     return (1.0 - eta) * ga_area + eta * lo_area
 
-def als_baseline(y, lam=1e5, p=0.001, niter=10, eps=1e-9):
-    """Sparse ALS baseline (Eilers & Boelens) with tiny ridge for stability."""
-    y = np.asarray(y, dtype=float)
-    L = y.size
-    if L < 3:
-        return np.zeros_like(y)
-    D = sp.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(L - 2, L), format="csc")
-    w = np.ones(L, dtype=float)
-    for _ in range(niter):
-        W = sp.diags(w, 0, shape=(L, L), format="csc")
-        Z = W + lam * (D.T @ D) + eps * sp.eye(L, format="csc")
-        rhs = w * y
-        try:
-            z = spla.spsolve(Z, rhs)
-        except Exception:
-            z = np.linalg.solve(Z.toarray(), rhs)
-        w = p * (y > z) + (1.0 - p) * (y < z)
-    return z
-
 
 # ---------- Data structures ----------
 @dataclass
@@ -103,6 +83,8 @@ CONFIG_PATH = Path.home() / ".gl_peakfit_config.json"
 DEFAULTS = {
     "als_lam": 1e5,
     "als_asym": 0.001,
+    "als_niter": 10,
+    "als_thresh": 0.0,
     # Legacy single template (migrated to templates/default if present)
     "saved_peaks": [],
     # Multiple templates live here as {"name": [peak dicts...]}
@@ -131,41 +113,6 @@ def save_config(cfg):
         messagebox.showwarning("Config", f"Could not save config: {e}")
 
 
-# ---------- Fitting utilities ----------
-def pack_params(peaks: List[Peak]):
-    """Build p0/bounds and model honoring lock_width/lock_center; η fixed per-peak."""
-    p0, lo, hi, struct = [], [], [], []
-    for pk in peaks:
-        s = {}
-        # height (always free)
-        s["ih"] = len(p0); p0.append(max(pk.height, 1e-9)); lo.append(0.0); hi.append(np.inf)
-        # center
-        if pk.lock_center:
-            s["ic"] = None; s["c_fixed"] = pk.center
-        else:
-            s["ic"] = len(p0); p0.append(pk.center); lo.append(-np.inf); hi.append(np.inf)
-        # width
-        if pk.lock_width:
-            s["iw"] = None; s["w_fixed"] = pk.fwhm
-        else:
-            s["iw"] = len(p0); p0.append(max(pk.fwhm, 1e-6)); lo.append(1e-6); hi.append(np.inf); s["w_fixed"] = None
-        s["eta"] = float(np.clip(pk.eta, 0, 1))
-        struct.append(s)
-
-    p0 = np.array(p0, float); lo = np.array(lo, float); hi = np.array(hi, float)
-
-    def model_peaks(x, *theta):
-        y = np.zeros_like(x, float)
-        for s in struct:
-            h = theta[s["ih"]]
-            c = theta[s["ic"]] if s["ic"] is not None else s["c_fixed"]
-            w = theta[s["iw"]] if s["iw"] is not None else s["w_fixed"]
-            y += pseudo_voigt(x, h, c, w, s["eta"])
-        return y
-
-    return p0, (lo, hi), model_peaks
-
-
 # ---------- File loader (CSV/TXT/DAT) ----------
 def load_xy_any(path: str):
     """Wrapper around :func:`core.data_io.load_xy` for backwards compatibility."""
@@ -183,7 +130,6 @@ class PeakFitApp:
 
         # Data
         self.x = None
-        the_int = None
         self.y_raw = None
         self.baseline = None
         self.use_baseline = tk.BooleanVar(value=True)
@@ -197,6 +143,8 @@ class PeakFitApp:
         self.cfg = load_config()
         self.als_lam = tk.DoubleVar(value=self.cfg["als_lam"])
         self.als_asym = tk.DoubleVar(value=self.cfg["als_asym"])
+        self.als_niter = tk.IntVar(value=self.cfg["als_niter"])
+        self.als_thresh = tk.DoubleVar(value=self.cfg["als_thresh"])
         self.global_eta = tk.DoubleVar(value=0.5)
         self.auto_apply_template = tk.BooleanVar(value=bool(self.cfg.get("auto_apply_template", False)))
         self.auto_apply_template_name = tk.StringVar(value=self.cfg.get("auto_apply_template_name", ""))
@@ -219,6 +167,10 @@ class PeakFitApp:
 
         # Components visibility
         self.components_visible = True
+
+        # Solver selection and diagnostics
+        self.solver_var = tk.StringVar(value="Classic")
+        self.snr_text = tk.StringVar(value="S/N: --")
 
         # UI
         self._build_ui()
@@ -265,8 +217,16 @@ class PeakFitApp:
         ttk.Entry(row, width=10, textvariable=self.als_lam).pack(side=tk.LEFT, padx=4)
         ttk.Label(row, text="p (asym):").pack(side=tk.LEFT)
         ttk.Entry(row, width=10, textvariable=self.als_asym).pack(side=tk.LEFT, padx=4)
+
+        row2 = ttk.Frame(baseline_box); row2.pack(fill=tk.X, pady=2)
+        ttk.Label(row2, text="Iterations:").pack(side=tk.LEFT)
+        ttk.Entry(row2, width=5, textvariable=self.als_niter).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row2, text="Threshold:").pack(side=tk.LEFT)
+        ttk.Entry(row2, width=7, textvariable=self.als_thresh).pack(side=tk.LEFT, padx=4)
+
         ttk.Button(baseline_box, text="Recompute baseline", command=self.compute_baseline).pack(side=tk.LEFT, pady=2)
         ttk.Button(baseline_box, text="Save as default", command=self.save_baseline_default).pack(side=tk.LEFT, padx=4)
+        ttk.Label(baseline_box, textvariable=self.snr_text).pack(side=tk.LEFT, padx=8)
 
         # Eta box
         eta_box = ttk.Labelframe(right, text="Shape factor η (0=Gaussian, 1=Lorentzian)"); eta_box.pack(fill=tk.X, pady=4)
@@ -348,6 +308,11 @@ class PeakFitApp:
 
         ttk.Checkbutton(tmpl, text="Auto-apply on open (use selected)", variable=self.auto_apply_template,
                         command=self.toggle_auto_apply).pack(anchor="w", pady=(4,0))
+
+        # Solver selection
+        solver_box = ttk.Labelframe(right, text="Solver"); solver_box.pack(fill=tk.X, pady=4)
+        ttk.Combobox(solver_box, textvariable=self.solver_var, state="readonly",
+                     values=["Classic", "Modern", "LMFIT"], width=12).pack(side=tk.LEFT, padx=4)
 
         # Actions
         actions = ttk.Labelframe(right, text="Actions"); actions.pack(fill=tk.X, pady=4)
@@ -459,27 +424,39 @@ class PeakFitApp:
             return
         lam = float(self.als_lam.get())
         asym = float(self.als_asym.get())
+        niter = int(self.als_niter.get())
+        thresh = float(self.als_thresh.get())
         use_slice = bool(self.baseline_use_range.get())
         mask = self._range_mask() if use_slice else None
 
         try:
             if mask is None or not np.any(mask):
-                self.baseline = als_baseline(self.y_raw, lam=lam, p=asym, niter=10)
+                self.baseline = signals.als_baseline(self.y_raw, lam=lam, p=asym,
+                                                     niter=niter, tol=thresh)
             else:
                 x_sub = self.x[mask]
                 y_sub = self.y_raw[mask]
-                z_sub = als_baseline(y_sub, lam=lam, p=asym, niter=10)
-                # Interpolate/extrapolate to full x (constant beyond ends)
+                z_sub = signals.als_baseline(y_sub, lam=lam, p=asym,
+                                             niter=niter, tol=thresh)
                 self.baseline = np.interp(self.x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
         except Exception as e:
             messagebox.showwarning("Baseline", f"ALS baseline failed: {e}")
             self.baseline = np.zeros_like(self.y_raw)
+
+        try:
+            y_t = self.get_fit_target()
+            snr = signals.snr_estimate(y_t if y_t is not None else self.y_raw)
+            self.snr_text.set(f"S/N: {snr:.2f}")
+        except Exception:
+            self.snr_text.set("S/N: --")
 
         self.refresh_plot()
 
     def save_baseline_default(self):
         self.cfg["als_lam"] = float(self.als_lam.get())
         self.cfg["als_asym"] = float(self.als_asym.get())
+        self.cfg["als_niter"] = int(self.als_niter.get())
+        self.cfg["als_thresh"] = float(self.als_thresh.get())
         save_config(self.cfg)
         messagebox.showinfo("Baseline", "Saved as default for future sessions.")
 
@@ -912,7 +889,6 @@ class PeakFitApp:
         self._sync_selected_edits()
 
         y_target = self.get_fit_target()
-        p0, bounds, model_peaks = pack_params(self.peaks)
 
         mask = self.current_fit_mask()
         if mask is None or not np.any(mask):
@@ -924,26 +900,30 @@ class PeakFitApp:
         base_applied = self.use_baseline.get() and self.baseline is not None
         add_mode = (self.baseline_mode.get() == "add")
         base_fit = self.baseline[mask] if (base_applied and add_mode) else None
+        mode = "add" if add_mode else "subtract"
 
-        def model(x, *theta):
-            y_model = model_peaks(x, *theta)
-            if base_fit is not None:
-                y_model = y_model + base_fit
-            return y_model
-
+        solver = self.solver_var.get().lower()
+        options: dict = {}
         try:
-            popt, _ = curve_fit(model, x_fit, y_fit, p0=p0, bounds=bounds, maxfev=20000)
+            if solver == "modern":
+                res = modern.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
+            elif solver == "lmfit":
+                res = lmfit_backend.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
+            else:
+                res = classic.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
         except Exception as e:
             messagebox.showerror("Fit", f"Fitting failed:\n{e}")
             return
 
-        j = 0
-        for pk in self.peaks:
-            pk.height = float(popt[j]); j += 1
+        theta = res["theta"]
+        for i, pk in enumerate(self.peaks):
+            c, h, w, eta = theta[4*i:4*(i+1)]
             if not pk.lock_center:
-                pk.center = float(popt[j]); j += 1
+                pk.center = float(c)
+            pk.height = float(h)
             if not pk.lock_width:
-                pk.fwhm = float(abs(popt[j])); j += 1
+                pk.fwhm = float(abs(w))
+            pk.eta = float(eta)
 
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
@@ -963,23 +943,7 @@ class PeakFitApp:
 
         areas = [pseudo_voigt_area(p.height, p.fwhm, p.eta) for p in self.peaks]
         total_area = float(np.sum(areas)) if areas else 1.0
-        rows = []
-        for i, (p, a) in enumerate(zip(self.peaks, areas), 1):
-            rows.append({
-                "peak": i,
-                "center": p.center,
-                "height": p.height,
-                "fwhm": p.fwhm,
-                "eta": p.eta,
-                "lock_width": p.lock_width,
-                "lock_center": p.lock_center,
-                "area": a,
-                "area_pct": 100.0 * a / total_area
-            })
-        pd.DataFrame(rows).to_csv(out_csv, index=False)
 
-        # Trace CSV
-        trace_path = str(Path(out_csv).with_name(Path(out_csv).stem + "_trace.csv"))
         y_target = self.get_fit_target()
         total_peaks = np.zeros_like(self.x, float)
         comp_cols = {}
@@ -996,6 +960,35 @@ class PeakFitApp:
             y_fit = total_peaks
             y_corr = self.y_raw - base if self.use_baseline.get() else self.y_raw
 
+        mask = self.current_fit_mask()
+        rmse = float(np.sqrt(np.mean((y_target[mask] - y_fit[mask]) ** 2))) if mask is not None else float("nan")
+
+        rows = []
+        fname = self.file_label.cget("text")
+        for i, (p, a) in enumerate(zip(self.peaks, areas), 1):
+            rows.append({
+                "file": fname,
+                "peak": i,
+                "center": p.center,
+                "height": p.height,
+                "fwhm": p.fwhm,
+                "eta": p.eta,
+                "lock_width": p.lock_width,
+                "lock_center": p.lock_center,
+                "area": a,
+                "area_pct": 100.0 * a / total_area,
+                "rmse": rmse,
+                "fit_ok": True,
+                "mode": self.baseline_mode.get(),
+                "als_lam": float(self.als_lam.get()),
+                "als_p": float(self.als_asym.get()),
+                "fit_xmin": self.fit_xmin if self.fit_xmin is not None else float(self.x.min()),
+                "fit_xmax": self.fit_xmax if self.fit_xmax is not None else float(self.x.max()),
+            })
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+        # Trace CSV
+        trace_path = str(Path(out_csv).with_name(Path(out_csv).stem + "_trace.csv"))
         df = pd.DataFrame({
             "x": self.x,
             "y_raw": self.y_raw,
