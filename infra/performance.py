@@ -1,8 +1,11 @@
 """Performance configuration for Peakfit 3.x."""
 from __future__ import annotations
+
 from typing import Optional
+
 import numpy as np
 import random
+
 from core import models
 
 _numba_enabled = False

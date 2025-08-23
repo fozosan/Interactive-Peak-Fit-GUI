@@ -28,6 +28,8 @@ class App(tk.Tk):
         self.y = None
         self.baseline = None
         self.peaks: list[peaks.Peak] = []
+        self.file_path: str | None = None
+        self.last_result: dict | None = None
 
         fig = Figure(figsize=(6, 4))
         self.ax = fig.add_subplot(111)
@@ -38,6 +40,8 @@ class App(tk.Tk):
         control.pack(side=tk.RIGHT, fill=tk.Y)
 
         tk.Button(control, text="Open", command=self.open_file).pack(fill=tk.X)
+        tk.Button(control, text="Export Peaks", command=self.export_peaks).pack(fill=tk.X)
+        tk.Button(control, text="Export Trace", command=self.export_trace).pack(fill=tk.X)
         tk.Button(control, text="Add Peak", command=self.add_peak).pack(fill=tk.X)
         tk.Button(control, text="Step", command=self.step_once).pack(fill=tk.X)
 
@@ -57,6 +61,8 @@ class App(tk.Tk):
         except Exception as exc:  # pragma: no cover - user feedback
             messagebox.showerror("Error", str(exc))
             return
+        self.file_path = path
+        self.last_result = None
         self.peaks.clear()
         self.refresh_plot()
 
@@ -106,6 +112,7 @@ class App(tk.Tk):
                 c, h, w, e = theta[4 * i : 4 * (i + 1)]
                 new.append(peaks.Peak(c, h, w, e))
             self.peaks = new
+            self.last_result = res
             self.refresh_plot()
         else:  # pragma: no cover - user feedback
             messagebox.showerror("Fit failed", res["message"])
@@ -131,7 +138,62 @@ class App(tk.Tk):
             c, h, w, e = theta[4 * i : 4 * (i + 1)]
             new.append(peaks.Peak(c, h, w, e))
         self.peaks = new
+        self.last_result = None
         self.refresh_plot()
+
+    def export_peaks(self) -> None:
+        """Export fitted peaks to a CSV peak table."""
+        if self.x is None or not self.peaks:
+            return
+        model = models.pv_sum(self.x, self.peaks)
+        base = self.baseline if self.baseline is not None else 0.0
+        resid = model + base - self.y
+        rmse = float(np.sqrt(np.mean(resid**2))) if self.y is not None else 0.0
+        areas = [models.pv_area(p.height, p.fwhm, p.eta) for p in self.peaks]
+        total = sum(areas) if areas else 1.0
+        records = []
+        for i, (p, area) in enumerate(zip(self.peaks, areas), start=1):
+            records.append(
+                {
+                    "file": self.file_path or "",
+                    "peak": i,
+                    "center": p.center,
+                    "height": p.height,
+                    "fwhm": p.fwhm,
+                    "eta": p.eta,
+                    "lock_width": p.lock_width,
+                    "lock_center": p.lock_center,
+                    "area": area,
+                    "area_pct": 100.0 * area / total,
+                    "rmse": rmse,
+                    "fit_ok": True,
+                    "mode": "add",
+                    "als_lam": "",
+                    "als_p": "",
+                    "fit_xmin": float(self.x[0]),
+                    "fit_xmax": float(self.x[-1]),
+                }
+            )
+
+        csv_text = data_io.build_peak_table(records)
+        path = filedialog.asksaveasfilename(defaultextension=".csv")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(csv_text)
+
+    def export_trace(self) -> None:
+        """Export a trace table capturing baseline, model and peaks."""
+        if self.x is None or self.y is None:
+            return
+        csv_text = data_io.build_trace_table(
+            self.x, self.y, self.baseline, self.peaks, mode="add"
+        )
+        path = filedialog.asksaveasfilename(defaultextension=".csv")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(csv_text)
 
     def refresh_plot(self) -> None:
         self.ax.clear()
