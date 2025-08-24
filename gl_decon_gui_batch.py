@@ -589,7 +589,6 @@ class PeakFitApp:
         ttk.Button(axes_box, text="Superscript", command=self.insert_superscript).pack(side=tk.LEFT, padx=2)
         ttk.Button(axes_box, text="Subscript", command=self.insert_subscript).pack(side=tk.LEFT, padx=2)
         ttk.Button(axes_box, text="Save as default", command=self.save_x_label_default).pack(side=tk.LEFT, padx=2)
-
         # Templates
         tmpl = ttk.Labelframe(right, text="Peak Templates"); tmpl.pack(fill=tk.X, pady=6)
         self.template_info = ttk.Label(tmpl, text="Templates: 0")
@@ -797,6 +796,12 @@ class PeakFitApp:
         self.cfg["x_label"] = self.x_label_var.get()
         save_config(self.cfg)
         messagebox.showinfo("Axes", f'Saved default x-axis label: "{self.x_label_var.get()}"')
+
+    @staticmethod
+    def _format_axis_label(text: str) -> str:
+        if "^" in text or "_" in text:
+            return f"${text}$"
+        return text
 
     @staticmethod
     def _format_axis_label(text: str) -> str:
