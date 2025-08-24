@@ -77,14 +77,19 @@ def solve(
     elif weight_mode == "inv_y":
         weights = 1.0 / np.clip(np.abs(y), 1e-12, None)
 
+    options = options.copy()
+    base = baseline if baseline is not None else 0.0
+    y_target = y - base
+    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
+    max_height_factor = float(options.get("max_height_factor", np.inf))
+    options["max_height"] = max_height_factor * p95
+    options["max_fwhm"] = options.get("max_fwhm", 0.5 * (x.max() - x.min()))
+
     theta0_full, bounds_full = pack_theta_bounds(peaks, x, options)
     dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
     fwhm_min = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
 
     all_locked = all(p.lock_center and p.lock_width for p in peaks)
-
-    base = baseline if baseline is not None else 0.0
-    y_target = y - base
 
     if all_locked:
         A = pv_design_matrix(x, peaks)

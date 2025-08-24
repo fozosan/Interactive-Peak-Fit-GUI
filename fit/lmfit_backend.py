@@ -1,14 +1,15 @@
-"""LMFIT backend using analytic residuals and Jacobian."""
-
+"""LMFIT backend using variable projection."""
 from __future__ import annotations
 
 from typing import Optional, Sequence, TypedDict
 
 import numpy as np
+from scipy.optimize import nnls
 
+from core.models import pv_design_matrix
 from core.peaks import Peak
-from core.residuals import build_residual_jac
 from .bounds import pack_theta_bounds
+from .utils import mad_sigma, robust_cost
 
 
 class SolveResult(TypedDict):
@@ -53,76 +54,115 @@ def solve(
     y = np.asarray(y, dtype=float)
     baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
 
+    loss = options.get("loss", "linear")
     weight_mode = options.get("weights", "none")
+    f_scale_opt = float(options.get("f_scale", 0.0))
+    lambda_c = float(options.get("lambda_c", 0.0))
+    lambda_w = float(options.get("lambda_w", 0.0))
+
     weights = None
     if weight_mode == "poisson":
         weights = 1.0 / np.sqrt(np.clip(np.abs(y), 1.0, None))
     elif weight_mode == "inv_y":
         weights = 1.0 / np.clip(np.abs(y), 1e-12, None)
 
+    options = options.copy()
+    base = baseline if baseline is not None else 0.0
+    y_target = y - base
+    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
+    max_height_factor = float(options.get("max_height_factor", np.inf))
+    options["max_height"] = max_height_factor * p95
+    options["max_fwhm"] = options.get("max_fwhm", 0.5 * (x.max() - x.min()))
+
     theta0_full, bounds_full = pack_theta_bounds(peaks, x, options)
     dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
     min_fwhm = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
-    x_min = float(x.min())
-    x_max = float(x.max())
-    clamp_center = bool(options.get("centers_in_window", False))
 
     params = lmfit.Parameters()
     for i, p in enumerate(peaks):
-        c = float(np.clip(p.center, x_min, x_max)) if clamp_center else float(p.center)
-        w = float(max(p.fwhm, min_fwhm))
-        params.add(f"h{i}", value=max(p.height, 1e-12), min=0)
-        params.add(
-            f"c{i}", value=c,
-            min=x_min if clamp_center else None,
-            max=x_max if clamp_center else None,
-            vary=not p.lock_center,
-        )
-        params.add(
-            f"w{i}", value=w, min=min_fwhm, vary=not p.lock_width
-        )
-
-    resid_jac = build_residual_jac(x, y, peaks, mode, baseline, weights)
+        if not p.lock_center:
+            params.add(
+                f"c{i}", value=p.center, min=x.min(), max=x.max(), vary=True
+            )
+        else:
+            params.add(f"c{i}", value=p.center, vary=False)
+        if not p.lock_width:
+            params.add(
+                f"w{i}", value=max(p.fwhm, min_fwhm), min=min_fwhm, max=options["max_fwhm"], vary=True
+            )
+        else:
+            params.add(f"w{i}", value=max(p.fwhm, min_fwhm), vary=False)
 
     def residual(pars: lmfit.Parameters) -> np.ndarray:
-        theta = []
-        for i, p in enumerate(peaks):
-            theta.append(pars[f"h{i}"].value)
-            if not p.lock_center:
-                theta.append(pars[f"c{i}"].value)
-            if not p.lock_width:
-                theta.append(pars[f"w{i}"].value)
-        r, _ = resid_jac(np.asarray(theta, dtype=float))
+        c = np.array([pars[f"c{i}"].value for i in range(len(peaks))], dtype=float)
+        f = np.array([pars[f"w{i}"].value for i in range(len(peaks))], dtype=float)
+        pk_tmp = [Peak(c[i], 1.0, f[i], peaks[i].eta) for i in range(len(peaks))]
+        A = pv_design_matrix(x, pk_tmp)
+        b = y_target
+        if weights is not None:
+            Aw = A * weights[:, None]
+            bw = b * weights
+        else:
+            Aw = A
+            bw = b
+        h, _ = nnls(Aw, bw)
+        h = np.minimum(h, options["max_height"])
+        model = A @ h
+        r = model - b
+        if weights is not None:
+            r = r * weights
+        tether = []
+        if lambda_c > 0:
+            for i, p in enumerate(peaks):
+                if not p.lock_center:
+                    scale = np.sqrt(lambda_c) / max(p.fwhm, min_fwhm)
+                    tether.append(scale * (c[i] - p.center))
+        if lambda_w > 0:
+            for i, p in enumerate(peaks):
+                if not p.lock_width:
+                    scale = np.sqrt(lambda_w)
+                    tether.append(scale * np.log(f[i] / max(p.fwhm, min_fwhm)))
+        if tether:
+            r = np.concatenate([r, np.asarray(tether)])
         return r
 
-    def jac(pars: lmfit.Parameters) -> np.ndarray:
-        theta = []
-        for i, p in enumerate(peaks):
-            theta.append(pars[f"h{i}"].value)
-            if not p.lock_center:
-                theta.append(pars[f"c{i}"].value)
-            if not p.lock_width:
-                theta.append(pars[f"w{i}"].value)
-        _, J = resid_jac(np.asarray(theta, dtype=float))
-        return J
+    resid0 = residual(params)
+    sigma = mad_sigma(resid0)
+    f_scale = f_scale_opt if f_scale_opt > 0 else max(sigma, 1e-12)
 
     maxfev = int(options.get("maxfev", 20000))
-    minimizer = lmfit.Minimizer(residual, params, jac=jac, nan_policy="omit")
-    result = minimizer.minimize(method="least_squares", max_nfev=maxfev)
+    minimizer = lmfit.Minimizer(residual, params, nan_policy="omit")
+    result = minimizer.minimize(
+        method="least_squares",
+        max_nfev=maxfev,
+        loss=loss,
+        f_scale=f_scale,
+    )
+
+    c = np.array([result.params[f"c{i}"].value for i in range(len(peaks))], dtype=float)
+    f = np.array([result.params[f"w{i}"].value for i in range(len(peaks))], dtype=float)
+    pk_final = [Peak(c[i], 1.0, f[i], peaks[i].eta) for i in range(len(peaks))]
+    A = pv_design_matrix(x, pk_final)
+    if weights is not None:
+        Aw = A * weights[:, None]
+        bw = y_target * weights
+    else:
+        Aw = A
+        bw = y_target
+    h, _ = nnls(Aw, bw)
+    h = np.minimum(h, options["max_height"])
+    model = A @ h
+    r = model - y_target
+    if weights is not None:
+        r = r * weights
+    cost = robust_cost(r, loss, f_scale)
 
     theta_full = theta0_full.copy()
-    idx = 0
-    for i, p in enumerate(peaks):
-        theta_full[4 * i + 1] = result.params[f"h{i}"].value
-        if not p.lock_center:
-            theta_full[4 * i + 0] = result.params[f"c{i}"].value
-        if not p.lock_width:
-            theta_full[4 * i + 2] = result.params[f"w{i}"].value
-        # eta stays as initial
-
-    r = residual(result.params)
-    cost = 0.5 * float(r @ r)
-    J = jac(result.params)
+    for i in range(len(peaks)):
+        theta_full[4 * i + 0] = c[i]
+        theta_full[4 * i + 1] = h[i]
+        theta_full[4 * i + 2] = f[i]
+    J = None
 
     return SolveResult(
         ok=result.success,
@@ -130,7 +170,6 @@ def solve(
         message=result.message,
         cost=cost,
         jac=J,
-        cov=result.covar,
-        meta={"nfev": result.nfev},
+        cov=None,
+        meta={"nfev": result.nfev, "sigma": sigma, "f_scale": f_scale},
     )
-

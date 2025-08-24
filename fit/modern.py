@@ -10,6 +10,7 @@ from scipy.optimize import least_squares
 from core.residuals import build_residual_jac
 from core.models import pv_design_matrix
 from .bounds import pack_theta_bounds
+from .utils import mad_sigma, robust_cost
 
 
 class SolveResult(TypedDict):
@@ -83,14 +84,19 @@ def solve(
     elif weight_mode == "inv_y":
         weights = 1.0 / np.clip(np.abs(y), 1e-12, None)
 
+    options = options.copy()
+    base = baseline if baseline is not None else 0.0
+    y_target = y - base
+    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
+    max_height_factor = float(options.get("max_height_factor", np.inf))
+    options["max_height"] = max_height_factor * p95
+    options["max_fwhm"] = options.get("max_fwhm", 0.5 * (x.max() - x.min()))
+
     theta0_full, bounds_full = pack_theta_bounds(peaks, x, options)
     dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
     fwhm_min = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
 
     all_locked = all(p.lock_center and p.lock_width for p in peaks)
-    base = baseline if baseline is not None else 0.0
-    y_target = y - base
-
     if all_locked:
         A = pv_design_matrix(x, peaks)
         if weights is not None:
@@ -125,6 +131,8 @@ def solve(
     best_cost = np.inf
     rng = np.random.default_rng(options.get("seed"))
 
+    resid_jac = build_residual_jac(x, y, peaks, mode, baseline, weights)
+
     for _ in range(max(1, restarts)):
         if jitter_pct:
             jitter = 1.0 + jitter_pct / 100.0 * rng.standard_normal(theta0.shape)
@@ -134,7 +142,12 @@ def solve(
         else:
             start = theta0
 
-        resid_jac = build_residual_jac(x, y, peaks, mode, baseline, weights)
+        r0, J0 = resid_jac(start)
+        local_f_scale = f_scale
+        if loss != "linear" and (not np.isfinite(local_f_scale) or local_f_scale <= 0):
+            sigma = mad_sigma(r0)
+            local_f_scale = max(sigma, 1e-12)
+        cost0 = robust_cost(r0, loss, local_f_scale)
 
         def fun(t):
             r, _ = resid_jac(t)
@@ -150,29 +163,63 @@ def solve(
             jac=jac,
             method="trf",
             loss=loss,
-            f_scale=f_scale,
+            f_scale=local_f_scale,
             bounds=bounds,
             x_scale=x_scale,
             max_nfev=maxfev,
         )
 
-        cost = float(res.cost)
-        if cost < best_cost:
+        r_new, J_new = resid_jac(res.x)
+        cost_new = robust_cost(r_new, loss, local_f_scale)
+        backtracked = False
+        if cost_new > cost0:
+            theta_old = start
+            step = res.x - start
+            for alpha in [0.5, 0.25, 0.125, 0.0625]:
+                theta_bt = theta_old + alpha * step
+                r_bt, J_bt = resid_jac(theta_bt)
+                cost_bt = robust_cost(r_bt, loss, local_f_scale)
+                if cost_bt < cost0:
+                    res.x = theta_bt
+                    r_new = r_bt
+                    J_new = J_bt
+                    cost_new = cost_bt
+                    backtracked = True
+                    break
+            else:
+                res.x = start
+                r_new, J_new = r0, J0
+                cost_new = cost0
+                backtracked = True
+        if cost_new < best_cost:
             best = res
-            best_cost = cost
+            best_cost = cost_new
+            best.residual = r_new  # type: ignore
+            best.jac = J_new
+            best.f_scale = local_f_scale  # type: ignore
+            best.backtracked = backtracked  # type: ignore
 
     if best is None:  # pragma: no cover - should not happen
         raise RuntimeError("least_squares failed")
 
     theta_full = theta0_full.copy()
     theta_full[indices] = best.x
-    jac_full = best.jac
+    jac_full = getattr(best, "jac", None)
     cov = None
-    if jac_full is not None:
+    if jac_full is not None and jac_full.size:
         try:
             cov = np.linalg.pinv(jac_full.T @ jac_full)
         except np.linalg.LinAlgError:
             cov = None
+
+    sigma_final = mad_sigma(getattr(best, "residual", np.zeros(1)))
+    meta = {
+        "nfev": getattr(best, "nfev", None),
+        "njev": getattr(best, "njev", None),
+        "sigma": sigma_final,
+        "f_scale": getattr(best, "f_scale", f_scale),
+        "backtracked": getattr(best, "backtracked", False),
+    }
 
     return SolveResult(
         ok=bool(best.success),
@@ -181,6 +228,6 @@ def solve(
         cost=best_cost,
         jac=jac_full,
         cov=cov,
-        meta={"nfev": best.nfev, "njev": getattr(best, "njev", None)},
+        meta=meta,
     )
 
