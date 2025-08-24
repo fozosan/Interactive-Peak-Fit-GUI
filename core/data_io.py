@@ -90,7 +90,6 @@ def build_peak_table(records: Iterable[dict]) -> str:
         writer.writerow(rec)
     return buf.getvalue()
 
-
 def build_trace_table(
     x: np.ndarray,
     y_raw: np.ndarray,
@@ -154,4 +153,3 @@ def build_trace_table(
         row.extend(comps_arr[:, idx])
         writer.writerow(row)
     return buf.getvalue()
-
