@@ -22,3 +22,5 @@ class FitResult:
     n_iter: int
     message: str = ""
     diagnostics: Dict[str, Any] = field(default_factory=dict)
+    hit_bounds: bool = False
+    hit_mask: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))

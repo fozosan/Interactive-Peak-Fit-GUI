@@ -30,6 +30,7 @@ def step_once(
     damping: float,
     trust_radius: float,
     bounds: Sequence | None,
+    wmin_eval: float = 0.0,
     f_scale: float = 1.0,
     max_backtracks: int = 8,
 ) -> tuple[np.ndarray, float, float, bool]:
@@ -38,8 +39,9 @@ def step_once(
     ``weight_mode`` selects the noise-weighting strategy and ``loss`` controls
     the robust IRLS weights.  Noise and robust weights are combined via
     :func:`core.weights.combine_weights` so that the behaviour matches the full
-    solvers.  Armijo-style backtracking (step halving) is used to ensure that
-    the returned step does not increase the weighted cost.
+    solvers.  ``wmin_eval`` enforces a minimum width during model evaluation to
+    guard against singularities. Armijo-style backtracking (step halving) is
+    used to ensure that the returned step does not increase the weighted cost.
 
     Returns
     -------
@@ -62,6 +64,8 @@ def step_once(
     c = np.array([p.center for p in peaks], dtype=float)
     h = np.array([p.height for p in peaks], dtype=float)
     f = np.array([p.fwhm for p in peaks], dtype=float)
+    if wmin_eval > 0.0:
+        f = np.maximum(f, wmin_eval)
     eta = np.array([p.eta for p in peaks], dtype=float)
 
     model = np.zeros_like(x)
@@ -124,6 +128,8 @@ def step_once(
         c_new = theta1[0::4]
         h_new = theta1[1::4]
         f_new = theta1[2::4]
+        if wmin_eval > 0.0:
+            f_new = np.maximum(f_new, wmin_eval)
         eta_new = theta1[3::4]
         model_new = np.zeros_like(x)
         for i in range(n):

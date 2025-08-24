@@ -34,6 +34,7 @@ def test_step_converges_close_to_fit():
 
     options = {}
     theta0, bounds = pack_theta_bounds(step_peaks, x, options)
+    wmin_eval = bounds[0][2] if bounds[0].size >= 3 else 1e-6
     weight_mode = "none"  # no noise weighting
 
     model0 = pv_sum(x, step_peaks)
@@ -50,6 +51,7 @@ def test_step_converges_close_to_fit():
         damping=0.0,
         trust_radius=np.inf,
         bounds=bounds,
+        wmin_eval=wmin_eval,
         f_scale=1.0,
     )
     assert accepted and cost1 < cost0
@@ -69,6 +71,7 @@ def test_step_converges_close_to_fit():
             damping=0.0,
             trust_radius=np.inf,
             bounds=bounds,
+            wmin_eval=wmin_eval,
             f_scale=1.0,
         )
         _update_peaks(step_peaks, theta)

@@ -14,6 +14,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "save_traces": False,
         "auto_max": 5,
     },
+    "classic": {
+        "maxfev": 20000,
+        "bound_centers_to_window": True,
+        "margin_frac": 0.0,
+        "fwhm_min_factor": 2.0,
+        "fwhm_max_factor": 0.5,
+        "height_factor": 3.0,
+    },
 }
 
 
@@ -44,6 +52,18 @@ def load(path: str | Path) -> Dict[str, Any]:
             data = json.load(fh)
         if isinstance(data, dict):
             _merge(cfg, data)
+            classic = cfg.setdefault("classic", {})
+            # Migrate legacy keys if present
+            if "fwhm_min_dx_factor" in classic and "fwhm_min_factor" not in classic:
+                classic["fwhm_min_factor"] = classic.pop("fwhm_min_dx_factor")
+            if "fwhm_max_span_factor" in classic and "fwhm_max_factor" not in classic:
+                classic["fwhm_max_factor"] = classic.pop("fwhm_max_span_factor")
+            if "max_height_factor" in classic and "height_factor" not in classic:
+                classic["height_factor"] = classic.pop("max_height_factor")
+            classic.setdefault("margin_frac", 0.0)
+            classic.setdefault("fwhm_min_factor", 2.0)
+            classic.setdefault("fwhm_max_factor", 0.5)
+            classic.setdefault("height_factor", 3.0)
     except json.JSONDecodeError:  # pragma: no cover - corrupted file
         pass
     return cfg

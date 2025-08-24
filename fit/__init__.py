@@ -81,6 +81,8 @@ def _adapt_result(
     meta = raw.get("meta", {}) or {}
     nfev = int(meta.get("nfev", 0))
     n_iter = int(meta.get("n_iter", meta.get("njev", nfev)))
+    hit_bounds = bool(raw.get("hit_bounds", False))
+    hit_mask = np.asarray(raw.get("hit_mask", []), dtype=bool)
     return FitResult(
         success=bool(raw.get("ok", False)),
         solver=solver_name,
@@ -92,6 +94,8 @@ def _adapt_result(
         n_iter=n_iter,
         message=str(raw.get("message", "")),
         diagnostics=meta,
+        hit_bounds=hit_bounds,
+        hit_mask=hit_mask,
     )
 
 

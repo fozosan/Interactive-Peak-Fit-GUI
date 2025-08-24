@@ -14,6 +14,7 @@ def test_step_weight_modes_smoke():
     peaks = [Peak(0.0, 1.0, 1.0, 0.5)]
     y = pv_sum(x, peaks)
     _, bounds = pack_theta_bounds(peaks, x, {})
+    wmin_eval = bounds[0][2] if bounds[0].size >= 3 else 1e-6
     for mode in ["none", "poisson", "inv_y"]:
         theta, cost, step_norm, accepted = step_engine.step_once(
             x,
@@ -26,6 +27,7 @@ def test_step_weight_modes_smoke():
             damping=0.0,
             trust_radius=np.inf,
             bounds=bounds,
+            wmin_eval=wmin_eval,
             f_scale=1.0,
         )
         assert accepted and np.isfinite(cost)

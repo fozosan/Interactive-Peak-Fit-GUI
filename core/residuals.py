@@ -67,11 +67,14 @@ def build_residual_jac(
     mode: str,
     baseline: np.ndarray | None,
     weights: np.ndarray | None,
+    wmin_eval: float = 0.0,
 ) -> Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]:
     """Return residual and Jacobian builder for solvers.
 
     The parameter vector ``theta`` follows the order ``[h1,(c1),(w1), h2,(c2),(w2), ...]``
-    where centres and widths are omitted when locked.
+    where centres and widths are omitted when locked.  ``wmin_eval`` provides a
+    minimum width used only for evaluation to guard against singular intermediate
+    values.
     """
 
     x = np.asarray(x, dtype=float)
@@ -104,6 +107,8 @@ def build_residual_jac(
             if not lock_w[i]:
                 f[i] = theta[j]
                 j += 1
+        if wmin_eval > 0.0:
+            f = np.maximum(f, wmin_eval)
 
         model = np.zeros_like(x)
         cols = []

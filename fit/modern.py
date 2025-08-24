@@ -128,7 +128,9 @@ def solve(
     best_cost = np.inf
     rng = np.random.default_rng(options.get("seed"))
 
-    resid_jac = build_residual_jac(x, y, peaks, mode, baseline, weights)
+    resid_jac = build_residual_jac(
+        x, y, peaks, mode, baseline, weights
+    )
 
     for _ in range(max(1, restarts)):
         if jitter_pct:

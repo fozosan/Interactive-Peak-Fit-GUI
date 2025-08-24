@@ -5,6 +5,8 @@ from typing import Sequence, Tuple
 
 import numpy as np
 
+from core.bounds import make_bounds
+
 
 class PeakLike:
     """Protocol-like base for objects with peak attributes.
@@ -51,13 +53,27 @@ def pack_theta_bounds(
     """
 
     x = np.asarray(x, dtype=float)
-    x_min = float(x.min())
-    x_max = float(x.max())
-    dx_med = float(np.median(np.diff(np.sort(x)))) if len(x) > 1 else 1.0
-    min_fwhm = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
-    max_fwhm = float(options.get("max_fwhm", 0.5 * (x_max - x_min)))
-    max_height = float(options.get("max_height", np.inf))
-    clamp_center = bool(options.get("centers_in_window", False))
+    span = float(x.max() - x.min()) if x.size else 0.0
+    opts = dict(options)
+    bound_centers = bool(
+        opts.get("centers_in_window", opts.get("bound_centers_to_window", False))
+    )
+    max_fwhm_factor = float(opts.get("max_fwhm_factor", 0.5))
+    if "max_fwhm" in opts and span > 0:
+        max_fwhm_factor = float(opts["max_fwhm"]) / span
+    max_height_factor = float(opts.get("max_height_factor", np.inf))
+    y_target = opts.get("y_target")
+    extra = {"max_height": opts.get("max_height")}
+    (lo_hw, hi_hw), _info = make_bounds(
+        peaks,
+        x,
+        None,
+        bound_centers_to_window=bound_centers,
+        max_fwhm_factor=max_fwhm_factor,
+        max_height_factor=max_height_factor,
+        y_target=y_target,
+        **extra,
+    )
 
     # ``theta_list`` collects the starting parameter vector.  We ensure all
     # starting values already respect the bounds so the solvers do not start
@@ -69,19 +85,13 @@ def pack_theta_bounds(
     lb_list: list[float] = []
     ub_list: list[float] = []
 
-    for pk in peaks:
-        # Clamp starting values to lie inside the declared bounds.  Heights and
-        # widths must be positive; eta is restricted to [0, 1]; centres can be
-        # optionally clamped to the data window.  Doing this here keeps all
-        # solvers consistent (Classic/Modern/LMFIT) as they all rely on this
-        # helper to form ``theta0``.
-        c = float(pk.center)
-        if clamp_center:
-            c = float(np.clip(c, x_min, x_max))
-        h = float(max(pk.height, 1e-12))
-        w = float(max(pk.fwhm, min_fwhm))
-        w = float(min(w, max_fwhm))
-        h = float(min(h, max_height))
+    for i, pk in enumerate(peaks):
+        h_lo, c_lo, w_lo = lo_hw[3 * i : 3 * i + 3]
+        h_hi, c_hi, w_hi = hi_hw[3 * i : 3 * i + 3]
+
+        c = float(np.clip(pk.center, c_lo, c_hi))
+        h = float(np.clip(max(pk.height, 1e-12), h_lo, h_hi))
+        w = float(np.clip(max(pk.fwhm, w_lo), w_lo, w_hi))
         e = float(np.clip(pk.eta, 0.0, 1.0))
 
         theta_list.extend([c, h, w, e])
@@ -90,24 +100,21 @@ def pack_theta_bounds(
         if pk.lock_center:
             lb_list.append(c)
             ub_list.append(c)
-        elif clamp_center:
-            lb_list.append(x_min)
-            ub_list.append(x_max)
         else:
-            lb_list.append(-np.inf)
-            ub_list.append(np.inf)
+            lb_list.append(c_lo)
+            ub_list.append(c_hi)
 
         # bounds for height
-        lb_list.append(0.0)
-        ub_list.append(max_height)
+        lb_list.append(h_lo)
+        ub_list.append(h_hi)
 
         # bounds for width
         if pk.lock_width:
             lb_list.append(w)
             ub_list.append(w)
         else:
-            lb_list.append(min_fwhm)
-            ub_list.append(max_fwhm)
+            lb_list.append(w_lo)
+            ub_list.append(w_hi)
 
         # bounds for eta
         lb_list.append(0.0)
