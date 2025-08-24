@@ -41,6 +41,16 @@ class SolveResult(TypedDict):
     meta: dict
 
 
+class SolveResult(TypedDict):
+    ok: bool
+    theta: np.ndarray
+    message: str
+    cost: float
+    jac: Optional[np.ndarray]
+    cov: Optional[np.ndarray]
+    meta: dict
+
+
 def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
     arr: list[float] = []
     for p in peaks:
