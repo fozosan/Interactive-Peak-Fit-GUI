@@ -22,6 +22,8 @@ class SolveResult(TypedDict):
     jac: Optional[np.ndarray]
     cov: Optional[np.ndarray]
     meta: dict
+    hit_bounds: bool
+    hit_mask: np.ndarray
 
 
 def _to_solver_vectors(theta0: np.ndarray, bounds, peaks, wmin_eval: float):
@@ -75,20 +77,23 @@ def solve(
     weight_mode = options.get("weights", "none")
     cfg = {
         "bound_centers_to_window": options.get("bound_centers_to_window", True),
-        "fwhm_min_dx_factor": options.get("fwhm_min_dx_factor", 2.0),
-        "fwhm_max_span_factor": options.get("fwhm_max_span_factor", 0.5),
-        "max_height_factor": options.get("max_height_factor", 3.0),
+        "margin_frac": options.get("margin_frac", 0.0),
+        "fwhm_min_factor": options.get("fwhm_min_factor", 2.0),
+        "fwhm_max_factor": options.get("fwhm_max_factor", 0.5),
+        "height_factor": options.get("height_factor", 3.0),
     }
 
-    if mode == "add":
-        y_target = y
-    else:
-        base = baseline if baseline is not None else 0.0
-        y_target = y - base
-    weights = None if weight_mode == "none" else noise_weights(y_target, weight_mode)
+    weights = None
+    if weight_mode != "none":
+        if mode == "add":
+            y_target = y
+        else:
+            base = baseline if baseline is not None else 0.0
+            y_target = y - base
+        weights = noise_weights(y_target, weight_mode)
 
     (lb_full, ub_full), theta0_full = make_bounds_classic(
-        x, y_target, peaks, None, cfg
+        x, y, peaks, None, mode, baseline, cfg
     )
 
     wmin_eval = float(lb_full[2]) if theta0_full.size >= 3 else 1e-6
@@ -128,7 +133,7 @@ def solve(
         theta0_full, (lb_full, ub_full), peaks, wmin_eval
     )
     resid_jac = build_residual_jac(
-        x, y, peaks, mode, baseline, weights, wmin_eval=wmin_eval, clip_heights=True
+        x, y, peaks, mode, baseline, weights, wmin_eval=wmin_eval
     )
 
     def fun(t):
@@ -164,6 +169,10 @@ def solve(
         except np.linalg.LinAlgError:
             cov = None
 
+    hit_mask = (np.isclose(theta_full, lb_full, atol=1e-12) |
+                np.isclose(theta_full, ub_full, atol=1e-12))
+    hit_bounds = bool(np.any(hit_mask))
+
     return SolveResult(
         ok=ok,
         theta=theta_full,
@@ -172,6 +181,8 @@ def solve(
         jac=jac_full,
         cov=cov,
         meta={"nfev": res.nfev, "njev": getattr(res, "njev", None)},
+        hit_bounds=hit_bounds,
+        hit_mask=hit_mask,
     )
 
 
@@ -194,16 +205,12 @@ def iterate(state: dict) -> dict:
     weight_mode = options.get("weights", "none")
     cfg = {
         "bound_centers_to_window": options.get("bound_centers_to_window", True),
-        "fwhm_min_dx_factor": options.get("fwhm_min_dx_factor", 2.0),
-        "fwhm_max_span_factor": options.get("fwhm_max_span_factor", 0.5),
-        "max_height_factor": options.get("max_height_factor", 3.0),
+        "margin_frac": options.get("margin_frac", 0.0),
+        "fwhm_min_factor": options.get("fwhm_min_factor", 2.0),
+        "fwhm_max_factor": options.get("fwhm_max_factor", 0.5),
+        "height_factor": options.get("height_factor", 3.0),
     }
-    if mode == "add":
-        y_target = y
-    else:
-        base = baseline if baseline is not None else 0.0
-        y_target = y - base
-    (lb, ub), theta0 = make_bounds_classic(x, y_target, peaks, None, cfg)
+    (lb, ub), theta0 = make_bounds_classic(x, y, peaks, None, mode, baseline, cfg)
     for i, pk in enumerate(peaks):
         pk.center = theta0[4 * i + 0]
         pk.height = theta0[4 * i + 1]
@@ -221,13 +228,17 @@ def iterate(state: dict) -> dict:
         damping=state.get("lambda", 0.0),
         trust_radius=state.get("trust_radius", np.inf),
         bounds=(lb, ub),
+        wmin_eval=lb[2] if lb.size >= 3 else 1e-6,
         f_scale=options.get("f_scale", 1.0),
         max_backtracks=options.get("max_backtracks", 8),
     )
 
+    hit_mask = (np.isclose(theta, lb, atol=1e-12) | np.isclose(theta, ub, atol=1e-12))
     state["theta"] = theta
     state["cost"] = cost
     state["step_norm"] = step_norm
     state["accepted"] = accepted
+    state["hit_bounds"] = bool(np.any(hit_mask))
+    state["hit_mask"] = hit_mask
     return state
 

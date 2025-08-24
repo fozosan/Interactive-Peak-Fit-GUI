@@ -41,17 +41,34 @@ def test_classic_clamps_bad_start():
     x = np.linspace(0, 1, 200)
     true = [Peak(0.3, 1.0, 0.05, 0.5), Peak(0.7, 0.8, 0.04, 0.5)]
     y = pv_sum(x, true)
-    start = [Peak(5.0, 1.0, 1.0, 0.5), Peak(-3.0, 0.5, 2.0, 0.5)]
+    start = [Peak(5.0, -1.0, 1.0, 0.5), Peak(-3.0, -0.5, 2.0, 0.5)]
     model0 = pv_sum(x, start)
     cost0 = 0.5 * float(np.dot(model0 - y, model0 - y))
     res = classic.solve(x, y, start, "subtract", None, {})
     theta = res["theta"]
     centers = theta[0::4]
+    heights = theta[1::4]
     widths = theta[2::4]
     xmin, xmax = float(x.min()), float(x.max())
     dx = float(np.median(np.diff(x))) if x.size > 1 else 1.0
     fwhm_min = max(2.0 * dx, 1e-6)
     fwhm_max = 0.5 * (xmax - xmin)
-    assert np.all(centers >= xmin) and np.all(centers <= xmax)
+    assert np.all(centers >= xmin - 1e-12) and np.all(centers <= xmax + 1e-12)
     assert np.all(widths >= fwhm_min) and np.all(widths <= fwhm_max)
+    assert np.all(heights >= 0.0)
     assert res["cost"] < cost0
+    assert res["hit_mask"].shape[0] == theta.size
+
+
+def test_classic_step_monotonic():
+    x = np.linspace(0, 1, 200)
+    true = [Peak(0.3, 1.0, 0.05, 0.5), Peak(0.7, 0.8, 0.04, 0.5)]
+    y = pv_sum(x, true)
+    peaks = [Peak(0.1, 0.2, 0.2, 0.5), Peak(0.9, 0.3, 0.25, 0.5)]
+    state = {"x_fit": x, "y_fit": y, "peaks": peaks, "mode": "subtract", "options": {}}
+    costs = []
+    for _ in range(5):
+        state = classic.iterate(state)
+        if state["accepted"]:
+            costs.append(state["cost"])
+    assert all(costs[i + 1] <= costs[i] for i in range(len(costs) - 1))

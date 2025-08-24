@@ -65,66 +65,64 @@ def make_bounds(peaks, x, fit_mask=None, *, bound_centers_to_window=True,
     return (lo, hi), info
 
 
-def make_bounds_classic(x, y, peaks, fit_mask=None, cfg=None):
-    """Return bounds and clipped start vector for the Classic solver.
-
-    Parameters
-    ----------
-    x, y : array-like
-        Data coordinates and target intensities (baseline already applied as
-        required).  ``y`` may be ``None`` when only geometric bounds are
-        desired.
-    peaks : sequence
-        Initial peak guesses.
-    fit_mask : array-like or ``None``
-        Boolean mask selecting the active fitting window within ``x``.
-    cfg : mapping
-        Classic configuration with keys ``bound_centers_to_window``,
-        ``fwhm_min_dx_factor``, ``fwhm_max_span_factor`` and
-        ``max_height_factor``.
-
-    Returns
-    -------
-    (lo, hi) : tuple of ``np.ndarray``
-        Lower and upper bounds for the flattened parameter vector ordered as
-        ``[c, h, w, eta, ...]``.
-    theta0 : ``np.ndarray``
-        Starting parameter vector clipped into ``[lo, hi]``.
-    """
+def make_bounds_classic(
+    x: np.ndarray,
+    y: np.ndarray | None,
+    peaks,
+    fit_mask=None,
+    mode: str = "subtract",
+    baseline: np.ndarray | None = None,
+    cfg: dict | None = None,
+):
+    """Return bounds and clipped start vector for the Classic solver."""
 
     cfg = cfg or {}
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float) if y is not None else np.array([], dtype=float)
+    baseline = (
+        np.asarray(baseline, dtype=float) if baseline is not None else None
+    )
 
     if fit_mask is not None and np.any(fit_mask):
         x_fit = x[fit_mask]
         y_fit = y[fit_mask] if y.size else y
+        b_fit = baseline[fit_mask] if baseline is not None else None
     else:
         x_fit = x
         y_fit = y
+        b_fit = baseline
 
     xmin = float(np.min(x_fit)) if x_fit.size else 0.0
     xmax = float(np.max(x_fit)) if x_fit.size else 0.0
     span = xmax - xmin
     dx = float(np.median(np.diff(np.sort(x_fit)))) if x_fit.size > 1 else 1.0
 
-    wmin = max(float(cfg.get("fwhm_min_dx_factor", 2.0)) * dx, 1e-6)
-    wmax = (
-        float(cfg.get("fwhm_max_span_factor", 0.5)) * span if span > 0 else np.inf
+    margin_frac = float(cfg.get("margin_frac", 0.0))
+    margin = margin_frac * span
+    fwhm_min = max(float(cfg.get("fwhm_min_factor", 2.0)) * dx, 1e-6)
+    fwhm_max = (
+        float(cfg.get("fwhm_max_factor", 0.5)) * span if span > 0 else np.inf
     )
 
     if y_fit.size:
-        p95 = float(np.nanpercentile(y_fit, 95))
-        p05 = float(np.nanpercentile(y_fit, 5))
-        hmax = float(cfg.get("max_height_factor", 3.0)) * max(p95 - p05, 1e-9)
+        if mode == "add":
+            target = y_fit
+        else:
+            base = b_fit if b_fit is not None else 0.0
+            target = y_fit - base
+        p95 = float(np.nanpercentile(target, 95))
+        med = float(np.nanmedian(target))
+        amp = max(p95 - med, 1e-9)
+        h_max = float(cfg.get("height_factor", 3.0)) * amp
     else:
-        hmax = np.inf
+        h_max = np.inf
 
     bound_centers = bool(cfg.get("bound_centers_to_window", True))
 
     lo = []
     hi = []
     theta0 = []
+
     for pk in peaks:
         c = float(pk.center)
         h = float(pk.height)
@@ -135,22 +133,26 @@ def make_bounds_classic(x, y, peaks, fit_mask=None, cfg=None):
             lo_c = hi_c = c
         else:
             if bound_centers:
-                lo_c, hi_c = xmin, xmax
+                lo_c = xmin - margin
+                hi_c = xmax + margin
             else:
-                pad = span
-                lo_c, hi_c = xmin - pad, xmax + pad
+                pad = span + margin
+                lo_c = xmin - pad
+                hi_c = xmax + pad
             c = float(np.clip(c, lo_c, hi_c))
 
         if getattr(pk, "lock_height", False):
             lo_h = hi_h = h
         else:
-            lo_h, hi_h = 0.0, hmax
+            lo_h = 0.0
+            hi_h = h_max
             h = float(np.clip(h, lo_h, hi_h))
 
         if getattr(pk, "lock_width", False):
             lo_w = hi_w = w
         else:
-            lo_w, hi_w = wmin, wmax
+            lo_w = fwhm_min
+            hi_w = fwhm_max
             w = float(np.clip(w, lo_w, hi_w))
 
         lo_e, hi_e = 0.0, 1.0

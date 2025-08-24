@@ -250,9 +250,10 @@ class PeakFitApp:
         self.solver_title = tk.StringVar(value=SOLVER_LABELS[self.solver_choice.get()])
         self.classic_maxfev = tk.IntVar(value=20000)
         self.classic_centers_window = tk.BooleanVar(value=True)
-        self.classic_fwhm_min_dx = tk.DoubleVar(value=2.0)
-        self.classic_fwhm_max_span = tk.DoubleVar(value=0.5)
-        self.classic_max_height = tk.DoubleVar(value=3.0)
+        self.classic_margin = tk.DoubleVar(value=0.0)
+        self.classic_fwhm_min = tk.DoubleVar(value=2.0)
+        self.classic_fwhm_max = tk.DoubleVar(value=0.5)
+        self.classic_height_factor = tk.DoubleVar(value=3.0)
         self.modern_loss = tk.StringVar(value="linear")
         self.modern_weight = tk.StringVar(value="none")
         self.modern_fscale = tk.DoubleVar(value=1.0)
@@ -472,15 +473,18 @@ class PeakFitApp:
         ttk.Label(rowc, text="Max evals").pack(side=tk.LEFT)
         ttk.Entry(rowc, width=7, textvariable=self.classic_maxfev).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(f_classic, text="Centers in window", variable=self.classic_centers_window).pack(anchor="w")
+        rowm = ttk.Frame(f_classic); rowm.pack(anchor="w")
+        ttk.Label(rowm, text="Window margin frac").pack(side=tk.LEFT)
+        ttk.Entry(rowm, width=4, textvariable=self.classic_margin).pack(side=tk.LEFT, padx=2)
         row1 = ttk.Frame(f_classic); row1.pack(anchor="w")
         ttk.Label(row1, text="Min FWHM×Δx").pack(side=tk.LEFT)
-        ttk.Entry(row1, width=4, textvariable=self.classic_fwhm_min_dx).pack(side=tk.LEFT, padx=2)
+        ttk.Entry(row1, width=4, textvariable=self.classic_fwhm_min).pack(side=tk.LEFT, padx=2)
         row2 = ttk.Frame(f_classic); row2.pack(anchor="w")
         ttk.Label(row2, text="Max span frac").pack(side=tk.LEFT)
-        ttk.Entry(row2, width=4, textvariable=self.classic_fwhm_max_span).pack(side=tk.LEFT, padx=2)
+        ttk.Entry(row2, width=4, textvariable=self.classic_fwhm_max).pack(side=tk.LEFT, padx=2)
         row3 = ttk.Frame(f_classic); row3.pack(anchor="w")
         ttk.Label(row3, text="Max height ×").pack(side=tk.LEFT)
-        ttk.Entry(row3, width=4, textvariable=self.classic_max_height).pack(side=tk.LEFT, padx=2)
+        ttk.Entry(row3, width=4, textvariable=self.classic_height_factor).pack(side=tk.LEFT, padx=2)
         self.solver_frames["classic"] = f_classic
 
         # Modern options (shared for VP and TRF)
@@ -631,9 +635,10 @@ class PeakFitApp:
         return {
             "maxfev": int(self.classic_maxfev.get()),
             "bound_centers_to_window": bool(self.classic_centers_window.get()),
-            "fwhm_min_dx_factor": float(self.classic_fwhm_min_dx.get()),
-            "fwhm_max_span_factor": float(self.classic_fwhm_max_span.get()),
-            "max_height_factor": float(self.classic_max_height.get()),
+            "margin_frac": float(self.classic_margin.get()),
+            "fwhm_min_factor": float(self.classic_fwhm_min.get()),
+            "fwhm_max_factor": float(self.classic_fwhm_max.get()),
+            "height_factor": float(self.classic_height_factor.get()),
         }
 
     def _on_solver_change(self):
