@@ -45,12 +45,15 @@ def solve(
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    baseline = np.asarray(baseline, dtype=float) if baseline is not None else 0.0
+    base_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
 
     if mode == "add":
-        target = y - baseline
+        target = y - (base_arr if base_arr is not None else 0.0)
     elif mode == "subtract":
-        target = y - baseline
+        # in subtract mode ``y`` is expected to already have the baseline
+        # removed, so any provided ``baseline`` is ignored
+        target = y
+        base_arr = None
     else:  # pragma: no cover - unknown mode
         return SolveResult(
             ok=False,
@@ -95,7 +98,9 @@ def solve(
     updated = [Peak(p.center, h, p.fwhm, p.eta) for p, h in zip(clean, heights)]
     theta = _theta_from_peaks(updated)
     model = pv_sum(x, updated)
-    resid = target - model
+    if base_arr is not None:
+        model = model + base_arr
+    resid = y - model
     cost = float(0.5 * np.dot(resid, resid))
 
     return SolveResult(
