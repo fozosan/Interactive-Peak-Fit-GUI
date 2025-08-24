@@ -48,7 +48,22 @@ from scipy.signal import find_peaks
 from core import signals
 from core.residuals import build_residual
 from fit import classic, lmfit_backend, modern, step_engine
-from fit.bounds import pack_theta_bounds
+
+# ``fit.bounds`` may be unavailable if the project root isn't on ``sys.path``
+# (e.g. launching the UI module directly). Fall back to adding the parent
+# directory of this file to ``sys.path`` and retry the import so the module is
+# located regardless of invocation context.
+try:  # pragma: no cover - exercised indirectly during manual runs
+    from fit.bounds import pack_theta_bounds
+except ModuleNotFoundError:  # pragma: no cover - executed only on misconfigured paths
+    import os
+    import sys
+
+    _here = os.path.abspath(os.path.dirname(__file__))
+    _root = os.path.abspath(os.path.join(_here, ".."))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    from fit.bounds import pack_theta_bounds
 from infra import performance
 from batch import runner as batch_runner
 from uncertainty import asymptotic, bayes, bootstrap
