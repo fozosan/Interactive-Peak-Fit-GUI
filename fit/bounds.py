@@ -1,7 +1,7 @@
 """Utilities for packing peak parameters and bounds."""
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from typing import Iterable, Sequence, Tuple
 
 import numpy as np
 
@@ -29,8 +29,10 @@ def pack_theta_bounds(
     peak. Bounds enforce non-negative heights, a minimum full-width at half
     maximum, and 0 ≤ η ≤ 1. If ``centers_in_window`` is truthy, peak centers are
     limited to ``[x.min(), x.max()]``. When ``lock_center`` or ``lock_width`` is
-    set on a peak the respective parameter is fixed by using identical lower and
-    upper bounds.
+    set on a peak the respective parameter is effectively fixed using a tiny
+    tolerance around the value to satisfy solvers that require strictly
+    increasing bounds. Initial parameter guesses are clipped into the valid
+    range so that they always satisfy the returned bounds.
     """
 
     x = np.asarray(x, dtype=float)
@@ -42,25 +44,25 @@ def pack_theta_bounds(
     x_max = float(x.max())
     min_fwhm = float(options.get("min_fwhm", 1e-6))
     clamp_center = bool(options.get("centers_in_window", False))
-
+    eps = np.finfo(float).eps
     for pk in peaks:
         # center
         c = float(pk.center)
+        if clamp_center and not pk.lock_center:
+            c = float(np.clip(c, x_min, x_max))
+        theta.append(c)
         if pk.lock_center:
-            lb_c = ub_c = c
+            lb.append(c - eps)
+            ub.append(c + eps)
         else:
             if clamp_center:
-                c = float(np.clip(c, x_min, x_max))
-                lb_c = x_min
-                ub_c = x_max
+                lb.append(x_min)
+                ub.append(x_max)
             else:
-                lb_c = -np.inf
-                ub_c = np.inf
-        theta.append(c)
-        lb.append(lb_c)
-        ub.append(ub_c)
+                lb.append(-np.inf)
+                ub.append(np.inf)
 
-        # height (non-negative)
+        # height
         h = float(max(pk.height, 0.0))
         theta.append(h)
         lb.append(0.0)
@@ -70,8 +72,8 @@ def pack_theta_bounds(
         w = float(max(pk.fwhm, min_fwhm))
         theta.append(w)
         if pk.lock_width:
-            lb.append(w)
-            ub.append(w)
+            lb.append(w - eps)
+            ub.append(w + eps)
         else:
             lb.append(min_fwhm)
             ub.append(np.inf)

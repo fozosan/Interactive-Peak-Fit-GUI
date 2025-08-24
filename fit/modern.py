@@ -63,7 +63,8 @@ def solve(
     for _ in range(max(1, restarts)):
         if jitter_pct:
             jitter = 1.0 + jitter_pct / 100.0 * rng.standard_normal(theta0.shape)
-            start = np.clip(theta0 * jitter, lb, ub)
+            start = theta0 * jitter
+            start = np.minimum(np.maximum(start, lb), ub)
         else:
             start = theta0
 
