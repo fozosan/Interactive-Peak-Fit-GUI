@@ -30,7 +30,8 @@ def bootstrap(base_solver: str, resample_cfg: dict, residual_builder) -> UncRepo
     Parameters
     ----------
     base_solver:
-        Which solver backend to use (``"classic"``, ``"modern"``, ``"lmfit"``).
+        Which solver backend to use (``"classic"``, ``"modern_vp"``,
+        ``"modern_trf"``, ``"lmfit_vp"``).
     resample_cfg:
         Dictionary describing the problem. Expected keys are ``x``, ``y``,
         ``peaks`` (template peaks), ``mode``, ``baseline``, ``theta`` (final
@@ -43,9 +44,11 @@ def bootstrap(base_solver: str, resample_cfg: dict, residual_builder) -> UncRepo
 
     if base_solver == "classic":
         from fit.classic import solve as solver
-    elif base_solver == "modern":
+    elif base_solver == "modern_vp":
+        from fit.modern_vp import solve as solver
+    elif base_solver == "modern_trf":
         from fit.modern import solve as solver
-    elif base_solver == "lmfit":
+    elif base_solver == "lmfit_vp":
         from fit.lmfit_backend import solve as solver
     else:  # pragma: no cover - unknown solver
         raise ValueError("unknown solver")
