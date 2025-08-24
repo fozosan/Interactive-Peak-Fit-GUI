@@ -46,6 +46,14 @@ def step_once(
     )
 
     theta0 = _theta_from_peaks(peaks)
+    lb = ub = None
+    if bounds is not None:
+        lb, ub = bounds
+        lb = np.asarray(lb, dtype=float)
+        ub = np.asarray(ub, dtype=float)
+        # ensure starting vector honours the bounds
+        theta0 = np.minimum(np.maximum(theta0, lb), ub)
+
     resid_fn = build_residual(x, y, peaks, mode, baseline, loss, weights)
     r0 = resid_fn(theta0)
 
@@ -85,9 +93,6 @@ def step_once(
 
     theta1 = theta0 + delta
     if bounds is not None:
-        lb, ub = bounds
-        lb = np.asarray(lb, dtype=float)
-        ub = np.asarray(ub, dtype=float)
         theta1 = np.minimum(np.maximum(theta1, lb), ub)
 
     r1 = resid_fn(theta1)
