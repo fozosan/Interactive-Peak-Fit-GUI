@@ -78,21 +78,20 @@ def solve(
         clean.append(Peak(c, h, w, e))
 
     A_cols = []
-    for p in clean:
+    for p in peaks:
         unit = Peak(p.center, 1.0, p.fwhm, p.eta)
         A_cols.append(pv_sum(x, [unit]))
     A = np.column_stack(A_cols) if A_cols else np.zeros((x.size, 0))
     try:
         heights, *_ = np.linalg.lstsq(A, target, rcond=None)
-        heights = np.maximum(heights, 0.0)
         ok = True
         message = "linear least squares"
     except np.linalg.LinAlgError as exc:  # pragma: no cover - ill-conditioned
-        heights = np.zeros(len(clean))
+        heights = np.zeros(len(peaks))
         ok = False
         message = str(exc)
 
-    updated = [Peak(p.center, h, p.fwhm, p.eta) for p, h in zip(clean, heights)]
+    updated = [Peak(p.center, h, p.fwhm, p.eta) for p, h in zip(peaks, heights)]
     theta = _theta_from_peaks(updated)
     model = pv_sum(x, updated)
     resid = target - model
