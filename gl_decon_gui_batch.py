@@ -787,8 +787,10 @@ class PeakFitApp:
         self.x_label_entry.focus_set()
 
     def apply_x_label(self):
-        # Re-render plot with the current label text
-        self.refresh_plot()
+        # Update the x-axis label in place without clearing the plot
+        label = self._format_axis_label(self.x_label_var.get())
+        self.ax.set_xlabel(label)
+        self.canvas.draw_idle()
 
     def save_x_label_default(self):
         # Persist the chosen x-axis label to the config file
@@ -1593,6 +1595,8 @@ class PeakFitApp:
     def refresh_plot(self):
         LW_RAW, LW_BASE, LW_CORR, LW_COMP, LW_FIT = 1.0, 1.0, 0.9, 0.8, 1.2
         self.ax.clear()
+        self.ax.set_xlabel(self._format_axis_label(self.x_label_var.get()))
+        self.ax.set_ylabel("Intensity")
         if self.x is None:
             self.ax.set_title("Open a data file to begin")
             self.canvas.draw_idle()
@@ -1629,7 +1633,6 @@ class PeakFitApp:
             lo, hi = sorted((self.fit_xmin, self.fit_xmax))
             self.ax.axvspan(lo, hi, color="0.8", alpha=0.25, lw=0)
 
-        self.ax.set_xlabel(self._format_axis_label(self.x_label_var.get())); self.ax.set_ylabel("Intensity")
         self.ax.legend(loc="best")
         self.canvas.draw_idle()
 
