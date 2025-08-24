@@ -114,8 +114,8 @@ def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str]
                     tpl.height = float(max(sig[idx_near], 1e-6))
 
         opts = config.get(solver_name, {})
-        y_fit = y - baseline if mode == "subtract" else y
-        base_arg = baseline if mode == "add" else None
+        y_fit = y
+        base_arg = baseline
         res = _apply_solver(solver_name, x, y_fit, template, mode, base_arg, opts)
 
         theta = np.asarray(res["theta"], dtype=float)
@@ -125,9 +125,7 @@ def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str]
             fitted.append(peaks.Peak(c, h, w, e, tpl.lock_center, tpl.lock_width))
 
         model = models.pv_sum(x, fitted)
-        resid = model + (baseline if mode == "add" else 0.0) - (
-            y if mode == "add" else y_fit
-        )
+        resid = model + baseline - y
         rmse = float(np.sqrt(np.mean(resid**2)))
         areas = [models.pv_area(p.height, p.fwhm, p.eta) for p in fitted]
         total = sum(areas) or 1.0
@@ -156,7 +154,7 @@ def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str]
 
         if save_traces:
             trace_csv = data_io.build_trace_table(
-                x, y, baseline, fitted, mode=mode
+                x, y, baseline, fitted
             )
             trace_path = Path(path).with_suffix(Path(path).suffix + ".trace.csv")
             with trace_path.open("w", encoding="utf-8") as fh:

@@ -46,24 +46,7 @@ def solve(
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     base_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
-
-    if mode == "add":
-        target = y - (base_arr if base_arr is not None else 0.0)
-    elif mode == "subtract":
-        # in subtract mode ``y`` is expected to already have the baseline
-        # removed, so any provided ``baseline`` is ignored
-        target = y
-        base_arr = None
-    else:  # pragma: no cover - unknown mode
-        return SolveResult(
-            ok=False,
-            theta=_theta_from_peaks(peaks),
-            message="unknown mode",
-            cost=float("nan"),
-            jac=None,
-            cov=None,
-            meta={},
-        )
+    target = y - (base_arr if base_arr is not None else 0.0)
 
     # enforce basic bounds on provided peak parameters
     x_min = float(x.min())
