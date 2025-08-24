@@ -27,7 +27,6 @@ Features:
 
 import json
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -44,15 +43,13 @@ from matplotlib.widgets import SpanSelector
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
-from .helptext import HELP
-
 from scipy.signal import find_peaks
 
 from core import signals
-from fit import classic, lmfit_backend, modern, step_engine
 from core.residuals import build_residual
-from uncertainty import asymptotic, bootstrap, bayes
-from infra import performance, config as infra_config
+from fit import classic, lmfit_backend, modern, step_engine
+from infra import performance
+from uncertainty import asymptotic, bayes, bootstrap
 
 
 # ---------- Math ----------
@@ -86,7 +83,6 @@ class Peak:
 
 # ---------- Config persistence ----------
 CONFIG_PATH = Path.home() / ".gl_peakfit_config.json"
-PERF_CONFIG_PATH = Path.home() / ".peakfit3_config.json"
 DEFAULTS = {
     "als_lam": 1e5,
     "als_asym": 0.001,
@@ -120,6 +116,7 @@ def save_config(cfg):
         messagebox.showwarning("Config", f"Could not save config: {e}")
 
 
+# ---------- Fitting utilities ----------
 # ---------- File loader (CSV/TXT/DAT) ----------
 def load_xy_any(path: str):
     """Wrapper around :func:`core.data_io.load_xy` for backwards compatibility."""
@@ -156,19 +153,6 @@ class PeakFitApp:
         self.auto_apply_template = tk.BooleanVar(value=bool(self.cfg.get("auto_apply_template", False)))
         self.auto_apply_template_name = tk.StringVar(value=self.cfg.get("auto_apply_template_name", ""))
 
-        # Performance settings
-        self.perf_cfg = infra_config.load(PERF_CONFIG_PATH)
-        perf = self.perf_cfg.get("performance", {})
-        self.use_numba = tk.BooleanVar(value=bool(perf.get("numba", False)))
-        self.use_gpu = tk.BooleanVar(value=bool(perf.get("gpu", False)))
-        self.use_cache = tk.BooleanVar(value=bool(perf.get("cache", False)))
-        self.use_seed = tk.BooleanVar(value=bool(perf.get("deterministic_seed", False)))
-
-        performance.set_numba(self.use_numba.get())
-        performance.set_gpu(self.use_gpu.get())
-        performance.set_max_workers((os.cpu_count() or 1) if self.use_cache.get() else 0)
-        performance.set_seed(0 if self.use_seed.get() else None)
-
         # Interaction
         self.add_peaks_mode = tk.BooleanVar(value=True)  # click-to-add toggle
 
@@ -192,15 +176,12 @@ class PeakFitApp:
         self.solver_var = tk.StringVar(value="Classic")
         self.snr_text = tk.StringVar(value="S/N: --")
 
-        # Uncertainty estimation
-        self.unc_mode = tk.StringVar(value="Asymptotic")
-        self.unc_n = tk.IntVar(value=100)
-        self.unc_report = None
-        self.last_fit = None
-
-        # Tooltip and help window state
-        self._tooltips: List[tk.Toplevel] = []
-        self.help_window: Optional[tk.Toplevel] = None
+        # Uncertainty and performance controls
+        self.unc_method = tk.StringVar(value="Asymptotic")
+        self.perf_numba = tk.BooleanVar(value=False)
+        self.perf_gpu = tk.BooleanVar(value=False)
+        self.seed_var = tk.StringVar(value="")
+        self.workers_var = tk.IntVar(value=0)
 
         # UI
         self._build_ui()
@@ -257,8 +238,6 @@ class PeakFitApp:
         ttk.Button(baseline_box, text="Recompute baseline", command=self.compute_baseline).pack(side=tk.LEFT, pady=2)
         ttk.Button(baseline_box, text="Save as default", command=self.save_baseline_default).pack(side=tk.LEFT, padx=4)
         ttk.Label(baseline_box, textvariable=self.snr_text).pack(side=tk.LEFT, padx=8)
-        ttk.Label(baseline_box, text=HELP["baseline"], wraplength=220).pack(anchor="w", pady=(4, 0))
-
         # Eta box
         eta_box = ttk.Labelframe(right, text="Shape factor η (0=Gaussian, 1=Lorentzian)"); eta_box.pack(fill=tk.X, pady=4)
         ttk.Entry(eta_box, width=10, textvariable=self.global_eta).pack(side=tk.LEFT, padx=4)
@@ -340,76 +319,40 @@ class PeakFitApp:
         ttk.Checkbutton(tmpl, text="Auto-apply on open (use selected)", variable=self.auto_apply_template,
                         command=self.toggle_auto_apply).pack(anchor="w", pady=(4,0))
 
-        # Performance
-        perf_box = ttk.Labelframe(right, text="Performance"); perf_box.pack(fill=tk.X, pady=4)
-        ttk.Checkbutton(perf_box, text="Use Numba", variable=self.use_numba,
-                        command=self.on_toggle_numba).pack(anchor="w")
-        ttk.Checkbutton(perf_box, text="Use GPU/CuPy", variable=self.use_gpu,
-                        command=self.on_toggle_gpu).pack(anchor="w")
-        ttk.Checkbutton(perf_box, text="Cache baseline", variable=self.use_cache,
-                        command=self.on_toggle_cache).pack(anchor="w")
-        ttk.Checkbutton(perf_box, text="Deterministic seed", variable=self.use_seed,
-                        command=self.on_toggle_seed).pack(anchor="w")
-
         # Solver selection
         solver_box = ttk.Labelframe(right, text="Solver"); solver_box.pack(fill=tk.X, pady=4)
-        solver_cb = ttk.Combobox(
-            solver_box,
-            textvariable=self.solver_var,
-            state="readonly",
-            values=["Classic", "Modern", "LMFIT"],
-            width=12,
-        )
-        solver_cb.pack(side=tk.LEFT, padx=4)
-        self._add_tooltip(solver_cb, HELP["solver"])
+        ttk.Combobox(solver_box, textvariable=self.solver_var, state="readonly",
+                     values=["Classic", "Modern", "LMFIT"], width=12).pack(side=tk.LEFT, padx=4)
+
+        # Uncertainty panel
+        unc_box = ttk.Labelframe(right, text="Uncertainty"); unc_box.pack(fill=tk.X, pady=4)
+        ttk.Combobox(unc_box, textvariable=self.unc_method, state="readonly",
+                     values=["Asymptotic", "Bootstrap", "Bayesian"], width=12).pack(side=tk.LEFT, padx=4)
+        ttk.Button(unc_box, text="Run", command=self.run_uncertainty).pack(side=tk.LEFT, padx=4)
+
+        # Performance panel
+        perf_box = ttk.Labelframe(right, text="Performance"); perf_box.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(perf_box, text="Numba", variable=self.perf_numba,
+                        command=self.apply_performance).pack(anchor="w")
+        ttk.Checkbutton(perf_box, text="GPU", variable=self.perf_gpu,
+                        command=self.apply_performance).pack(anchor="w")
+        rowp = ttk.Frame(perf_box); rowp.pack(fill=tk.X, pady=2)
+        ttk.Label(rowp, text="Seed:").pack(side=tk.LEFT)
+        ttk.Entry(rowp, width=8, textvariable=self.seed_var).pack(side=tk.LEFT, padx=4)
+        ttk.Label(rowp, text="Max workers:").pack(side=tk.LEFT, padx=(8,0))
+        ttk.Spinbox(rowp, from_=0, to=64, textvariable=self.workers_var, width=5).pack(side=tk.LEFT)
+        ttk.Button(rowp, text="Apply", command=self.apply_performance).pack(side=tk.LEFT, padx=4)
 
         # Actions
         actions = ttk.Labelframe(right, text="Actions"); actions.pack(fill=tk.X, pady=4)
         ttk.Button(actions, text="Auto-seed", command=self.auto_seed).pack(side=tk.LEFT)
-        btn_step = ttk.Button(actions, text="Step \u25B6", command=self.step_once)
-        btn_step.pack(side=tk.LEFT, padx=4)
-        self._add_tooltip(btn_step, HELP["step"])
+        ttk.Button(actions, text="Step \u25B6", command=self.step_once).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Toggle components", command=self.toggle_components).pack(side=tk.LEFT, padx=4)
-
-        # Uncertainty
-        unc_box = ttk.Labelframe(right, text="Uncertainty"); unc_box.pack(fill=tk.X, pady=4)
-        ttk.Combobox(unc_box, textvariable=self.unc_mode, state="readonly",
-                     values=["Asymptotic", "Bootstrap", "Bayesian"], width=12).pack(side=tk.LEFT, padx=4)
-        ttk.Label(unc_box, text="N/steps:").pack(side=tk.LEFT)
-        ttk.Entry(unc_box, width=6, textvariable=self.unc_n).pack(side=tk.LEFT, padx=2)
-        ttk.Button(unc_box, text="Run", command=self.compute_uncertainty).pack(side=tk.LEFT, padx=4)
-        ttk.Button(unc_box, text="Export", command=self.export_uncertainty).pack(side=tk.LEFT, padx=4)
 
         # Status
         self.status = ttk.Label(self.root, text="Open CSV/TXT/DAT, set baseline/range, add peaks, set η, then Fit.")
         self.status.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
-
-    def _add_tooltip(self, widget, text: str):
-        tip = tk.Toplevel(widget)
-        tip.withdraw()
-        tip.overrideredirect(True)
-        lbl = ttk.Label(
-            tip,
-            text=text,
-            justify=tk.LEFT,
-            background="#ffffe0",
-            relief="solid",
-            borderwidth=1,
-            padding=2,
-        )
-        lbl.pack()
-
-        def show(event):
-            tip.geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
-            tip.deiconify()
-
-        def hide(_event):
-            tip.withdraw()
-
-        widget.bind("<Enter>", show)
-        widget.bind("<Leave>", hide)
-        self._tooltips.append(tip)
 
     def _new_figure(self):
         self.ax.clear()
@@ -729,32 +672,6 @@ class PeakFitApp:
         self.auto_apply_template_name.set(self.cfg["auto_apply_template_name"])
         save_config(self.cfg)
 
-    # ----- Performance toggles -----
-    def _save_perf_cfg(self):
-        self.perf_cfg["performance"] = {
-            "numba": bool(self.use_numba.get()),
-            "gpu": bool(self.use_gpu.get()),
-            "cache": bool(self.use_cache.get()),
-            "deterministic_seed": bool(self.use_seed.get()),
-        }
-        infra_config.save(PERF_CONFIG_PATH, self.perf_cfg)
-
-    def on_toggle_numba(self):
-        performance.set_numba(bool(self.use_numba.get()))
-        self._save_perf_cfg()
-
-    def on_toggle_gpu(self):
-        performance.set_gpu(bool(self.use_gpu.get()))
-        self._save_perf_cfg()
-
-    def on_toggle_cache(self):
-        performance.set_max_workers((os.cpu_count() or 1) if self.use_cache.get() else 0)
-        self._save_perf_cfg()
-
-    def on_toggle_seed(self):
-        performance.set_seed(0 if self.use_seed.get() else None)
-        self._save_perf_cfg()
-
     # ----- Template application (data ops) -----
     def serialize_peaks(self) -> list:
         return [
@@ -1040,85 +957,64 @@ class PeakFitApp:
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
         self.status.config(text="Fit complete. Edit/lock as needed; Fit again or Export.")
-        # store fit info for uncertainty estimation
-        self.last_fit = {
-            "x": x_fit,
-            "y": y_fit,
-            "mode": mode,
-            "baseline": base_fit,
-            "theta": theta,
-            "peaks": [Peak(p.center, p.height, p.fwhm, p.eta, p.lock_width, p.lock_center) for p in self.peaks],
-            "solver": solver,
-            "options": options,
-            "result": res,
-        }
-        self.unc_report = None
 
-    def compute_uncertainty(self):
-        if not self.last_fit:
-            messagebox.showinfo("Uncertainty", "Run a fit first.")
+    def run_uncertainty(self):
+        if self.x is None or self.y_raw is None or not self.peaks:
+            messagebox.showinfo("Uncertainty", "Load data and perform a fit first.")
             return
-        info = self.last_fit
-        mode = self.unc_mode.get().lower()
-        try:
-            resid = build_residual(info["x"], info["y"], info["peaks"], info["mode"], info["baseline"], "linear", None)
-            if mode == "asymptotic":
-                rep = asymptotic.asymptotic(info["result"], resid)
-                sigma = rep["params"].get("sigma")
-                self.status.config(text="Asymptotic σ: " + np.array2string(np.asarray(sigma), precision=3))
-            elif mode == "bootstrap":
-                resample_cfg = {
-                    "x": info["x"],
-                    "y": info["y"],
-                    "peaks": info["peaks"],
-                    "mode": info["mode"],
-                    "baseline": info["baseline"],
-                    "theta": info["theta"],
-                    "options": info.get("options", {}),
-                    "n": int(self.unc_n.get()),
-                }
-                rep = bootstrap.bootstrap(info["solver"], resample_cfg, resid)
-                sigma = np.sqrt(np.diag(rep["params"].get("cov", np.zeros((1,1)))))
-                self.status.config(text="Bootstrap σ: " + np.array2string(np.asarray(sigma), precision=3))
-            else:  # bayesian
-                init = {
-                    "x": info["x"],
-                    "y": info["y"],
-                    "peaks": info["peaks"],
-                    "mode": info["mode"],
-                    "baseline": info["baseline"],
-                    "theta": info["theta"],
-                }
-                sampler_cfg = {"nsteps": int(self.unc_n.get())}
-                rep = bayes.bayesian({}, "gaussian", init, sampler_cfg, None)
-                samples = np.asarray(rep["params"].get("samples"))
-                ci_lo = np.percentile(samples, 2.5, axis=0)
-                ci_hi = np.percentile(samples, 97.5, axis=0)
-                pairs = [f"({l:.3g},{h:.3g})" for l, h in zip(ci_lo, ci_hi)]
-                self.status.config(text="Bayesian 95% CI: " + ", ".join(pairs))
-        except Exception as exc:
-            messagebox.showerror("Uncertainty", str(exc))
+        self._sync_selected_edits()
+        mask = self.current_fit_mask()
+        if mask is None or not np.any(mask):
+            messagebox.showwarning("Uncertainty", "Fit range is empty. Use 'Full range' or set a valid Min/Max.")
             return
-        self.unc_report = rep
+        x_fit = self.x[mask]
+        y_fit = self.get_fit_target()[mask]
+        base_applied = self.use_baseline.get() and self.baseline is not None
+        add_mode = (self.baseline_mode.get() == "add")
+        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
+        mode = "add" if add_mode else "subtract"
 
-    def export_uncertainty(self):
-        if self.unc_report is None:
-            messagebox.showinfo("Uncertainty", "Compute uncertainty first.")
-            return
-        out_json = filedialog.asksaveasfilename(
-            title="Save uncertainty report", defaultextension=".json", filetypes=[("JSON","*.json")]
-        )
-        if not out_json:
-            return
+        theta = []
+        for p in self.peaks:
+            theta.extend([p.center, p.height, p.fwhm, p.eta])
+        theta = np.asarray(theta, dtype=float)
+
+        resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
+        method = self.unc_method.get().lower()
         try:
-            def _convert(obj):
-                if isinstance(obj, np.ndarray):
-                    return obj.tolist()
-                raise TypeError
-            Path(out_json).write_text(json.dumps(self.unc_report, default=_convert, indent=2))
-            messagebox.showinfo("Uncertainty", f"Saved:\n{out_json}")
-        except Exception as exc:
-            messagebox.showerror("Uncertainty", f"Could not save report:\n{exc}")
+            if method == "asymptotic":
+                rep = asymptotic.asymptotic({"theta": theta, "jac": None}, resid_fn)
+            elif method == "bootstrap":
+                cfg = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
+                       "baseline": base_fit, "theta": theta, "options": {}, "n": 100}
+                rep = bootstrap.bootstrap(self.solver_var.get().lower(), cfg, resid_fn)
+            elif method == "bayesian":
+                init = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
+                        "baseline": base_fit, "theta": theta}
+                rep = bayes.bayesian({}, "gaussian", init, {}, None)
+            else:
+                messagebox.showerror("Uncertainty", "Unknown method")
+                return
+        except Exception as e:
+            messagebox.showerror("Uncertainty", f"Failed: {e}")
+            return
+
+        sigmas = rep.get("params", {}).get("sigma")
+        if sigmas is not None:
+            msg = "σ: " + ", ".join(f"{s:.3g}" for s in np.ravel(sigmas))
+        else:
+            msg = f"Computed {rep.get('type')} uncertainty."
+        self.status.config(text=msg)
+        messagebox.showinfo("Uncertainty", msg)
+
+    def apply_performance(self):
+        performance.set_numba(bool(self.perf_numba.get()))
+        performance.set_gpu(bool(self.perf_gpu.get()))
+        seed_txt = self.seed_var.get().strip()
+        seed = int(seed_txt) if seed_txt else None
+        performance.set_seed(seed)
+        performance.set_max_workers(self.workers_var.get())
+        self.status.config(text="Performance options applied.")
 
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:
@@ -1243,18 +1139,25 @@ class PeakFitApp:
 
     # ----- Help -----
     def show_help(self):
-        if self.help_window and self.help_window.winfo_exists():
-            self.help_window.lift()
-            return
-
-        win = tk.Toplevel(self.root)
-        win.title("Help")
-        txt = tk.Text(win, wrap="word", width=60, height=24)
-        message = "\n\n".join(HELP.values())
-        txt.insert("1.0", message)
-        txt.config(state="disabled")
-        txt.pack(fill=tk.BOTH, expand=True)
-        self.help_window = win
+        message = (
+            "Supported files:\n"
+            "  • CSV, TXT, DAT with two numeric columns (x,y).\n"
+            "  • Delimiters auto-detected (comma, tab, spaces, semicolons).\n"
+            "  • Lines starting with #, %, // (or text headers) are ignored.\n\n"
+            "Baseline modes:\n"
+            "  • Add to fit (default): model = baseline + sum(peaks) on raw data.\n"
+            "  • Subtract: model = sum(peaks) on (raw - baseline).\n\n"
+            "Fit range:\n"
+            "  • Type Min/Max or drag with 'Select on plot'; 'Full range' clears.\n"
+            "  • 'Baseline uses fit range' computes ALS on that slice, then interpolates.\n\n"
+            "Templates:\n"
+            "  • Save multiple named templates; 'Save changes' overwrites selected.\n"
+            "  • 'Auto-apply on open' uses the currently selected template.\n\n"
+            "Interaction:\n"
+            "  • 'Add peaks on click' toggles picking; Zoom/Pan ignores clicks.\n"
+            "  • 'Zoom out' widens x-view; 'Reset view' equals toolbar Home.\n"
+        )
+        messagebox.showinfo("Help", message)
 
 
 def main():

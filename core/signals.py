@@ -19,11 +19,7 @@ def als_baseline(y: np.ndarray, lam: float = 1e5, p: float = 0.001,
     y = np.asarray(y, dtype=float)
     L = y.size
     # second-order difference matrix
-    # ``np.diff`` defaults to operating along the last axis, which would yield
-    # a (L, L-2) matrix and subsequently cause shape mismatches when forming
-    # ``D.T @ D``. Explicitly differencing along rows produces the intended
-    # (L-2, L) matrix so that ``D.T @ D`` is square (L x L).
-    D = np.diff(np.eye(L), 2, axis=0)
+    D = np.diff(np.eye(L), 2)
     w = np.ones(L)
     z = np.zeros_like(y)
     for _ in range(int(niter)):
