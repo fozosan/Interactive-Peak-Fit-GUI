@@ -96,13 +96,21 @@ def build_trace_table(
     y_raw: np.ndarray,
     baseline: np.ndarray | None,
     peaks: Iterable,
+    mode: str = "add",
 ) -> str:
     """Return a CSV trace table for the current fit.
 
-    The table always includes both the baseline-corrected and baseline-added
-    traces regardless of how the fit was performed. This mirrors the behaviour
-    of the legacy 2.7 exporter so single and batch exports share an identical
-    format.
+    Parameters
+    ----------
+    x, y_raw:
+        Input data arrays.
+    baseline:
+        Baseline array or ``None``.
+    peaks:
+        Iterable of peak-like objects. Each contributes its own column.
+    mode:
+        ``"add"`` or ``"subtract"`` — controls how the fitted target and
+        model columns are formed.
     """
 
     x = np.asarray(x, dtype=float)
@@ -119,10 +127,16 @@ def build_trace_table(
     comps_arr = np.vstack(comps) if comps else np.empty((0, x.size))
     model = comps_arr.sum(axis=0) if comps else np.zeros_like(x)
 
-    y_corr = y_raw - base
-    y_fit = model + base
+    if mode == "add":
+        y_target = y_raw
+        y_fit = model + base
+    elif mode == "subtract":
+        y_target = y_raw - base
+        y_fit = model
+    else:  # pragma: no cover - unknown mode
+        raise ValueError("unknown mode")
 
-    headers = ["x", "y_raw", "baseline", "y_corr", "y_fit"] + [
+    headers = ["x", "y_raw", "baseline", "y_target", "y_fit"] + [
         f"peak{i+1}" for i in range(comps_arr.shape[0])
     ]
 
@@ -134,7 +148,7 @@ def build_trace_table(
             x[idx],
             y_raw[idx],
             base[idx] if baseline is not None else 0.0,
-            y_corr[idx],
+            y_target[idx],
             y_fit[idx],
         ]
         row.extend(comps_arr[:, idx])
