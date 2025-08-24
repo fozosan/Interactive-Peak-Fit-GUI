@@ -47,7 +47,7 @@ from scipy.signal import find_peaks
 
 from core import signals
 from core.residuals import build_residual
-from fit import classic, lmfit_backend, modern
+from fit import classic, lmfit_backend, modern, modern_vp
 from infra import performance
 from batch import runner as batch_runner
 from uncertainty import asymptotic, bayes, bootstrap
@@ -55,6 +55,14 @@ from uncertainty import asymptotic, bayes, bootstrap
 MODERN_LOSSES = ["linear", "soft_l1", "huber", "cauchy"]
 MODERN_WEIGHTS = ["none", "poisson", "inv_y"]
 LMFIT_ALGOS = ["least_squares", "leastsq", "nelder", "differential_evolution"]
+
+SOLVER_LABELS = {
+    "classic": "Classic",
+    "modern_vp": "Modern (Variable Projection)",
+    "modern_trf": "Modern (Legacy TRF)",
+    "lmfit_vp": "LMFIT (Variable Projection)",
+}
+SOLVER_LABELS_INV = {v: k for k, v in SOLVER_LABELS.items()}
 
 
 # ---------- Math ----------
@@ -105,6 +113,8 @@ DEFAULTS = {
     "batch_reheight": False,
     "batch_auto_max": 5,
     "batch_save_traces": False,
+    # Default solver backend
+    "solver_choice": "modern_vp",
 }
 
 def load_config():
@@ -115,6 +125,12 @@ def load_config():
             # Migration: move legacy saved_peaks into templates["default"] if templates is empty
             if cfg.get("saved_peaks") and not cfg.get("templates"):
                 cfg["templates"] = {"default": cfg["saved_peaks"]}
+            # Migration: legacy solver names
+            sc = cfg.get("solver_choice")
+            if sc == "modern":
+                cfg["solver_choice"] = "modern_vp"
+            elif sc == "lmfit":
+                cfg["solver_choice"] = "lmfit_vp"
             return cfg
         except Exception:
             return dict(DEFAULTS)
@@ -125,6 +141,29 @@ def save_config(cfg):
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
     except Exception as e:
         messagebox.showwarning("Config", f"Could not save config: {e}")
+
+
+def add_tooltip(widget, text: str) -> None:
+    """Attach a simple tooltip to ``widget`` displaying ``text``."""
+
+    def on_enter(_e):
+        tip = tk.Toplevel(widget)
+        tip.wm_overrideredirect(True)
+        x = widget.winfo_rootx() + 20
+        y = widget.winfo_rooty() + 10
+        tip.wm_geometry(f"+{x}+{y}")
+        lbl = tk.Label(tip, text=text, background="#ffffe0", relief=tk.SOLID, borderwidth=1)
+        lbl.pack()
+        widget._tip = tip
+
+    def on_leave(_e):
+        tip = getattr(widget, "_tip", None)
+        if tip is not None:
+            tip.destroy()
+            widget._tip = None
+
+    widget.bind("<Enter>", on_enter)
+    widget.bind("<Leave>", on_leave)
 
 
 # ---------- Fitting utilities ----------
@@ -196,7 +235,19 @@ class PeakFitApp:
         self._baseline_cache = {}
 
         # Solver selection and diagnostics
-        self.solver_var = tk.StringVar(value="Classic")
+        try:
+            import lmfit  # noqa: F401
+            self.has_lmfit = True
+        except Exception:
+            self.has_lmfit = False
+        self.solver_choice = tk.StringVar(value=self.cfg.get("solver_choice", "modern_vp"))
+        if not self.has_lmfit and self.solver_choice.get() == "lmfit_vp":
+            self.solver_choice.set("modern_vp")
+            self.cfg["solver_choice"] = "modern_vp"
+            save_config(self.cfg)
+        self.bootstrap_solver_choice = tk.StringVar(value=self.solver_choice.get())
+        self.bootstrap_solver_label = tk.StringVar(value=SOLVER_LABELS[self.solver_choice.get()])
+        self.solver_title = tk.StringVar(value=SOLVER_LABELS[self.solver_choice.get()])
         self.classic_maxfev = tk.IntVar(value=20000)
         self.modern_loss = tk.StringVar(value="linear")
         self.modern_weight = tk.StringVar(value="none")
@@ -392,21 +443,32 @@ class PeakFitApp:
                         command=self.toggle_auto_apply).pack(anchor="w", pady=(4,0))
 
         # Solver selection
-        solver_box = ttk.Labelframe(right, text="Solver"); solver_box.pack(fill=tk.X, pady=4)
-        self.solver_combo = ttk.Combobox(solver_box, textvariable=self.solver_var, state="readonly",
-                     values=["Classic", "Modern", "LMFIT"], width=12)
-        self.solver_combo.pack(side=tk.LEFT, padx=4)
-        self.solver_combo.bind("<<ComboboxSelected>>", lambda _e: self._show_solver_opts())
+        solver_box = ttk.Labelframe(right, text="Fitting method"); solver_box.pack(fill=tk.X, pady=4)
+        for key in ["classic", "modern_vp", "modern_trf", "lmfit_vp"]:
+            rb = ttk.Radiobutton(
+                solver_box,
+                text=SOLVER_LABELS[key],
+                variable=self.solver_choice,
+                value=key,
+                command=self._on_solver_change,
+            )
+            if key == "lmfit_vp" and not self.has_lmfit:
+                rb.state(["disabled"])
+                add_tooltip(rb, "Install lmfit to enable.")
+            rb.pack(anchor="w")
 
+        opts_parent = ttk.Frame(solver_box)
+        opts_parent.pack(fill=tk.X, pady=2)
         self.solver_frames = {}
+
         # Classic options
-        f_classic = ttk.Frame(solver_box)
+        f_classic = ttk.Frame(opts_parent)
         ttk.Label(f_classic, text="Max evals").pack(side=tk.LEFT)
         ttk.Entry(f_classic, width=7, textvariable=self.classic_maxfev).pack(side=tk.LEFT, padx=4)
-        self.solver_frames["Classic"] = f_classic
+        self.solver_frames["classic"] = f_classic
 
-        # Modern options
-        f_modern = ttk.Frame(solver_box)
+        # Modern options (shared for VP and TRF)
+        f_modern = ttk.Frame(opts_parent)
         r1 = ttk.Frame(f_modern); r1.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(r1, text="Loss").pack(side=tk.LEFT)
         ttk.Combobox(r1, textvariable=self.modern_loss, state="readonly",
@@ -425,10 +487,11 @@ class PeakFitApp:
         ttk.Entry(r2, width=4, textvariable=self.modern_jitter).pack(side=tk.LEFT, padx=2)
         ttk.Checkbutton(f_modern, text="Centers in window", variable=self.modern_centers_window).pack(anchor="w")
         ttk.Checkbutton(f_modern, text="Min FWHM ≈2×Δx", variable=self.modern_min_fwhm).pack(anchor="w")
-        self.solver_frames["Modern"] = f_modern
+        self.solver_frames["modern_vp"] = f_modern
+        self.solver_frames["modern_trf"] = f_modern
 
         # LMFIT options
-        f_lmfit = ttk.Frame(solver_box)
+        f_lmfit = ttk.Frame(opts_parent)
         ttk.Label(f_lmfit, text="Algo").pack(side=tk.LEFT)
         ttk.Combobox(f_lmfit, textvariable=self.lmfit_algo, state="readonly",
                      values=LMFIT_ALGOS, width=18).pack(side=tk.LEFT, padx=2)
@@ -436,15 +499,38 @@ class PeakFitApp:
         ttk.Entry(f_lmfit, width=7, textvariable=self.lmfit_maxfev).pack(side=tk.LEFT, padx=2)
         ttk.Checkbutton(f_lmfit, text="Share FWHM", variable=self.lmfit_share_fwhm).pack(anchor="w", padx=(4,0))
         ttk.Checkbutton(f_lmfit, text="Share η", variable=self.lmfit_share_eta).pack(anchor="w", padx=(4,0))
-        self.solver_frames["LMFIT"] = f_lmfit
+        self.solver_frames["lmfit_vp"] = f_lmfit
 
         self._show_solver_opts()
 
         # Uncertainty panel
         unc_box = ttk.Labelframe(right, text="Uncertainty"); unc_box.pack(fill=tk.X, pady=4)
-        ttk.Combobox(unc_box, textvariable=self.unc_method, state="readonly",
-                     values=["Asymptotic", "Bootstrap", "Bayesian"], width=12).pack(side=tk.LEFT, padx=4)
+        self.unc_method_combo = ttk.Combobox(
+            unc_box,
+            textvariable=self.unc_method,
+            state="readonly",
+            values=["Asymptotic", "Bootstrap", "Bayesian"],
+            width=14,
+        )
+        self.unc_method_combo.pack(side=tk.LEFT, padx=4)
+        self.unc_method_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_unc_widgets())
+
+        solver_labels = [SOLVER_LABELS[k] for k in ["classic", "modern_vp", "modern_trf"]]
+        if self.has_lmfit:
+            solver_labels.append(SOLVER_LABELS["lmfit_vp"])
+        self.bootstrap_solver_combo = ttk.Combobox(
+            unc_box,
+            textvariable=self.bootstrap_solver_label,
+            state="readonly",
+            values=solver_labels,
+            width=24,
+        )
+        self.bootstrap_solver_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._on_bootstrap_solver_change(),
+        )
         ttk.Button(unc_box, text="Run", command=self.run_uncertainty).pack(side=tk.LEFT, padx=4)
+        self._update_unc_widgets()
 
         # Performance panel
         perf_box = ttk.Labelframe(right, text="Performance"); perf_box.pack(fill=tk.X, pady=4)
@@ -489,22 +575,23 @@ class PeakFitApp:
         ttk.Button(actions, text="Auto-seed", command=self.auto_seed).pack(side=tk.LEFT)
         ttk.Button(actions, text="Step \u25B6", command=self.step_once).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=4)
+        ttk.Label(actions, textvariable=self.solver_title).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Toggle components", command=self.toggle_components).pack(side=tk.LEFT, padx=4)
 
         # Status
         self.status = ttk.Label(self.root, text="Open CSV/TXT/DAT, set baseline/range, add peaks, set η, then Fit.")
         self.status.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
 
-    def _show_solver_opts(self, *_):
+    def _show_solver_opts(self):
         for f in self.solver_frames.values():
             f.pack_forget()
-        frame = self.solver_frames.get(self.solver_var.get())
+        frame = self.solver_frames.get(self.solver_choice.get())
         if frame:
             frame.pack(side=tk.LEFT, padx=4)
 
-    def _solver_options(self) -> dict:
-        solver = self.solver_var.get().lower()
-        if solver == "modern":
+    def _solver_options(self, choice: str | None = None) -> dict:
+        solver = choice or self.solver_choice.get()
+        if solver in ("modern_vp", "modern_trf"):
             min_fwhm = 1e-6
             if self.modern_min_fwhm.get() and self.x is not None and self.x.size > 1:
                 min_fwhm = 2.0 * float(np.median(np.diff(self.x)))
@@ -518,7 +605,7 @@ class PeakFitApp:
                 "centers_in_window": bool(self.modern_centers_window.get()),
                 "min_fwhm": float(min_fwhm),
             }
-        if solver == "lmfit":
+        if solver == "lmfit_vp":
             return {
                 "algo": self.lmfit_algo.get(),
                 "maxfev": int(self.lmfit_maxfev.get()),
@@ -526,6 +613,39 @@ class PeakFitApp:
                 "share_eta": bool(self.lmfit_share_eta.get()),
             }
         return {"maxfev": int(self.classic_maxfev.get())}
+
+    def _on_solver_change(self):
+        choice = self.solver_choice.get()
+        self.solver_title.set(SOLVER_LABELS[choice])
+        self.cfg["solver_choice"] = choice
+        save_config(self.cfg)
+        # sync bootstrap default
+        self.bootstrap_solver_choice.set(choice)
+        self.bootstrap_solver_label.set(SOLVER_LABELS[choice])
+        self._show_solver_opts()
+        self._update_unc_widgets()
+
+    def _on_bootstrap_solver_change(self):
+        label = self.bootstrap_solver_label.get()
+        choice = SOLVER_LABELS_INV.get(label, "classic")
+        self.bootstrap_solver_choice.set(choice)
+        self._update_unc_widgets()
+
+    def _update_unc_widgets(self):
+        label = SOLVER_LABELS[self.bootstrap_solver_choice.get()]
+        self.unc_method_combo["values"] = [
+            "Asymptotic",
+            f"Bootstrap (base solver = {label})",
+            "Bayesian",
+        ]
+        # Preserve current selection if possible
+        current = self.unc_method.get()
+        if current.startswith("Bootstrap"):
+            self.unc_method.set(f"Bootstrap (base solver = {label})")
+        if self.unc_method.get().startswith("Bootstrap"):
+            self.bootstrap_solver_combo.pack(side=tk.LEFT, padx=4)
+        else:
+            self.bootstrap_solver_combo.pack_forget()
 
     def _new_figure(self):
         self.ax.clear()
@@ -1111,11 +1231,13 @@ class PeakFitApp:
             "options": options,
         }
 
-        solver = self.solver_var.get().lower()
+        solver = self.solver_choice.get()
         try:
-            if solver == "modern":
+            if solver == "modern_vp":
+                res = modern_vp.iterate(state)
+            elif solver == "modern_trf":
                 res = modern.iterate(state)
-            elif solver == "lmfit":
+            elif solver == "lmfit_vp":
                 res = lmfit_backend.iterate(state)
             else:
                 res = classic.iterate(state)
@@ -1158,12 +1280,14 @@ class PeakFitApp:
         base_fit = self.baseline[mask] if (base_applied and add_mode) else None
         mode = "add" if add_mode else "subtract"
 
-        solver = self.solver_var.get().lower()
+        solver = self.solver_choice.get()
         options = self._solver_options()
         try:
-            if solver == "modern":
+            if solver == "modern_vp":
+                res = modern_vp.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
+            elif solver == "modern_trf":
                 res = modern.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
-            elif solver == "lmfit":
+            elif solver == "lmfit_vp":
                 res = lmfit_backend.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
             else:
                 res = classic.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
@@ -1213,7 +1337,7 @@ class PeakFitApp:
         elif source == "current":
             peaks_list = [p.__dict__ for p in self.peaks]
 
-        solver = self.solver_var.get().lower()
+        solver = self.solver_choice.get()
         cfg = {
             "peaks": peaks_list,
             "solver": solver,
@@ -1229,7 +1353,7 @@ class PeakFitApp:
             "source": source,
             "reheight": bool(self.batch_reheight.get()),
             "auto_max": int(self.batch_auto_max.get()),
-            solver: self._solver_options(),
+            solver: self._solver_options(solver),
         }
         try:
             batch_runner.run(patterns, cfg)
@@ -1265,16 +1389,23 @@ class PeakFitApp:
         theta = np.asarray(theta, dtype=float)
 
         resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
-        method = self.unc_method.get().lower()
-        solver = self.solver_var.get().lower()
+        method_label = self.unc_method.get()
+        method = "bootstrap" if method_label.startswith("Bootstrap") else method_label.lower()
         try:
             if method == "asymptotic":
                 rep = asymptotic.asymptotic({"theta": theta, "jac": None}, resid_fn)
             elif method == "bootstrap":
-                cfg = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
-                       "baseline": base_fit, "theta": theta,
-                       "options": self._solver_options(), "n": 100}
-                rep = bootstrap.bootstrap(solver, cfg, resid_fn)
+                cfg = {
+                    "x": x_fit,
+                    "y": y_fit,
+                    "peaks": self.peaks,
+                    "mode": mode,
+                    "baseline": base_fit,
+                    "theta": theta,
+                    "options": self._solver_options(self.bootstrap_solver_choice.get()),
+                    "n": 100,
+                }
+                rep = bootstrap.bootstrap(self.bootstrap_solver_choice.get(), cfg, resid_fn)
             elif method == "bayesian":
                 init = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
                         "baseline": base_fit, "theta": theta}
