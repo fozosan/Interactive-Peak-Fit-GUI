@@ -1,90 +1,97 @@
-"""Utilities for packing peak parameters and bounds."""
+"""Parameter packing and bounds computation for peak fitting."""
 from __future__ import annotations
 
-from typing import Iterable, Sequence, Tuple
+from typing import Sequence, Tuple
 
 import numpy as np
 
-from core.peaks import Peak
+
+class PeakLike:
+    """Protocol-like base for objects with peak attributes.
+
+    ``fit.bounds`` works with both :class:`core.peaks.Peak` and the lightweight
+    ``ui.app.Peak`` dataclasses used by the GUI.  We only rely on attribute
+    access, so a formal ``Protocol`` is unnecessary and avoids an optional
+    typing dependency."""
+
+    center: float
+    height: float
+    fwhm: float
+    eta: float
+    lock_center: bool
+    lock_width: bool
 
 
 def pack_theta_bounds(
-    peaks: Sequence[Peak],
-    x: np.ndarray,
+    peaks: Sequence[PeakLike],
+    x: Sequence[float],
     options: dict,
 ) -> Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
-    """Return flattened peak parameters and bound arrays.
+    """Flatten ``peaks`` into a parameter vector and matching bounds.
 
     Parameters
     ----------
     peaks:
-        Sequence of :class:`~core.peaks.Peak` objects to flatten.
+        Sequence of peak-like objects.  Each must provide ``center``, ``height``,
+        ``fwhm`` and ``eta`` attributes plus ``lock_center``/``lock_width`` flags.
     x:
-        Abscissa values used to optionally clamp peak centers.
+        Sample positions corresponding to the data being fitted.  Only the
+        minimum and maximum are used to optionally constrain peak centers.
     options:
-        Mapping that may contain ``min_fwhm`` and ``centers_in_window`` keys
-        controlling bounds.
+        Mapping of solver options.  ``min_fwhm`` (default ``1e-6``) enforces a
+        lower bound on widths.  ``centers_in_window`` constrains centers to the
+        range of ``x`` when true.
 
-    The parameter vector is ordered as ``[center, height, fwhm, eta]`` for each
-    peak. Bounds enforce non-negative heights, a minimum full-width at half
-    maximum, and 0 ≤ η ≤ 1. If ``centers_in_window`` is truthy, peak centers are
-    limited to ``[x.min(), x.max()]``. When ``lock_center`` or ``lock_width`` is
-    set on a peak the respective parameter is effectively fixed using a tiny
-    tolerance around the value to satisfy solvers that require strictly
-    increasing bounds. Initial parameter guesses are clipped into the valid
-    range so that they always satisfy the returned bounds.
+    Returns
+    -------
+    theta : ``np.ndarray``
+        Flattened parameter vector ``[c0, h0, w0, e0, c1, h1, ...]``.
+    bounds : tuple of ``np.ndarray``
+        Lower and upper bounds suitable for scipy ``least_squares`` style APIs.
     """
 
     x = np.asarray(x, dtype=float)
-    theta: list[float] = []
-    lb: list[float] = []
-    ub: list[float] = []
-
     x_min = float(x.min())
     x_max = float(x.max())
     min_fwhm = float(options.get("min_fwhm", 1e-6))
     clamp_center = bool(options.get("centers_in_window", False))
-    eps = np.finfo(float).eps
+
+    theta_list: list[float] = []
+    lb_list: list[float] = []
+    ub_list: list[float] = []
+
     for pk in peaks:
-        # center
-        c = float(pk.center)
-        if clamp_center and not pk.lock_center:
-            c = float(np.clip(c, x_min, x_max))
-        theta.append(c)
+        # parameter packing
+        theta_list.extend([pk.center, pk.height, pk.fwhm, pk.eta])
+
+        # bounds for center
         if pk.lock_center:
-            lb.append(c - eps)
-            ub.append(c + eps)
+            lb_list.append(pk.center)
+            ub_list.append(pk.center)
+        elif clamp_center:
+            lb_list.append(x_min)
+            ub_list.append(x_max)
         else:
-            if clamp_center:
-                lb.append(x_min)
-                ub.append(x_max)
-            else:
-                lb.append(-np.inf)
-                ub.append(np.inf)
+            lb_list.append(-np.inf)
+            ub_list.append(np.inf)
 
-        # height
-        h = float(max(pk.height, 0.0))
-        theta.append(h)
-        lb.append(0.0)
-        ub.append(np.inf)
+        # bounds for height
+        lb_list.append(0.0)
+        ub_list.append(np.inf)
 
-        # FWHM
-        w = float(max(pk.fwhm, min_fwhm))
-        theta.append(w)
+        # bounds for width
         if pk.lock_width:
-            lb.append(w - eps)
-            ub.append(w + eps)
+            lb_list.append(pk.fwhm)
+            ub_list.append(pk.fwhm)
         else:
-            lb.append(min_fwhm)
-            ub.append(np.inf)
+            lb_list.append(min_fwhm)
+            ub_list.append(np.inf)
 
-        # eta (shape factor)
-        e = float(np.clip(pk.eta, 0.0, 1.0))
-        theta.append(e)
-        lb.append(0.0)
-        ub.append(1.0)
+        # bounds for eta
+        lb_list.append(0.0)
+        ub_list.append(1.0)
 
-    theta_arr = np.asarray(theta, dtype=float)
-    lb_arr = np.asarray(lb, dtype=float)
-    ub_arr = np.asarray(ub, dtype=float)
-    return theta_arr, (lb_arr, ub_arr)
+    theta = np.asarray(theta_list, dtype=float)
+    lb = np.asarray(lb_list, dtype=float)
+    ub = np.asarray(ub_list, dtype=float)
+    return theta, (lb, ub)
