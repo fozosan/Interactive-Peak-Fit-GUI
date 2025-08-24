@@ -9,6 +9,17 @@ from core.peaks import Peak
 from core.models import pv_sum
 
 
+def _clip_params(pars) -> None:
+    """Clamp ``lmfit`` Parameters to their min/max bounds in-place."""
+
+    for p in pars.values():
+        v = p.value
+        if p.min is not None and v < p.min:
+            p.value = p.min
+        if p.max is not None and v > p.max:
+            p.value = p.max
+
+
 class SolveResult(TypedDict):
     ok: bool
     theta: np.ndarray
@@ -138,6 +149,7 @@ def solve(
         idx += 4
 
     def residual(pars: lmfit.Parameters) -> np.ndarray:
+        _clip_params(pars)
         pk: list[Peak] = []
         for i in range(len(peaks)):
             pk.append(
@@ -163,6 +175,7 @@ def solve(
 
     res = lmfit.minimize(residual, params, method=algo, max_nfev=maxfev)
 
+    _clip_params(res.params)
     theta = []
     for i in range(len(peaks)):
         theta.extend(
