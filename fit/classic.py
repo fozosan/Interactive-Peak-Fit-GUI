@@ -10,6 +10,7 @@ from scipy.optimize import least_squares
 from core.residuals import build_residual_jac
 from core.models import pv_design_matrix
 from .bounds import pack_theta_bounds
+from . import step_engine
 
 
 class SolveResult(TypedDict):
@@ -163,4 +164,50 @@ def solve(
         cov=cov,
         meta={"nfev": res.nfev, "njev": getattr(res, "njev", None)},
     )
+
+
+def iterate(state: dict) -> dict:
+    """Perform a single iteration of the classic solver.
+
+    The implementation is a thin wrapper around :func:`step_engine.step_once`
+    so that the Step button in the GUI can advance the solution using the same
+    residuals and bounds as the full solver.  ``state`` should contain the
+    fields ``x_fit``, ``y_fit`` and ``peaks`` as well as optional ``baseline``
+    and ``options`` dictionaries.
+    """
+
+    x = state["x_fit"]
+    y = state["y_fit"]
+    peaks = state["peaks"]
+    mode = state.get("mode", "subtract")
+    baseline = state.get("baseline")
+    options = state.get("options", {})
+
+    loss = options.get("loss", "linear")
+    weight_mode = options.get("weights", "none")
+    weights = None
+    if weight_mode == "poisson":
+        weights = 1.0 / np.sqrt(np.clip(np.abs(y), 1.0, None))
+    elif weight_mode == "inv_y":
+        weights = 1.0 / np.clip(np.abs(y), 1e-12, None)
+
+    _, bounds = pack_theta_bounds(peaks, x, options)
+
+    theta, cost = step_engine.step_once(
+        x,
+        y,
+        peaks,
+        mode,
+        baseline,
+        loss=loss,
+        weights=weights,
+        damping=state.get("lambda", 0.0),
+        trust_radius=state.get("trust_radius", np.inf),
+        bounds=bounds,
+        f_scale=options.get("f_scale", 1.0),
+    )
+
+    state["theta"] = theta
+    state["cost"] = cost
+    return state
 

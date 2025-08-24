@@ -11,6 +11,7 @@ from core.residuals import build_residual_jac
 from core.models import pv_design_matrix
 from .bounds import pack_theta_bounds
 from .utils import mad_sigma, robust_cost
+from . import step_engine
 
 
 class SolveResult(TypedDict):
@@ -230,4 +231,49 @@ def solve(
         cov=cov,
         meta=meta,
     )
+
+
+def iterate(state: dict) -> dict:
+    """Single iteration of the modern solver.
+
+    This mirrors the behaviour of :func:`step_engine.step_once` but honours the
+    solver options used by :func:`solve`.  Only a subset of the full solver
+    functionality is required for stepping, so we reuse the generic step
+    engine here.
+    """
+
+    x = state["x_fit"]
+    y = state["y_fit"]
+    peaks = state["peaks"]
+    mode = state.get("mode", "subtract")
+    baseline = state.get("baseline")
+    options = state.get("options", {})
+
+    loss = options.get("loss", "linear")
+    weight_mode = options.get("weights", "none")
+    weights = None
+    if weight_mode == "poisson":
+        weights = 1.0 / np.sqrt(np.clip(np.abs(y), 1.0, None))
+    elif weight_mode == "inv_y":
+        weights = 1.0 / np.clip(np.abs(y), 1e-12, None)
+
+    _, bounds = pack_theta_bounds(peaks, x, options)
+
+    theta, cost = step_engine.step_once(
+        x,
+        y,
+        peaks,
+        mode,
+        baseline,
+        loss=loss,
+        weights=weights,
+        damping=state.get("lambda", 0.0),
+        trust_radius=state.get("trust_radius", np.inf),
+        bounds=bounds,
+        f_scale=options.get("f_scale", 1.0),
+    )
+
+    state["theta"] = theta
+    state["cost"] = cost
+    return state
 

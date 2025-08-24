@@ -10,6 +10,7 @@ from core.models import pv_design_matrix
 from core.peaks import Peak
 from .bounds import pack_theta_bounds
 from .utils import mad_sigma, robust_cost
+from . import step_engine
 
 
 class SolveResult(TypedDict):
@@ -173,3 +174,47 @@ def solve(
         cov=None,
         meta={"nfev": result.nfev, "sigma": sigma, "f_scale": f_scale},
     )
+
+
+def iterate(state: dict) -> dict:
+    """Perform a single iteration using the lmfit backend.
+
+    The iterate function provides a light-weight stepping interface by
+    delegating to :func:`step_engine.step_once`, matching the behaviour of the
+    full :func:`solve` routine for one iteration.
+    """
+
+    x = state["x_fit"]
+    y = state["y_fit"]
+    peaks = state["peaks"]
+    mode = state.get("mode", "subtract")
+    baseline = state.get("baseline")
+    options = state.get("options", {})
+
+    loss = options.get("loss", "linear")
+    weight_mode = options.get("weights", "none")
+    weights = None
+    if weight_mode == "poisson":
+        weights = 1.0 / np.sqrt(np.clip(np.abs(y), 1.0, None))
+    elif weight_mode == "inv_y":
+        weights = 1.0 / np.clip(np.abs(y), 1e-12, None)
+
+    _, bounds = pack_theta_bounds(peaks, x, options)
+
+    theta, cost = step_engine.step_once(
+        x,
+        y,
+        peaks,
+        mode,
+        baseline,
+        loss=loss,
+        weights=weights,
+        damping=state.get("lambda", 0.0),
+        trust_radius=state.get("trust_radius", np.inf),
+        bounds=bounds,
+        f_scale=options.get("f_scale", 1.0),
+    )
+
+    state["theta"] = theta
+    state["cost"] = cost
+    return state
