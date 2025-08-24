@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import glob
 from pathlib import Path
-from typing import Iterable, Sequence, List, Callable, Optional
+from typing import Iterable, Sequence, List
 
 import numpy as np
 
 from core import data_io, models, peaks, signals
-from fit import classic, modern
+from fit import classic, lmfit_backend, modern
 
 
 def _apply_solver(name: str, x, y, pk, mode, baseline, options):
@@ -23,7 +23,7 @@ def _apply_solver(name: str, x, y, pk, mode, baseline, options):
         return classic.solve(x, y, pk, mode, baseline, options)
     if name == "modern":
         return modern.solve(x, y, pk, mode, baseline, options)
-    raise ValueError("unknown solver")
+    return lmfit_backend.solve(x, y, pk, mode, baseline, options)
 
 
 def _auto_seed(x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: int = 5) -> List[peaks.Peak]:
@@ -51,7 +51,7 @@ def _auto_seed(x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: in
     return found
 
 
-def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str], None]] = None) -> None:
+def run(patterns: Iterable[str], config: dict) -> None:
     """Run the peak fitting pipeline over matching files.
 
     Parameters
@@ -60,8 +60,8 @@ def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str]
         Iterable of glob patterns. All matching files are processed.
     config:
         Dictionary describing the batch job. Supported keys include ``peaks``
-        (list of peak dictionaries), ``solver`` (``classic`` | ``modern``),
-        ``mode`` (``add`` | ``subtract``), ``baseline``
+        (list of peak dictionaries), ``solver`` (``classic`` | ``modern`` |
+        ``lmfit``), ``mode`` (``add`` | ``subtract``), ``baseline``
         parameters, per-solver options, ``save_traces`` flag, ``peak_output``
         for the output CSV, ``source`` (``current`` | ``template`` | ``auto``)
         selecting the peak seeds, ``reheight`` to refresh heights per spectrum
@@ -89,8 +89,6 @@ def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str]
     records = []
 
     for path in files:
-        if progress:
-            progress(f"Processing {path}")
         x, y = data_io.load_xy(path)
         baseline = signals.als_baseline(
             y,
@@ -114,9 +112,7 @@ def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str]
                     tpl.height = float(max(sig[idx_near], 1e-6))
 
         opts = config.get(solver_name, {})
-        y_fit = y
-        base_arg = baseline
-        res = _apply_solver(solver_name, x, y_fit, template, mode, base_arg, opts)
+        res = _apply_solver(solver_name, x, y, template, mode, baseline, opts)
 
         theta = np.asarray(res["theta"], dtype=float)
         fitted = []
@@ -125,7 +121,9 @@ def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str]
             fitted.append(peaks.Peak(c, h, w, e, tpl.lock_center, tpl.lock_width))
 
         model = models.pv_sum(x, fitted)
-        resid = model + baseline - y
+        resid = model + (baseline if mode == "add" else 0.0) - (
+            y if mode == "add" else y - baseline
+        )
         rmse = float(np.sqrt(np.mean(resid**2)))
         areas = [models.pv_area(p.height, p.fwhm, p.eta) for p in fitted]
         total = sum(areas) or 1.0
@@ -154,13 +152,11 @@ def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str]
 
         if save_traces:
             trace_csv = data_io.build_trace_table(
-                x, y, baseline, fitted
+                x, y, baseline, fitted, mode=mode
             )
             trace_path = Path(path).with_suffix(Path(path).suffix + ".trace.csv")
             with trace_path.open("w", encoding="utf-8") as fh:
                 fh.write(trace_csv)
-        if progress:
-            progress(f"Finished {path}")
 
     peak_csv = data_io.build_peak_table(records)
     with open(peak_output, "w", encoding="utf-8") as fh:
