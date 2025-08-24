@@ -1123,7 +1123,7 @@ class PeakFitApp:
             theta, _ = step_engine.step_once(
                 x_fit, y_fit, self.peaks, mode, base_fit,
                 loss="linear", weights=None, damping=0.0,
-                trust_radius=np.inf, bounds=None
+                trust_radius=np.inf, bounds=bounds
             )
         except Exception as e:
             messagebox.showerror("Step", f"Step failed:\n{e}")
