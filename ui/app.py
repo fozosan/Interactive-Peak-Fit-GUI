@@ -27,6 +27,7 @@ Features:
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -49,6 +50,7 @@ from core import signals
 from fit import classic, lmfit_backend, modern, step_engine
 from core.residuals import build_residual
 from uncertainty import asymptotic, bootstrap, bayes
+from infra import performance, config as infra_config
 
 
 # ---------- Math ----------
@@ -82,6 +84,7 @@ class Peak:
 
 # ---------- Config persistence ----------
 CONFIG_PATH = Path.home() / ".gl_peakfit_config.json"
+PERF_CONFIG_PATH = Path.home() / ".peakfit3_config.json"
 DEFAULTS = {
     "als_lam": 1e5,
     "als_asym": 0.001,
@@ -150,6 +153,19 @@ class PeakFitApp:
         self.global_eta = tk.DoubleVar(value=0.5)
         self.auto_apply_template = tk.BooleanVar(value=bool(self.cfg.get("auto_apply_template", False)))
         self.auto_apply_template_name = tk.StringVar(value=self.cfg.get("auto_apply_template_name", ""))
+
+        # Performance settings
+        self.perf_cfg = infra_config.load(PERF_CONFIG_PATH)
+        perf = self.perf_cfg.get("performance", {})
+        self.use_numba = tk.BooleanVar(value=bool(perf.get("numba", False)))
+        self.use_gpu = tk.BooleanVar(value=bool(perf.get("gpu", False)))
+        self.use_cache = tk.BooleanVar(value=bool(perf.get("cache", False)))
+        self.use_seed = tk.BooleanVar(value=bool(perf.get("deterministic_seed", False)))
+
+        performance.set_numba(self.use_numba.get())
+        performance.set_gpu(self.use_gpu.get())
+        performance.set_max_workers((os.cpu_count() or 1) if self.use_cache.get() else 0)
+        performance.set_seed(0 if self.use_seed.get() else None)
 
         # Interaction
         self.add_peaks_mode = tk.BooleanVar(value=True)  # click-to-add toggle
@@ -316,6 +332,17 @@ class PeakFitApp:
 
         ttk.Checkbutton(tmpl, text="Auto-apply on open (use selected)", variable=self.auto_apply_template,
                         command=self.toggle_auto_apply).pack(anchor="w", pady=(4,0))
+
+        # Performance
+        perf_box = ttk.Labelframe(right, text="Performance"); perf_box.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(perf_box, text="Use Numba", variable=self.use_numba,
+                        command=self.on_toggle_numba).pack(anchor="w")
+        ttk.Checkbutton(perf_box, text="Use GPU/CuPy", variable=self.use_gpu,
+                        command=self.on_toggle_gpu).pack(anchor="w")
+        ttk.Checkbutton(perf_box, text="Cache baseline", variable=self.use_cache,
+                        command=self.on_toggle_cache).pack(anchor="w")
+        ttk.Checkbutton(perf_box, text="Deterministic seed", variable=self.use_seed,
+                        command=self.on_toggle_seed).pack(anchor="w")
 
         # Solver selection
         solver_box = ttk.Labelframe(right, text="Solver"); solver_box.pack(fill=tk.X, pady=4)
@@ -659,6 +686,32 @@ class PeakFitApp:
         self.cfg["auto_apply_template_name"] = self.template_var.get()
         self.auto_apply_template_name.set(self.cfg["auto_apply_template_name"])
         save_config(self.cfg)
+
+    # ----- Performance toggles -----
+    def _save_perf_cfg(self):
+        self.perf_cfg["performance"] = {
+            "numba": bool(self.use_numba.get()),
+            "gpu": bool(self.use_gpu.get()),
+            "cache": bool(self.use_cache.get()),
+            "deterministic_seed": bool(self.use_seed.get()),
+        }
+        infra_config.save(PERF_CONFIG_PATH, self.perf_cfg)
+
+    def on_toggle_numba(self):
+        performance.set_numba(bool(self.use_numba.get()))
+        self._save_perf_cfg()
+
+    def on_toggle_gpu(self):
+        performance.set_gpu(bool(self.use_gpu.get()))
+        self._save_perf_cfg()
+
+    def on_toggle_cache(self):
+        performance.set_max_workers((os.cpu_count() or 1) if self.use_cache.get() else 0)
+        self._save_perf_cfg()
+
+    def on_toggle_seed(self):
+        performance.set_seed(0 if self.use_seed.get() else None)
+        self._save_perf_cfg()
 
     # ----- Template application (data ops) -----
     def serialize_peaks(self) -> list:
