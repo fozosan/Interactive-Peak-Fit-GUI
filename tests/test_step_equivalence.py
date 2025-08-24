@@ -34,7 +34,7 @@ def test_step_converges_close_to_fit():
 
     options = {}
     theta0, bounds = pack_theta_bounds(step_peaks, x, options)
-    weights = None  # no noise weighting
+    weight_mode = "none"  # no noise weighting
 
     model0 = pv_sum(x, step_peaks)
     r0 = model0 - y
@@ -46,7 +46,7 @@ def test_step_converges_close_to_fit():
         "subtract",
         None,
         loss="linear",
-        weights=weights,
+        weight_mode=weight_mode,
         damping=0.0,
         trust_radius=np.inf,
         bounds=bounds,
@@ -65,7 +65,7 @@ def test_step_converges_close_to_fit():
             "subtract",
             None,
             loss="linear",
-            weights=weights,
+            weight_mode=weight_mode,
             damping=0.0,
             trust_radius=np.inf,
             bounds=bounds,
