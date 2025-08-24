@@ -249,6 +249,10 @@ class PeakFitApp:
         self.bootstrap_solver_label = tk.StringVar(value=SOLVER_LABELS[self.solver_choice.get()])
         self.solver_title = tk.StringVar(value=SOLVER_LABELS[self.solver_choice.get()])
         self.classic_maxfev = tk.IntVar(value=20000)
+        self.classic_centers_window = tk.BooleanVar(value=True)
+        self.classic_fwhm_min_dx = tk.DoubleVar(value=2.0)
+        self.classic_fwhm_max_span = tk.DoubleVar(value=0.5)
+        self.classic_max_height = tk.DoubleVar(value=3.0)
         self.modern_loss = tk.StringVar(value="linear")
         self.modern_weight = tk.StringVar(value="none")
         self.modern_fscale = tk.DoubleVar(value=1.0)
@@ -463,8 +467,20 @@ class PeakFitApp:
 
         # Classic options
         f_classic = ttk.Frame(opts_parent)
-        ttk.Label(f_classic, text="Max evals").pack(side=tk.LEFT)
-        ttk.Entry(f_classic, width=7, textvariable=self.classic_maxfev).pack(side=tk.LEFT, padx=4)
+        rowc = ttk.Frame(f_classic)
+        rowc.pack(anchor="w")
+        ttk.Label(rowc, text="Max evals").pack(side=tk.LEFT)
+        ttk.Entry(rowc, width=7, textvariable=self.classic_maxfev).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(f_classic, text="Centers in window", variable=self.classic_centers_window).pack(anchor="w")
+        row1 = ttk.Frame(f_classic); row1.pack(anchor="w")
+        ttk.Label(row1, text="Min FWHM×Δx").pack(side=tk.LEFT)
+        ttk.Entry(row1, width=4, textvariable=self.classic_fwhm_min_dx).pack(side=tk.LEFT, padx=2)
+        row2 = ttk.Frame(f_classic); row2.pack(anchor="w")
+        ttk.Label(row2, text="Max span frac").pack(side=tk.LEFT)
+        ttk.Entry(row2, width=4, textvariable=self.classic_fwhm_max_span).pack(side=tk.LEFT, padx=2)
+        row3 = ttk.Frame(f_classic); row3.pack(anchor="w")
+        ttk.Label(row3, text="Max height ×").pack(side=tk.LEFT)
+        ttk.Entry(row3, width=4, textvariable=self.classic_max_height).pack(side=tk.LEFT, padx=2)
         self.solver_frames["classic"] = f_classic
 
         # Modern options (shared for VP and TRF)
@@ -612,7 +628,13 @@ class PeakFitApp:
                 "share_fwhm": bool(self.lmfit_share_fwhm.get()),
                 "share_eta": bool(self.lmfit_share_eta.get()),
             }
-        return {"maxfev": int(self.classic_maxfev.get())}
+        return {
+            "maxfev": int(self.classic_maxfev.get()),
+            "bound_centers_to_window": bool(self.classic_centers_window.get()),
+            "fwhm_min_dx_factor": float(self.classic_fwhm_min_dx.get()),
+            "fwhm_max_span_factor": float(self.classic_fwhm_max_span.get()),
+            "max_height_factor": float(self.classic_max_height.get()),
+        }
 
     def _on_solver_change(self):
         choice = self.solver_choice.get()

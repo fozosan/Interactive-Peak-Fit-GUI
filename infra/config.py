@@ -14,6 +14,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "save_traces": False,
         "auto_max": 5,
     },
+    "classic": {
+        "maxfev": 20000,
+        "bound_centers_to_window": True,
+        "fwhm_min_dx_factor": 2.0,
+        "fwhm_max_span_factor": 0.5,
+        "max_height_factor": 3.0,
+    },
 }
 
 

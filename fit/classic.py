@@ -10,7 +10,7 @@ from scipy.optimize import least_squares
 from core.residuals import build_residual_jac
 from core.models import pv_design_matrix
 from core.weights import noise_weights
-from .bounds import pack_theta_bounds
+from core.bounds import make_bounds_classic
 from . import step_engine
 
 
@@ -24,7 +24,7 @@ class SolveResult(TypedDict):
     meta: dict
 
 
-def _to_solver_vectors(theta0: np.ndarray, bounds, peaks, fwhm_min: float):
+def _to_solver_vectors(theta0: np.ndarray, bounds, peaks, wmin_eval: float):
     lb, ub = bounds
     theta_list = []
     lb_list = []
@@ -43,14 +43,14 @@ def _to_solver_vectors(theta0: np.ndarray, bounds, peaks, fwhm_min: float):
             theta_list.append(c)
             lb_list.append(lb[4 * i + 0])
             ub_list.append(ub[4 * i + 0])
-            x_scale.append(max(theta0[4 * i + 2], fwhm_min))
+            x_scale.append(max(theta0[4 * i + 2], wmin_eval))
             indices.append(4 * i + 0)
         if not p.lock_width:
             w = theta0[4 * i + 2]
             theta_list.append(w)
             lb_list.append(lb[4 * i + 2])
             ub_list.append(ub[4 * i + 2])
-            x_scale.append(max(w, fwhm_min))
+            x_scale.append(max(w, wmin_eval))
             indices.append(4 * i + 2)
     return (
         np.asarray(theta_list, dtype=float),
@@ -73,19 +73,25 @@ def solve(
     baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
 
     weight_mode = options.get("weights", "none")
+    cfg = {
+        "bound_centers_to_window": options.get("bound_centers_to_window", True),
+        "fwhm_min_dx_factor": options.get("fwhm_min_dx_factor", 2.0),
+        "fwhm_max_span_factor": options.get("fwhm_max_span_factor", 0.5),
+        "max_height_factor": options.get("max_height_factor", 3.0),
+    }
 
-    options = options.copy()
-    base = baseline if baseline is not None else 0.0
-    y_target = y - base
+    if mode == "add":
+        y_target = y
+    else:
+        base = baseline if baseline is not None else 0.0
+        y_target = y - base
     weights = None if weight_mode == "none" else noise_weights(y_target, weight_mode)
-    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
-    max_height_factor = float(options.get("max_height_factor", np.inf))
-    options["max_height"] = max_height_factor * p95
-    options["max_fwhm"] = options.get("max_fwhm", 0.5 * (x.max() - x.min()))
 
-    theta0_full, bounds_full = pack_theta_bounds(peaks, x, options)
-    dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
-    fwhm_min = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
+    (lb_full, ub_full), theta0_full = make_bounds_classic(
+        x, y_target, peaks, None, cfg
+    )
+
+    wmin_eval = float(lb_full[2]) if theta0_full.size >= 3 else 1e-6
 
     all_locked = all(p.lock_center and p.lock_width for p in peaks)
 
@@ -105,7 +111,8 @@ def solve(
         cost = 0.5 * float(r @ r)
         theta_full = theta0_full.copy()
         for i, val in enumerate(h):
-            theta_full[4 * i + 1] = val
+            idx = 4 * i + 1
+            theta_full[idx] = float(np.clip(val, lb_full[idx], ub_full[idx]))
         jac = Aw if weights is not None else A
         return SolveResult(
             ok=True,
@@ -117,8 +124,12 @@ def solve(
             meta={"nfev": 1},
         )
 
-    theta0, bounds, x_scale, indices = _to_solver_vectors(theta0_full, bounds_full, peaks, fwhm_min)
-    resid_jac = build_residual_jac(x, y, peaks, mode, baseline, weights)
+    theta0, bounds, x_scale, indices = _to_solver_vectors(
+        theta0_full, (lb_full, ub_full), peaks, wmin_eval
+    )
+    resid_jac = build_residual_jac(
+        x, y, peaks, mode, baseline, weights, wmin_eval=wmin_eval, clip_heights=True
+    )
 
     def fun(t):
         r, _ = resid_jac(t)
@@ -144,6 +155,7 @@ def solve(
     ok = bool(res.success)
     theta_full = theta0_full.copy()
     theta_full[indices] = res.x
+    theta_full = np.minimum(np.maximum(theta_full, lb_full), ub_full)
     jac_full = res.jac
     cov = None
     if jac_full is not None:
@@ -179,11 +191,24 @@ def iterate(state: dict) -> dict:
     mode = state.get("mode", "subtract")
     baseline = state.get("baseline")
     options = state.get("options", {})
-
-    loss = options.get("loss", "linear")
     weight_mode = options.get("weights", "none")
-
-    _, bounds = pack_theta_bounds(peaks, x, options)
+    cfg = {
+        "bound_centers_to_window": options.get("bound_centers_to_window", True),
+        "fwhm_min_dx_factor": options.get("fwhm_min_dx_factor", 2.0),
+        "fwhm_max_span_factor": options.get("fwhm_max_span_factor", 0.5),
+        "max_height_factor": options.get("max_height_factor", 3.0),
+    }
+    if mode == "add":
+        y_target = y
+    else:
+        base = baseline if baseline is not None else 0.0
+        y_target = y - base
+    (lb, ub), theta0 = make_bounds_classic(x, y_target, peaks, None, cfg)
+    for i, pk in enumerate(peaks):
+        pk.center = theta0[4 * i + 0]
+        pk.height = theta0[4 * i + 1]
+        pk.fwhm = theta0[4 * i + 2]
+        pk.eta = theta0[4 * i + 3]
 
     theta, cost, step_norm, accepted = step_engine.step_once(
         x,
@@ -191,11 +216,11 @@ def iterate(state: dict) -> dict:
         peaks,
         mode,
         baseline,
-        loss=loss,
+        loss="linear",
         weight_mode=weight_mode,
         damping=state.get("lambda", 0.0),
         trust_radius=state.get("trust_radius", np.inf),
-        bounds=bounds,
+        bounds=(lb, ub),
         f_scale=options.get("f_scale", 1.0),
         max_backtracks=options.get("max_backtracks", 8),
     )
