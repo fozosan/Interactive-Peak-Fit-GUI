@@ -18,7 +18,7 @@ Features:
   • Global η (Gaussian–Lorentzian shape factor) with "Apply to all"
   • Auto-seed peaks (respects fit range)
   • Choose a fit x-range (type Min/Max or drag with a SpanSelector); shaded on plot
-  • Solver selection (Classic, Modern) plus Step ▶ single iteration
+  • Solver selection (Classic, Modern, LMFIT) plus Step ▶ single iteration
   • Multiple peak templates (save as new, save changes, select/apply, delete); optional auto-apply on open
   • Zoom out & Reset view buttons
   • Supports CSV, TXT, DAT (auto delimiter detection; skips headers/comments)
@@ -33,7 +33,6 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-import time
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -46,9 +45,9 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 
 from scipy.signal import find_peaks
 
-from core import signals, data_io
+from core import signals
 from core.residuals import build_residual
-from fit import classic, modern, step_engine
+from fit import classic, lmfit_backend, modern, step_engine
 from fit.bounds import pack_theta_bounds
 from infra import performance
 from batch import runner as batch_runner
@@ -56,6 +55,7 @@ from uncertainty import asymptotic, bayes, bootstrap
 
 MODERN_LOSSES = ["linear", "soft_l1", "huber", "cauchy"]
 MODERN_WEIGHTS = ["none", "poisson", "inv_y"]
+LMFIT_ALGOS = ["least_squares", "leastsq", "nelder", "differential_evolution"]
 
 
 # ---------- Math ----------
@@ -196,10 +196,6 @@ class PeakFitApp:
 
         self._baseline_cache = {}
 
-        # Debug log window
-        self.log_win = None
-        self.log_text = None
-
         # Solver selection and diagnostics
         self.solver_var = tk.StringVar(value="Classic")
         self.classic_maxfev = tk.IntVar(value=20000)
@@ -211,6 +207,10 @@ class PeakFitApp:
         self.modern_jitter = tk.DoubleVar(value=0.0)
         self.modern_centers_window = tk.BooleanVar(value=True)
         self.modern_min_fwhm = tk.BooleanVar(value=True)
+        self.lmfit_algo = tk.StringVar(value="least_squares")
+        self.lmfit_maxfev = tk.IntVar(value=20000)
+        self.lmfit_share_fwhm = tk.BooleanVar(value=False)
+        self.lmfit_share_eta = tk.BooleanVar(value=False)
         self.snr_text = tk.StringVar(value="S/N: --")
 
         # Uncertainty and performance controls
@@ -228,37 +228,6 @@ class PeakFitApp:
         self._build_ui()
         self._new_figure()
         self._update_template_info()
-
-    # ----- Debug logging -----
-    def _ensure_log_window(self):
-        if self.log_win is None or not self.log_win.winfo_exists():
-            self.log_win = tk.Toplevel(self.root)
-            self.log_win.title("Debug Log")
-            txt = tk.Text(self.log_win, width=60, height=15, state="disabled")
-            scroll = ttk.Scrollbar(self.log_win, orient="vertical", command=txt.yview)
-            txt.configure(yscrollcommand=scroll.set)
-            txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            scroll.pack(side=tk.RIGHT, fill=tk.Y)
-            self.log_text = txt
-
-    def open_log(self):
-        self._ensure_log_window()
-        if self.log_win is not None:
-            self.log_win.deiconify()
-            self.log_win.lift()
-
-    def log(self, message: str):
-        print(message)
-        self._ensure_log_window()
-        if self.log_text is None:
-            return
-        timestamp = time.strftime("%H:%M:%S")
-        self.log_text.configure(state="normal")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.configure(state="disabled")
-        self.log_text.see(tk.END)
-        if self.log_win is not None:
-            self.log_win.update_idletasks()
 
     # ----- UI -----
     def _build_ui(self):
@@ -426,7 +395,7 @@ class PeakFitApp:
         # Solver selection
         solver_box = ttk.Labelframe(right, text="Solver"); solver_box.pack(fill=tk.X, pady=4)
         self.solver_combo = ttk.Combobox(solver_box, textvariable=self.solver_var, state="readonly",
-                     values=["Classic", "Modern"], width=12)
+                     values=["Classic", "Modern", "LMFIT"], width=12)
         self.solver_combo.pack(side=tk.LEFT, padx=4)
         self.solver_combo.bind("<<ComboboxSelected>>", lambda _e: self._show_solver_opts())
 
@@ -459,6 +428,16 @@ class PeakFitApp:
         ttk.Checkbutton(f_modern, text="Min FWHM ≈2×Δx", variable=self.modern_min_fwhm).pack(anchor="w")
         self.solver_frames["Modern"] = f_modern
 
+        # LMFIT options
+        f_lmfit = ttk.Frame(solver_box)
+        ttk.Label(f_lmfit, text="Algo").pack(side=tk.LEFT)
+        ttk.Combobox(f_lmfit, textvariable=self.lmfit_algo, state="readonly",
+                     values=LMFIT_ALGOS, width=18).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_lmfit, text="Max evals").pack(side=tk.LEFT, padx=(6,0))
+        ttk.Entry(f_lmfit, width=7, textvariable=self.lmfit_maxfev).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(f_lmfit, text="Share FWHM", variable=self.lmfit_share_fwhm).pack(anchor="w", padx=(4,0))
+        ttk.Checkbutton(f_lmfit, text="Share η", variable=self.lmfit_share_eta).pack(anchor="w", padx=(4,0))
+        self.solver_frames["LMFIT"] = f_lmfit
 
         self._show_solver_opts()
 
@@ -512,7 +491,6 @@ class PeakFitApp:
         ttk.Button(actions, text="Step \u25B6", command=self.step_once).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Toggle components", command=self.toggle_components).pack(side=tk.LEFT, padx=4)
-        ttk.Button(actions, text="Show Log", command=self.open_log).pack(side=tk.LEFT, padx=4)
 
         # Status
         self.status = ttk.Label(self.root, text="Open CSV/TXT/DAT, set baseline/range, add peaks, set η, then Fit.")
@@ -527,32 +505,28 @@ class PeakFitApp:
 
     def _solver_options(self) -> dict:
         solver = self.solver_var.get().lower()
-
-        # Options that apply to both solvers
-        min_fwhm = 1e-6
-        if self.x is not None and self.x.size > 1:
-            if self.modern_min_fwhm.get():
-                min_fwhm = 2.0 * float(np.median(np.diff(self.x)))
-        opts = {
-            "centers_in_window": bool(self.modern_centers_window.get()),
-            "min_fwhm": float(min_fwhm),
-        }
-
         if solver == "modern":
-            opts.update(
-                {
-                    "loss": self.modern_loss.get(),
-                    "weights": self.modern_weight.get(),
-                    "f_scale": float(self.modern_fscale.get()),
-                    "maxfev": int(self.modern_maxfev.get()),
-                    "restarts": int(self.modern_restarts.get()),
-                    "jitter_pct": float(self.modern_jitter.get()),
-                }
-            )
-        else:
-            opts["maxfev"] = int(self.classic_maxfev.get())
-
-        return opts
+            min_fwhm = 1e-6
+            if self.modern_min_fwhm.get() and self.x is not None and self.x.size > 1:
+                min_fwhm = 2.0 * float(np.median(np.diff(self.x)))
+            return {
+                "loss": self.modern_loss.get(),
+                "weights": self.modern_weight.get(),
+                "f_scale": float(self.modern_fscale.get()),
+                "maxfev": int(self.modern_maxfev.get()),
+                "restarts": int(self.modern_restarts.get()),
+                "jitter_pct": float(self.modern_jitter.get()),
+                "centers_in_window": bool(self.modern_centers_window.get()),
+                "min_fwhm": float(min_fwhm),
+            }
+        if solver == "lmfit":
+            return {
+                "algo": self.lmfit_algo.get(),
+                "maxfev": int(self.lmfit_maxfev.get()),
+                "share_fwhm": bool(self.lmfit_share_fwhm.get()),
+                "share_eta": bool(self.lmfit_share_eta.get()),
+            }
+        return {"maxfev": int(self.classic_maxfev.get())}
 
     def _new_figure(self):
         self.ax.clear()
@@ -611,11 +585,9 @@ class PeakFitApp:
         )
         if not path:
             return
-        self.log(f"Opening data file: {path}")
         try:
             x, y = load_xy_any(path)
         except Exception as e:
-            self.log(f"Failed to read file: {e}")
             messagebox.showerror("Open data", f"Failed to read file:\n{e}")
             return
 
@@ -623,7 +595,6 @@ class PeakFitApp:
         self.file_label.config(text=Path(path).name)
         self.compute_baseline()
         self.peaks.clear()
-        self.log("File loaded")
 
         # Auto-apply selected template if enabled
         if self.auto_apply_template.get():
@@ -661,8 +632,6 @@ class PeakFitApp:
         use_slice = bool(self.baseline_use_range.get())
         mask = self._range_mask() if use_slice else None
 
-        self.log(f"Computing baseline (lam={lam}, p={asym}, niter={niter}, thresh={thresh})")
-
         key = None
         if performance.cache_baseline_enabled():
             mkey = None
@@ -686,7 +655,6 @@ class PeakFitApp:
                 if key is not None:
                     self._baseline_cache[key] = base
             except Exception as e:
-                self.log(f"ALS baseline failed: {e}")
                 messagebox.showwarning("Baseline", f"ALS baseline failed: {e}")
                 self.baseline = np.zeros_like(self.y_raw)
 
@@ -698,7 +666,6 @@ class PeakFitApp:
             self.snr_text.set("S/N: --")
 
         self.refresh_plot()
-        self.log("Baseline computed")
 
     def save_baseline_default(self):
         self.cfg["als_lam"] = float(self.als_lam.get())
@@ -1121,20 +1088,22 @@ class PeakFitApp:
             return
         self._sync_selected_edits()
 
+        y_target = self.get_fit_target()
         mask = self.current_fit_mask()
         if mask is None or not np.any(mask):
             messagebox.showwarning("Step", "Fit range is empty. Use 'Full range' or set a valid Min/Max.")
             return
         x_fit = self.x[mask]
-        y_fit = self.y_raw[mask]
+        y_fit = y_target[mask]
 
         base_applied = self.use_baseline.get() and self.baseline is not None
-        base_fit = self.baseline[mask] if base_applied else None
-        mode = self.baseline_mode.get()
+        add_mode = (self.baseline_mode.get() == "add")
+        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
+        mode = "add" if add_mode else "subtract"
 
         options = self._solver_options()
         _, bounds = pack_theta_bounds(self.peaks, x_fit, options)
-        self.log("Running single fit step")
+
         try:
             theta, _ = step_engine.step_once(
                 x_fit,
@@ -1149,7 +1118,6 @@ class PeakFitApp:
                 bounds=bounds,
             )
         except Exception as e:
-            self.log(f"Step failed: {e}")
             messagebox.showerror("Step", f"Step failed:\n{e}")
             return
 
@@ -1166,34 +1134,36 @@ class PeakFitApp:
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
         self.status.config(text="Step complete. Fit again or Export.")
-        self.log("Step complete")
 
     def fit(self):
         if self.x is None or self.y_raw is None or not self.peaks:
             return
         self._sync_selected_edits()
 
+        y_target = self.get_fit_target()
+
         mask = self.current_fit_mask()
         if mask is None or not np.any(mask):
             messagebox.showwarning("Fit", "Fit range is empty. Use 'Full range' or set a valid Min/Max.")
             return
         x_fit = self.x[mask]
-        y_fit = self.y_raw[mask]
+        y_fit = y_target[mask]
 
         base_applied = self.use_baseline.get() and self.baseline is not None
-        base_fit = self.baseline[mask] if base_applied else None
-        mode = self.baseline_mode.get()
+        add_mode = (self.baseline_mode.get() == "add")
+        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
+        mode = "add" if add_mode else "subtract"
 
         solver = self.solver_var.get().lower()
         options = self._solver_options()
-        self.log(f"Starting fit with solver {solver}")
         try:
             if solver == "modern":
                 res = modern.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
+            elif solver == "lmfit":
+                res = lmfit_backend.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
             else:
                 res = classic.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
         except Exception as e:
-            self.log(f"Fit failed: {e}")
             messagebox.showerror("Fit", f"Fitting failed:\n{e}")
             return
 
@@ -1210,7 +1180,6 @@ class PeakFitApp:
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
         self.status.config(text="Fit complete. Edit/lock as needed; Fit again or Export.")
-        self.log("Fit complete")
 
     def run_batch(self):
         folder = filedialog.askdirectory(title="Select folder to batch process")
@@ -1224,7 +1193,6 @@ class PeakFitApp:
         )
         if not out_csv:
             return
-        self.log(f"Running batch in {folder}")
         patterns = [p.strip() for p in self.batch_patterns.get().split(";") if p.strip()]
         if not patterns:
             patterns = ["*.csv", "*.txt", "*.dat"]
@@ -1260,11 +1228,9 @@ class PeakFitApp:
             solver: self._solver_options(),
         }
         try:
-            batch_runner.run(patterns, cfg, progress=self.log)
+            batch_runner.run(patterns, cfg)
             messagebox.showinfo("Batch", f"Summary saved:\n{out_csv}")
-            self.log("Batch complete")
         except Exception as e:
-            self.log(f"Batch failed: {e}")
             messagebox.showerror("Batch", f"Batch failed:\n{e}")
         self.cfg["batch_patterns"] = self.batch_patterns.get()
         self.cfg["batch_source"] = source
@@ -1283,10 +1249,11 @@ class PeakFitApp:
             messagebox.showwarning("Uncertainty", "Fit range is empty. Use 'Full range' or set a valid Min/Max.")
             return
         x_fit = self.x[mask]
-        y_fit = self.y_raw[mask]
+        y_fit = self.get_fit_target()[mask]
         base_applied = self.use_baseline.get() and self.baseline is not None
-        base_fit = self.baseline[mask] if base_applied else None
-        mode = self.baseline_mode.get()
+        add_mode = (self.baseline_mode.get() == "add")
+        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
+        mode = "add" if add_mode else "subtract"
 
         theta = []
         for p in self.peaks:
@@ -1296,7 +1263,6 @@ class PeakFitApp:
         resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
         method = self.unc_method.get().lower()
         solver = self.solver_var.get().lower()
-        self.log(f"Running uncertainty ({method}) with solver {solver}")
         try:
             if method == "asymptotic":
                 rep = asymptotic.asymptotic({"theta": theta, "jac": None}, resid_fn)
@@ -1313,7 +1279,6 @@ class PeakFitApp:
                 messagebox.showerror("Uncertainty", "Unknown method")
                 return
         except Exception as e:
-            self.log(f"Uncertainty failed: {e}")
             messagebox.showerror("Uncertainty", f"Failed: {e}")
             return
 
@@ -1324,7 +1289,6 @@ class PeakFitApp:
             msg = f"Computed {rep.get('type')} uncertainty."
         self.status.config(text=msg)
         messagebox.showinfo("Uncertainty", msg)
-        self.log("Uncertainty computation complete")
 
     def apply_performance(self):
         performance.set_numba(bool(self.perf_numba.get()))
@@ -1354,20 +1318,28 @@ class PeakFitApp:
         )
         if not out_csv:
             return
-        self.log(f"Exporting results to {out_csv}")
 
         areas = [pseudo_voigt_area(p.height, p.fwhm, p.eta) for p in self.peaks]
         total_area = float(np.sum(areas)) if areas else 1.0
 
+        y_target = self.get_fit_target()
         total_peaks = np.zeros_like(self.x, float)
-        for p in self.peaks:
-            total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
+        comp_cols = {}
+        for i, p in enumerate(self.peaks, 1):
+            comp = pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
+            comp_cols[f"peak{i}"] = comp
+            total_peaks += comp
 
         base = self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
-        y_fit = total_peaks + base
+        if self.use_baseline.get() and self.baseline_mode.get() == "add":
+            y_fit = base + total_peaks
+            y_corr = self.y_raw - base  # for reference
+        else:
+            y_fit = total_peaks
+            y_corr = self.y_raw - base if self.use_baseline.get() else self.y_raw
 
         mask = self.current_fit_mask()
-        rmse = float(np.sqrt(np.mean((y_fit[mask] - self.y_raw[mask]) ** 2))) if mask is not None else float("nan")
+        rmse = float(np.sqrt(np.mean((y_target[mask] - y_fit[mask]) ** 2))) if mask is not None else float("nan")
 
         rows = []
         fname = self.file_label.cget("text")
@@ -1395,17 +1367,19 @@ class PeakFitApp:
 
         # Trace CSV
         trace_path = str(Path(out_csv).with_name(Path(out_csv).stem + "_trace.csv"))
-        trace_csv = data_io.build_trace_table(
-            self.x,
-            self.y_raw,
-            base if self.use_baseline.get() else None,
-            self.peaks,
-        )
-        with open(trace_path, "w", encoding="utf-8") as fh:
-            fh.write(trace_csv)
+        df = pd.DataFrame({
+            "x": self.x,
+            "y_raw": self.y_raw,
+            "baseline": base,
+            "y_corr": y_corr,
+            "y_target": y_target,   # data actually used for fitting
+            "y_fit": y_fit
+        })
+        for k, v in comp_cols.items():
+            df[k] = v
+        df.to_csv(trace_path, index=False)
 
         messagebox.showinfo("Export", f"Saved:\n{out_csv}\n{trace_path}")
-        self.log("Export complete")
 
     # ----- Plot -----
     def toggle_components(self):
@@ -1462,6 +1436,7 @@ class PeakFitApp:
         opts = {
             "modern_losses": MODERN_LOSSES,
             "modern_weights": MODERN_WEIGHTS,
+            "lmfit_algos": LMFIT_ALGOS,
         }
         message = helptext.build_help(opts)
         win = tk.Toplevel(self.root)
