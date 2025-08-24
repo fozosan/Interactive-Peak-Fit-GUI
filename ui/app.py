@@ -18,7 +18,7 @@ Features:
   • Global η (Gaussian–Lorentzian shape factor) with "Apply to all"
   • Auto-seed peaks (respects fit range)
   • Choose a fit x-range (type Min/Max or drag with a SpanSelector); shaded on plot
-  • Solver selection (Classic or Modern) plus Step ▶ single iteration
+  • Solver selection (Classic, Modern, LMFIT) plus Step ▶ single iteration
   • Multiple peak templates (save as new, save changes, select/apply, delete); optional auto-apply on open
   • Zoom out & Reset view buttons
   • Supports CSV, TXT, DAT (auto delimiter detection; skips headers/comments)
@@ -47,7 +47,7 @@ from scipy.signal import find_peaks
 
 from core import signals
 from core.residuals import build_residual
-from fit import classic, modern, step_engine
+from fit import classic, lmfit_backend, modern, step_engine
 from fit.bounds import pack_theta_bounds
 from infra import performance
 from batch import runner as batch_runner
@@ -55,6 +55,7 @@ from uncertainty import asymptotic, bayes, bootstrap
 
 MODERN_LOSSES = ["linear", "soft_l1", "huber", "cauchy"]
 MODERN_WEIGHTS = ["none", "poisson", "inv_y"]
+LMFIT_ALGOS = ["least_squares", "leastsq", "nelder", "differential_evolution"]
 
 
 # ---------- Math ----------
@@ -206,6 +207,10 @@ class PeakFitApp:
         self.modern_jitter = tk.DoubleVar(value=0.0)
         self.modern_centers_window = tk.BooleanVar(value=True)
         self.modern_min_fwhm = tk.BooleanVar(value=True)
+        self.lmfit_algo = tk.StringVar(value="least_squares")
+        self.lmfit_maxfev = tk.IntVar(value=20000)
+        self.lmfit_share_fwhm = tk.BooleanVar(value=False)
+        self.lmfit_share_eta = tk.BooleanVar(value=False)
         self.snr_text = tk.StringVar(value="S/N: --")
 
         # Uncertainty and performance controls
@@ -390,7 +395,7 @@ class PeakFitApp:
         # Solver selection
         solver_box = ttk.Labelframe(right, text="Solver"); solver_box.pack(fill=tk.X, pady=4)
         self.solver_combo = ttk.Combobox(solver_box, textvariable=self.solver_var, state="readonly",
-                     values=["Classic", "Modern"], width=12)
+                     values=["Classic", "Modern", "LMFIT"], width=12)
         self.solver_combo.pack(side=tk.LEFT, padx=4)
         self.solver_combo.bind("<<ComboboxSelected>>", lambda _e: self._show_solver_opts())
 
@@ -422,6 +427,17 @@ class PeakFitApp:
         ttk.Checkbutton(f_modern, text="Centers in window", variable=self.modern_centers_window).pack(anchor="w")
         ttk.Checkbutton(f_modern, text="Min FWHM ≈2×Δx", variable=self.modern_min_fwhm).pack(anchor="w")
         self.solver_frames["Modern"] = f_modern
+
+        # LMFIT options
+        f_lmfit = ttk.Frame(solver_box)
+        ttk.Label(f_lmfit, text="Algo").pack(side=tk.LEFT)
+        ttk.Combobox(f_lmfit, textvariable=self.lmfit_algo, state="readonly",
+                     values=LMFIT_ALGOS, width=18).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_lmfit, text="Max evals").pack(side=tk.LEFT, padx=(6,0))
+        ttk.Entry(f_lmfit, width=7, textvariable=self.lmfit_maxfev).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(f_lmfit, text="Share FWHM", variable=self.lmfit_share_fwhm).pack(anchor="w", padx=(4,0))
+        ttk.Checkbutton(f_lmfit, text="Share η", variable=self.lmfit_share_eta).pack(anchor="w", padx=(4,0))
+        self.solver_frames["LMFIT"] = f_lmfit
 
         self._show_solver_opts()
 
@@ -502,6 +518,13 @@ class PeakFitApp:
                 "jitter_pct": float(self.modern_jitter.get()),
                 "centers_in_window": bool(self.modern_centers_window.get()),
                 "min_fwhm": float(min_fwhm),
+            }
+        if solver == "lmfit":
+            return {
+                "algo": self.lmfit_algo.get(),
+                "maxfev": int(self.lmfit_maxfev.get()),
+                "share_fwhm": bool(self.lmfit_share_fwhm.get()),
+                "share_eta": bool(self.lmfit_share_eta.get()),
             }
         return {"maxfev": int(self.classic_maxfev.get())}
 
@@ -1136,6 +1159,8 @@ class PeakFitApp:
         try:
             if solver == "modern":
                 res = modern.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
+            elif solver == "lmfit":
+                res = lmfit_backend.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
             else:
                 res = classic.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
         except Exception as e:
@@ -1411,6 +1436,7 @@ class PeakFitApp:
         opts = {
             "modern_losses": MODERN_LOSSES,
             "modern_weights": MODERN_WEIGHTS,
+            "lmfit_algos": LMFIT_ALGOS,
         }
         message = helptext.build_help(opts)
         win = tk.Toplevel(self.root)
