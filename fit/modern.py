@@ -2,7 +2,7 @@
 with support for robust losses, weights and multi-start restarts."""
 from __future__ import annotations
 
-from typing import Optional, TypedDict
+from typing import Dict, Any, Optional
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -12,15 +12,6 @@ from core.residuals import build_residual
 from .bounds import pack_theta_bounds
 
 
-class SolveResult(TypedDict):
-    ok: bool
-    theta: np.ndarray
-    message: str
-    cost: float
-    jac: Optional[np.ndarray]
-    cov: Optional[np.ndarray]
-    meta: dict
-
 
 def solve(
     x: np.ndarray,
@@ -29,7 +20,7 @@ def solve(
     mode: str,
     baseline: np.ndarray | None,
     options: dict,
-) -> SolveResult:
+) -> Dict[str, Any]:
     """Solve the non-linear least squares problem using SciPy's TRF solver.
 
     Parameters in ``options`` follow the blueprint: ``loss`` (passed directly to
@@ -109,12 +100,12 @@ def solve(
         except np.linalg.LinAlgError:  # pragma: no cover - singular
             cov = None
 
-    return SolveResult(
-        ok=ok,
-        theta=theta,
-        message=best.message,
-        cost=best_cost,
-        jac=jac,
-        cov=cov,
-        meta={"nfev": best.nfev, "njev": getattr(best, "njev", None)},
-    )
+    return {
+        "ok": ok,
+        "theta": theta,
+        "message": best.message,
+        "cost": best_cost,
+        "jac": jac,
+        "cov": cov,
+        "meta": {"nfev": best.nfev, "njev": getattr(best, "njev", None)},
+    }

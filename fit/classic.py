@@ -8,7 +8,7 @@ robust weighting/restart features provided by the modern solver.
 
 from __future__ import annotations
 
-from typing import Optional, TypedDict
+from typing import Dict, Any, Optional
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -18,17 +18,6 @@ from core.residuals import build_residual
 from .bounds import pack_theta_bounds
 
 
-class SolveResult(TypedDict):
-    """Return structure for solver results."""
-
-    ok: bool
-    theta: np.ndarray
-    message: str
-    cost: float
-    jac: Optional[np.ndarray]
-    cov: Optional[np.ndarray]
-    meta: dict
-
 
 def solve(
     x: np.ndarray,
@@ -37,7 +26,7 @@ def solve(
     mode: str,
     baseline: np.ndarray | None,
     options: dict,
-) -> SolveResult:
+) -> Dict[str, Any]:
     """Solve the non-linear least squares problem for classic fitting.
 
     Parameters
@@ -86,13 +75,13 @@ def solve(
         except np.linalg.LinAlgError:  # pragma: no cover - singular
             cov = None
 
-    return SolveResult(
-        ok=bool(res.success),
-        theta=theta,
-        message=res.message,
-        cost=cost,
-        jac=jac,
-        cov=cov,
-        meta={"nfev": res.nfev, "njev": getattr(res, "njev", None)},
-    )
+    return {
+        "ok": bool(res.success),
+        "theta": theta,
+        "message": res.message,
+        "cost": cost,
+        "jac": jac,
+        "cov": cov,
+        "meta": {"nfev": res.nfev, "njev": getattr(res, "njev", None)},
+    }
 
