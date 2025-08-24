@@ -4,7 +4,8 @@ Interactive peak fit GUI for any spectroscopy (Gaussian–Lorentzian / pseudo-Vo
 Designed by Farhan Zahin, 
 built with ChatGPT
 
-Build: v3 (axes label editing with superscript/subscript, scrollable Help, ALS iterations/threshold)
+Build: v3 (axes label editing with superscript/subscript, scrollable Help, ALS iterations/threshold,
+solver backends with robust losses/weights, Step iteration, uncertainty/performance panels)
 
 The previous v2.7 stable release remains available for download and can run standalone.
 
@@ -35,6 +36,23 @@ An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
 • Choose/clear a fit x-range by typing limits or dragging on the plot. Shaded region indicates the active window.
 
 • Thin line rendering and “Toggle components” for clarity during inspection.
+
+• Select a fitting engine:
+    - **Classic** – fast linear least squares that only adjusts peak heights; ideal when the baseline is trustworthy and peaks are well seeded.
+    - **Modern** – SciPy’s Trust Region Reflective solver for full non-linear fitting with support for robust loss functions (`linear`, `soft_l1`, `huber`), optional per-point weights (`1/σ²`), configurable multi-start restarts and random jitter to escape local minima.
+    - **LMFIT** *(optional)* – leverages the `lmfit` library to impose bounds or algebraic parameter constraints and offers alternative algorithms (Levenberg–Marquardt, Nelder–Mead, differential evolution, …).
+    - **Step ▶** – executes a single Gauss–Newton iteration so you can visualize convergence step-by-step.
+
+• Uncertainty & performance tools:
+    - **Uncertainty**
+        * *Asymptotic* – covariance from the solver’s final Jacobian.
+        * *Bootstrap* – residual resampling with configurable iterations, parallel workers and reproducible seeds.
+        * *Bayesian* – MCMC sampling via `emcee` to obtain posterior distributions and credible intervals.
+    - **Performance**
+        * Toggle Numba JIT or CuPy GPU acceleration for faster model evaluations.
+        * Cache ALS baselines between fits to skip repeated computations.
+        * Set deterministic seeds for reproducible restarts and bootstrap draws.
+        * Run bootstrap iterations in parallel to utilize multiple CPU cores.
 
 • Axes/Labels: set a custom X-axis label with superscript/subscript helpers and save it as default (persists in ~/.gl_peakfit_config.json).
 
@@ -82,7 +100,7 @@ Keyboard/Mouse Tips
 Version History (high-level)
 ============================
 
-v3    – Superscript/subscript helpers for axis labels; scrollable Help dialog; ALS baseline exposes Iterations and Threshold; mouse-wheel scrolling works anywhere on the right panel.
+v3    – Superscript/subscript helpers for axis labels; scrollable Help dialog; ALS baseline exposes Iterations and Threshold; mouse-wheel scrolling on the right panel; solver backends (Classic/Modern/LMFIT), Step iteration, uncertainty and performance panels.
 
 v2.7  – Previous stable standalone release (still available for download).
 
