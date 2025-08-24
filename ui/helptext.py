@@ -11,11 +11,13 @@ def build_help(opts: dict) -> str:
     ----------
     opts:
         Dictionary of option lists used to keep this help in sync with the UI.
-        Expected keys include ``modern_losses`` and ``modern_weights``.
+        Expected keys include ``modern_losses``, ``modern_weights``, and
+        ``lmfit_algos``.
     """
 
     modern_losses = ", ".join(opts.get("modern_losses", []))
     modern_weights = ", ".join(opts.get("modern_weights", []))
+    lmfit_algos = ", ".join(opts.get("lmfit_algos", []))
 
     return dedent(
         f"""
@@ -58,6 +60,8 @@ def build_help(opts: dict) -> str:
           [{modern_losses}], weighting [{modern_weights}], multi-start
           restarts and optional jitter. Toggles: 'Centers in window' and
           'Min FWHM ≈2×Δx'.
+        • LMFIT – interface to the optional ``lmfit`` package with algorithms
+          [{lmfit_algos}], plus 'Share FWHM' and 'Share η' constraints.
 
         Uncertainty
         -----------
