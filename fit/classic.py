@@ -28,8 +28,14 @@ def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
     return np.asarray(arr, dtype=float)
 
 
-def solve(x: np.ndarray, y: np.ndarray, peaks: list, mode: str,
-          baseline: np.ndarray | None, options: dict) -> SolveResult:
+def solve(
+    x: np.ndarray,
+    y: np.ndarray,
+    peaks: list,
+    mode: str,
+    baseline: np.ndarray | None,
+    options: dict,
+) -> SolveResult:
     """Fit peak heights with centers/widths fixed using linear least squares.
 
     This lightweight implementation serves as an initial backend so the UI can
@@ -55,6 +61,21 @@ def solve(x: np.ndarray, y: np.ndarray, peaks: list, mode: str,
             cov=None,
             meta={},
         )
+
+    # enforce basic bounds on provided peak parameters
+    x_min = float(x.min())
+    x_max = float(x.max())
+    min_fwhm = float(options.get("min_fwhm", 1e-6))
+    clamp_center = bool(options.get("centers_in_window", False))
+    clean: list[Peak] = []
+    for p in peaks:
+        c = p.center
+        if clamp_center:
+            c = float(np.clip(c, x_min, x_max))
+        h = max(p.height, 0.0)
+        w = max(p.fwhm, min_fwhm)
+        e = float(np.clip(p.eta, 0.0, 1.0))
+        clean.append(Peak(c, h, w, e))
 
     A_cols = []
     for p in peaks:

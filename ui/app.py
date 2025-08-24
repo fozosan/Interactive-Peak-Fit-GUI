@@ -48,6 +48,7 @@ from scipy.signal import find_peaks
 from core import signals
 from core.residuals import build_residual
 from fit import classic, lmfit_backend, modern, step_engine
+from fit.bounds import pack_theta_bounds
 from infra import performance
 from batch import runner as batch_runner
 from uncertainty import asymptotic, bayes, bootstrap
@@ -1099,6 +1100,9 @@ class PeakFitApp:
         add_mode = (self.baseline_mode.get() == "add")
         base_fit = self.baseline[mask] if (base_applied and add_mode) else None
         mode = "add" if add_mode else "subtract"
+
+        options = self._solver_options()
+        _, bounds = pack_theta_bounds(self.peaks, x_fit, options)
 
         try:
             theta, _ = step_engine.step_once(
