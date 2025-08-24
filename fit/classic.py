@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Optional, Sequence, TypedDict
 
 import numpy as np
+from scipy.optimize import lsq_linear
 
 from core.models import pv_sum
 from core.peaks import Peak
@@ -78,20 +79,21 @@ def solve(
         clean.append(Peak(c, h, w, e))
 
     A_cols = []
-    for p in peaks:
+    for p in clean:
         unit = Peak(p.center, 1.0, p.fwhm, p.eta)
         A_cols.append(pv_sum(x, [unit]))
     A = np.column_stack(A_cols) if A_cols else np.zeros((x.size, 0))
     try:
-        heights, *_ = np.linalg.lstsq(A, target, rcond=None)
-        ok = True
-        message = "linear least squares"
-    except np.linalg.LinAlgError as exc:  # pragma: no cover - ill-conditioned
+        res = lsq_linear(A, target, bounds=(0.0, np.inf))
+        heights = res.x
+        ok = res.success
+        message = res.message
+    except Exception as exc:  # pragma: no cover - solver failure
         heights = np.zeros(len(peaks))
         ok = False
         message = str(exc)
 
-    updated = [Peak(p.center, h, p.fwhm, p.eta) for p, h in zip(peaks, heights)]
+    updated = [Peak(p.center, h, p.fwhm, p.eta) for p, h in zip(clean, heights)]
     theta = _theta_from_peaks(updated)
     model = pv_sum(x, updated)
     resid = target - model
