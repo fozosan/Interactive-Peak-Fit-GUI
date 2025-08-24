@@ -9,6 +9,7 @@ from scipy.optimize import least_squares
 
 from core.peaks import Peak
 from core.residuals import build_residual
+from .bounds import pack_theta_bounds
 
 
 class SolveResult(TypedDict):
@@ -61,20 +62,7 @@ def solve(
     elif weight_mode == "inv_y":
         weights = 1.0 / np.clip(y, 1e-12, None)
 
-    theta0 = _theta_from_peaks(peaks)
-    n_params = theta0.size
-
-    # bounds: enforce positive heights/FWHM and 0<=eta<=1; centers free
-    lb = np.full(n_params, -np.inf)
-    ub = np.full(n_params, np.inf)
-    for i in range(len(peaks)):
-        lb[4 * i + 1] = 0.0  # height >=0
-        lb[4 * i + 2] = options.get("min_fwhm", 1e-6)
-        lb[4 * i + 3] = 0.0
-        ub[4 * i + 3] = 1.0
-        if options.get("centers_in_window", False):
-            lb[4 * i] = x.min()
-            ub[4 * i] = x.max()
+    theta0, (lb, ub) = pack_theta_bounds(peaks, x, options)
 
     best = None
     best_cost = np.inf
@@ -84,6 +72,8 @@ def solve(
         if jitter_pct:
             jitter = 1.0 + jitter_pct / 100.0 * rng.standard_normal(theta0.shape)
             start = theta0 * jitter
+            # jitter might push parameters outside the bounds
+            start = np.minimum(np.maximum(start, lb), ub)
         else:
             start = theta0
 
@@ -107,7 +97,7 @@ def solve(
         raise RuntimeError("least_squares did not run")
 
     ok = bool(best.success)
-    theta = best.x
+    theta = np.minimum(np.maximum(best.x, lb), ub)
     jac = best.jac if ok else None
     cov = None
     if jac is not None:

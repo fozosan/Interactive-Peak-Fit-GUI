@@ -9,6 +9,17 @@ from core.peaks import Peak
 from core.models import pv_sum
 
 
+def _clip_params(pars) -> None:
+    """Clamp ``lmfit`` Parameters to their min/max bounds in-place."""
+
+    for p in pars.values():
+        v = p.value
+        if p.min is not None and v < p.min:
+            p.value = p.min
+        if p.max is not None and v > p.max:
+            p.value = p.max
+
+
 class SolveResult(TypedDict):
     ok: bool
     theta: np.ndarray
@@ -57,26 +68,88 @@ def solve(
     y = np.asarray(y, dtype=float)
     baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
 
+    # Build consistent bounds/initial values with other solvers
+    from .bounds import pack_theta_bounds
+
+    theta0, (lb, ub) = pack_theta_bounds(peaks, x, options)
+
     params = lmfit.Parameters()
     share_w = bool(options.get("share_fwhm", False))
     share_e = bool(options.get("share_eta", False))
-    if share_w:
-        params.add("w0", value=peaks[0].fwhm, min=0)
-    if share_e:
-        params.add("e0", value=peaks[0].eta, min=0, max=1)
+
+    # Add shared parameters first if requested
+    if share_w and peaks:
+        params.add(
+            "w0",
+            value=theta0[2],
+            min=lb[2],
+            max=ub[2],
+            vary=lb[2] != ub[2],
+        )
+    if share_e and peaks:
+        params.add(
+            "e0",
+            value=theta0[3],
+            min=lb[3],
+            max=ub[3],
+            vary=lb[3] != ub[3],
+        )
+
+    idx = 0
     for i, p in enumerate(peaks):
-        params.add(f"c{i}", value=p.center, vary=not p.lock_center)
-        params.add(f"h{i}", value=p.height)
-        if share_w and i > 0:
-            params.add(f"w{i}", expr="w0")
+        c0, h0, w0_i, e0_i = theta0[idx : idx + 4]
+        lb_c, ub_c = lb[idx], ub[idx]
+        lb_h, ub_h = lb[idx + 1], ub[idx + 1]
+        lb_w, ub_w = lb[idx + 2], ub[idx + 2]
+        lb_e, ub_e = lb[idx + 3], ub[idx + 3]
+
+        params.add(
+            f"c{i}",
+            value=c0,
+            min=lb_c,
+            max=ub_c,
+            vary=lb_c != ub_c,
+        )
+        params.add(
+            f"h{i}",
+            value=h0,
+            min=lb_h,
+            max=ub_h,
+        )
+
+        if share_w:
+            if i == 0:
+                # already have w0 parameter defined
+                pass
+            else:
+                params.add(f"w{i}", expr="w0")
         else:
-            params.add(f"w{i}", value=p.fwhm, min=0, vary=not p.lock_width)
-        if share_e and i > 0:
-            params.add(f"e{i}", expr="e0")
+            params.add(
+                f"w{i}",
+                value=w0_i,
+                min=lb_w,
+                max=ub_w,
+                vary=lb_w != ub_w,
+            )
+
+        if share_e:
+            if i == 0:
+                pass
+            else:
+                params.add(f"e{i}", expr="e0")
         else:
-            params.add(f"e{i}", value=p.eta, min=0, max=1)
+            params.add(
+                f"e{i}",
+                value=e0_i,
+                min=lb_e,
+                max=ub_e,
+                vary=lb_e != ub_e,
+            )
+
+        idx += 4
 
     def residual(pars: lmfit.Parameters) -> np.ndarray:
+        _clip_params(pars)
         pk: list[Peak] = []
         for i in range(len(peaks)):
             pk.append(
@@ -102,6 +175,7 @@ def solve(
 
     res = lmfit.minimize(residual, params, method=algo, max_nfev=maxfev)
 
+    _clip_params(res.params)
     theta = []
     for i in range(len(peaks)):
         theta.extend(
