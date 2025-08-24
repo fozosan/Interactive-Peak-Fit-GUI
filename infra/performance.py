@@ -11,6 +11,8 @@ from core import models
 _numba_enabled = False
 _gpu_enabled = False
 _max_workers = 0
+_cache_baseline = True
+_gpu_chunk = 262144
 
 
 def set_numba(flag: bool) -> None:
@@ -54,3 +56,23 @@ def set_max_workers(n: int) -> None:
 
     global _max_workers
     _max_workers = max(0, int(n))
+
+
+def set_cache_baseline(flag: bool) -> None:
+    """Enable or disable ALS baseline caching."""
+
+    global _cache_baseline
+    _cache_baseline = bool(flag)
+
+
+def cache_baseline_enabled() -> bool:
+    """Return True if baseline caching is enabled."""
+
+    return _cache_baseline
+
+
+def set_gpu_chunk(n: int) -> None:
+    """Configure chunk size for GPU evaluations."""
+
+    global _gpu_chunk
+    _gpu_chunk = max(1, int(n))

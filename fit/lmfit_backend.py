@@ -58,11 +58,23 @@ def solve(
     baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
 
     params = lmfit.Parameters()
+    share_w = bool(options.get("share_fwhm", False))
+    share_e = bool(options.get("share_eta", False))
+    if share_w:
+        params.add("w0", value=peaks[0].fwhm, min=0)
+    if share_e:
+        params.add("e0", value=peaks[0].eta, min=0, max=1)
     for i, p in enumerate(peaks):
         params.add(f"c{i}", value=p.center, vary=not p.lock_center)
         params.add(f"h{i}", value=p.height)
-        params.add(f"w{i}", value=p.fwhm, min=0, vary=not p.lock_width)
-        params.add(f"e{i}", value=p.eta, min=0, max=1)
+        if share_w and i > 0:
+            params.add(f"w{i}", expr="w0")
+        else:
+            params.add(f"w{i}", value=p.fwhm, min=0, vary=not p.lock_width)
+        if share_e and i > 0:
+            params.add(f"e{i}", expr="e0")
+        else:
+            params.add(f"e{i}", value=p.eta, min=0, max=1)
 
     def residual(pars: lmfit.Parameters) -> np.ndarray:
         pk: list[Peak] = []

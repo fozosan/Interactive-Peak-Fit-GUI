@@ -51,6 +51,10 @@ from fit import classic, lmfit_backend, modern, step_engine
 from infra import performance
 from uncertainty import asymptotic, bayes, bootstrap
 
+MODERN_LOSSES = ["linear", "soft_l1", "huber", "cauchy"]
+MODERN_WEIGHTS = ["none", "poisson", "inv_y"]
+LMFIT_ALGOS = ["least_squares", "leastsq", "nelder", "differential_evolution"]
+
 
 # ---------- Math ----------
 def gaussian(x, x0, fwhm):
@@ -172,6 +176,8 @@ class PeakFitApp:
         # Components visibility
         self.components_visible = True
 
+        self._baseline_cache = {}
+
         # Solver selection and diagnostics
         self.solver_var = tk.StringVar(value="Classic")
         self.classic_maxfev = tk.IntVar(value=20000)
@@ -181,16 +187,24 @@ class PeakFitApp:
         self.modern_maxfev = tk.IntVar(value=20000)
         self.modern_restarts = tk.IntVar(value=1)
         self.modern_jitter = tk.DoubleVar(value=0.0)
+        self.modern_centers_window = tk.BooleanVar(value=True)
+        self.modern_min_fwhm = tk.BooleanVar(value=True)
         self.lmfit_algo = tk.StringVar(value="least_squares")
         self.lmfit_maxfev = tk.IntVar(value=20000)
+        self.lmfit_share_fwhm = tk.BooleanVar(value=False)
+        self.lmfit_share_eta = tk.BooleanVar(value=False)
         self.snr_text = tk.StringVar(value="S/N: --")
 
         # Uncertainty and performance controls
         self.unc_method = tk.StringVar(value="Asymptotic")
         self.perf_numba = tk.BooleanVar(value=False)
         self.perf_gpu = tk.BooleanVar(value=False)
+        self.perf_cache = tk.BooleanVar(value=True)
+        self.perf_deterministic = tk.BooleanVar(value=False)
+        self.perf_parallel = tk.BooleanVar(value=False)
         self.seed_var = tk.StringVar(value="")
         self.workers_var = tk.IntVar(value=0)
+        self.gpu_chunk_var = tk.IntVar(value=262144)
 
         # UI
         self._build_ui()
@@ -205,10 +219,12 @@ class PeakFitApp:
         ttk.Button(top, text="Help", command=self.show_help).pack(side=tk.LEFT, padx=(6,0))
         self.file_label = ttk.Label(top, text="No file loaded"); self.file_label.pack(side=tk.LEFT, padx=10)
 
-        mid = ttk.Frame(self.root); mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         # Left: plot
-        left = ttk.Frame(mid); left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        left = ttk.Frame(paned)
+        paned.add(left, stretch="always")
         self.fig = plt.Figure(figsize=(7,5), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel("x"); self.ax.set_ylabel("Intensity")
@@ -217,8 +233,26 @@ class PeakFitApp:
         self.nav = NavigationToolbar2Tk(self.canvas, left)
         self.cid = self.canvas.mpl_connect("button_press_event", self.on_click_plot)
 
-        # Right: controls
-        right = ttk.Frame(mid, padding=6); right.pack(side=tk.RIGHT, fill=tk.Y)
+        # Right: scrollable controls
+        right_container = ttk.Frame(paned)
+        paned.add(right_container)
+        canvas = tk.Canvas(right_container, borderwidth=0, highlightthickness=0)
+        vsb = ttk.Scrollbar(right_container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right = ttk.Frame(canvas, padding=6)
+        canvas.create_window((0,0), window=right, anchor="nw")
+
+        def _on_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        right.bind("<Configure>", _on_configure)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         # Baseline box
         baseline_box = ttk.Labelframe(right, text="Baseline (ALS)"); baseline_box.pack(fill=tk.X, pady=4)
@@ -348,10 +382,10 @@ class PeakFitApp:
         r1 = ttk.Frame(f_modern); r1.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(r1, text="Loss").pack(side=tk.LEFT)
         ttk.Combobox(r1, textvariable=self.modern_loss, state="readonly",
-                     values=["linear", "soft_l1", "huber", "cauchy"], width=8).pack(side=tk.LEFT, padx=2)
+                     values=MODERN_LOSSES, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Label(r1, text="Weights").pack(side=tk.LEFT, padx=(6,0))
         ttk.Combobox(r1, textvariable=self.modern_weight, state="readonly",
-                     values=["none", "poisson", "inv_y"], width=8).pack(side=tk.LEFT, padx=2)
+                     values=MODERN_WEIGHTS, width=8).pack(side=tk.LEFT, padx=2)
         r2 = ttk.Frame(f_modern); r2.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(r2, text="f_scale").pack(side=tk.LEFT)
         ttk.Entry(r2, width=6, textvariable=self.modern_fscale).pack(side=tk.LEFT, padx=2)
@@ -361,15 +395,19 @@ class PeakFitApp:
         ttk.Entry(r2, width=4, textvariable=self.modern_restarts).pack(side=tk.LEFT, padx=2)
         ttk.Label(r2, text="Jitter %").pack(side=tk.LEFT, padx=(6,0))
         ttk.Entry(r2, width=4, textvariable=self.modern_jitter).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(f_modern, text="Centers in window", variable=self.modern_centers_window).pack(anchor="w")
+        ttk.Checkbutton(f_modern, text="Min FWHM ≈2×Δx", variable=self.modern_min_fwhm).pack(anchor="w")
         self.solver_frames["Modern"] = f_modern
 
         # LMFIT options
         f_lmfit = ttk.Frame(solver_box)
         ttk.Label(f_lmfit, text="Algo").pack(side=tk.LEFT)
         ttk.Combobox(f_lmfit, textvariable=self.lmfit_algo, state="readonly",
-                     values=["least_squares", "leastsq", "nelder", "differential_evolution"], width=18).pack(side=tk.LEFT, padx=2)
+                     values=LMFIT_ALGOS, width=18).pack(side=tk.LEFT, padx=2)
         ttk.Label(f_lmfit, text="Max evals").pack(side=tk.LEFT, padx=(6,0))
         ttk.Entry(f_lmfit, width=7, textvariable=self.lmfit_maxfev).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(f_lmfit, text="Share FWHM", variable=self.lmfit_share_fwhm).pack(anchor="w", padx=(4,0))
+        ttk.Checkbutton(f_lmfit, text="Share η", variable=self.lmfit_share_eta).pack(anchor="w", padx=(4,0))
         self.solver_frames["LMFIT"] = f_lmfit
 
         self._show_solver_opts()
@@ -386,11 +424,19 @@ class PeakFitApp:
                         command=self.apply_performance).pack(anchor="w")
         ttk.Checkbutton(perf_box, text="GPU", variable=self.perf_gpu,
                         command=self.apply_performance).pack(anchor="w")
+        ttk.Checkbutton(perf_box, text="Cache baseline", variable=self.perf_cache,
+                        command=self.apply_performance).pack(anchor="w")
+        ttk.Checkbutton(perf_box, text="Deterministic seeds", variable=self.perf_deterministic,
+                        command=self.apply_performance).pack(anchor="w")
+        ttk.Checkbutton(perf_box, text="Parallel bootstrap", variable=self.perf_parallel,
+                        command=self.apply_performance).pack(anchor="w")
         rowp = ttk.Frame(perf_box); rowp.pack(fill=tk.X, pady=2)
         ttk.Label(rowp, text="Seed:").pack(side=tk.LEFT)
         ttk.Entry(rowp, width=8, textvariable=self.seed_var).pack(side=tk.LEFT, padx=4)
         ttk.Label(rowp, text="Max workers:").pack(side=tk.LEFT, padx=(8,0))
         ttk.Spinbox(rowp, from_=0, to=64, textvariable=self.workers_var, width=5).pack(side=tk.LEFT)
+        ttk.Label(rowp, text="GPU chunk:").pack(side=tk.LEFT, padx=(8,0))
+        ttk.Entry(rowp, width=7, textvariable=self.gpu_chunk_var).pack(side=tk.LEFT, padx=2)
         ttk.Button(rowp, text="Apply", command=self.apply_performance).pack(side=tk.LEFT, padx=4)
 
         # Actions
@@ -414,6 +460,9 @@ class PeakFitApp:
     def _solver_options(self) -> dict:
         solver = self.solver_var.get().lower()
         if solver == "modern":
+            min_fwhm = 1e-6
+            if self.modern_min_fwhm.get() and self.x is not None and self.x.size > 1:
+                min_fwhm = 2.0 * float(np.median(np.diff(self.x)))
             return {
                 "loss": self.modern_loss.get(),
                 "weights": self.modern_weight.get(),
@@ -421,11 +470,15 @@ class PeakFitApp:
                 "maxfev": int(self.modern_maxfev.get()),
                 "restarts": int(self.modern_restarts.get()),
                 "jitter_pct": float(self.modern_jitter.get()),
+                "centers_in_window": bool(self.modern_centers_window.get()),
+                "min_fwhm": float(min_fwhm),
             }
         if solver == "lmfit":
             return {
                 "algo": self.lmfit_algo.get(),
                 "maxfev": int(self.lmfit_maxfev.get()),
+                "share_fwhm": bool(self.lmfit_share_fwhm.get()),
+                "share_eta": bool(self.lmfit_share_eta.get()),
             }
         return {"maxfev": int(self.classic_maxfev.get())}
 
@@ -533,19 +586,31 @@ class PeakFitApp:
         use_slice = bool(self.baseline_use_range.get())
         mask = self._range_mask() if use_slice else None
 
-        try:
-            if mask is None or not np.any(mask):
-                self.baseline = signals.als_baseline(self.y_raw, lam=lam, p=asym,
-                                                     niter=niter, tol=thresh)
-            else:
-                x_sub = self.x[mask]
-                y_sub = self.y_raw[mask]
-                z_sub = signals.als_baseline(y_sub, lam=lam, p=asym,
-                                             niter=niter, tol=thresh)
-                self.baseline = np.interp(self.x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
-        except Exception as e:
-            messagebox.showwarning("Baseline", f"ALS baseline failed: {e}")
-            self.baseline = np.zeros_like(self.y_raw)
+        key = None
+        if performance.cache_baseline_enabled():
+            mkey = None
+            if mask is not None and np.any(mask):
+                mkey = (float(self.x[mask][0]), float(self.x[mask][-1]))
+            key = (hash(self.y_raw.tobytes()), lam, asym, niter, thresh, mkey)
+        if key is not None and key in self._baseline_cache:
+            self.baseline = self._baseline_cache[key]
+        else:
+            try:
+                if mask is None or not np.any(mask):
+                    base = signals.als_baseline(self.y_raw, lam=lam, p=asym,
+                                                niter=niter, tol=thresh)
+                else:
+                    x_sub = self.x[mask]
+                    y_sub = self.y_raw[mask]
+                    z_sub = signals.als_baseline(y_sub, lam=lam, p=asym,
+                                                 niter=niter, tol=thresh)
+                    base = np.interp(self.x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
+                self.baseline = base
+                if key is not None:
+                    self._baseline_cache[key] = base
+            except Exception as e:
+                messagebox.showwarning("Baseline", f"ALS baseline failed: {e}")
+                self.baseline = np.zeros_like(self.y_raw)
 
         try:
             y_t = self.get_fit_target()
@@ -1087,10 +1152,18 @@ class PeakFitApp:
     def apply_performance(self):
         performance.set_numba(bool(self.perf_numba.get()))
         performance.set_gpu(bool(self.perf_gpu.get()))
+        performance.set_cache_baseline(bool(self.perf_cache.get()))
         seed_txt = self.seed_var.get().strip()
         seed = int(seed_txt) if seed_txt else None
-        performance.set_seed(seed)
-        performance.set_max_workers(self.workers_var.get())
+        if self.perf_deterministic.get():
+            performance.set_seed(seed)
+        else:
+            performance.set_seed(None)
+        if self.perf_parallel.get():
+            performance.set_max_workers(self.workers_var.get())
+        else:
+            performance.set_max_workers(0)
+        performance.set_gpu_chunk(self.gpu_chunk_var.get())
         self.status.config(text="Performance options applied.")
 
     def on_export(self):
@@ -1216,25 +1289,23 @@ class PeakFitApp:
 
     # ----- Help -----
     def show_help(self):
-        message = (
-            "Supported files:\n"
-            "  • CSV, TXT, DAT with two numeric columns (x,y).\n"
-            "  • Delimiters auto-detected (comma, tab, spaces, semicolons).\n"
-            "  • Lines starting with #, %, // (or text headers) are ignored.\n\n"
-            "Baseline modes:\n"
-            "  • Add to fit (default): model = baseline + sum(peaks) on raw data.\n"
-            "  • Subtract: model = sum(peaks) on (raw - baseline).\n\n"
-            "Fit range:\n"
-            "  • Type Min/Max or drag with 'Select on plot'; 'Full range' clears.\n"
-            "  • 'Baseline uses fit range' computes ALS on that slice, then interpolates.\n\n"
-            "Templates:\n"
-            "  • Save multiple named templates; 'Save changes' overwrites selected.\n"
-            "  • 'Auto-apply on open' uses the currently selected template.\n\n"
-            "Interaction:\n"
-            "  • 'Add peaks on click' toggles picking; Zoom/Pan ignores clicks.\n"
-            "  • 'Zoom out' widens x-view; 'Reset view' equals toolbar Home.\n"
-        )
-        messagebox.showinfo("Help", message)
+        from . import helptext
+
+        opts = {
+            "modern_losses": MODERN_LOSSES,
+            "modern_weights": MODERN_WEIGHTS,
+            "lmfit_algos": LMFIT_ALGOS,
+        }
+        message = helptext.build_help(opts)
+        win = tk.Toplevel(self.root)
+        win.title("Help")
+        txt = tk.Text(win, wrap="word", width=100)
+        txt.insert("1.0", message)
+        txt.config(state="disabled")
+        scroll = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
 
 def main():
