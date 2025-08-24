@@ -47,23 +47,7 @@ from scipy.signal import find_peaks
 
 from core import signals
 from core.residuals import build_residual
-from fit import classic, lmfit_backend, modern, step_engine
-
-# ``fit.bounds`` may be unavailable if the project root isn't on ``sys.path``
-# (e.g. launching the UI module directly). Fall back to adding the parent
-# directory of this file to ``sys.path`` and retry the import so the module is
-# located regardless of invocation context.
-try:  # pragma: no cover - exercised indirectly during manual runs
-    from fit.bounds import pack_theta_bounds
-except ModuleNotFoundError:  # pragma: no cover - executed only on misconfigured paths
-    import os
-    import sys
-
-    _here = os.path.abspath(os.path.dirname(__file__))
-    _root = os.path.abspath(os.path.join(_here, ".."))
-    if _root not in sys.path:
-        sys.path.insert(0, _root)
-    from fit.bounds import pack_theta_bounds
+from fit import classic, lmfit_backend, modern
 from infra import performance
 from batch import runner as batch_runner
 from uncertainty import asymptotic, bayes, bootstrap
@@ -1117,24 +1101,29 @@ class PeakFitApp:
         mode = "add" if add_mode else "subtract"
 
         options = self._solver_options()
-        _, bounds = pack_theta_bounds(self.peaks, x_fit, options)
 
+        state = {
+            "x_fit": x_fit,
+            "y_fit": y_fit,
+            "peaks": self.peaks,
+            "mode": mode,
+            "baseline": base_fit,
+            "options": options,
+        }
+
+        solver = self.solver_var.get().lower()
         try:
-            theta, _ = step_engine.step_once(
-                x_fit,
-                y_fit,
-                self.peaks,
-                mode,
-                base_fit,
-                loss="linear",
-                weights=None,
-                damping=0.0,
-                trust_radius=np.inf,
-                bounds=bounds,
-            )
-        except Exception as e:
+            if solver == "modern":
+                res = modern.iterate(state)
+            elif solver == "lmfit":
+                res = lmfit_backend.iterate(state)
+            else:
+                res = classic.iterate(state)
+        except Exception as e:  # pragma: no cover - UI feedback only
             messagebox.showerror("Step", f"Step failed:\n{e}")
             return
+
+        theta = res.get("theta")
 
         j = 0
         for pk in self.peaks:
