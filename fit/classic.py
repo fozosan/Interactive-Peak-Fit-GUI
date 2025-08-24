@@ -9,6 +9,7 @@ from scipy.optimize import least_squares
 
 from core.residuals import build_residual_jac
 from core.models import pv_design_matrix
+from core.robust import noise_weights
 from .bounds import pack_theta_bounds
 from . import step_engine
 
@@ -72,11 +73,7 @@ def solve(
     baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
 
     weight_mode = options.get("weights", "none")
-    weights = None
-    if weight_mode == "poisson":
-        weights = 1.0 / np.sqrt(np.clip(np.abs(y), 1.0, None))
-    elif weight_mode == "inv_y":
-        weights = 1.0 / np.clip(np.abs(y), 1e-12, None)
+    weights = None if weight_mode == "none" else noise_weights(y, weight_mode)
 
     options = options.copy()
     base = baseline if baseline is not None else 0.0
@@ -185,11 +182,7 @@ def iterate(state: dict) -> dict:
 
     loss = options.get("loss", "linear")
     weight_mode = options.get("weights", "none")
-    weights = None
-    if weight_mode == "poisson":
-        weights = 1.0 / np.sqrt(np.clip(np.abs(y), 1.0, None))
-    elif weight_mode == "inv_y":
-        weights = 1.0 / np.clip(np.abs(y), 1e-12, None)
+    weights = None if weight_mode == "none" else noise_weights(y, weight_mode)
 
     _, bounds = pack_theta_bounds(peaks, x, options)
 

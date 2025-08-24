@@ -6,7 +6,8 @@ from typing import Sequence
 import numpy as np
 
 from core.peaks import Peak
-from core.residuals import build_residual, jacobian_fd
+from core.jacobians import pv_and_grads
+from core.robust import irls_weights
 
 
 def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
@@ -31,48 +32,48 @@ def step_once(
     bounds: Sequence | None,
     f_scale: float = 1.0,
 ) -> tuple[np.ndarray, float]:
-    """Perform one Gauss-Newton/Levenberg-Marquardt step.
+    """Perform one weighted Gauss-Newton/LM step.
 
-    ``loss`` can be ``linear``, ``soft_l1``, ``huber`` or ``cauchy`` and is
-    implemented via an iteratively reweighted least squares (IRLS) scheme. Any
-    ``weights`` provided are applied first, then the robust loss weights. Bounds
-    are enforced by simple clipping after the step.
+    Parameters mirror those of the full solvers. ``weights`` should contain
+    per-point noise weights (or ``None``). Robust losses are applied via IRLS
+    using :func:`core.robust.irls_weights`.
     """
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    baseline = (
-        np.asarray(baseline, dtype=float) if baseline is not None else None
-    )
+    baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
 
-    theta0 = _theta_from_peaks(peaks)
-    resid_fn = build_residual(x, y, peaks, mode, baseline, loss, weights)
-    r0 = resid_fn(theta0)
+    n = len(peaks)
+    c = np.array([p.center for p in peaks], dtype=float)
+    h = np.array([p.height for p in peaks], dtype=float)
+    f = np.array([p.fwhm for p in peaks], dtype=float)
+    eta = np.array([p.eta for p in peaks], dtype=float)
 
-    # robust loss via IRLS
-    if loss != "linear":
-        rs = r0 / f_scale
-        if loss == "soft_l1":
-            w = 1.0 / np.sqrt(1.0 + rs**2)
-        elif loss == "huber":
-            w = np.where(np.abs(rs) <= 1.0, 1.0, 1.0 / np.abs(rs))
-        elif loss == "cauchy":
-            w = 1.0 / (1.0 + rs**2)
-        else:  # pragma: no cover - unknown loss
-            raise ValueError("unknown loss")
-        w_sqrt = np.sqrt(w)
-        r0 = w_sqrt * r0
+    model = np.zeros_like(x)
+    dcols = []
+    for i in range(n):
+        pv, d_dc, d_df = pv_and_grads(x, h[i], c[i], f[i], eta[i])
+        model += pv
+        base = pv / h[i] if h[i] != 0 else pv_and_grads(x, 1.0, c[i], f[i], eta[i])[0]
+        dcols.extend([d_dc, base, d_df])
+    J = np.column_stack(dcols) if dcols else np.zeros((x.size, 0))
+
+    base_arr = baseline if baseline is not None else 0.0
+    if mode == "add":
+        r = model + base_arr - y
     else:
-        w_sqrt = None
+        r = model - (y - base_arr)
 
-    J = jacobian_fd(resid_fn, theta0)
-    if w_sqrt is not None:
-        J = J * w_sqrt[:, None]
+    w = irls_weights(r, loss, f_scale)
+    if weights is not None:
+        w = w * weights
+    r_w = r * w
+    J_w = J * w[:, None]
 
-    JTJ = J.T @ J
+    JTJ = J_w.T @ J_w
     if damping:
         JTJ = JTJ + np.eye(JTJ.shape[0]) * damping
-    rhs = -J.T @ r0
+    rhs = -J_w.T @ r_w
     try:
         delta = np.linalg.solve(JTJ, rhs)
     except np.linalg.LinAlgError:  # pragma: no cover - singular matrix
@@ -83,13 +84,32 @@ def step_once(
         if norm > trust_radius and norm > 0:
             delta *= trust_radius / norm
 
-    theta1 = theta0 + delta
+    theta0 = _theta_from_peaks(peaks)
+    mask = np.ones(theta0.size, dtype=bool)
+    mask[3::4] = False  # do not update eta
+    theta_reduced = theta0[mask] + delta
     if bounds is not None:
-        lb, ub = bounds
-        lb = np.asarray(lb, dtype=float)
-        ub = np.asarray(ub, dtype=float)
-        theta1 = np.minimum(np.maximum(theta1, lb), ub)
+        lb = np.asarray(bounds[0], dtype=float)[mask]
+        ub = np.asarray(bounds[1], dtype=float)[mask]
+        theta_reduced = np.minimum(np.maximum(theta_reduced, lb), ub)
+    theta1 = theta0.copy()
+    theta1[mask] = theta_reduced
 
-    r1 = resid_fn(theta1)
-    cost = 0.5 * float(r1 @ r1)
+    # Recompute cost at the new parameters
+    c_new = theta1[0::4]
+    h_new = theta1[1::4]
+    f_new = theta1[2::4]
+    eta_new = theta1[3::4]
+    model_new = np.zeros_like(x)
+    for i in range(n):
+        pv, _, _ = pv_and_grads(x, h_new[i], c_new[i], f_new[i], eta_new[i])
+        model_new += pv
+    if mode == "add":
+        r_new = model_new + base_arr - y
+    else:
+        r_new = model_new - (y - base_arr)
+    w_new = irls_weights(r_new, loss, f_scale)
+    if weights is not None:
+        w_new = w_new * weights
+    cost = 0.5 * float((r_new * w_new) @ (r_new * w_new))
     return theta1, cost

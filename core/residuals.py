@@ -9,7 +9,8 @@ try:  # optional CuPy support
 except Exception:  # pragma: no cover - CuPy may be absent
     cp = None  # type: ignore
 
-from .models import pv_sum, pv_sum_with_jac
+from .models import pv_sum
+from .jacobians import pv_and_grads
 from .peaks import Peak
 
 
@@ -104,14 +105,17 @@ def build_residual_jac(
                 f[i] = theta[j]
                 j += 1
 
-        model, dh, dc, df = pv_sum_with_jac(x, c, h, f, e)
+        model = np.zeros_like(x)
         cols = []
         for i in range(n):
-            cols.append(dh[:, i])
+            pv, d_dc, d_df = pv_and_grads(x, h[i], c[i], f[i], e[i])
+            model += pv
+            base = pv / h[i] if h[i] != 0 else pv_and_grads(x, 1.0, c[i], f[i], e[i])[0]
+            cols.append(base)
             if not lock_c[i]:
-                cols.append(dc[:, i])
+                cols.append(d_dc)
             if not lock_w[i]:
-                cols.append(df[:, i])
+                cols.append(d_df)
         J = np.column_stack(cols) if cols else np.zeros((x.size, 0))
 
         base = baseline if baseline is not None else 0.0
