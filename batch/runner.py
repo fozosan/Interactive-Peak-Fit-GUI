@@ -15,7 +15,7 @@ from typing import Iterable, Sequence, List
 import numpy as np
 
 from core import data_io, models, peaks, signals
-from fit import classic, lmfit_backend, modern
+from fit import classic, modern
 
 
 def _apply_solver(name: str, x, y, pk, mode, baseline, options):
@@ -23,7 +23,7 @@ def _apply_solver(name: str, x, y, pk, mode, baseline, options):
         return classic.solve(x, y, pk, mode, baseline, options)
     if name == "modern":
         return modern.solve(x, y, pk, mode, baseline, options)
-    return lmfit_backend.solve(x, y, pk, mode, baseline, options)
+    raise ValueError("unknown solver")
 
 
 def _auto_seed(x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: int = 5) -> List[peaks.Peak]:
@@ -60,8 +60,8 @@ def run(patterns: Iterable[str], config: dict) -> None:
         Iterable of glob patterns. All matching files are processed.
     config:
         Dictionary describing the batch job. Supported keys include ``peaks``
-        (list of peak dictionaries), ``solver`` (``classic`` | ``modern`` |
-        ``lmfit``), ``mode`` (``add`` | ``subtract``), ``baseline``
+        (list of peak dictionaries), ``solver`` (``classic`` | ``modern``),
+        ``mode`` (``add`` | ``subtract``), ``baseline``
         parameters, per-solver options, ``save_traces`` flag, ``peak_output``
         for the output CSV, ``source`` (``current`` | ``template`` | ``auto``)
         selecting the peak seeds, ``reheight`` to refresh heights per spectrum
