@@ -5,9 +5,11 @@ from __future__ import annotations
 from typing import Sequence
 
 import numpy as np
+from scipy.optimize import least_squares
 
-from core.models import pv_sum
 from core.peaks import Peak
+from core.residuals import build_residual
+from .bounds import pack_theta_bounds
 
 
 def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
@@ -15,7 +17,6 @@ def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
     for p in peaks:
         arr.extend([p.center, p.height, p.fwhm, p.eta])
     return np.asarray(arr, dtype=float)
-
 
 def solve(
     x: np.ndarray,

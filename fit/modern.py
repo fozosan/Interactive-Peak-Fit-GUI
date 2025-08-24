@@ -36,7 +36,16 @@ def solve(
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
+    base_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
+
+    # Handle baseline according to mode
+    y_target = y
+    base_model = None
+    if base_arr is not None:
+        if mode == "subtract":
+            y_target = y - base_arr
+        else:  # add
+            base_model = base_arr
 
     loss = options.get("loss", "linear")
     weight_mode = options.get("weights", "none")
@@ -48,9 +57,9 @@ def solve(
     # construct weights
     weights = None
     if weight_mode == "poisson":
-        weights = 1.0 / np.sqrt(np.clip(y, 1.0, None))
+        weights = 1.0 / np.sqrt(np.clip(y_target, 1.0, None))
     elif weight_mode == "inv_y":
-        weights = 1.0 / np.clip(y, 1e-12, None)
+        weights = 1.0 / np.clip(y_target, 1e-12, None)
 
     theta0, (lb, ub) = pack_theta_bounds(peaks, x, options)
 
