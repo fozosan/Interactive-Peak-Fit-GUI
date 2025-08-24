@@ -2,7 +2,7 @@
 with support for robust losses, weights and multi-start restarts."""
 from __future__ import annotations
 
-from typing import Optional, Sequence, TypedDict
+from typing import Sequence
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -10,16 +10,6 @@ from scipy.optimize import least_squares
 from core.peaks import Peak
 from core.residuals import build_residual
 from .bounds import pack_theta_bounds
-
-
-class SolveResult(TypedDict):
-    ok: bool
-    theta: np.ndarray
-    message: str
-    cost: float
-    jac: Optional[np.ndarray]
-    cov: Optional[np.ndarray]
-    meta: dict
 
 
 def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
@@ -36,7 +26,7 @@ def solve(
     mode: str,
     baseline: np.ndarray | None,
     options: dict,
-) -> SolveResult:
+) -> dict:
     """Solve the non-linear least squares problem using SciPy's TRF solver.
 
     Parameters in ``options`` follow the blueprint: ``loss`` (passed directly to
@@ -77,7 +67,7 @@ def solve(
         else:
             start = theta0
 
-        resid_fn = build_residual(x, y, peaks, baseline, loss, weights)
+        resid_fn = build_residual(x, y, peaks, mode, baseline, loss, weights)
 
         res = least_squares(
             resid_fn,
@@ -107,12 +97,13 @@ def solve(
         except np.linalg.LinAlgError:  # pragma: no cover - singular
             cov = None
 
-    return SolveResult(
-        ok=ok,
-        theta=theta,
-        message=best.message,
-        cost=best_cost,
-        jac=jac,
-        cov=cov,
-        meta={"nfev": best.nfev, "njev": getattr(best, "njev", None)},
-    )
+    return {
+        "ok": ok,
+        "theta": theta,
+        "message": best.message,
+        "cost": best_cost,
+        "jac": jac,
+        "cov": cov,
+        "meta": {"nfev": best.nfev, "njev": getattr(best, "njev", None)},
+    }
+

@@ -527,21 +527,32 @@ class PeakFitApp:
 
     def _solver_options(self) -> dict:
         solver = self.solver_var.get().lower()
-        if solver == "modern":
-            min_fwhm = 1e-6
-            if self.modern_min_fwhm.get() and self.x is not None and self.x.size > 1:
+
+        # Options that apply to both solvers
+        min_fwhm = 1e-6
+        if self.x is not None and self.x.size > 1:
+            if self.modern_min_fwhm.get():
                 min_fwhm = 2.0 * float(np.median(np.diff(self.x)))
-            return {
-                "loss": self.modern_loss.get(),
-                "weights": self.modern_weight.get(),
-                "f_scale": float(self.modern_fscale.get()),
-                "maxfev": int(self.modern_maxfev.get()),
-                "restarts": int(self.modern_restarts.get()),
-                "jitter_pct": float(self.modern_jitter.get()),
-                "centers_in_window": bool(self.modern_centers_window.get()),
-                "min_fwhm": float(min_fwhm),
-            }
-        return {"maxfev": int(self.classic_maxfev.get())}
+        opts = {
+            "centers_in_window": bool(self.modern_centers_window.get()),
+            "min_fwhm": float(min_fwhm),
+        }
+
+        if solver == "modern":
+            opts.update(
+                {
+                    "loss": self.modern_loss.get(),
+                    "weights": self.modern_weight.get(),
+                    "f_scale": float(self.modern_fscale.get()),
+                    "maxfev": int(self.modern_maxfev.get()),
+                    "restarts": int(self.modern_restarts.get()),
+                    "jitter_pct": float(self.modern_jitter.get()),
+                }
+            )
+        else:
+            opts["maxfev"] = int(self.classic_maxfev.get())
+
+        return opts
 
     def _new_figure(self):
         self.ax.clear()
@@ -1282,7 +1293,7 @@ class PeakFitApp:
             theta.extend([p.center, p.height, p.fwhm, p.eta])
         theta = np.asarray(theta, dtype=float)
 
-        resid_fn = build_residual(x_fit, y_fit, self.peaks, base_fit, "linear", None)
+        resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
         method = self.unc_method.get().lower()
         solver = self.solver_var.get().lower()
         self.log(f"Running uncertainty ({method}) with solver {solver}")

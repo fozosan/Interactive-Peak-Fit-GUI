@@ -54,7 +54,7 @@ def step_once(
         # ensure starting vector honours the bounds
         theta0 = np.minimum(np.maximum(theta0, lb), ub)
 
-    resid_fn = build_residual(x, y, peaks, baseline, loss, weights)
+    resid_fn = build_residual(x, y, peaks, mode, baseline, loss, weights)
     r0 = resid_fn(theta0)
 
     # robust loss via IRLS

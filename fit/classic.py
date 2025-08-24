@@ -1,24 +1,13 @@
 """Classic solver backend using SciPy's least squares routines."""
+
 from __future__ import annotations
 
-from typing import Optional, Sequence, TypedDict
+from typing import Sequence
 
 import numpy as np
 
 from core.models import pv_sum
 from core.peaks import Peak
-
-
-class SolveResult(TypedDict):
-    """Return structure for solver results."""
-
-    ok: bool
-    theta: np.ndarray
-    message: str
-    cost: float
-    jac: Optional[np.ndarray]
-    cov: Optional[np.ndarray]
-    meta: dict
 
 
 def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
@@ -35,7 +24,7 @@ def solve(
     mode: str,
     baseline: np.ndarray | None,
     options: dict,
-) -> SolveResult:
+) -> dict:
     """Fit peak heights with centers/widths fixed using linear least squares.
 
     This lightweight implementation serves as an initial backend so the UI can
@@ -45,8 +34,22 @@ def solve(
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    base_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
-    target = y - (base_arr if base_arr is not None else 0.0)
+    baseline = np.asarray(baseline, dtype=float) if baseline is not None else 0.0
+
+    if mode == "add":
+        target = y - baseline
+    elif mode == "subtract":
+        target = y - baseline
+    else:  # pragma: no cover - unknown mode
+        return {
+            "ok": False,
+            "theta": _theta_from_peaks(peaks),
+            "message": "unknown mode",
+            "cost": float("nan"),
+            "jac": None,
+            "cov": None,
+            "meta": {},
+        }
 
     # enforce basic bounds on provided peak parameters
     x_min = float(x.min())
@@ -81,17 +84,16 @@ def solve(
     updated = [Peak(p.center, h, p.fwhm, p.eta) for p, h in zip(clean, heights)]
     theta = _theta_from_peaks(updated)
     model = pv_sum(x, updated)
-    if base_arr is not None:
-        model = model + base_arr
-    resid = y - model
+    resid = target - model
     cost = float(0.5 * np.dot(resid, resid))
 
-    return SolveResult(
-        ok=ok,
-        theta=theta,
-        message=message,
-        cost=cost,
-        jac=None,
-        cov=None,
-        meta={},
-    )
+    return {
+        "ok": ok,
+        "theta": theta,
+        "message": message,
+        "cost": cost,
+        "jac": None,
+        "cov": None,
+        "meta": {},
+    }
+
