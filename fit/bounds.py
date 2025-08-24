@@ -53,7 +53,8 @@ def pack_theta_bounds(
     x = np.asarray(x, dtype=float)
     x_min = float(x.min())
     x_max = float(x.max())
-    min_fwhm = float(options.get("min_fwhm", 1e-6))
+    dx_med = float(np.median(np.diff(np.sort(x)))) if len(x) > 1 else 1.0
+    min_fwhm = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
     clamp_center = bool(options.get("centers_in_window", False))
 
     # ``theta_list`` collects the starting parameter vector.  We ensure all
