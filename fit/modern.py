@@ -77,7 +77,7 @@ def solve(
         else:
             start = theta0
 
-        resid_fn = build_residual(x, y, peaks, mode, baseline, loss, weights)
+        resid_fn = build_residual(x, y, peaks, baseline, loss, weights)
 
         res = least_squares(
             resid_fn,

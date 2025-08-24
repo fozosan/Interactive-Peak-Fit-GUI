@@ -45,22 +45,8 @@ def solve(
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    baseline = np.asarray(baseline, dtype=float) if baseline is not None else 0.0
-
-    if mode == "add":
-        target = y - baseline
-    elif mode == "subtract":
-        target = y - baseline
-    else:  # pragma: no cover - unknown mode
-        return SolveResult(
-            ok=False,
-            theta=_theta_from_peaks(peaks),
-            message="unknown mode",
-            cost=float("nan"),
-            jac=None,
-            cov=None,
-            meta={},
-        )
+    base_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
+    target = y - (base_arr if base_arr is not None else 0.0)
 
     # enforce basic bounds on provided peak parameters
     x_min = float(x.min())
@@ -95,7 +81,9 @@ def solve(
     updated = [Peak(p.center, h, p.fwhm, p.eta) for p, h in zip(clean, heights)]
     theta = _theta_from_peaks(updated)
     model = pv_sum(x, updated)
-    resid = target - model
+    if base_arr is not None:
+        model = model + base_arr
+    resid = y - model
     cost = float(0.5 * np.dot(resid, resid))
 
     return SolveResult(

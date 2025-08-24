@@ -46,7 +46,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 
 from scipy.signal import find_peaks
 
-from core import signals
+from core import signals, data_io
 from core.residuals import build_residual
 from fit import classic, modern, step_engine
 from fit.bounds import pack_theta_bounds
@@ -1110,18 +1110,16 @@ class PeakFitApp:
             return
         self._sync_selected_edits()
 
-        y_target = self.get_fit_target()
         mask = self.current_fit_mask()
         if mask is None or not np.any(mask):
             messagebox.showwarning("Step", "Fit range is empty. Use 'Full range' or set a valid Min/Max.")
             return
         x_fit = self.x[mask]
-        y_fit = y_target[mask]
+        y_fit = self.y_raw[mask]
 
         base_applied = self.use_baseline.get() and self.baseline is not None
-        add_mode = (self.baseline_mode.get() == "add")
-        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
-        mode = "add" if add_mode else "subtract"
+        base_fit = self.baseline[mask] if base_applied else None
+        mode = self.baseline_mode.get()
 
         options = self._solver_options()
         _, bounds = pack_theta_bounds(self.peaks, x_fit, options)
@@ -1164,19 +1162,16 @@ class PeakFitApp:
             return
         self._sync_selected_edits()
 
-        y_target = self.get_fit_target()
-
         mask = self.current_fit_mask()
         if mask is None or not np.any(mask):
             messagebox.showwarning("Fit", "Fit range is empty. Use 'Full range' or set a valid Min/Max.")
             return
         x_fit = self.x[mask]
-        y_fit = y_target[mask]
+        y_fit = self.y_raw[mask]
 
         base_applied = self.use_baseline.get() and self.baseline is not None
-        add_mode = (self.baseline_mode.get() == "add")
-        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
-        mode = "add" if add_mode else "subtract"
+        base_fit = self.baseline[mask] if base_applied else None
+        mode = self.baseline_mode.get()
 
         solver = self.solver_var.get().lower()
         options = self._solver_options()
@@ -1277,18 +1272,17 @@ class PeakFitApp:
             messagebox.showwarning("Uncertainty", "Fit range is empty. Use 'Full range' or set a valid Min/Max.")
             return
         x_fit = self.x[mask]
-        y_fit = self.get_fit_target()[mask]
+        y_fit = self.y_raw[mask]
         base_applied = self.use_baseline.get() and self.baseline is not None
-        add_mode = (self.baseline_mode.get() == "add")
-        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
-        mode = "add" if add_mode else "subtract"
+        base_fit = self.baseline[mask] if base_applied else None
+        mode = self.baseline_mode.get()
 
         theta = []
         for p in self.peaks:
             theta.extend([p.center, p.height, p.fwhm, p.eta])
         theta = np.asarray(theta, dtype=float)
 
-        resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
+        resid_fn = build_residual(x_fit, y_fit, self.peaks, base_fit, "linear", None)
         method = self.unc_method.get().lower()
         solver = self.solver_var.get().lower()
         self.log(f"Running uncertainty ({method}) with solver {solver}")
@@ -1354,24 +1348,15 @@ class PeakFitApp:
         areas = [pseudo_voigt_area(p.height, p.fwhm, p.eta) for p in self.peaks]
         total_area = float(np.sum(areas)) if areas else 1.0
 
-        y_target = self.get_fit_target()
         total_peaks = np.zeros_like(self.x, float)
-        comp_cols = {}
-        for i, p in enumerate(self.peaks, 1):
-            comp = pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
-            comp_cols[f"peak{i}"] = comp
-            total_peaks += comp
+        for p in self.peaks:
+            total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
 
         base = self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
-        if self.use_baseline.get() and self.baseline_mode.get() == "add":
-            y_fit = base + total_peaks
-            y_corr = self.y_raw - base  # for reference
-        else:
-            y_fit = total_peaks
-            y_corr = self.y_raw - base if self.use_baseline.get() else self.y_raw
+        y_fit = total_peaks + base
 
         mask = self.current_fit_mask()
-        rmse = float(np.sqrt(np.mean((y_target[mask] - y_fit[mask]) ** 2))) if mask is not None else float("nan")
+        rmse = float(np.sqrt(np.mean((y_fit[mask] - self.y_raw[mask]) ** 2))) if mask is not None else float("nan")
 
         rows = []
         fname = self.file_label.cget("text")
@@ -1399,17 +1384,14 @@ class PeakFitApp:
 
         # Trace CSV
         trace_path = str(Path(out_csv).with_name(Path(out_csv).stem + "_trace.csv"))
-        df = pd.DataFrame({
-            "x": self.x,
-            "y_raw": self.y_raw,
-            "baseline": base,
-            "y_corr": y_corr,
-            "y_target": y_target,   # data actually used for fitting
-            "y_fit": y_fit
-        })
-        for k, v in comp_cols.items():
-            df[k] = v
-        df.to_csv(trace_path, index=False)
+        trace_csv = data_io.build_trace_table(
+            self.x,
+            self.y_raw,
+            base if self.use_baseline.get() else None,
+            self.peaks,
+        )
+        with open(trace_path, "w", encoding="utf-8") as fh:
+            fh.write(trace_csv)
 
         messagebox.showinfo("Export", f"Saved:\n{out_csv}\n{trace_path}")
         self.log("Export complete")
