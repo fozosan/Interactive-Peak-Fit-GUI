@@ -7,7 +7,7 @@ import numpy as np
 
 from core.peaks import Peak
 from core.jacobians import pv_and_grads
-from core.robust import irls_weights
+from core.weights import noise_weights, robust_weights
 
 
 def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
@@ -26,7 +26,7 @@ def step_once(
     mode: str,
     baseline: np.ndarray | None,
     loss: str,
-    weights: np.ndarray | None,
+    weight_mode: str,
     damping: float,
     trust_radius: float,
     bounds: Sequence | None,
@@ -34,9 +34,9 @@ def step_once(
 ) -> tuple[np.ndarray, float]:
     """Perform one weighted Gauss-Newton/LM step.
 
-    Parameters mirror those of the full solvers. ``weights`` should contain
-    per-point noise weights (or ``None``). Robust losses are applied via IRLS
-    using :func:`core.robust.irls_weights`.
+    ``weight_mode`` selects the noise-weighting strategy and ``loss`` controls
+    the robust IRLS weights. Both noise and robust weights are applied to the
+    residuals and Jacobian in the same manner as the full solvers.
     """
 
     x = np.asarray(x, dtype=float)
@@ -59,14 +59,13 @@ def step_once(
     J = np.column_stack(dcols) if dcols else np.zeros((x.size, 0))
 
     base_arr = baseline if baseline is not None else 0.0
-    if mode == "add":
-        r = model + base_arr - y
-    else:
-        r = model - (y - base_arr)
+    y_target = y - base_arr
+    r = model - y_target
 
-    w = irls_weights(r, loss, f_scale)
-    if weights is not None:
-        w = w * weights
+    w_noise = noise_weights(y_target, weight_mode)
+    w_robust = robust_weights(r, loss, f_scale)
+    w = w_noise * w_robust
+
     r_w = r * w
     J_w = J * w[:, None]
 
@@ -104,12 +103,8 @@ def step_once(
     for i in range(n):
         pv, _, _ = pv_and_grads(x, h_new[i], c_new[i], f_new[i], eta_new[i])
         model_new += pv
-    if mode == "add":
-        r_new = model_new + base_arr - y
-    else:
-        r_new = model_new - (y - base_arr)
-    w_new = irls_weights(r_new, loss, f_scale)
-    if weights is not None:
-        w_new = w_new * weights
+    r_new = model_new - y_target
+    w_robust_new = robust_weights(r_new, loss, f_scale)
+    w_new = w_noise * w_robust_new
     cost = 0.5 * float((r_new * w_new) @ (r_new * w_new))
     return theta1, cost

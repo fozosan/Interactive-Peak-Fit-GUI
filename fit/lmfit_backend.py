@@ -8,9 +8,9 @@ from scipy.optimize import nnls
 
 from core.models import pv_design_matrix
 from core.peaks import Peak
+from core.weights import noise_weights
 from .bounds import pack_theta_bounds
 from .utils import mad_sigma, robust_cost
-from core.robust import noise_weights
 from . import step_engine
 
 
@@ -62,11 +62,10 @@ def solve(
     lambda_c = float(options.get("lambda_c", 0.0))
     lambda_w = float(options.get("lambda_w", 0.0))
 
-    weights = None if weight_mode == "none" else noise_weights(y, weight_mode)
-
     options = options.copy()
     base = baseline if baseline is not None else 0.0
     y_target = y - base
+    weights = None if weight_mode == "none" else noise_weights(y_target, weight_mode)
     p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
     max_height_factor = float(options.get("max_height_factor", np.inf))
     options["max_height"] = max_height_factor * p95
@@ -190,7 +189,6 @@ def iterate(state: dict) -> dict:
 
     loss = options.get("loss", "linear")
     weight_mode = options.get("weights", "none")
-    weights = None if weight_mode == "none" else noise_weights(y, weight_mode)
 
     _, bounds = pack_theta_bounds(peaks, x, options)
 
@@ -201,7 +199,7 @@ def iterate(state: dict) -> dict:
         mode,
         baseline,
         loss=loss,
-        weights=weights,
+        weight_mode=weight_mode,
         damping=state.get("lambda", 0.0),
         trust_radius=state.get("trust_radius", np.inf),
         bounds=bounds,
