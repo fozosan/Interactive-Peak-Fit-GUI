@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import glob
 from pathlib import Path
-from typing import Iterable, Sequence, List
+from typing import Iterable, Sequence, List, Callable, Optional
 
 import numpy as np
 
@@ -51,7 +51,7 @@ def _auto_seed(x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: in
     return found
 
 
-def run(patterns: Iterable[str], config: dict) -> None:
+def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str], None]] = None) -> None:
     """Run the peak fitting pipeline over matching files.
 
     Parameters
@@ -89,6 +89,8 @@ def run(patterns: Iterable[str], config: dict) -> None:
     records = []
 
     for path in files:
+        if progress:
+            progress(f"Processing {path}")
         x, y = data_io.load_xy(path)
         baseline = signals.als_baseline(
             y,
@@ -157,6 +159,8 @@ def run(patterns: Iterable[str], config: dict) -> None:
             trace_path = Path(path).with_suffix(Path(path).suffix + ".trace.csv")
             with trace_path.open("w", encoding="utf-8") as fh:
                 fh.write(trace_csv)
+        if progress:
+            progress(f"Finished {path}")
 
     peak_csv = data_io.build_peak_table(records)
     with open(peak_output, "w", encoding="utf-8") as fh:
