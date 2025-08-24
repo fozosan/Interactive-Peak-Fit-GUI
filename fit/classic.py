@@ -1,31 +1,22 @@
-"""Classic solver backend using SciPy's least squares routines."""
+"""Classic solver backend using SciPy's least squares routines.
+
+This implementation mirrors the behaviour of Peakfit 2.7 where the solver
+optimises peak heights as well as any unlocked centers and widths.  It relies
+on :func:`scipy.optimize.least_squares` with simple linear loss and without the
+robust weighting/restart features provided by the modern solver.
+"""
+
 from __future__ import annotations
 
-from typing import Optional, Sequence, TypedDict
+from typing import Dict, Any, Optional
 
 import numpy as np
+from scipy.optimize import least_squares
 
-from core.models import pv_sum
 from core.peaks import Peak
+from core.residuals import build_residual
+from .bounds import pack_theta_bounds
 
-
-class SolveResult(TypedDict):
-    """Return structure for solver results."""
-
-    ok: bool
-    theta: np.ndarray
-    message: str
-    cost: float
-    jac: Optional[np.ndarray]
-    cov: Optional[np.ndarray]
-    meta: dict
-
-
-def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
-    arr = []
-    for p in peaks:
-        arr.extend([p.center, p.height, p.fwhm, p.eta])
-    return np.asarray(arr, dtype=float)
 
 
 def solve(
@@ -35,63 +26,62 @@ def solve(
     mode: str,
     baseline: np.ndarray | None,
     options: dict,
-) -> SolveResult:
-    """Fit peak heights with centers/widths fixed using linear least squares.
+) -> Dict[str, Any]:
+    """Solve the non-linear least squares problem for classic fitting.
 
-    This lightweight implementation serves as an initial backend so the UI can
-    demonstrate fitting. It solves for peak heights only and returns an array of
-    full peak parameters to remain compatible with the blueprint API.
+    Parameters
+    ----------
+    x, y : ndarray
+        Data points.
+    peaks : list[Peak]
+        Initial peak guesses with lock flags.
+    mode : str
+        Baseline mode (``"add"`` or ``"subtract"``).
+    baseline : ndarray | None
+        Baseline array if applicable.
+    options : dict
+        Solver options supporting ``centers_in_window``, ``min_fwhm`` and
+        ``maxfev``.
     """
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     base_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
-    target = y - (base_arr if base_arr is not None else 0.0)
 
-    # enforce basic bounds on provided peak parameters
-    x_min = float(x.min())
-    x_max = float(x.max())
-    min_fwhm = float(options.get("min_fwhm", 1e-6))
-    clamp_center = bool(options.get("centers_in_window", False))
-    clean: list[Peak] = []
-    for p in peaks:
-        c = p.center
-        if clamp_center:
-            c = float(np.clip(c, x_min, x_max))
-        h = max(p.height, 0.0)
-        w = max(p.fwhm, min_fwhm)
-        e = float(np.clip(p.eta, 0.0, 1.0))
-        clean.append(Peak(c, h, w, e))
-
-    A_cols = []
-    for p in clean:
-        unit = Peak(p.center, 1.0, p.fwhm, p.eta)
-        A_cols.append(pv_sum(x, [unit]))
-    A = np.column_stack(A_cols) if A_cols else np.zeros((x.size, 0))
-    try:
-        heights, *_ = np.linalg.lstsq(A, target, rcond=None)
-        heights = np.maximum(heights, 0.0)
-        ok = True
-        message = "linear least squares"
-    except np.linalg.LinAlgError as exc:  # pragma: no cover - ill-conditioned
-        heights = np.zeros(len(clean))
-        ok = False
-        message = str(exc)
-
-    updated = [Peak(p.center, h, p.fwhm, p.eta) for p, h in zip(clean, heights)]
-    theta = _theta_from_peaks(updated)
-    model = pv_sum(x, updated)
+    # Handle baseline according to mode
+    y_target = y
+    base_model = None
     if base_arr is not None:
-        model = model + base_arr
-    resid = y - model
-    cost = float(0.5 * np.dot(resid, resid))
+        if mode == "subtract":
+            y_target = y - base_arr
+        else:  # add
+            base_model = base_arr
 
-    return SolveResult(
-        ok=ok,
-        theta=theta,
-        message=message,
-        cost=cost,
-        jac=None,
-        cov=None,
-        meta={},
-    )
+    maxfev = int(options.get("maxfev", 20000))
+
+    theta0, (lb, ub) = pack_theta_bounds(peaks, x, options)
+    resid_fn = build_residual(x, y_target, peaks, base_model, "linear", None)
+
+    res = least_squares(resid_fn, theta0, max_nfev=maxfev, bounds=(lb, ub))
+
+    theta = np.minimum(np.maximum(res.x, lb), ub)
+    cost = 0.5 * float(res.cost)
+    jac = res.jac if res.success else None
+    cov = None
+    if jac is not None:
+        try:
+            JTJ_inv = np.linalg.pinv(jac.T @ jac)
+            cov = JTJ_inv
+        except np.linalg.LinAlgError:  # pragma: no cover - singular
+            cov = None
+
+    return {
+        "ok": bool(res.success),
+        "theta": theta,
+        "message": res.message,
+        "cost": cost,
+        "jac": jac,
+        "cov": cov,
+        "meta": {"nfev": res.nfev, "njev": getattr(res, "njev", None)},
+    }
+

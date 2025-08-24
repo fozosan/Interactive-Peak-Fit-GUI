@@ -2,7 +2,7 @@
 with support for robust losses, weights and multi-start restarts."""
 from __future__ import annotations
 
-from typing import Optional, Sequence, TypedDict
+from typing import Dict, Any, Optional
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -12,22 +12,6 @@ from core.residuals import build_residual
 from .bounds import pack_theta_bounds
 
 
-class SolveResult(TypedDict):
-    ok: bool
-    theta: np.ndarray
-    message: str
-    cost: float
-    jac: Optional[np.ndarray]
-    cov: Optional[np.ndarray]
-    meta: dict
-
-
-def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
-    arr: list[float] = []
-    for p in peaks:
-        arr.extend([p.center, p.height, p.fwhm, p.eta])
-    return np.asarray(arr, dtype=float)
-
 
 def solve(
     x: np.ndarray,
@@ -36,7 +20,7 @@ def solve(
     mode: str,
     baseline: np.ndarray | None,
     options: dict,
-) -> SolveResult:
+) -> Dict[str, Any]:
     """Solve the non-linear least squares problem using SciPy's TRF solver.
 
     Parameters in ``options`` follow the blueprint: ``loss`` (passed directly to
@@ -46,7 +30,16 @@ def solve(
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
+    base_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
+
+    # Handle baseline according to mode
+    y_target = y
+    base_model = None
+    if base_arr is not None:
+        if mode == "subtract":
+            y_target = y - base_arr
+        else:  # add
+            base_model = base_arr
 
     loss = options.get("loss", "linear")
     weight_mode = options.get("weights", "none")
@@ -58,9 +51,9 @@ def solve(
     # construct weights
     weights = None
     if weight_mode == "poisson":
-        weights = 1.0 / np.sqrt(np.clip(y, 1.0, None))
+        weights = 1.0 / np.sqrt(np.clip(y_target, 1.0, None))
     elif weight_mode == "inv_y":
-        weights = 1.0 / np.clip(y, 1e-12, None)
+        weights = 1.0 / np.clip(y_target, 1e-12, None)
 
     theta0, (lb, ub) = pack_theta_bounds(peaks, x, options)
 
@@ -77,7 +70,7 @@ def solve(
         else:
             start = theta0
 
-        resid_fn = build_residual(x, y, peaks, baseline, loss, weights)
+        resid_fn = build_residual(x, y_target, peaks, base_model, loss, weights)
 
         res = least_squares(
             resid_fn,
@@ -107,12 +100,12 @@ def solve(
         except np.linalg.LinAlgError:  # pragma: no cover - singular
             cov = None
 
-    return SolveResult(
-        ok=ok,
-        theta=theta,
-        message=best.message,
-        cost=best_cost,
-        jac=jac,
-        cov=cov,
-        meta={"nfev": best.nfev, "njev": getattr(best, "njev", None)},
-    )
+    return {
+        "ok": ok,
+        "theta": theta,
+        "message": best.message,
+        "cost": best_cost,
+        "jac": jac,
+        "cov": cov,
+        "meta": {"nfev": best.nfev, "njev": getattr(best, "njev", None)},
+    }
