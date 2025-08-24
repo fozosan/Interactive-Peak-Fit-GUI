@@ -1,7 +1,7 @@
 """Utilities for packing peak parameters and bounds."""
 from __future__ import annotations
 
-from typing import Iterable, Sequence, Tuple
+from typing import Sequence, Tuple
 
 import numpy as np
 
@@ -46,29 +46,30 @@ def pack_theta_bounds(
     for pk in peaks:
         # center
         c = float(pk.center)
-        theta.append(c)
         if pk.lock_center:
-            lb.append(c)
-            ub.append(c)
+            lb_c = ub_c = c
         else:
             if clamp_center:
-                lb.append(x_min)
-                ub.append(x_max)
+                c = float(np.clip(c, x_min, x_max))
+                lb_c = x_min
+                ub_c = x_max
             else:
-                lb.append(-np.inf)
-                ub.append(np.inf)
+                lb_c = -np.inf
+                ub_c = np.inf
+        theta.append(c)
+        lb.append(lb_c)
+        ub.append(ub_c)
 
-        # height
-        h = float(pk.height)
+        # height (non-negative)
+        h = float(max(pk.height, 0.0))
         theta.append(h)
         lb.append(0.0)
         ub.append(np.inf)
 
         # FWHM
-        w = float(pk.fwhm)
+        w = float(max(pk.fwhm, min_fwhm))
         theta.append(w)
         if pk.lock_width:
-            w = max(w, min_fwhm)
             lb.append(w)
             ub.append(w)
         else:
