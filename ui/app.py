@@ -49,6 +49,7 @@ from core import signals
 from core.residuals import build_residual
 from fit import classic, lmfit_backend, modern, step_engine
 from infra import performance
+from batch import runner as batch_runner
 from uncertainty import asymptotic, bayes, bootstrap
 
 MODERN_LOSSES = ["linear", "soft_l1", "huber", "cauchy"]
@@ -99,6 +100,11 @@ DEFAULTS = {
     "auto_apply_template": False,
     "auto_apply_template_name": "",
     "x_label": "x",
+    "batch_patterns": "*.csv;*.txt;*.dat",
+    "batch_source": "template",
+    "batch_reheight": False,
+    "batch_auto_max": 5,
+    "batch_save_traces": False,
 }
 
 def load_config():
@@ -179,6 +185,13 @@ class PeakFitApp:
 
         # Axis label
         self.x_label_var = tk.StringVar(value=str(self.cfg.get("x_label", "x")))
+
+        # Batch defaults
+        self.batch_patterns = tk.StringVar(value=self.cfg.get("batch_patterns", "*.csv;*.txt;*.dat"))
+        self.batch_source = tk.StringVar(value=self.cfg.get("batch_source", "template"))
+        self.batch_reheight = tk.BooleanVar(value=bool(self.cfg.get("batch_reheight", False)))
+        self.batch_auto_max = tk.IntVar(value=int(self.cfg.get("batch_auto_max", 5)))
+        self.batch_save_traces = tk.BooleanVar(value=bool(self.cfg.get("batch_save_traces", False)))
 
         self._baseline_cache = {}
 
@@ -453,6 +466,23 @@ class PeakFitApp:
         ttk.Label(rowp, text="GPU chunk:").pack(side=tk.LEFT, padx=(8,0))
         ttk.Entry(rowp, width=7, textvariable=self.gpu_chunk_var).pack(side=tk.LEFT, padx=2)
         ttk.Button(rowp, text="Apply", command=self.apply_performance).pack(side=tk.LEFT, padx=4)
+
+        # Batch processing
+        batch_box = ttk.Labelframe(right, text="Batch"); batch_box.pack(fill=tk.X, pady=4)
+        rowb1 = ttk.Frame(batch_box); rowb1.pack(fill=tk.X, pady=2)
+        ttk.Label(rowb1, text="Pattern").pack(side=tk.LEFT)
+        ttk.Entry(rowb1, width=22, textvariable=self.batch_patterns).pack(side=tk.LEFT, padx=4)
+        rowb2 = ttk.Frame(batch_box); rowb2.pack(fill=tk.X, pady=2)
+        ttk.Label(rowb2, text="Source:").pack(side=tk.LEFT)
+        ttk.Radiobutton(rowb2, text="Current", variable=self.batch_source, value="current").pack(side=tk.LEFT)
+        ttk.Radiobutton(rowb2, text="Template", variable=self.batch_source, value="template").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(rowb2, text="Auto", variable=self.batch_source, value="auto").pack(side=tk.LEFT)
+        rowb3 = ttk.Frame(batch_box); rowb3.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(rowb3, text="Re-height", variable=self.batch_reheight).pack(side=tk.LEFT)
+        ttk.Checkbutton(rowb3, text="Save traces", variable=self.batch_save_traces).pack(side=tk.LEFT, padx=4)
+        ttk.Label(rowb3, text="Auto max:").pack(side=tk.LEFT, padx=(8,0))
+        ttk.Spinbox(rowb3, from_=1, to=20, textvariable=self.batch_auto_max, width=5).pack(side=tk.LEFT)
+        ttk.Button(batch_box, text="Run Batch…", command=self.run_batch).pack(side=tk.LEFT, pady=4)
 
         # Actions
         actions = ttk.Labelframe(right, text="Actions"); actions.pack(fill=tk.X, pady=4)
@@ -1139,6 +1169,64 @@ class PeakFitApp:
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
         self.status.config(text="Fit complete. Edit/lock as needed; Fit again or Export.")
+
+    def run_batch(self):
+        folder = filedialog.askdirectory(title="Select folder to batch process")
+        if not folder:
+            return
+        out_csv = filedialog.asksaveasfilename(
+            title="Save batch summary CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            initialfile="batch_summary.csv",
+        )
+        if not out_csv:
+            return
+        patterns = [p.strip() for p in self.batch_patterns.get().split(";") if p.strip()]
+        if not patterns:
+            patterns = ["*.csv", "*.txt", "*.dat"]
+        patterns = [str(Path(folder) / p) for p in patterns]
+        source = self.batch_source.get()
+        peaks_list = []
+        if source == "template":
+            tname = self.template_var.get()
+            tmpl = self.cfg.get("templates", {}).get(tname)
+            if not tmpl:
+                messagebox.showwarning("Batch", "Select a valid template first.")
+                return
+            peaks_list = tmpl
+        elif source == "current":
+            peaks_list = [p.__dict__ for p in self.peaks]
+
+        solver = self.solver_var.get().lower()
+        cfg = {
+            "peaks": peaks_list,
+            "solver": solver,
+            "mode": self.baseline_mode.get(),
+            "baseline": {
+                "lam": float(self.als_lam.get()),
+                "p": float(self.als_asym.get()),
+                "niter": int(self.als_niter.get()),
+                "thresh": float(self.als_thresh.get()),
+            },
+            "save_traces": bool(self.batch_save_traces.get()),
+            "peak_output": out_csv,
+            "source": source,
+            "reheight": bool(self.batch_reheight.get()),
+            "auto_max": int(self.batch_auto_max.get()),
+            solver: self._solver_options(),
+        }
+        try:
+            batch_runner.run(patterns, cfg)
+            messagebox.showinfo("Batch", f"Summary saved:\n{out_csv}")
+        except Exception as e:
+            messagebox.showerror("Batch", f"Batch failed:\n{e}")
+        self.cfg["batch_patterns"] = self.batch_patterns.get()
+        self.cfg["batch_source"] = source
+        self.cfg["batch_reheight"] = bool(self.batch_reheight.get())
+        self.cfg["batch_auto_max"] = int(self.batch_auto_max.get())
+        self.cfg["batch_save_traces"] = bool(self.batch_save_traces.get())
+        save_config(self.cfg)
 
     def run_uncertainty(self):
         if self.x is None or self.y_raw is None or not self.peaks:
