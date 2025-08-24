@@ -2,13 +2,13 @@
 with support for robust losses, weights and multi-start restarts."""
 from __future__ import annotations
 
-from typing import Optional, Sequence, TypedDict
+from typing import Optional, TypedDict
 
 import numpy as np
 from scipy.optimize import least_squares
 
-from core.peaks import Peak
 from core.residuals import build_residual
+from .bounds import pack_theta_bounds
 
 
 class SolveResult(TypedDict):
@@ -19,53 +19,6 @@ class SolveResult(TypedDict):
     jac: Optional[np.ndarray]
     cov: Optional[np.ndarray]
     meta: dict
-
-
-class SolveResult(TypedDict):
-    ok: bool
-    theta: np.ndarray
-    message: str
-    cost: float
-    jac: Optional[np.ndarray]
-    cov: Optional[np.ndarray]
-    meta: dict
-
-
-class SolveResult(TypedDict):
-    ok: bool
-    theta: np.ndarray
-    message: str
-    cost: float
-    jac: Optional[np.ndarray]
-    cov: Optional[np.ndarray]
-    meta: dict
-
-
-class SolveResult(TypedDict):
-    ok: bool
-    theta: np.ndarray
-    message: str
-    cost: float
-    jac: Optional[np.ndarray]
-    cov: Optional[np.ndarray]
-    meta: dict
-
-
-class SolveResult(TypedDict):
-    ok: bool
-    theta: np.ndarray
-    message: str
-    cost: float
-    jac: Optional[np.ndarray]
-    cov: Optional[np.ndarray]
-    meta: dict
-
-
-def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
-    arr: list[float] = []
-    for p in peaks:
-        arr.extend([p.center, p.height, p.fwhm, p.eta])
-    return np.asarray(arr, dtype=float)
 
 
 def solve(
@@ -101,20 +54,7 @@ def solve(
     elif weight_mode == "inv_y":
         weights = 1.0 / np.clip(y, 1e-12, None)
 
-    theta0 = _theta_from_peaks(peaks)
-    n_params = theta0.size
-
-    # bounds: enforce positive heights/FWHM and 0<=eta<=1; centers free
-    lb = np.full(n_params, -np.inf)
-    ub = np.full(n_params, np.inf)
-    for i in range(len(peaks)):
-        lb[4 * i + 1] = 0.0  # height >=0
-        lb[4 * i + 2] = options.get("min_fwhm", 1e-6)
-        lb[4 * i + 3] = 0.0
-        ub[4 * i + 3] = 1.0
-        if options.get("centers_in_window", False):
-            lb[4 * i] = x.min()
-            ub[4 * i] = x.max()
+    theta0, (lb, ub) = pack_theta_bounds(peaks, x, options)
 
     best = None
     best_cost = np.inf
@@ -123,7 +63,7 @@ def solve(
     for _ in range(max(1, restarts)):
         if jitter_pct:
             jitter = 1.0 + jitter_pct / 100.0 * rng.standard_normal(theta0.shape)
-            start = theta0 * jitter
+            start = np.clip(theta0 * jitter, lb, ub)
         else:
             start = theta0
 

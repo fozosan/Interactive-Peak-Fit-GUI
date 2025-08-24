@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 """Utilities for packing peak parameters and bounds."""
+from __future__ import annotations
 
 from typing import Sequence, Tuple
 
@@ -12,66 +11,74 @@ from core.peaks import Peak
 def pack_theta_bounds(
     peaks: Sequence[Peak],
     x: np.ndarray,
-    options: dict | None = None,
-) -> Tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
-    """Return flattened parameters and corresponding bounds.
+    options: dict,
+) -> Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+    """Return flattened peak parameters and bound arrays.
 
     Parameters
     ----------
     peaks:
-        Iterable of :class:`~core.peaks.Peak` instances describing the
-        current model.
+        Sequence of :class:`~core.peaks.Peak` objects to flatten.
     x:
-        1D array of x-values used for bounding peak centers when
-        ``options['centers_in_window']`` is true.
+        Abscissa values used to optionally clamp peak centers.
     options:
-        Mapping of solver options. Recognised keys are ``centers_in_window``
-        and ``min_fwhm``.
+        Mapping that may contain ``min_fwhm`` and ``centers_in_window`` keys
+        controlling bounds.
 
-    Returns
-    -------
-    theta, bounds
-        ``theta`` is the flattened parameter vector ``[c1, h1, w1, e1, c2, ...]``.
-        ``bounds`` is a ``(lb, ub)`` tuple matching ``theta``.
+    The parameter vector is ordered as ``[center, height, fwhm, eta]`` for each
+    peak. Bounds enforce non-negative heights, a minimum full-width at half
+    maximum, and 0 ≤ η ≤ 1. If ``centers_in_window`` is truthy, peak centers are
+    limited to ``[x.min(), x.max()]``. When ``lock_center`` or ``lock_width`` is
+    set on a peak the respective parameter is fixed by using identical lower and
+    upper bounds.
     """
 
-    options = options or {}
     x = np.asarray(x, dtype=float)
-    theta = []
-    lb = []
-    ub = []
+    theta: list[float] = []
+    lb: list[float] = []
+    ub: list[float] = []
 
-    x_min = float(x.min()) if x.size else -np.inf
-    x_max = float(x.max()) if x.size else np.inf
+    x_min = float(x.min())
+    x_max = float(x.max())
     min_fwhm = float(options.get("min_fwhm", 1e-6))
-    clamp_centers = bool(options.get("centers_in_window", False))
+    clamp_center = bool(options.get("centers_in_window", False))
 
     for pk in peaks:
-        theta.extend([pk.center, pk.height, pk.fwhm, pk.eta])
-
-        # center bounds
+        # center
+        c = float(pk.center)
         if pk.lock_center:
-            c_lb = c_ub = pk.center
-        elif clamp_centers:
-            c_lb, c_ub = x_min, x_max
+            lb_c = ub_c = c
         else:
-            c_lb, c_ub = -np.inf, np.inf
-        lb.append(c_lb)
-        ub.append(c_ub)
+            if clamp_center:
+                c = float(np.clip(c, x_min, x_max))
+                lb_c = x_min
+                ub_c = x_max
+            else:
+                lb_c = -np.inf
+                ub_c = np.inf
+        theta.append(c)
+        lb.append(lb_c)
+        ub.append(ub_c)
 
-        # height bounds (non-negative)
+        # height (non-negative)
+        h = float(max(pk.height, 0.0))
+        theta.append(h)
         lb.append(0.0)
         ub.append(np.inf)
 
-        # fwhm bounds
+        # FWHM
+        w = float(max(pk.fwhm, min_fwhm))
+        theta.append(w)
         if pk.lock_width:
-            lb.append(pk.fwhm)
-            ub.append(pk.fwhm)
+            lb.append(w)
+            ub.append(w)
         else:
             lb.append(min_fwhm)
             ub.append(np.inf)
 
-        # eta bounds (0-1)
+        # eta (shape factor)
+        e = float(np.clip(pk.eta, 0.0, 1.0))
+        theta.append(e)
         lb.append(0.0)
         ub.append(1.0)
 
@@ -79,6 +86,3 @@ def pack_theta_bounds(
     lb_arr = np.asarray(lb, dtype=float)
     ub_arr = np.asarray(ub, dtype=float)
     return theta_arr, (lb_arr, ub_arr)
-
-
-__all__ = ["pack_theta_bounds"]
