@@ -57,24 +57,43 @@ def solve(
     y = np.asarray(y, dtype=float)
     baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
 
+    # Optionally clamp centres to the data range and enforce minimal widths.
+    x_min = float(x.min())
+    x_max = float(x.max())
+    min_fwhm = float(options.get("min_fwhm", 1e-6))
+    clamp_center = bool(options.get("centers_in_window", False))
+
     params = lmfit.Parameters()
     share_w = bool(options.get("share_fwhm", False))
     share_e = bool(options.get("share_eta", False))
     if share_w:
-        params.add("w0", value=peaks[0].fwhm, min=0)
+        params.add("w0", value=max(peaks[0].fwhm, min_fwhm), min=min_fwhm)
     if share_e:
-        params.add("e0", value=peaks[0].eta, min=0, max=1)
+        params.add("e0", value=np.clip(peaks[0].eta, 0.0, 1.0), min=0, max=1)
     for i, p in enumerate(peaks):
-        params.add(f"c{i}", value=p.center, vary=not p.lock_center)
-        params.add(f"h{i}", value=p.height)
+        c = float(p.center)
+        if clamp_center:
+            c = float(np.clip(c, x_min, x_max))
+        h = float(max(p.height, 1e-12))
+        w = float(max(p.fwhm, min_fwhm))
+        e = float(np.clip(p.eta, 0.0, 1.0))
+
+        if clamp_center and not p.lock_center:
+            params.add(f"c{i}", value=c, min=x_min, max=x_max, vary=True)
+        else:
+            params.add(f"c{i}", value=c, vary=not p.lock_center)
+
+        params.add(f"h{i}", value=h, min=0)
+
         if share_w and i > 0:
             params.add(f"w{i}", expr="w0")
         else:
-            params.add(f"w{i}", value=p.fwhm, min=0, vary=not p.lock_width)
+            params.add(f"w{i}", value=w, min=min_fwhm, vary=not p.lock_width)
+
         if share_e and i > 0:
             params.add(f"e{i}", expr="e0")
         else:
-            params.add(f"e{i}", value=p.eta, min=0, max=1)
+            params.add(f"e{i}", value=e, min=0, max=1)
 
     def residual(pars: lmfit.Parameters) -> np.ndarray:
         pk: list[Peak] = []

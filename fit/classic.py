@@ -1,13 +1,14 @@
-"""Classic solver backend using SciPy's least squares routines."""
+"""Classic solver backend using SciPy's standard least-squares routine."""
+
 from __future__ import annotations
 
 from typing import Optional, Sequence, TypedDict
 
 import numpy as np
-from scipy.optimize import lsq_linear
+from scipy.optimize import least_squares
 
-from core.models import pv_sum
-from core.peaks import Peak
+from core.residuals import build_residual
+from .bounds import pack_theta_bounds
 
 
 class SolveResult(TypedDict):
@@ -22,13 +23,6 @@ class SolveResult(TypedDict):
     meta: dict
 
 
-def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
-    arr = []
-    for p in peaks:
-        arr.extend([p.center, p.height, p.fwhm, p.eta])
-    return np.asarray(arr, dtype=float)
-
-
 def solve(
     x: np.ndarray,
     y: np.ndarray,
@@ -37,74 +31,49 @@ def solve(
     baseline: np.ndarray | None,
     options: dict,
 ) -> SolveResult:
-    """Fit peak heights with centers/widths fixed using linear least squares.
+    """Solve the full non-linear least squares problem with a linear loss.
 
-    This lightweight implementation serves as an initial backend so the UI can
-    demonstrate fitting. It solves for peak heights only and returns an array of
-    full peak parameters to remain compatible with the blueprint API.
+    This function mirrors the behaviour of the classic 2.7 backend where all
+    peak parameters (centre, height, FWHM and eta) are optimised simultaneously
+    using SciPy's :func:`least_squares` with a standard (linear) loss.  It acts
+    as the lightweight counterpart to :mod:`fit.modern` which adds robust losses
+    and restarts.
     """
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    baseline = np.asarray(baseline, dtype=float) if baseline is not None else 0.0
+    baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
 
-    if mode == "add":
-        target = y - baseline
-    elif mode == "subtract":
-        target = y - baseline
-    else:  # pragma: no cover - unknown mode
-        return SolveResult(
-            ok=False,
-            theta=_theta_from_peaks(peaks),
-            message="unknown mode",
-            cost=float("nan"),
-            jac=None,
-            cov=None,
-            meta={},
-        )
+    maxfev = int(options.get("maxfev", 20000))
 
-    # enforce basic bounds on provided peak parameters
-    x_min = float(x.min())
-    x_max = float(x.max())
-    min_fwhm = float(options.get("min_fwhm", 1e-6))
-    clamp_center = bool(options.get("centers_in_window", False))
-    clean: list[Peak] = []
-    for p in peaks:
-        c = p.center
-        if clamp_center:
-            c = float(np.clip(c, x_min, x_max))
-        h = max(p.height, 0.0)
-        w = max(p.fwhm, min_fwhm)
-        e = float(np.clip(p.eta, 0.0, 1.0))
-        clean.append(Peak(c, h, w, e))
+    theta0, bounds = pack_theta_bounds(peaks, x, options)
+    resid_fn = build_residual(x, y, peaks, mode, baseline, "linear", None)
 
-    A_cols = []
-    for p in clean:
-        unit = Peak(p.center, 1.0, p.fwhm, p.eta)
-        A_cols.append(pv_sum(x, [unit]))
-    A = np.column_stack(A_cols) if A_cols else np.zeros((x.size, 0))
-    try:
-        res = lsq_linear(A, target, bounds=(0.0, np.inf))
-        heights = res.x
-        ok = res.success
-        message = res.message
-    except Exception as exc:  # pragma: no cover - solver failure
-        heights = np.zeros(len(peaks))
-        ok = False
-        message = str(exc)
+    res = least_squares(
+        resid_fn,
+        theta0,
+        method="trf",
+        loss="linear",
+        max_nfev=maxfev,
+        bounds=bounds,
+    )
 
-    updated = [Peak(p.center, h, p.fwhm, p.eta) for p, h in zip(clean, heights)]
-    theta = _theta_from_peaks(updated)
-    model = pv_sum(x, updated)
-    resid = target - model
-    cost = float(0.5 * np.dot(resid, resid))
+    ok = bool(res.success)
+    theta = res.x
+    jac = res.jac if ok else None
+    cov = None
+    if jac is not None:
+        try:
+            cov = np.linalg.pinv(jac.T @ jac)
+        except np.linalg.LinAlgError:  # pragma: no cover - singular
+            cov = None
 
     return SolveResult(
         ok=ok,
         theta=theta,
-        message=message,
-        cost=cost,
-        jac=None,
-        cov=None,
-        meta={},
+        message=res.message,
+        cost=float(res.cost),
+        jac=jac,
+        cov=cov,
+        meta={"nfev": res.nfev, "njev": getattr(res, "njev", None)},
     )
