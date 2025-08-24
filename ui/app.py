@@ -1293,7 +1293,7 @@ class PeakFitApp:
             theta.extend([p.center, p.height, p.fwhm, p.eta])
         theta = np.asarray(theta, dtype=float)
 
-        resid_fn = build_residual(x_fit, y_fit, self.peaks, base_fit, "linear", None)
+        resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
         method = self.unc_method.get().lower()
         solver = self.solver_var.get().lower()
         self.log(f"Running uncertainty ({method}) with solver {solver}")

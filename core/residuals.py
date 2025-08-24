@@ -17,6 +17,7 @@ def build_residual(
     x: np.ndarray,
     y: np.ndarray,
     peaks: Sequence[Peak],
+    mode: str,
     baseline: np.ndarray | None,
     loss: str,
     weights: np.ndarray | None,
@@ -43,8 +44,14 @@ def build_residual(
             c, h, fw, eta = theta[4 * i : 4 * (i + 1)]
             pk.append(Peak(c, h, fw, eta))
         model = pv_sum(x, pk)
-        base = baseline if baseline is not None else 0.0
-        r = model + base - y
+        if mode == "add":
+            base = baseline if baseline is not None else 0.0
+            r = model + base - y
+        elif mode == "subtract":
+            base = baseline if baseline is not None else 0.0
+            r = model - (y - base)
+        else:  # pragma: no cover - unknown mode
+            raise ValueError("unknown mode")
         if w is not None:
             r = r * w
         return r

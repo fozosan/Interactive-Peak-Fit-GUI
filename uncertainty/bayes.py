@@ -47,7 +47,7 @@ def bayesian(
     ub = np.asarray(priors.get("ub", np.inf), dtype=float)
     sigma = float(priors.get("sigma", 1.0))
 
-    resid_fn = build_residual(x, y, peaks_tpl, baseline, "linear", None)
+    resid_fn = build_residual(x, y, peaks_tpl, mode, baseline, "linear", None)
 
     def log_prob(theta: np.ndarray) -> float:
         if np.any(theta < lb) or np.any(theta > ub):

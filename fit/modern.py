@@ -2,7 +2,7 @@
 with support for robust losses, weights and multi-start restarts."""
 from __future__ import annotations
 
-from typing import Dict, Any, Optional
+from typing import Sequence
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -12,6 +12,12 @@ from core.residuals import build_residual
 from .bounds import pack_theta_bounds
 
 
+def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
+    arr: list[float] = []
+    for p in peaks:
+        arr.extend([p.center, p.height, p.fwhm, p.eta])
+    return np.asarray(arr, dtype=float)
+
 
 def solve(
     x: np.ndarray,
@@ -20,7 +26,7 @@ def solve(
     mode: str,
     baseline: np.ndarray | None,
     options: dict,
-) -> Dict[str, Any]:
+) -> dict:
     """Solve the non-linear least squares problem using SciPy's TRF solver.
 
     Parameters in ``options`` follow the blueprint: ``loss`` (passed directly to
@@ -70,7 +76,7 @@ def solve(
         else:
             start = theta0
 
-        resid_fn = build_residual(x, y_target, peaks, base_model, loss, weights)
+        resid_fn = build_residual(x, y, peaks, mode, baseline, loss, weights)
 
         res = least_squares(
             resid_fn,
@@ -109,3 +115,4 @@ def solve(
         "cov": cov,
         "meta": {"nfev": best.nfev, "njev": getattr(best, "njev", None)},
     }
+
