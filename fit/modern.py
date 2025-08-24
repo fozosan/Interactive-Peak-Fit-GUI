@@ -79,7 +79,7 @@ def solve(
             bounds=(lb, ub),
         )
 
-        cost = 0.5 * float(res.cost)
+        cost = float(res.cost)  # ``res.cost`` already includes the 1/2 factor
         if cost < best_cost:
             best = res
             best_cost = cost
