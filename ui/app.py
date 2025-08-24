@@ -44,6 +44,8 @@ from matplotlib.widgets import SpanSelector
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
+from .helptext import HELP
+
 from scipy.signal import find_peaks
 
 from core import signals
@@ -196,6 +198,10 @@ class PeakFitApp:
         self.unc_report = None
         self.last_fit = None
 
+        # Tooltip and help window state
+        self._tooltips: List[tk.Toplevel] = []
+        self.help_window: Optional[tk.Toplevel] = None
+
         # UI
         self._build_ui()
         self._new_figure()
@@ -251,6 +257,7 @@ class PeakFitApp:
         ttk.Button(baseline_box, text="Recompute baseline", command=self.compute_baseline).pack(side=tk.LEFT, pady=2)
         ttk.Button(baseline_box, text="Save as default", command=self.save_baseline_default).pack(side=tk.LEFT, padx=4)
         ttk.Label(baseline_box, textvariable=self.snr_text).pack(side=tk.LEFT, padx=8)
+        ttk.Label(baseline_box, text=HELP["baseline"], wraplength=220).pack(anchor="w", pady=(4, 0))
 
         # Eta box
         eta_box = ttk.Labelframe(right, text="Shape factor η (0=Gaussian, 1=Lorentzian)"); eta_box.pack(fill=tk.X, pady=4)
@@ -346,13 +353,22 @@ class PeakFitApp:
 
         # Solver selection
         solver_box = ttk.Labelframe(right, text="Solver"); solver_box.pack(fill=tk.X, pady=4)
-        ttk.Combobox(solver_box, textvariable=self.solver_var, state="readonly",
-                     values=["Classic", "Modern", "LMFIT"], width=12).pack(side=tk.LEFT, padx=4)
+        solver_cb = ttk.Combobox(
+            solver_box,
+            textvariable=self.solver_var,
+            state="readonly",
+            values=["Classic", "Modern", "LMFIT"],
+            width=12,
+        )
+        solver_cb.pack(side=tk.LEFT, padx=4)
+        self._add_tooltip(solver_cb, HELP["solver"])
 
         # Actions
         actions = ttk.Labelframe(right, text="Actions"); actions.pack(fill=tk.X, pady=4)
         ttk.Button(actions, text="Auto-seed", command=self.auto_seed).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Step \u25B6", command=self.step_once).pack(side=tk.LEFT, padx=4)
+        btn_step = ttk.Button(actions, text="Step \u25B6", command=self.step_once)
+        btn_step.pack(side=tk.LEFT, padx=4)
+        self._add_tooltip(btn_step, HELP["step"])
         ttk.Button(actions, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Toggle components", command=self.toggle_components).pack(side=tk.LEFT, padx=4)
 
@@ -368,6 +384,32 @@ class PeakFitApp:
         # Status
         self.status = ttk.Label(self.root, text="Open CSV/TXT/DAT, set baseline/range, add peaks, set η, then Fit.")
         self.status.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
+
+    def _add_tooltip(self, widget, text: str):
+        tip = tk.Toplevel(widget)
+        tip.withdraw()
+        tip.overrideredirect(True)
+        lbl = ttk.Label(
+            tip,
+            text=text,
+            justify=tk.LEFT,
+            background="#ffffe0",
+            relief="solid",
+            borderwidth=1,
+            padding=2,
+        )
+        lbl.pack()
+
+        def show(event):
+            tip.geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+            tip.deiconify()
+
+        def hide(_event):
+            tip.withdraw()
+
+        widget.bind("<Enter>", show)
+        widget.bind("<Leave>", hide)
+        self._tooltips.append(tip)
 
     def _new_figure(self):
         self.ax.clear()
@@ -1201,25 +1243,18 @@ class PeakFitApp:
 
     # ----- Help -----
     def show_help(self):
-        message = (
-            "Supported files:\n"
-            "  • CSV, TXT, DAT with two numeric columns (x,y).\n"
-            "  • Delimiters auto-detected (comma, tab, spaces, semicolons).\n"
-            "  • Lines starting with #, %, // (or text headers) are ignored.\n\n"
-            "Baseline modes:\n"
-            "  • Add to fit (default): model = baseline + sum(peaks) on raw data.\n"
-            "  • Subtract: model = sum(peaks) on (raw - baseline).\n\n"
-            "Fit range:\n"
-            "  • Type Min/Max or drag with 'Select on plot'; 'Full range' clears.\n"
-            "  • 'Baseline uses fit range' computes ALS on that slice, then interpolates.\n\n"
-            "Templates:\n"
-            "  • Save multiple named templates; 'Save changes' overwrites selected.\n"
-            "  • 'Auto-apply on open' uses the currently selected template.\n\n"
-            "Interaction:\n"
-            "  • 'Add peaks on click' toggles picking; Zoom/Pan ignores clicks.\n"
-            "  • 'Zoom out' widens x-view; 'Reset view' equals toolbar Home.\n"
-        )
-        messagebox.showinfo("Help", message)
+        if self.help_window and self.help_window.winfo_exists():
+            self.help_window.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Help")
+        txt = tk.Text(win, wrap="word", width=60, height=24)
+        message = "\n\n".join(HELP.values())
+        txt.insert("1.0", message)
+        txt.config(state="disabled")
+        txt.pack(fill=tk.BOTH, expand=True)
+        self.help_window = win
 
 
 def main():
