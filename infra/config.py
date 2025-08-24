@@ -7,6 +7,13 @@ from typing import Any, Dict
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "version": "3.0",
+    "batch": {
+        "patterns": "*.csv;*.txt;*.dat",
+        "source": "template",
+        "reheight": False,
+        "save_traces": False,
+        "auto_max": 5,
+    },
 }
 
 
