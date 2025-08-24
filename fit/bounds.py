@@ -55,6 +55,8 @@ def pack_theta_bounds(
     x_max = float(x.max())
     dx_med = float(np.median(np.diff(np.sort(x)))) if len(x) > 1 else 1.0
     min_fwhm = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
+    max_fwhm = float(options.get("max_fwhm", 0.5 * (x_max - x_min)))
+    max_height = float(options.get("max_height", np.inf))
     clamp_center = bool(options.get("centers_in_window", False))
 
     # ``theta_list`` collects the starting parameter vector.  We ensure all
@@ -78,6 +80,8 @@ def pack_theta_bounds(
             c = float(np.clip(c, x_min, x_max))
         h = float(max(pk.height, 1e-12))
         w = float(max(pk.fwhm, min_fwhm))
+        w = float(min(w, max_fwhm))
+        h = float(min(h, max_height))
         e = float(np.clip(pk.eta, 0.0, 1.0))
 
         theta_list.extend([c, h, w, e])
@@ -95,7 +99,7 @@ def pack_theta_bounds(
 
         # bounds for height
         lb_list.append(0.0)
-        ub_list.append(np.inf)
+        ub_list.append(max_height)
 
         # bounds for width
         if pk.lock_width:
@@ -103,7 +107,7 @@ def pack_theta_bounds(
             ub_list.append(w)
         else:
             lb_list.append(min_fwhm)
-            ub_list.append(np.inf)
+            ub_list.append(max_fwhm)
 
         # bounds for eta
         lb_list.append(0.0)
