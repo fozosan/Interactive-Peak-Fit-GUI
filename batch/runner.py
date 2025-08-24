@@ -114,7 +114,9 @@ def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str]
                     tpl.height = float(max(sig[idx_near], 1e-6))
 
         opts = config.get(solver_name, {})
-        res = _apply_solver(solver_name, x, y, template, mode, baseline, opts)
+        y_fit = y - baseline if mode == "subtract" else y
+        base_arg = baseline if mode == "add" else None
+        res = _apply_solver(solver_name, x, y_fit, template, mode, base_arg, opts)
 
         theta = np.asarray(res["theta"], dtype=float)
         fitted = []
@@ -124,7 +126,7 @@ def run(patterns: Iterable[str], config: dict, progress: Optional[Callable[[str]
 
         model = models.pv_sum(x, fitted)
         resid = model + (baseline if mode == "add" else 0.0) - (
-            y if mode == "add" else y - baseline
+            y if mode == "add" else y_fit
         )
         rmse = float(np.sqrt(np.mean(resid**2)))
         areas = [models.pv_area(p.height, p.fwhm, p.eta) for p in fitted]
