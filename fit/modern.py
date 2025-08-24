@@ -2,12 +2,11 @@
 with support for robust losses, weights and multi-start restarts."""
 from __future__ import annotations
 
-from typing import Optional, Sequence, TypedDict
+from typing import Optional, TypedDict
 
 import numpy as np
 from scipy.optimize import least_squares
 
-from core.peaks import Peak
 from core.residuals import build_residual
 from .bounds import pack_theta_bounds
 

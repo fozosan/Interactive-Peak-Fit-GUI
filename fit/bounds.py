@@ -45,7 +45,6 @@ def pack_theta_bounds(
     min_fwhm = float(options.get("min_fwhm", 1e-6))
     clamp_center = bool(options.get("centers_in_window", False))
     eps = np.finfo(float).eps
-
     for pk in peaks:
         # center
         c = float(pk.center)
