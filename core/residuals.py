@@ -9,7 +9,7 @@ try:  # optional CuPy support
 except Exception:  # pragma: no cover - CuPy may be absent
     cp = None  # type: ignore
 
-from .models import pv_sum
+from .models import pv_sum, pv_sum_with_jac
 from .peaks import Peak
 
 
@@ -57,6 +57,76 @@ def build_residual(
         return r
 
     return residual
+
+
+def build_residual_jac(
+    x: np.ndarray,
+    y: np.ndarray,
+    peaks: Sequence[Peak],
+    mode: str,
+    baseline: np.ndarray | None,
+    weights: np.ndarray | None,
+) -> Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]:
+    """Return residual and Jacobian builder for solvers.
+
+    The parameter vector ``theta`` follows the order ``[h1,(c1),(w1), h2,(c2),(w2), ...]``
+    where centres and widths are omitted when locked.
+    """
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
+    w = np.asarray(weights, dtype=float) if weights is not None else None
+
+    n = len(peaks)
+    h0 = np.array([p.height for p in peaks], dtype=float)
+    c0 = np.array([p.center for p in peaks], dtype=float)
+    f0 = np.array([p.fwhm for p in peaks], dtype=float)
+    e = np.array([p.eta for p in peaks], dtype=float)
+    lock_c = np.array([p.lock_center for p in peaks], dtype=bool)
+    lock_w = np.array([p.lock_width for p in peaks], dtype=bool)
+
+    def residual_jac(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        theta = np.asarray(theta, dtype=float)
+        if theta.size != (n + (~lock_c).sum() + (~lock_w).sum()):
+            raise ValueError("theta has wrong size")
+        h = h0.copy()
+        c = c0.copy()
+        f = f0.copy()
+        j = 0
+        for i in range(n):
+            h[i] = theta[j]
+            j += 1
+            if not lock_c[i]:
+                c[i] = theta[j]
+                j += 1
+            if not lock_w[i]:
+                f[i] = theta[j]
+                j += 1
+
+        model, dh, dc, df = pv_sum_with_jac(x, c, h, f, e)
+        cols = []
+        for i in range(n):
+            cols.append(dh[:, i])
+            if not lock_c[i]:
+                cols.append(dc[:, i])
+            if not lock_w[i]:
+                cols.append(df[:, i])
+        J = np.column_stack(cols) if cols else np.zeros((x.size, 0))
+
+        base = baseline if baseline is not None else 0.0
+        if mode == "add":
+            r = model + base - y
+        elif mode == "subtract":
+            r = model - (y - base)
+        else:  # pragma: no cover - unknown mode
+            raise ValueError("unknown mode")
+        if w is not None:
+            r = r * w
+            J = J * w[:, None]
+        return r, J
+
+    return residual_jac
 
 
 def _xp(arr: np.ndarray):

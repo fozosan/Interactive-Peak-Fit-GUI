@@ -53,21 +53,39 @@ def pack_theta_bounds(
     x = np.asarray(x, dtype=float)
     x_min = float(x.min())
     x_max = float(x.max())
-    min_fwhm = float(options.get("min_fwhm", 1e-6))
+    dx_med = float(np.median(np.diff(np.sort(x)))) if len(x) > 1 else 1.0
+    min_fwhm = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
     clamp_center = bool(options.get("centers_in_window", False))
+
+    # ``theta_list`` collects the starting parameter vector.  We ensure all
+    # starting values already respect the bounds so the solvers do not start
+    # outside the feasible region which can lead to immediate failures or very
+    # poor convergence (observed when loading templates or using auto-seeded
+    # peaks).
 
     theta_list: list[float] = []
     lb_list: list[float] = []
     ub_list: list[float] = []
 
     for pk in peaks:
-        # parameter packing
-        theta_list.extend([pk.center, pk.height, pk.fwhm, pk.eta])
+        # Clamp starting values to lie inside the declared bounds.  Heights and
+        # widths must be positive; eta is restricted to [0, 1]; centres can be
+        # optionally clamped to the data window.  Doing this here keeps all
+        # solvers consistent (Classic/Modern/LMFIT) as they all rely on this
+        # helper to form ``theta0``.
+        c = float(pk.center)
+        if clamp_center:
+            c = float(np.clip(c, x_min, x_max))
+        h = float(max(pk.height, 1e-12))
+        w = float(max(pk.fwhm, min_fwhm))
+        e = float(np.clip(pk.eta, 0.0, 1.0))
+
+        theta_list.extend([c, h, w, e])
 
         # bounds for center
         if pk.lock_center:
-            lb_list.append(pk.center)
-            ub_list.append(pk.center)
+            lb_list.append(c)
+            ub_list.append(c)
         elif clamp_center:
             lb_list.append(x_min)
             ub_list.append(x_max)
@@ -81,8 +99,8 @@ def pack_theta_bounds(
 
         # bounds for width
         if pk.lock_width:
-            lb_list.append(pk.fwhm)
-            ub_list.append(pk.fwhm)
+            lb_list.append(w)
+            ub_list.append(w)
         else:
             lb_list.append(min_fwhm)
             ub_list.append(np.inf)
@@ -94,4 +112,15 @@ def pack_theta_bounds(
     theta = np.asarray(theta_list, dtype=float)
     lb = np.asarray(lb_list, dtype=float)
     ub = np.asarray(ub_list, dtype=float)
+
+    # ``scipy.optimize.least_squares`` requires ``lb < ub`` for all parameters
+    # (strict inequality).  Locked parameters yield equal bounds which previously
+    # triggered the "Each lower bound must be strictly less than each upper
+    # bound" error when fitting from templates.  Add a tiny epsilon to the upper
+    # bound to keep the parameter effectively fixed while satisfying the solver
+    # requirement.
+    mask = lb >= ub
+    if np.any(mask):
+        ub[mask] = lb[mask] + 1e-12
+
     return theta, (lb, ub)

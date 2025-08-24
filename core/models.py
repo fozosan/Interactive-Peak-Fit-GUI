@@ -35,6 +35,68 @@ def pv_sum(x: np.ndarray, peaks: list, xp_module=xp) -> np.ndarray:
     return y
 
 
+def pv_sum_with_jac(
+    x: np.ndarray,
+    centers: np.ndarray,
+    heights: np.ndarray,
+    fwhm: np.ndarray,
+    eta: np.ndarray,
+    xp_module=xp,
+):
+    """Return ``y`` and analytic Jacobian for pseudo-Voigt peaks.
+
+    Parameters are arrays of per-peak values.  The Jacobian is dense with
+    derivative columns ordered as ``[dh, dc, df]`` for each peak.  Widths are
+    internally clipped to ``>=1e-6`` to avoid divisions by zero.
+    """
+
+    x = xp_module.asarray(x, dtype=float)
+    c = xp_module.asarray(centers, dtype=float)
+    h = xp_module.asarray(heights, dtype=float)
+    f = xp_module.maximum(xp_module.asarray(fwhm, dtype=float), 1e-6)
+    e = xp_module.asarray(eta, dtype=float)
+
+    dx = x[:, None] - c[None, :]
+
+    A = 4.0 * xp_module.log(2.0)
+    B = 4.0
+
+    g = xp_module.exp(-A * (dx**2) / f**2)
+    dg_dc = g * (2.0 * A) * dx / f**2
+    dg_df = g * (2.0 * A) * (dx**2) / f**3
+
+    denom = 1.0 + B * (dx**2) / f**2
+    L = 1.0 / denom
+    dL_dc = (2.0 * B) * dx / f**2 / denom**2
+    dL_df = (2.0 * B) * (dx**2) / f**3 / denom**2
+
+    e = e[None, :]
+    base = (1.0 - e) * g + e * L
+    y = (h[None, :] * base).sum(axis=1)
+
+    dh = base
+    dc = h[None, :] * ((1.0 - e) * dg_dc + e * dL_dc)
+    df = h[None, :] * ((1.0 - e) * dg_df + e * dL_df)
+
+    return y, dh, dc, df
+
+
+def pv_design_matrix(x: np.ndarray, peaks: list, xp_module=xp) -> np.ndarray:
+    """Return design matrix for height-only fits.
+
+    Each column ``k`` is the pseudo-Voigt peak ``k`` evaluated at unit height
+    with fixed centre/FWHM/eta from ``peaks``.
+    """
+
+    centers = [p.center for p in peaks]
+    widths = [p.fwhm for p in peaks]
+    etas = [p.eta for p in peaks]
+    heights = [1.0] * len(peaks)
+    _, dh, _, _ = pv_sum_with_jac(
+        x, np.asarray(centers), np.asarray(heights), np.asarray(widths), np.asarray(etas), xp_module
+    )
+    return xp_module.asarray(dh)
+
 def pv_area(height: float, fwhm: float, eta: float) -> float:
     """Return the analytic area of a pseudo-Voigt peak."""
 

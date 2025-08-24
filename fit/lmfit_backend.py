@@ -1,4 +1,5 @@
-"""LMFIT backend providing parameter constraints and alternative algorithms."""
+"""LMFIT backend using analytic residuals and Jacobian."""
+
 from __future__ import annotations
 
 from typing import Optional, Sequence, TypedDict
@@ -6,7 +7,8 @@ from typing import Optional, Sequence, TypedDict
 import numpy as np
 
 from core.peaks import Peak
-from core.models import pv_sum
+from core.residuals import build_residual_jac
+from .bounds import pack_theta_bounds
 
 
 class SolveResult(TypedDict):
@@ -29,20 +31,14 @@ def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
 def solve(
     x: np.ndarray,
     y: np.ndarray,
-    peaks: list,
+    peaks: list[Peak],
     mode: str,
     baseline: np.ndarray | None,
     options: dict,
 ) -> SolveResult:
-    """Fit peaks using the optional `lmfit` dependency.
-
-    If `lmfit` is not installed, ``ok`` will be ``False`` and ``message`` will
-    explain the missing dependency.
-    """
-
     try:
         import lmfit
-    except Exception as exc:  # pragma: no cover - lmfit missing
+    except Exception as exc:  # pragma: no cover - dependency missing
         return SolveResult(
             ok=False,
             theta=_theta_from_peaks(peaks),
@@ -57,71 +53,84 @@ def solve(
     y = np.asarray(y, dtype=float)
     baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
 
+    weight_mode = options.get("weights", "none")
+    weights = None
+    if weight_mode == "poisson":
+        weights = 1.0 / np.sqrt(np.clip(np.abs(y), 1.0, None))
+    elif weight_mode == "inv_y":
+        weights = 1.0 / np.clip(np.abs(y), 1e-12, None)
+
+    theta0_full, bounds_full = pack_theta_bounds(peaks, x, options)
+    dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
+    min_fwhm = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
+    x_min = float(x.min())
+    x_max = float(x.max())
+    clamp_center = bool(options.get("centers_in_window", False))
+
     params = lmfit.Parameters()
-    share_w = bool(options.get("share_fwhm", False))
-    share_e = bool(options.get("share_eta", False))
-    if share_w:
-        params.add("w0", value=peaks[0].fwhm, min=0)
-    if share_e:
-        params.add("e0", value=peaks[0].eta, min=0, max=1)
     for i, p in enumerate(peaks):
-        params.add(f"c{i}", value=p.center, vary=not p.lock_center)
-        params.add(f"h{i}", value=p.height)
-        if share_w and i > 0:
-            params.add(f"w{i}", expr="w0")
-        else:
-            params.add(f"w{i}", value=p.fwhm, min=0, vary=not p.lock_width)
-        if share_e and i > 0:
-            params.add(f"e{i}", expr="e0")
-        else:
-            params.add(f"e{i}", value=p.eta, min=0, max=1)
+        c = float(np.clip(p.center, x_min, x_max)) if clamp_center else float(p.center)
+        w = float(max(p.fwhm, min_fwhm))
+        params.add(f"h{i}", value=max(p.height, 1e-12), min=0)
+        params.add(
+            f"c{i}", value=c,
+            min=x_min if clamp_center else None,
+            max=x_max if clamp_center else None,
+            vary=not p.lock_center,
+        )
+        params.add(
+            f"w{i}", value=w, min=min_fwhm, vary=not p.lock_width
+        )
+
+    resid_jac = build_residual_jac(x, y, peaks, mode, baseline, weights)
 
     def residual(pars: lmfit.Parameters) -> np.ndarray:
-        pk: list[Peak] = []
-        for i in range(len(peaks)):
-            pk.append(
-                Peak(
-                    pars[f"c{i}"].value,
-                    pars[f"h{i}"].value,
-                    pars[f"w{i}"].value,
-                    pars[f"e{i}"].value,
-                )
-            )
-        model = pv_sum(x, pk)
-        base = baseline if baseline is not None else 0.0
-        if mode == "add":
-            r = model + base - y
-        elif mode == "subtract":
-            r = model - (y - base)
-        else:  # pragma: no cover - unknown mode
-            raise ValueError("unknown mode")
+        theta = []
+        for i, p in enumerate(peaks):
+            theta.append(pars[f"h{i}"].value)
+            if not p.lock_center:
+                theta.append(pars[f"c{i}"].value)
+            if not p.lock_width:
+                theta.append(pars[f"w{i}"].value)
+        r, _ = resid_jac(np.asarray(theta, dtype=float))
         return r
 
-    algo = options.get("algo", "least_squares")
+    def jac(pars: lmfit.Parameters) -> np.ndarray:
+        theta = []
+        for i, p in enumerate(peaks):
+            theta.append(pars[f"h{i}"].value)
+            if not p.lock_center:
+                theta.append(pars[f"c{i}"].value)
+            if not p.lock_width:
+                theta.append(pars[f"w{i}"].value)
+        _, J = resid_jac(np.asarray(theta, dtype=float))
+        return J
+
     maxfev = int(options.get("maxfev", 20000))
+    minimizer = lmfit.Minimizer(residual, params, jac=jac, nan_policy="omit")
+    result = minimizer.minimize(method="least_squares", max_nfev=maxfev)
 
-    res = lmfit.minimize(residual, params, method=algo, max_nfev=maxfev)
+    theta_full = theta0_full.copy()
+    idx = 0
+    for i, p in enumerate(peaks):
+        theta_full[4 * i + 1] = result.params[f"h{i}"].value
+        if not p.lock_center:
+            theta_full[4 * i + 0] = result.params[f"c{i}"].value
+        if not p.lock_width:
+            theta_full[4 * i + 2] = result.params[f"w{i}"].value
+        # eta stays as initial
 
-    theta = []
-    for i in range(len(peaks)):
-        theta.extend(
-            [
-                res.params[f"c{i}"].value,
-                res.params[f"h{i}"].value,
-                res.params[f"w{i}"].value,
-                res.params[f"e{i}"].value,
-            ]
-        )
-    theta = np.asarray(theta, dtype=float)
-    r = residual(res.params)
+    r = residual(result.params)
     cost = 0.5 * float(r @ r)
+    J = jac(result.params)
 
     return SolveResult(
-        ok=res.success,
-        theta=theta,
-        message=res.message,
+        ok=result.success,
+        theta=theta_full,
+        message=result.message,
         cost=cost,
-        jac=None,
-        cov=res.covar,
-        meta={"nfev": res.nfev},
+        jac=J,
+        cov=result.covar,
+        meta={"nfev": result.nfev},
     )
+
