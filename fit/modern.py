@@ -2,7 +2,7 @@
 with support for robust losses, weights and multi-start restarts."""
 from __future__ import annotations
 
-from typing import Optional, Sequence, TypedDict
+from typing import Optional, TypedDict
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -22,13 +22,6 @@ class SolveResult(TypedDict):
     meta: dict
 
 
-def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
-    arr: list[float] = []
-    for p in peaks:
-        arr.extend([p.center, p.height, p.fwhm, p.eta])
-    return np.asarray(arr, dtype=float)
-
-
 def solve(
     x: np.ndarray,
     y: np.ndarray,
@@ -46,7 +39,16 @@ def solve(
 
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    baseline = np.asarray(baseline, dtype=float) if baseline is not None else None
+    base_arr = np.asarray(baseline, dtype=float) if baseline is not None else None
+
+    # Handle baseline according to mode
+    y_target = y
+    base_model = None
+    if base_arr is not None:
+        if mode == "subtract":
+            y_target = y - base_arr
+        else:  # add
+            base_model = base_arr
 
     loss = options.get("loss", "linear")
     weight_mode = options.get("weights", "none")
@@ -58,9 +60,9 @@ def solve(
     # construct weights
     weights = None
     if weight_mode == "poisson":
-        weights = 1.0 / np.sqrt(np.clip(y, 1.0, None))
+        weights = 1.0 / np.sqrt(np.clip(y_target, 1.0, None))
     elif weight_mode == "inv_y":
-        weights = 1.0 / np.clip(y, 1e-12, None)
+        weights = 1.0 / np.clip(y_target, 1e-12, None)
 
     theta0, (lb, ub) = pack_theta_bounds(peaks, x, options)
 
@@ -77,7 +79,7 @@ def solve(
         else:
             start = theta0
 
-        resid_fn = build_residual(x, y, peaks, baseline, loss, weights)
+        resid_fn = build_residual(x, y_target, peaks, base_model, loss, weights)
 
         res = least_squares(
             resid_fn,
