@@ -15,19 +15,7 @@ from typing import Iterable, Sequence, List
 import numpy as np
 
 from core import data_io, models, peaks, signals
-from fit import classic, lmfit_backend, modern, modern_vp
-
-
-def _apply_solver(name: str, x, y, pk, mode, baseline, options):
-    if name == "classic":
-        return classic.solve(x, y, pk, mode, baseline, options)
-    if name == "modern_vp":
-        return modern_vp.solve(x, y, pk, mode, baseline, options)
-    if name == "modern_trf":
-        return modern.solve(x, y, pk, mode, baseline, options)
-    if name == "lmfit_vp":
-        return lmfit_backend.solve(x, y, pk, mode, baseline, options)
-    raise ValueError("unknown solver")
+from fit import orchestrator
 
 
 def _auto_seed(x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: int = 5) -> List[peaks.Peak]:
@@ -115,14 +103,14 @@ def run(patterns: Iterable[str], config: dict) -> None:
                     idx_near = int(np.argmin(np.abs(x - tpl.center)))
                     tpl.height = float(max(sig[idx_near], 1e-6))
 
-        opts = config.get(solver_name, {})
-        res = _apply_solver(solver_name, x, y, template, mode, baseline, opts)
+        opts = dict(config.get(solver_name, {}))
+        opts["solver"] = solver_name
+        res = orchestrator.run_fit_with_fallbacks(
+            x, y, template, mode, baseline, opts
+        )
 
-        theta = np.asarray(res["theta"], dtype=float)
-        fitted = []
-        for i, tpl in enumerate(template):
-            c, h, w, e = theta[4 * i : 4 * (i + 1)]
-            fitted.append(peaks.Peak(c, h, w, e, tpl.lock_center, tpl.lock_width))
+        theta = np.asarray(res.theta, dtype=float)  # noqa: F841 - for debugging
+        fitted = res.peaks_out
 
         model = models.pv_sum(x, fitted)
         resid = model + (baseline if mode == "add" else 0.0) - (
@@ -145,7 +133,7 @@ def run(patterns: Iterable[str], config: dict) -> None:
                     "area": area,
                     "area_pct": 100.0 * area / total,
                     "rmse": rmse,
-                    "fit_ok": bool(res["ok"]),
+                    "fit_ok": bool(res.success),
                     "mode": mode,
                     "als_lam": base_cfg.get("lam"),
                     "als_p": base_cfg.get("p"),

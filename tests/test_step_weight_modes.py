@@ -15,7 +15,7 @@ def test_step_weight_modes_smoke():
     y = pv_sum(x, peaks)
     _, bounds = pack_theta_bounds(peaks, x, {})
     for mode in ["none", "poisson", "inv_y"]:
-        theta, cost = step_engine.step_once(
+        theta, cost, step_norm, accepted = step_engine.step_once(
             x,
             y,
             peaks,
@@ -28,4 +28,4 @@ def test_step_weight_modes_smoke():
             bounds=bounds,
             f_scale=1.0,
         )
-        assert np.isfinite(cost)
+        assert accepted and np.isfinite(cost)

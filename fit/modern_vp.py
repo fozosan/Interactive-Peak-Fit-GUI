@@ -7,7 +7,7 @@ import numpy as np
 from scipy.optimize import nnls
 
 from core.models import pv_design_matrix, pv_sum_with_jac
-from core.weights import noise_weights
+from core.weights import noise_weights, robust_weights, combine_weights
 from core.peaks import Peak
 from .bounds import pack_theta_bounds
 from .utils import mad_sigma, robust_cost
@@ -349,7 +349,7 @@ def iterate(state: dict) -> dict:
 
     _, bounds = pack_theta_bounds(peaks, x, options)
 
-    theta, cost = step_engine.step_once(
+    theta, cost, step_norm, accepted = step_engine.step_once(
         x,
         y,
         peaks,
@@ -361,8 +361,38 @@ def iterate(state: dict) -> dict:
         trust_radius=state.get("trust_radius", np.inf),
         bounds=bounds,
         f_scale=options.get("f_scale", 1.0),
+        max_backtracks=options.get("max_backtracks", 8),
     )
+
+    # Re-solve heights via NNLS to mirror variable projection behaviour
+    base_arr = baseline if baseline is not None else 0.0
+    y_target = y - base_arr
+    weights = None if weight_mode == "none" else noise_weights(y_target, weight_mode)
+    pk_tmp = [
+        Peak(theta[4 * i + 0], 1.0, theta[4 * i + 2], theta[4 * i + 3])
+        for i in range(len(peaks))
+    ]
+    A = pv_design_matrix(x, pk_tmp)
+    if weights is not None:
+        Aw = A * weights[:, None]
+        bw = y_target * weights
+    else:
+        Aw = A
+        bw = y_target
+    h, _ = nnls(Aw, bw)
+    h = np.minimum(h, options.get("max_height", np.inf))
+    for i, val in enumerate(h):
+        theta[4 * i + 1] = val
+    model = A @ h
+    r = model - y_target
+    w_noise = weights if weights is not None else np.ones_like(r)
+    w_rob = robust_weights(r, loss, options.get("f_scale", 1.0))
+    w = combine_weights(w_noise, w_rob)
+    r_w = r * w
+    cost = 0.5 * float(r_w @ r_w)
 
     state["theta"] = theta
     state["cost"] = cost
+    state["step_norm"] = step_norm
+    state["accepted"] = accepted
     return state

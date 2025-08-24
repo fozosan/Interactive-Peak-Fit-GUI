@@ -47,7 +47,7 @@ from scipy.signal import find_peaks
 
 from core import signals
 from core.residuals import build_residual
-from fit import classic, lmfit_backend, modern, modern_vp
+from fit import orchestrator
 from infra import performance
 from batch import runner as batch_runner
 from uncertainty import asymptotic, bayes, bootstrap
@@ -1221,6 +1221,8 @@ class PeakFitApp:
         mode = "add" if add_mode else "subtract"
 
         options = self._solver_options()
+        solver = self.solver_choice.get()
+        options["solver"] = solver
 
         state = {
             "x_fit": x_fit,
@@ -1231,21 +1233,15 @@ class PeakFitApp:
             "options": options,
         }
 
-        solver = self.solver_choice.get()
         try:
-            if solver == "modern_vp":
-                res = modern_vp.iterate(state)
-            elif solver == "modern_trf":
-                res = modern.iterate(state)
-            elif solver == "lmfit_vp":
-                res = lmfit_backend.iterate(state)
-            else:
-                res = classic.iterate(state)
+            res = orchestrator.step_once(state)
         except Exception as e:  # pragma: no cover - UI feedback only
             messagebox.showerror("Step", f"Step failed:\n{e}")
             return
 
         theta = res.get("theta")
+        accepted = res.get("accepted", True)
+        step_norm = res.get("step_norm", 0.0)
 
         j = 0
         for pk in self.peaks:
@@ -1259,7 +1255,7 @@ class PeakFitApp:
 
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
-        self.status.config(text="Step complete. Fit again or Export.")
+        self.status.config(text=f"{solver} step {'accepted' if accepted else 'rejected'} (\u0394={step_norm:.3g})")
 
     def fit(self):
         if self.x is None or self.y_raw is None or not self.peaks:
@@ -1282,28 +1278,16 @@ class PeakFitApp:
 
         solver = self.solver_choice.get()
         options = self._solver_options()
+        options["solver"] = solver
         try:
-            if solver == "modern_vp":
-                res = modern_vp.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
-            elif solver == "modern_trf":
-                res = modern.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
-            elif solver == "lmfit_vp":
-                res = lmfit_backend.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
-            else:
-                res = classic.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
+            res = orchestrator.run_fit_with_fallbacks(
+                x_fit, y_fit, self.peaks, mode, base_fit, options
+            )
         except Exception as e:
             messagebox.showerror("Fit", f"Fitting failed:\n{e}")
             return
 
-        theta = res["theta"]
-        for i, pk in enumerate(self.peaks):
-            c, h, w, eta = theta[4*i:4*(i+1)]
-            if not pk.lock_center:
-                pk.center = float(c)
-            pk.height = float(h)
-            if not pk.lock_width:
-                pk.fwhm = float(abs(w))
-            pk.eta = float(eta)
+        self.peaks[:] = res.peaks_out
 
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()

@@ -7,7 +7,7 @@ import numpy as np
 
 from core.peaks import Peak
 from core.jacobians import pv_and_grads
-from core.weights import noise_weights, robust_weights
+from core.weights import noise_weights, robust_weights, combine_weights
 
 
 def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
@@ -31,12 +31,27 @@ def step_once(
     trust_radius: float,
     bounds: Sequence | None,
     f_scale: float = 1.0,
-) -> tuple[np.ndarray, float]:
-    """Perform one weighted Gauss-Newton/LM step.
+    max_backtracks: int = 8,
+) -> tuple[np.ndarray, float, float, bool]:
+    """Perform one weighted Gauss-Newton/LM step with backtracking.
 
     ``weight_mode`` selects the noise-weighting strategy and ``loss`` controls
-    the robust IRLS weights. Both noise and robust weights are applied to the
-    residuals and Jacobian in the same manner as the full solvers.
+    the robust IRLS weights.  Noise and robust weights are combined via
+    :func:`core.weights.combine_weights` so that the behaviour matches the full
+    solvers.  Armijo-style backtracking (step halving) is used to ensure that
+    the returned step does not increase the weighted cost.
+
+    Returns
+    -------
+    theta : ``np.ndarray``
+        Flattened parameter vector after the step (or the original vector if
+        the step was rejected).
+    cost : float
+        Weighted cost at ``theta``.
+    step_norm : float
+        Euclidean norm of the accepted parameter update.
+    accepted : bool
+        ``True`` if the step decreased the cost, ``False`` otherwise.
     """
 
     x = np.asarray(x, dtype=float)
@@ -64,10 +79,11 @@ def step_once(
 
     w_noise = noise_weights(y_target, weight_mode)
     w_robust = robust_weights(r, loss, f_scale)
-    w = w_noise * w_robust
+    w = combine_weights(w_noise, w_robust)
 
     r_w = r * w
     J_w = J * w[:, None]
+    cost0 = 0.5 * float(r_w @ r_w)
 
     JTJ = J_w.T @ J_w
     if damping:
@@ -86,25 +102,51 @@ def step_once(
     theta0 = _theta_from_peaks(peaks)
     mask = np.ones(theta0.size, dtype=bool)
     mask[3::4] = False  # do not update eta
-    theta_reduced = theta0[mask] + delta
+    theta_base = theta0[mask]
+
     if bounds is not None:
         lb = np.asarray(bounds[0], dtype=float)[mask]
         ub = np.asarray(bounds[1], dtype=float)[mask]
-        theta_reduced = np.minimum(np.maximum(theta_reduced, lb), ub)
-    theta1 = theta0.copy()
-    theta1[mask] = theta_reduced
+    else:
+        lb = ub = None
 
-    # Recompute cost at the new parameters
-    c_new = theta1[0::4]
-    h_new = theta1[1::4]
-    f_new = theta1[2::4]
-    eta_new = theta1[3::4]
-    model_new = np.zeros_like(x)
-    for i in range(n):
-        pv, _, _ = pv_and_grads(x, h_new[i], c_new[i], f_new[i], eta_new[i])
-        model_new += pv
-    r_new = model_new - y_target
-    w_robust_new = robust_weights(r_new, loss, f_scale)
-    w_new = w_noise * w_robust_new
-    cost = 0.5 * float((r_new * w_new) @ (r_new * w_new))
-    return theta1, cost
+    step = delta.copy()
+    accepted = False
+    theta_reduced = theta_base.copy()
+    cost = cost0
+    for _ in range(max_backtracks + 1):
+        theta_try = theta_base + step
+        if lb is not None and ub is not None:
+            theta_try = np.minimum(np.maximum(theta_try, lb), ub)
+        theta1 = theta0.copy()
+        theta1[mask] = theta_try
+
+        c_new = theta1[0::4]
+        h_new = theta1[1::4]
+        f_new = theta1[2::4]
+        eta_new = theta1[3::4]
+        model_new = np.zeros_like(x)
+        for i in range(n):
+            pv, _, _ = pv_and_grads(x, h_new[i], c_new[i], f_new[i], eta_new[i])
+            model_new += pv
+        r_new = model_new - y_target
+        w_rob_new = robust_weights(r_new, loss, f_scale)
+        w_new = combine_weights(w_noise, w_rob_new)
+        r_w_new = r_new * w_new
+        cost_new = 0.5 * float(r_w_new @ r_w_new)
+        if cost_new <= cost0:
+            theta_reduced = theta_try
+            cost = cost_new
+            accepted = True
+            break
+        step *= 0.5
+
+    theta_out = theta0.copy()
+    if accepted:
+        theta_out[mask] = theta_reduced
+        step_norm = float(np.linalg.norm(theta_reduced - theta_base))
+    else:
+        step_norm = 0.0
+        cost = cost0
+
+    return theta_out, cost, step_norm, accepted

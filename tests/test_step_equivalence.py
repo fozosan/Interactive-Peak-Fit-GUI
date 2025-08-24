@@ -39,7 +39,7 @@ def test_step_converges_close_to_fit():
     model0 = pv_sum(x, step_peaks)
     r0 = model0 - y
     cost0 = 0.5 * float(np.dot(r0, r0))
-    theta, cost1 = step_engine.step_once(
+    theta, cost1, step_norm, accepted = step_engine.step_once(
         x,
         y,
         step_peaks,
@@ -52,13 +52,13 @@ def test_step_converges_close_to_fit():
         bounds=bounds,
         f_scale=1.0,
     )
-    assert cost1 < cost0
+    assert accepted and cost1 < cost0
     lb, ub = bounds
     assert np.all(theta >= lb) and np.all(theta <= ub)
     _update_peaks(step_peaks, theta)
 
     for _ in range(19):
-        theta, cost1 = step_engine.step_once(
+        theta, cost1, step_norm, accepted = step_engine.step_once(
             x,
             y,
             step_peaks,
