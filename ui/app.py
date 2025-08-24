@@ -5,7 +5,7 @@ Interactive peak fit GUI for spectra (Gaussian–Lorentzian / pseudo-Voigt)
 Designed by Farhan Zahin
 Built with ChatGPT
 
-Build: v2.7+
+Build: v3
 
 Features:
   • ALS baseline with saved defaults
@@ -97,7 +97,8 @@ DEFAULTS = {
     # Multiple templates live here as {"name": [peak dicts...]}
     "templates": {},
     "auto_apply_template": False,
-    "auto_apply_template_name": ""
+    "auto_apply_template_name": "",
+    "x_label": "x",
 }
 
 def load_config():
@@ -176,6 +177,9 @@ class PeakFitApp:
         # Components visibility
         self.components_visible = True
 
+        # Axis label
+        self.x_label_var = tk.StringVar(value=str(self.cfg.get("x_label", "x")))
+
         self._baseline_cache = {}
 
         # Solver selection and diagnostics
@@ -227,7 +231,7 @@ class PeakFitApp:
         paned.add(left, stretch="always")
         self.fig = plt.Figure(figsize=(7,5), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_xlabel("x"); self.ax.set_ylabel("Intensity")
+        self.ax.set_xlabel(self._format_axis_label(self.x_label_var.get())); self.ax.set_ylabel("Intensity")
         self.canvas = FigureCanvasTkAgg(self.fig, master=left)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.nav = NavigationToolbar2Tk(self.canvas, left)
@@ -344,6 +348,17 @@ class PeakFitApp:
         ttk.Button(fr, text="Apply", command=self.apply_fit_range_from_fields).grid(row=0, column=4, padx=4)
         ttk.Button(fr, text="Select on plot", command=self.enable_span).grid(row=1, column=1, columnspan=2, pady=2)
         ttk.Button(fr, text="Full range", command=self.clear_fit_range).grid(row=1, column=3, pady=2)
+
+        # Axes / label controls
+        axes_box = ttk.Labelframe(right, text="Axes / Labels")
+        axes_box.pack(fill=tk.X, pady=6)
+        ttk.Label(axes_box, text="X-axis label:").pack(side=tk.LEFT)
+        self.x_label_entry = ttk.Entry(axes_box, width=16, textvariable=self.x_label_var)
+        self.x_label_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Button(axes_box, text="Apply", command=self.apply_x_label).pack(side=tk.LEFT, padx=2)
+        ttk.Button(axes_box, text="Superscript", command=self.insert_superscript).pack(side=tk.LEFT, padx=2)
+        ttk.Button(axes_box, text="Subscript", command=self.insert_subscript).pack(side=tk.LEFT, padx=2)
+        ttk.Button(axes_box, text="Save as default", command=self.save_x_label_default).pack(side=tk.LEFT, padx=2)
 
         # Templates
         tmpl = ttk.Labelframe(right, text="Peak Templates"); tmpl.pack(fill=tk.X, pady=6)
@@ -484,7 +499,7 @@ class PeakFitApp:
 
     def _new_figure(self):
         self.ax.clear()
-        self.ax.set_xlabel("x"); self.ax.set_ylabel("Intensity")
+        self.ax.set_xlabel(self._format_axis_label(self.x_label_var.get())); self.ax.set_ylabel("Intensity")
         self.ax.set_title("Open a data file to begin")
         self.canvas.draw_idle()
 
@@ -709,6 +724,33 @@ class PeakFitApp:
             self.compute_baseline()
         else:
             self.refresh_plot()
+
+    # ----- Axes label helpers -----
+    def insert_superscript(self):
+        self.x_label_entry.insert(tk.INSERT, "^{ }")
+        self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 2)
+        self.x_label_entry.focus_set()
+
+    def insert_subscript(self):
+        self.x_label_entry.insert(tk.INSERT, "_{ }")
+        self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 2)
+        self.x_label_entry.focus_set()
+
+    def apply_x_label(self):
+        label = self._format_axis_label(self.x_label_var.get())
+        self.ax.set_xlabel(label)
+        self.canvas.draw_idle()
+
+    def save_x_label_default(self):
+        self.cfg["x_label"] = self.x_label_var.get()
+        save_config(self.cfg)
+        messagebox.showinfo("Axes", f'Saved default x-axis label: "{self.x_label_var.get()}"')
+
+    @staticmethod
+    def _format_axis_label(text: str) -> str:
+        if "^" in text or "_" in text:
+            return f"${text}$"
+        return text
 
     # ----- Templates helpers -----
     def _templates(self) -> dict:
@@ -1248,6 +1290,8 @@ class PeakFitApp:
     def refresh_plot(self):
         LW_RAW, LW_BASE, LW_CORR, LW_COMP, LW_FIT = 1.0, 1.0, 0.9, 0.8, 1.2
         self.ax.clear()
+        self.ax.set_xlabel(self._format_axis_label(self.x_label_var.get()))
+        self.ax.set_ylabel("Intensity")
         if self.x is None:
             self.ax.set_title("Open a data file to begin")
             self.canvas.draw_idle()
@@ -1283,7 +1327,6 @@ class PeakFitApp:
             lo, hi = sorted((self.fit_xmin, self.fit_xmax))
             self.ax.axvspan(lo, hi, color="0.8", alpha=0.25, lw=0)
 
-        self.ax.set_xlabel("x"); self.ax.set_ylabel("Intensity")
         self.ax.legend(loc="best")
         self.canvas.draw_idle()
 

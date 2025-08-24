@@ -4,7 +4,9 @@ Interactive peak fit GUI for any spectroscopy (Gaussian–Lorentzian / pseudo-Vo
 Designed by Farhan Zahin, 
 built with ChatGPT
 
-Build: v2.7 (scrollable Help, custom X-axis label, ALS iterations/threshold)
+Build: v3 (axes label editing with superscript/subscript, scrollable Help, ALS iterations/threshold)
+
+The previous v2.7 stable release remains available for download and can run standalone.
 
 <img width="1987" height="1289" alt="main-window png" src="https://github.com/user-attachments/assets/9c0b832c-3355-49e7-9bee-01be2abbad60" />
 
@@ -34,7 +36,7 @@ An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
 
 • Thin line rendering and “Toggle components” for clarity during inspection.
 
-• Axes/Labels: set a custom X-axis label and save it as default (persists in ~/.gl_peakfit_config.json).
+• Axes/Labels: set a custom X-axis label with superscript/subscript helpers and save it as default (persists in ~/.gl_peakfit_config.json).
 
 • Peak templates: save as new, save changes, apply, delete; optional auto-apply on file open.
 
@@ -80,7 +82,9 @@ Keyboard/Mouse Tips
 Version History (high-level)
 ============================
 
-v2.7  – Scrollable Help dialog; custom X-axis label with persistence; ALS baseline exposes Iterations and Threshold; mouse-wheel scrolling works anywhere on the right panel.
+v3    – Superscript/subscript helpers for axis labels; scrollable Help dialog; ALS baseline exposes Iterations and Threshold; mouse-wheel scrolling works anywhere on the right panel.
+
+v2.7  – Previous stable standalone release (still available for download).
 
 v2.6  – Unified single/batch **peak table** schema and metadata via shared builder; identical column order everywhere.
 
