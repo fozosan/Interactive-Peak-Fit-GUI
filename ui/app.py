@@ -174,6 +174,15 @@ class PeakFitApp:
 
         # Solver selection and diagnostics
         self.solver_var = tk.StringVar(value="Classic")
+        self.classic_maxfev = tk.IntVar(value=20000)
+        self.modern_loss = tk.StringVar(value="linear")
+        self.modern_weight = tk.StringVar(value="none")
+        self.modern_fscale = tk.DoubleVar(value=1.0)
+        self.modern_maxfev = tk.IntVar(value=20000)
+        self.modern_restarts = tk.IntVar(value=1)
+        self.modern_jitter = tk.DoubleVar(value=0.0)
+        self.lmfit_algo = tk.StringVar(value="least_squares")
+        self.lmfit_maxfev = tk.IntVar(value=20000)
         self.snr_text = tk.StringVar(value="S/N: --")
 
         # Uncertainty and performance controls
@@ -238,6 +247,7 @@ class PeakFitApp:
         ttk.Button(baseline_box, text="Recompute baseline", command=self.compute_baseline).pack(side=tk.LEFT, pady=2)
         ttk.Button(baseline_box, text="Save as default", command=self.save_baseline_default).pack(side=tk.LEFT, padx=4)
         ttk.Label(baseline_box, textvariable=self.snr_text).pack(side=tk.LEFT, padx=8)
+
         # Eta box
         eta_box = ttk.Labelframe(right, text="Shape factor η (0=Gaussian, 1=Lorentzian)"); eta_box.pack(fill=tk.X, pady=4)
         ttk.Entry(eta_box, width=10, textvariable=self.global_eta).pack(side=tk.LEFT, padx=4)
@@ -321,8 +331,48 @@ class PeakFitApp:
 
         # Solver selection
         solver_box = ttk.Labelframe(right, text="Solver"); solver_box.pack(fill=tk.X, pady=4)
-        ttk.Combobox(solver_box, textvariable=self.solver_var, state="readonly",
-                     values=["Classic", "Modern", "LMFIT"], width=12).pack(side=tk.LEFT, padx=4)
+        self.solver_combo = ttk.Combobox(solver_box, textvariable=self.solver_var, state="readonly",
+                     values=["Classic", "Modern", "LMFIT"], width=12)
+        self.solver_combo.pack(side=tk.LEFT, padx=4)
+        self.solver_combo.bind("<<ComboboxSelected>>", lambda _e: self._show_solver_opts())
+
+        self.solver_frames = {}
+        # Classic options
+        f_classic = ttk.Frame(solver_box)
+        ttk.Label(f_classic, text="Max evals").pack(side=tk.LEFT)
+        ttk.Entry(f_classic, width=7, textvariable=self.classic_maxfev).pack(side=tk.LEFT, padx=4)
+        self.solver_frames["Classic"] = f_classic
+
+        # Modern options
+        f_modern = ttk.Frame(solver_box)
+        r1 = ttk.Frame(f_modern); r1.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(r1, text="Loss").pack(side=tk.LEFT)
+        ttk.Combobox(r1, textvariable=self.modern_loss, state="readonly",
+                     values=["linear", "soft_l1", "huber", "cauchy"], width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Label(r1, text="Weights").pack(side=tk.LEFT, padx=(6,0))
+        ttk.Combobox(r1, textvariable=self.modern_weight, state="readonly",
+                     values=["none", "poisson", "inv_y"], width=8).pack(side=tk.LEFT, padx=2)
+        r2 = ttk.Frame(f_modern); r2.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(r2, text="f_scale").pack(side=tk.LEFT)
+        ttk.Entry(r2, width=6, textvariable=self.modern_fscale).pack(side=tk.LEFT, padx=2)
+        ttk.Label(r2, text="Max evals").pack(side=tk.LEFT, padx=(6,0))
+        ttk.Entry(r2, width=7, textvariable=self.modern_maxfev).pack(side=tk.LEFT, padx=2)
+        ttk.Label(r2, text="Restarts").pack(side=tk.LEFT, padx=(6,0))
+        ttk.Entry(r2, width=4, textvariable=self.modern_restarts).pack(side=tk.LEFT, padx=2)
+        ttk.Label(r2, text="Jitter %").pack(side=tk.LEFT, padx=(6,0))
+        ttk.Entry(r2, width=4, textvariable=self.modern_jitter).pack(side=tk.LEFT, padx=2)
+        self.solver_frames["Modern"] = f_modern
+
+        # LMFIT options
+        f_lmfit = ttk.Frame(solver_box)
+        ttk.Label(f_lmfit, text="Algo").pack(side=tk.LEFT)
+        ttk.Combobox(f_lmfit, textvariable=self.lmfit_algo, state="readonly",
+                     values=["least_squares", "leastsq", "nelder", "differential_evolution"], width=18).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_lmfit, text="Max evals").pack(side=tk.LEFT, padx=(6,0))
+        ttk.Entry(f_lmfit, width=7, textvariable=self.lmfit_maxfev).pack(side=tk.LEFT, padx=2)
+        self.solver_frames["LMFIT"] = f_lmfit
+
+        self._show_solver_opts()
 
         # Uncertainty panel
         unc_box = ttk.Labelframe(right, text="Uncertainty"); unc_box.pack(fill=tk.X, pady=4)
@@ -353,6 +403,31 @@ class PeakFitApp:
         # Status
         self.status = ttk.Label(self.root, text="Open CSV/TXT/DAT, set baseline/range, add peaks, set η, then Fit.")
         self.status.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
+
+    def _show_solver_opts(self, *_):
+        for f in self.solver_frames.values():
+            f.pack_forget()
+        frame = self.solver_frames.get(self.solver_var.get())
+        if frame:
+            frame.pack(side=tk.LEFT, padx=4)
+
+    def _solver_options(self) -> dict:
+        solver = self.solver_var.get().lower()
+        if solver == "modern":
+            return {
+                "loss": self.modern_loss.get(),
+                "weights": self.modern_weight.get(),
+                "f_scale": float(self.modern_fscale.get()),
+                "maxfev": int(self.modern_maxfev.get()),
+                "restarts": int(self.modern_restarts.get()),
+                "jitter_pct": float(self.modern_jitter.get()),
+            }
+        if solver == "lmfit":
+            return {
+                "algo": self.lmfit_algo.get(),
+                "maxfev": int(self.lmfit_maxfev.get()),
+            }
+        return {"maxfev": int(self.classic_maxfev.get())}
 
     def _new_figure(self):
         self.ax.clear()
@@ -932,7 +1007,7 @@ class PeakFitApp:
         mode = "add" if add_mode else "subtract"
 
         solver = self.solver_var.get().lower()
-        options: dict = {}
+        options = self._solver_options()
         try:
             if solver == "modern":
                 res = modern.solve(x_fit, y_fit, self.peaks, mode, base_fit, options)
@@ -981,13 +1056,15 @@ class PeakFitApp:
 
         resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
         method = self.unc_method.get().lower()
+        solver = self.solver_var.get().lower()
         try:
             if method == "asymptotic":
                 rep = asymptotic.asymptotic({"theta": theta, "jac": None}, resid_fn)
             elif method == "bootstrap":
                 cfg = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
-                       "baseline": base_fit, "theta": theta, "options": {}, "n": 100}
-                rep = bootstrap.bootstrap(self.solver_var.get().lower(), cfg, resid_fn)
+                       "baseline": base_fit, "theta": theta,
+                       "options": self._solver_options(), "n": 100}
+                rep = bootstrap.bootstrap(solver, cfg, resid_fn)
             elif method == "bayesian":
                 init = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
                         "baseline": base_fit, "theta": theta}
