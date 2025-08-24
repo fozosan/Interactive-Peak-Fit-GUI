@@ -185,7 +185,7 @@ def iterate(state: dict) -> dict:
 
     _, bounds = pack_theta_bounds(peaks, x, options)
 
-    theta, cost = step_engine.step_once(
+    theta, cost, step_norm, accepted = step_engine.step_once(
         x,
         y,
         peaks,
@@ -197,9 +197,12 @@ def iterate(state: dict) -> dict:
         trust_radius=state.get("trust_radius", np.inf),
         bounds=bounds,
         f_scale=options.get("f_scale", 1.0),
+        max_backtracks=options.get("max_backtracks", 8),
     )
 
     state["theta"] = theta
     state["cost"] = cost
+    state["step_norm"] = step_norm
+    state["accepted"] = accepted
     return state
 
