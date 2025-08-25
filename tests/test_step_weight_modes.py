@@ -5,29 +5,22 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 from core.peaks import Peak
 from core.models import pv_sum
-from fit.bounds import pack_theta_bounds
-from fit import step_engine
+from core.weights import noise_weights
+from fit import classic
 
 
-def test_step_weight_modes_smoke():
+def test_step_weight_modes():
     x = np.linspace(-5, 5, 100)
-    peaks = [Peak(0.0, 1.0, 1.0, 0.5)]
-    y = pv_sum(x, peaks)
-    _, bounds = pack_theta_bounds(peaks, x, {})
-    wmin_eval = bounds[0][2] if bounds[0].size >= 3 else 1e-6
+    true = [Peak(0.0, 1.0, 1.0, 0.5)]
+    y = pv_sum(x, true)
+    start = [Peak(0.1, 0.9, 1.1, 0.5)]
     for mode in ["none", "poisson", "inv_y"]:
-        theta, cost, step_norm, accepted = step_engine.step_once(
-            x,
-            y,
-            peaks,
-            "subtract",
-            None,
-            loss="linear",
-            weight_mode=mode,
-            damping=0.0,
-            trust_radius=np.inf,
-            bounds=bounds,
-            wmin_eval=wmin_eval,
-            f_scale=1.0,
-        )
-        assert accepted and np.isfinite(cost)
+        state = classic.prepare_state(x, y, start, mode="subtract", baseline=None, opts={"weights": mode})["state"]
+        r = pv_sum(x, state["peaks"]) - y
+        w = noise_weights(mode, y)
+        if w is None:
+            cost_fit = 0.5 * float(r @ r)
+        else:
+            cost_fit = 0.5 * float((r * w) @ (r * w))
+        _, _, c0, _, _ = classic.iterate(state)
+        assert np.isclose(c0, cost_fit, rtol=1e-9, atol=1e-12)

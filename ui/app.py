@@ -47,7 +47,19 @@ from scipy.signal import find_peaks
 
 from core import signals
 from core.residuals import build_residual
-from fit import orchestrator
+from fit import orchestrator, classic, modern_vp, modern
+try:  # optional
+    from fit import lmfit_backend
+except Exception:  # pragma: no cover - optional dependency may be missing
+    lmfit_backend = None
+
+BACKENDS = {
+    "classic": classic,
+    "modern_vp": modern_vp,
+    "modern_trf": modern,
+}
+if lmfit_backend is not None:
+    BACKENDS["lmfit_vp"] = lmfit_backend
 from infra import performance
 from batch import runner as batch_runner
 from uncertainty import asymptotic, bayes, bootstrap
@@ -593,7 +605,8 @@ class PeakFitApp:
         # Actions
         actions = ttk.Labelframe(right, text="Actions"); actions.pack(fill=tk.X, pady=4)
         ttk.Button(actions, text="Auto-seed", command=self.auto_seed).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Step \u25B6", command=self.step_once).pack(side=tk.LEFT, padx=4)
+        self.step_btn = ttk.Button(actions, text="Step \u25B6", command=self.step_once)
+        self.step_btn.pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=4)
         ttk.Label(actions, textvariable=self.solver_title).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Toggle components", command=self.toggle_components).pack(side=tk.LEFT, padx=4)
@@ -1251,38 +1264,42 @@ class PeakFitApp:
         solver = self.solver_choice.get()
         options["solver"] = solver
 
-        state = {
-            "x_fit": x_fit,
-            "y_fit": y_fit,
-            "peaks": self.peaks,
-            "mode": mode,
-            "baseline": base_fit,
-            "options": options,
-        }
+        backend = BACKENDS.get(solver)
+        if backend is None:  # pragma: no cover
+            messagebox.showerror("Step", f"Unknown solver {solver}")
+            return
 
         try:
-            res = orchestrator.step_once(state)
+            prep = backend.prepare_state(x_fit, y_fit, self.peaks, mode, base_fit, options)
+            state = prep["state"]
+            state, accepted, c0, c1, info = backend.iterate(state)
         except Exception as e:  # pragma: no cover - UI feedback only
             messagebox.showerror("Step", f"Step failed:\n{e}")
             return
 
-        theta = res.get("theta")
-        accepted = res.get("accepted", True)
-        step_norm = res.get("step_norm", 0.0)
-
-        j = 0
-        for pk in self.peaks:
-            c, h, w, eta = theta[j:j+4]; j += 4
-            if not pk.lock_center:
-                pk.center = float(c)
-            pk.height = float(h)
-            if not pk.lock_width:
-                pk.fwhm = float(abs(w))
-            pk.eta = float(eta)
-
-        self.refresh_tree(keep_selection=True)
-        self.refresh_plot()
-        self.status.config(text=f"{solver} step {'accepted' if accepted else 'rejected'} (\u0394={step_norm:.3g})")
+        if accepted:
+            theta = state.get("theta")
+            j = 0
+            for pk in self.peaks:
+                c, h, w, eta = theta[j:j+4]; j += 4
+                if not pk.lock_center:
+                    pk.center = float(c)
+                pk.height = float(h)
+                if not pk.lock_width:
+                    pk.fwhm = float(abs(w))
+                pk.eta = float(eta)
+            self.refresh_tree(keep_selection=True)
+            self.refresh_plot()
+            self.status.config(
+                text=(
+                    f"{solver} Step accepted: Δcost={c0 - c1:.3g}, "
+                    f"backtracks={info.get('backtracks',0)}, λ={info.get('lambda',0.0):.3g}"
+                )
+            )
+        else:
+            self.status.config(
+                text=f"{solver} Step rejected (reason={info.get('reason','no_decrease')})"
+            )
 
     def fit(self):
         if self.x is None or self.y_raw is None or not self.peaks:
@@ -1307,12 +1324,16 @@ class PeakFitApp:
         options = self._solver_options()
         options["solver"] = solver
         try:
+            self.step_btn.config(state=tk.DISABLED)
             res = orchestrator.run_fit_with_fallbacks(
                 x_fit, y_fit, self.peaks, mode, base_fit, options
             )
         except Exception as e:
             messagebox.showerror("Fit", f"Fitting failed:\n{e}")
+            self.step_btn.config(state=tk.NORMAL)
             return
+        finally:
+            self.step_btn.config(state=tk.NORMAL)
 
         self.peaks[:] = res.peaks_out
 
