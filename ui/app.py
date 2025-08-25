@@ -297,7 +297,7 @@ def load_xy_any(path: str):
 class PeakFitApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Origin-like Peak Fit (pseudo-Voigt)")
+        self.root.title("Interactive Peak Fit (pseudo-Voigt)")
 
         # Data
         self.x = None
