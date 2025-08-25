@@ -11,7 +11,7 @@
 
 > Replace with your image or keep the path below.
 
-![Main window](docs/main-window.png)
+<img width="1987" height="1289" alt="main-window png" src="https://github.com/user-attachments/assets/9c0b832c-3355-49e7-9bee-01be2abbad60" />
 
 ---
 
@@ -67,121 +67,133 @@
 ```bash
 python -m pip install --upgrade pip
 python -m pip install numpy scipy pandas matplotlib lmfit
-
-Option B — conda
+````
+### Option B — conda
+```bash
 conda install numpy scipy pandas matplotlib
 pip install lmfit
+````
 
+`lmfit` is optional and only needed for the LMFIT backend.
 
-lmfit is optional and only needed for the LMFIT backend.
-
-Run
+## Run
+```bash
 python run_app.py
 ```
 
-The main window opens with the plot on the left and controls on the right.
+- The main window opens with the plot on the left and controls on the right.
 
-Help dialog (F1) is scrollable and independent of the right-panel scroll.
+- Help dialog (F1) is scrollable and independent of the right-panel scroll.
 
-Quick Start
+---
 
-Open Data… and select a two-column file (x,y).
+## Quick Start
 
-Adjust Baseline (ALS) parameters (λ, p, Iterations, Threshold).
+- Open Data… and select a two-column file (x,y).
+
+- Adjust Baseline (ALS) parameters (λ, p, Iterations, Threshold).
 Optionally check “Baseline uses fit range” and set a range (drag or enter Min/Max).
 
-Add peaks by clicking near their centers (or use Auto-seed).
+- Add peaks by clicking near their centers (or use Auto-seed).
 
-(Optional) Lock Width or Center, set per-peak η, or Apply to all.
+- (Optional) Lock Width or Center, set per-peak η, or Apply to all.
 
-Choose Fit mode (Add/Subtract) and Fitting method (Classic / Modern TRF / Modern VP / LMFIT-VP).
+- Choose Fit mode (Add/Subtract) and Fitting method (Classic / Modern TRF / Modern VP / LMFIT-VP).
 
-Click Fit. Use Step ▶ to inspect single-iteration behavior.
+- Click Fit. Use Step ▶ to inspect single-iteration behavior.
 
-Export CSV (peak table and trace CSV) or run Batch for a folder.
+- Export CSV (peak table and trace CSV) or run Batch for a folder.
 
-Uncertainty
+## Uncertainty
 
-Asymptotic: computes covariance from the Jacobian at the solution and overlays a 95% CI band on the fitted curve.
+- Asymptotic: computes covariance from the Jacobian at the solution and overlays a 95% CI band on the fitted curve.
 
-Bootstrap / MCMC: planned for future releases.
+- Bootstrap / MCMC: planned for future releases.
 
-Export Schemas
-A) Peak Table CSV (single & batch use the same columns and order)
+## Export Schemas
+#### A) Peak Table CSV (single & batch use the same columns and order)
 ```
 file, peak, center, height, fwhm, eta, lock_width, lock_center,
 area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax
 ```
 
-area: pseudo-Voigt closed-form area
+- `area`: pseudo-Voigt closed-form area
 
-area_pct: area normalized by total area
+- `area_pct`: area normalized by total area
 
-rmse: computed over the active fit window versus the correct target (Add: raw y; Subtract: y − baseline)
+- `rmse`: computed over the active fit window versus the correct target (Add: raw y; Subtract: y − baseline)
 
-B) Trace CSV (per spectrum; single & batch)
+#### B) Trace CSV (per spectrum; single & batch)
 ```
 x, y_raw, baseline,
 y_target_add, y_fit_add, peak1, peak2, …,
 y_target_sub, y_fit_sub, peak1_sub, peak2_sub, …
 ```
 
-peakN = baseline-ADDED component (matches Add-mode display)
+- `peakN` = baseline-ADDED component (matches Add-mode display)
 
-peakN_sub = baseline-SUBTRACTED pure component (useful for calculations)
+- `peakN_sub` = baseline-SUBTRACTED pure component (useful for calculations)
 
-Batch Processing
+---
 
-Select folder & patterns (semicolon-separated).
+## Batch Processing
 
-Peaks source: Current (optionally re-height), Selected template, or Auto-seed.
+- Select folder & patterns (semicolon-separated).
 
-Writes one summary CSV and, if enabled, per-spectrum trace CSVs.
+- Peaks source: Current (optionally re-height), Selected template, or Auto-seed.
 
-Progress and per-file messages stream to the status bar log.
+- Writes one summary CSV and, if enabled, per-spectrum trace CSVs.
 
-Tips & Troubleshooting
+- Progress and per-file messages stream to the status bar log.
 
-Add vs. Subtract: In Add mode, the baseline is added back during fitting. If fits look too tall, double-check the mode.
+## Tips & Troubleshooting
 
-ALS tuning: Increase λ (smoother) and/or decrease p (more under peaks) if ALS rides peaks.
+- Add vs. Subtract: In Add mode, the baseline is added back during fitting. If fits look too tall, double-check the mode.
 
-Robustness: For spikes/outliers, try robust loss (soft_l1, huber, cauchy) and/or weights (poisson or inv_y).
+- ALS tuning: Increase λ (smoother) and/or decrease p (more under peaks) if ALS rides peaks.
 
-Step ▶ rejected: Try a smaller damping λ or run a full Fit to re-linearize.
+- Robustness: For spikes/outliers, try robust loss (soft_l1, huber, cauchy) and/or weights (poisson or inv_y).
 
-Scroll: The right panel scrolls when the mouse is over it; the Help window has its own scroll.
+- Step ▶ rejected: Try a smaller damping λ or run a full Fit to re-linearize.
 
-Packaging (optional)
+- Scroll: The right panel scrolls when the mouse is over it; the Help window has its own scroll.
 
-Create a single-file executable with PyInstaller:
+## Packaging (optional)
 
+- Create a single-file executable with PyInstaller:
+```bash
 pip install pyinstaller
 pyinstaller -F -n PeakFit --add-data "ui;ui" --add-data "docs;docs" run_app.py
 # On macOS you may prefer: pyinstaller -w -F ...
 # On Windows, ensure tcl/tk resources are found; PyInstaller usually bundles them automatically.
+```
 
+The output binary will be in `dist/PeakFit` (or `PeakFit.exe` on Windows).
 
-The output binary will be in dist/PeakFit (or PeakFit.exe on Windows).
+---
 
-Version History (high level)
+## Version History (high level)
 
-v3.2-beta – Stability and parity; Classic restored (curve_fit); Step ▶ unified & safe; settings persisted; status/log UI; asymptotic uncertainty band.
+- v3.2-beta – Stability and parity; Classic restored (curve_fit); Step ▶ unified & safe; settings persisted; status/log UI; asymptotic uncertainty band.
 
-v3.1 – Solver tuning: center-in-window (optional), Δx-based FWHM lower bound, parameter-wise jitter, x-scaling.
+- v3.1 – Solver tuning: center-in-window (optional), Δx-based FWHM lower bound, parameter-wise jitter, x-scaling.
 
-v3.0 – Modern TRF with robust losses & weights; ALS iterations/threshold; scrollable Help; resizable panel; persisted x-label.
+- v3.0 – Modern TRF with robust losses & weights; ALS iterations/threshold; scrollable Help; resizable panel; persisted x-label.
 
-v2.7 – Stable standalone release with ALS/Help/x-label persistence.
+- v2.7 – Stable standalone release with ALS/Help/x-label persistence.
 
-… earlier versions: template system, range selection, exports, etc.
+- … earlier versions: template system, range selection, exports, etc.
 
-License
+---
 
-MIT — see LICENSE.
+## License
 
-Citation
+MIT — see `LICENSE`.
+
+## Citation
 
 If this tool helps your research, please consider citing this repository:
 
+```scss
 Zahin, F. (2025). Interactive Peak Fit GUI (pseudo-Voigt). GitHub repository.
+```
