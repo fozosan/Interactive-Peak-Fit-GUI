@@ -43,7 +43,7 @@ def _auto_seed(x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: in
     return found
 
 
-def run(patterns: Iterable[str], config: dict) -> None:
+def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
     """Run the peak fitting pipeline over matching files.
 
     Parameters
@@ -65,6 +65,7 @@ def run(patterns: Iterable[str], config: dict) -> None:
         files.extend(sorted(glob.glob(pattern)))
     if not files:
         raise FileNotFoundError("no files matched patterns")
+    total = len(files)
 
     base_template: Sequence[peaks.Peak] = [
         peaks.Peak(**p) for p in config.get("peaks", [])
@@ -80,7 +81,9 @@ def run(patterns: Iterable[str], config: dict) -> None:
 
     records = []
 
-    for path in files:
+    for i, path in enumerate(files, 1):
+        if progress:
+            progress(i, total, path)
         x, y = data_io.load_xy(path)
         baseline = signals.als_baseline(
             y,
@@ -142,6 +145,7 @@ def run(patterns: Iterable[str], config: dict) -> None:
                 }
             )
 
+        trace_path = None
         if save_traces:
             trace_csv = data_io.build_trace_table(
                 x, y, baseline, fitted, mode=mode
@@ -149,6 +153,8 @@ def run(patterns: Iterable[str], config: dict) -> None:
             trace_path = Path(path).with_suffix(Path(path).suffix + ".trace.csv")
             with trace_path.open("w", encoding="utf-8") as fh:
                 fh.write(trace_csv)
+        if log:
+            log(path, bool(res.success), rmse, str(trace_path) if trace_path else "")
 
     peak_csv = data_io.build_peak_table(records)
     with open(peak_output, "w", encoding="utf-8") as fh:
