@@ -305,6 +305,7 @@ def save_config(cfg):
 
 
 # ---------- Fitting utilities ----------
+
 def pack_params(peaks: List[Peak]):
     """Build p0/bounds and model honoring lock_width/lock_center; η fixed per-peak."""
     p0, lo, hi, struct = [], [], [], []
@@ -337,6 +338,7 @@ def pack_params(peaks: List[Peak]):
 
 
 # ---------- File loader (CSV/TXT/DAT) ----------
+
 def load_xy_any(path: str):
     """
     Robust loader for 2-column x,y data.
@@ -910,6 +912,7 @@ class PeakFitApp:
             return
 
         x0 = float(event.xdata)
+        # Height seeding from baseline-corrected signal (robust against absolute cursor height)
         sig = self.get_seed_signal(baseline=self.baseline)
         y_at = float(np.interp(x0, self.x, sig))
         default_h = max(y_at - float(np.median(sig)), 1e-6)
