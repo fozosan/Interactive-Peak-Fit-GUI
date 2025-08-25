@@ -20,7 +20,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "margin_frac": 0.0,
         "fwhm_min_factor": 2.0,
         "fwhm_max_factor": 0.5,
-        "height_factor": 3.0,
+        "height_factor": 1.0,
     },
 }
 
@@ -63,7 +63,7 @@ def load(path: str | Path) -> Dict[str, Any]:
             classic.setdefault("margin_frac", 0.0)
             classic.setdefault("fwhm_min_factor", 2.0)
             classic.setdefault("fwhm_max_factor", 0.5)
-            classic.setdefault("height_factor", 3.0)
+            classic.setdefault("height_factor", 1.0)
     except json.JSONDecodeError:  # pragma: no cover - corrupted file
         pass
     return cfg

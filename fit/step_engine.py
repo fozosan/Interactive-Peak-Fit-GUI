@@ -32,11 +32,11 @@ def step_once(
     bounds: Sequence | None,
     wmin_eval: float = 0.0,
     f_scale: float = 1.0,
-    max_backtracks: int = 8,
+    max_backtracks: int = 10,
     rel_tol: float = 1e-6,
     abs_tol: float = 1e-12,
     min_step_ratio: float = 1e-9,
-) -> tuple[np.ndarray, float, float, bool, float, int, str]:
+) -> tuple[np.ndarray, float, float, dict]:
     """Perform one weighted Gauss-Newton/LM step with backtracking.
 
     ``weight_mode`` selects the noise-weighting strategy and ``loss`` controls
@@ -53,10 +53,11 @@ def step_once(
         the step was rejected).
     cost : float
         Weighted cost at ``theta``.
-    step_norm : float
-        Euclidean norm of the accepted parameter update.
-    accepted : bool
-        ``True`` if the step decreased the cost, ``False`` otherwise.
+    cost0 : float
+        Cost at the start of the step.
+    info : dict
+        Dictionary with ``step_norm``, ``accepted``, ``lambda``, ``backtracks``
+        and ``reason`` for diagnostic use.
     """
 
     x = np.asarray(x, dtype=float)
@@ -84,10 +85,10 @@ def step_once(
     y_target = y - base_arr
     r = model - y_target
 
+    w_noise = noise_weights(y_target, weight_mode)
     lam = float(damping)
-    for attempt in range(2):
-        w_noise = noise_weights(weight_mode, y_target)
-        w_robust = robust_weights(loss, r, f_scale)
+    for _ in range(2):
+        w_robust = robust_weights(r, loss, f_scale)
         w = combine_weights(w_noise, w_robust)
         if w is None:
             r_w = r
@@ -99,12 +100,13 @@ def step_once(
             break
         lam = lam * 10 if lam else 1e-3
     else:
-        cost0 = float("inf")
-        return _theta_from_peaks(peaks), cost0, 0.0, False, cost0, 0, "nonfinite"
+        info = {"lambda": lam, "backtracks": 0, "step_norm": 0.0, "accepted": False, "reason": "nonfinite"}
+        return _theta_from_peaks(peaks), float("inf"), float("inf"), info
 
     cost0 = 0.5 * float(r_w @ r_w)
     if not np.isfinite(cost0):
-        return _theta_from_peaks(peaks), float(cost0), 0.0, False, float(cost0), 0, "nonfinite"
+        info = {"lambda": lam, "backtracks": 0, "step_norm": 0.0, "accepted": False, "reason": "nonfinite"}
+        return _theta_from_peaks(peaks), float(cost0), float(cost0), info
 
     JTJ = J_w.T @ J_w
     if lam:
@@ -124,8 +126,9 @@ def step_once(
     norm_theta = np.linalg.norm(theta0)
     denom = max(1.0, norm_theta)
     if np.linalg.norm(delta) / denom < min_step_ratio:
+        info = {"lambda": lam, "backtracks": 0, "step_norm": 0.0, "accepted": False, "reason": "tiny_step"}
         cost0 = float(cost0)
-        return theta0, cost0, 0.0, False, cost0, 0, "tiny_step"
+        return theta0, cost0, cost0, info
     mask = np.ones(theta0.size, dtype=bool)
     mask[3::4] = False  # do not update eta
     theta_base = theta0[mask]
@@ -160,7 +163,7 @@ def step_once(
             pv, _, _ = pv_and_grads(x, h_new[i], c_new[i], f_new[i], eta_new[i])
             model_new += pv
         r_new = model_new - y_target
-        w_rob_new = robust_weights(loss, r_new, f_scale)
+        w_rob_new = robust_weights(r_new, loss, f_scale)
         w_new = combine_weights(w_noise, w_rob_new)
         if w_new is None:
             r_w_new = r_new
@@ -193,4 +196,48 @@ def step_once(
         step_norm = 0.0
         cost = cost0
 
-    return theta_out, cost, step_norm, accepted, cost0, n_bt, reason
+    info = {
+        "lambda": lam,
+        "backtracks": n_bt,
+        "step_norm": step_norm,
+        "accepted": accepted,
+        "reason": reason,
+    }
+    return theta_out, cost, cost0, info
+
+
+def prepare_state(x, y, peaks, mode, baseline, opts):
+    """Dispatch to solver-specific ``prepare_state``."""
+    solver = opts.get("solver", "modern_vp")
+    if solver == "classic":
+        from . import classic
+        return classic.prepare_state(x, y, peaks, mode, baseline, opts)
+    if solver == "modern_trf":
+        from . import modern
+        return modern.prepare_state(x, y, peaks, mode, baseline, opts)
+    if solver == "modern_vp":
+        from . import modern_vp
+        return modern_vp.prepare_state(x, y, peaks, mode, baseline, opts)
+    if solver == "lmfit_vp":
+        from . import lmfit_backend
+        return lmfit_backend.prepare_state(x, y, peaks, mode, baseline, opts)
+    raise ValueError(f"unknown solver '{solver}'")
+
+
+def iterate(state):
+    """Dispatch to solver-specific ``iterate``."""
+    opts = state.get("options", {})
+    solver = opts.get("solver", "modern_vp")
+    if solver == "classic":
+        from . import classic
+        return classic.iterate(state)
+    if solver == "modern_trf":
+        from . import modern
+        return modern.iterate(state)
+    if solver == "modern_vp":
+        from . import modern_vp
+        return modern_vp.iterate(state)
+    if solver == "lmfit_vp":
+        from . import lmfit_backend
+        return lmfit_backend.iterate(state)
+    raise ValueError(f"unknown solver '{solver}'")

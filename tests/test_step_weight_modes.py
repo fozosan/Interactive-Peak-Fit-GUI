@@ -5,7 +5,6 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 from core.peaks import Peak
 from core.models import pv_sum
-from core.weights import noise_weights
 from fit import classic
 
 
@@ -17,10 +16,6 @@ def test_step_weight_modes():
     for mode in ["none", "poisson", "inv_y"]:
         state = classic.prepare_state(x, y, start, mode="subtract", baseline=None, opts={"weights": mode})["state"]
         r = pv_sum(x, state["peaks"]) - y
-        w = noise_weights(mode, y)
-        if w is None:
-            cost_fit = 0.5 * float(r @ r)
-        else:
-            cost_fit = 0.5 * float((r * w) @ (r * w))
+        cost_fit = 0.5 * float(r @ r)
         _, _, c0, _, _ = classic.iterate(state)
         assert np.isclose(c0, cost_fit, rtol=1e-9, atol=1e-12)
