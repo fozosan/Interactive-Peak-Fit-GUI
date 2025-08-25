@@ -65,7 +65,7 @@ def solve(
     options = options.copy()
     base = baseline if baseline is not None else 0.0
     y_target = y - base
-    weights = noise_weights(weight_mode, y_target)
+    weights = noise_weights(y_target, weight_mode)
     p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
     max_height_factor = float(options.get("max_height_factor", np.inf))
     options["max_height"] = max_height_factor * p95
@@ -202,7 +202,7 @@ def iterate(state: dict):
 
     _, bounds = pack_theta_bounds(peaks, x, options)
 
-    theta, cost1, step_norm, accepted, cost0, n_bt, reason = step_engine.step_once(
+    theta, cost1, cost0, info = step_engine.step_once(
         x,
         y,
         peaks,
@@ -220,11 +220,11 @@ def iterate(state: dict):
 
     state["theta"] = theta
     state["cost"] = cost1
-    state["step_norm"] = step_norm
-    state["accepted"] = accepted
+    state["step_norm"] = info["step_norm"]
+    state["accepted"] = info["accepted"]
+    state["lambda"] = info["lambda"]
     state["peaks"] = [
         Peak(theta[4 * i], theta[4 * i + 1], theta[4 * i + 2], theta[4 * i + 3])
         for i in range(len(peaks))
     ]
-    info = {"backtracks": n_bt, "step_norm": step_norm, "lambda": state.get("lambda", 0.0), "reason": reason}
-    return state, accepted, cost0, cost1, info
+    return state, info["accepted"], cost0, cost1, info

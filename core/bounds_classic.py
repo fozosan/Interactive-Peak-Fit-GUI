@@ -1,38 +1,58 @@
 import numpy as np
 
 
-def make_bounds_classic(x_fit, y_target, peaks, fit_window=None, fwhm_min=None):
-    x_lo, x_hi = float(np.min(x_fit)), float(np.max(x_fit))
-    if fit_window:
-        x_lo, x_hi = float(min(fit_window)), float(max(fit_window))
+def make_bounds_classic(
+    x_fit,
+    y_fit,
+    peaks,
+    *,
+    centers_in_window: bool,
+    fwhm_min_factor: float = 2.0,
+    fwhm_max_factor: float = 0.5,
+    height_max_factor: float = 1.0,
+    margin_frac: float = 0.0,
+):
+    """Return simple bounds for Classic solver.
 
-    dx = np.median(np.diff(np.sort(x_fit)))
-    fwhm_lo = max(fwhm_min or 0.0, 2.0*dx)
-    fwhm_hi = max(1e-6, x_hi - x_lo)
+    Parameters are ordered ``height``, optional ``center`` (if unlocked), and
+    optional ``width`` (if unlocked) for each peak. Only free parameters are
+    included. ``wmin_eval`` is returned to clamp widths inside residual
+    evaluation.
+    """
+    x = np.asarray(x_fit, float)
+    y = np.asarray(y_fit, float)
+    if x.size:
+        x_lo = float(np.min(x))
+        x_hi = float(np.max(x))
+        span = x_hi - x_lo
+        dx_med = np.median(np.diff(np.sort(x))) if x.size > 1 else 1.0
+    else:  # pragma: no cover - degenerate input
+        x_lo = x_hi = 0.0
+        span = 1.0
+        dx_med = 1.0
+    wmin = max(fwhm_min_factor * dx_med, 1e-9)
+    wmax = max(span * fwhm_max_factor, wmin)
+    margin = span * margin_frac
+    if centers_in_window:
+        c_lo, c_hi = x_lo, x_hi
+    else:
+        c_lo, c_hi = x_lo - margin, x_hi + margin
+    y_abs = np.abs(y[np.isfinite(y)])
+    if y_abs.size:
+        p95 = float(np.percentile(y_abs, 95))
+    else:  # pragma: no cover - degenerate input
+        p95 = 1.0
+    hmax = height_max_factor * p95
 
-    p95 = float(np.percentile(y_target, 95))
-    h_lo, h_hi = 0.0, max(1e-12, 2.0*p95, float(np.max(y_target)))
-
-    # pack respecting locks (height always varied; center/width only if unlocked)
-    p0, lo, hi, struct = [], [], [], []
+    lo = []
+    hi = []
     for pk in peaks:
-        s = {}
-        h0 = min(pk.height, h_hi) * 0.999
-        s["ih"] = len(p0); p0.append(max(h0, 1e-9)); lo.append(h_lo); hi.append(h_hi)
-        if pk.lock_center:
-            s["ic"] = None; s["c_fixed"] = pk.center
-        else:
-            s["ic"] = len(p0); p0.append(pk.center); lo.append(x_lo); hi.append(x_hi)
-        if pk.lock_width:
-            s["iw"] = None; s["w_fixed"] = pk.fwhm
-        else:
-            s["iw"] = len(p0); p0.append(max(pk.fwhm, fwhm_lo)); lo.append(fwhm_lo); hi.append(fwhm_hi); s["w_fixed"] = None
-        s["eta"] = float(np.clip(pk.eta, 0.0, 1.0))
-        struct.append(s)
-
-    p0 = np.asarray(p0, float)
-    lo = np.asarray(lo, float)
-    hi = np.asarray(hi, float)
-    # clip p0 into bounds to avoid instant infeasible starts
-    p0 = np.minimum(np.maximum(p0, lo), hi)
-    return p0, (lo, hi), struct
+        lo.append(0.0)
+        hi.append(hmax)
+        if not pk.lock_center:
+            lo.append(c_lo)
+            hi.append(c_hi)
+        if not pk.lock_width:
+            lo.append(wmin)
+            hi.append(wmax)
+    return np.asarray(lo, float), np.asarray(hi, float), float(wmin)
