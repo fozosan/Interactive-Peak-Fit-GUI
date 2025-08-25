@@ -204,9 +204,8 @@ class ScrollableFrame(ttk.Frame):
 
         self._wheel_accum = 0
         self._wheel_bound = False
-        for w in (self.canvas, self.interior):
-            w.bind("<Enter>", self._bind_mousewheel)
-            w.bind("<Leave>", self._unbind_mousewheel)
+        self.interior.bind("<Enter>", self._bind_mousewheel)
+        self.interior.bind("<Leave>", self._unbind_mousewheel)
 
     def _on_interior_configure(self, _event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -219,11 +218,22 @@ class ScrollableFrame(ttk.Frame):
         if self._wheel_bound:
             return
         self._wheel_bound = True
-        for w in (self.canvas, self.interior):
-            w.bind("<MouseWheel>", self._on_mousewheel, add="+")
-            w.bind("<Shift-MouseWheel>", self._on_shift_wheel, add="+")
-            w.bind("<Button-4>", self._on_button4, add="+")
-            w.bind("<Button-5>", self._on_button5, add="+")
+
+        targets = (self.canvas, self.interior)
+        for w in targets:
+            w.bind("<MouseWheel>", self._on_mousewheel_win, add=True)
+            w.bind("<Shift-MouseWheel>", self._on_shift_wheel, add=True)
+            w.bind("<Button-4>", self._on_wheel_linux_up, add=True)
+            w.bind("<Button-5>", self._on_wheel_linux_down, add=True)
+
+        for tag in ("Treeview", "TEntry", "TCombobox", "Listbox", "Text", "TSpinbox"):
+            try:
+                self.canvas.bind_class(tag, "<MouseWheel>", self._on_mousewheel_win, add=True)
+                self.canvas.bind_class(tag, "<Shift-MouseWheel>", self._on_shift_wheel, add=True)
+                self.canvas.bind_class(tag, "<Button-4>", self._on_wheel_linux_up, add=True)
+                self.canvas.bind_class(tag, "<Button-5>", self._on_wheel_linux_down, add=True)
+            except Exception:
+                pass
 
     def _unbind_mousewheel(self, _event=None):
         if not self._wheel_bound:
@@ -235,43 +245,27 @@ class ScrollableFrame(ttk.Frame):
             w.unbind("<Button-4>")
             w.unbind("<Button-5>")
 
-    def _pointer_inside_me(self) -> bool:
-        x, y = self.canvas.winfo_pointerxy()
-        w = self.canvas.winfo_containing(x, y)
-        while w is not None:
-            if w is self.canvas or w is self.interior:
-                return True
-            w = getattr(w, "master", None)
-        return False
-
-    def _on_mousewheel(self, event):
-        if not self._pointer_inside_me():
-            return
+    # ---- Wheel handlers (local) ----
+    def _on_mousewheel_win(self, event):
         self._wheel_accum += event.delta
         step = 0
         while abs(self._wheel_accum) >= 120:
             step += -1 if self._wheel_accum > 0 else 1
             self._wheel_accum -= 120 * (1 if self._wheel_accum > 0 else -1)
-        if step != 0:
+        if step:
             self.canvas.yview_scroll(step, "units")
         return "break"
 
     def _on_shift_wheel(self, event):
-        if not self._pointer_inside_me():
-            return
         direction = -1 if event.delta > 0 else 1
         self.canvas.xview_scroll(direction, "units")
         return "break"
 
-    def _on_button4(self, _event):
-        if not self._pointer_inside_me():
-            return
+    def _on_wheel_linux_up(self, _event):
         self.canvas.yview_scroll(-1, "units")
         return "break"
 
-    def _on_button5(self, _event):
-        if not self._pointer_inside_me():
-            return
+    def _on_wheel_linux_down(self, _event):
         self.canvas.yview_scroll(1, "units")
         return "break"
 
