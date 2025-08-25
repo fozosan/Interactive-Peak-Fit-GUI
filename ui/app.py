@@ -455,7 +455,13 @@ class PeakFitApp:
         self.fit_xmax: Optional[float] = None
         self.fit_min_var = tk.StringVar(value="")
         self.fit_max_var = tk.StringVar(value="")
-        self.span: Optional[SpanSelector] = None
+
+        # Span/interaction state
+        self._span = None
+        self._span_active = False
+        self._span_prev_click_toggle = None
+        self._span_cids: list[int] = []
+        self._cursor_before_span: str = ""
 
         # Peaks
         self.peaks: List[Peak] = []
@@ -465,6 +471,9 @@ class PeakFitApp:
 
         # Components visibility
         self.components_visible = True
+
+        # Matplotlib click binding
+        self.cid = None
 
         # Axis label
         self.x_label_var = tk.StringVar(value=str(self.cfg.get("x_label", "x")))
@@ -663,8 +672,13 @@ class PeakFitApp:
 
         # Interaction
         inter = ttk.Labelframe(right, text="Interaction"); inter.pack(fill=tk.X, pady=6)
-        ttk.Checkbutton(inter, text="Add peaks on click", variable=self.add_peaks_mode,
-                        command=self._on_add_peaks_toggle).pack(anchor="w")
+        self.add_peaks_checkbox = ttk.Checkbutton(
+            inter,
+            text="Add peaks on click",
+            variable=self.add_peaks_mode,
+            command=self._on_add_peaks_toggle,
+        )
+        self.add_peaks_checkbox.pack(anchor="w")
         ttk.Label(inter, text="Tip: while toolbar Zoom/Pan is active, clicks never add peaks.").pack(anchor="w")
         row_zoom = ttk.Frame(inter); row_zoom.pack(fill=tk.X, pady=(4,0))
         ttk.Button(row_zoom, text="Zoom out", command=self.zoom_out).pack(side=tk.LEFT)
@@ -973,9 +987,30 @@ class PeakFitApp:
         save_config(self.cfg)
         self._update_unc_widgets()
 
+    def _suspend_clicks(self):
+        """Disable click-to-add regardless of checkbox state."""
+        try:
+            if getattr(self, "cid", None) is not None:
+                self.canvas.mpl_disconnect(self.cid)
+                self.cid = None
+        except Exception:
+            self.cid = None
+
+    def _restore_clicks(self):
+        """Restore click-to-add to match the current checkbox state."""
+        try:
+            if self.cid is None and self.add_peaks_mode.get():
+                self.cid = self.canvas.mpl_connect("button_press_event", self.on_click_plot)
+        except Exception:
+            self.cid = None
+
     def _on_add_peaks_toggle(self):
         self.cfg["ui_add_peaks_on_click"] = bool(self.add_peaks_mode.get())
         save_config(self.cfg)
+        if self.add_peaks_mode.get():
+            self._restore_clicks()
+        else:
+            self._suspend_clicks()
 
     def _on_eta_change(self):
         self.cfg["ui_eta"] = float(self.global_eta.get())
@@ -1194,34 +1229,105 @@ class PeakFitApp:
 
     # ----- Fit range helpers -----
     def enable_span(self):
-        if self.span is not None:
-            try:
-                self.span.set_active(True)
-                return
-            except Exception:
-                self.span = None
+        if self._span_active and self._span is not None:
+            return
 
-        def onselect(xmin, xmax):
-            self.fit_xmin, self.fit_xmax = float(xmin), float(xmax)
-            self.fit_min_var.set(f"{self.fit_xmin:.6g}")
-            self.fit_max_var.set(f"{self.fit_xmax:.6g}")
-            if self.span is not None:
+        self._span_prev_click_toggle = bool(self.add_peaks_mode.get())
+        self.add_peaks_checkbox.configure(state="disabled")
+        self.add_peaks_mode.set(False)
+        self._suspend_clicks()
+        self._span_active = True
+        self.status_var.set("Drag to select fit range… ESC to cancel")
+        self._span_cids = []
+        try:
+            widget = self.canvas.get_tk_widget()
+            self._cursor_before_span = widget.cget("cursor") or ""
+            widget.configure(cursor="tcross")
+        except Exception:
+            self._cursor_before_span = ""
+
+        def _finish(_ok: bool):
+            try:
+                if self._span is not None:
+                    try:
+                        self._span.set_active(False)
+                    except Exception:
+                        pass
+                    try:
+                        self._span.disconnect_events()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._span = None
+            for cid in self._span_cids:
                 try:
-                    self.span.set_active(False)
+                    self.canvas.mpl_disconnect(cid)
                 except Exception:
                     pass
-            if self.baseline_use_range.get():
-                self.compute_baseline()
-            else:
-                self.refresh_plot()
+            self._span_cids = []
+            try:
+                self.add_peaks_checkbox.configure(state="normal")
+            except Exception:
+                pass
+            self.add_peaks_mode.set(self._span_prev_click_toggle)
+            try:
+                self.canvas.get_tk_widget().configure(cursor=self._cursor_before_span)
+            except Exception:
+                pass
+            self._restore_clicks()
+            self._span_active = False
+
+        def onselect(xmin, xmax):
+            try:
+                self.fit_xmin, self.fit_xmax = float(xmin), float(xmax)
+                self.fit_min_var.set(f"{self.fit_xmin:.6g}")
+                self.fit_max_var.set(f"{self.fit_xmax:.6g}")
+                if self.baseline_use_range.get():
+                    self.compute_baseline()
+                else:
+                    self.refresh_plot()
+                self.status_var.set("Range selected.")
+            finally:
+                _finish(True)
+
+        def on_key(event):
+            if event.key == "escape" and self._span_active:
+                _finish(False)
+                self.status_var.set("Range selection canceled.")
+
+        def on_leave(_event):
+            if self._span_active:
+                _finish(False)
+                self.status_var.set("Range selection canceled.")
 
         try:
-            self.span = SpanSelector(self.ax, onselect, "horizontal", useblit=True,
-                                     props=dict(alpha=0.15, facecolor="tab:blue"))
+            self._span = SpanSelector(
+                self.ax,
+                onselect,
+                "horizontal",
+                useblit=True,
+                props=dict(alpha=0.15, facecolor="tab:blue"),
+            )
         except TypeError:
-            self.span = SpanSelector(self.ax, onselect, "horizontal", useblit=True,
-                                     rectprops=dict(alpha=0.15, facecolor="tab:blue"))
-        self.status_var.set("Drag on the plot to select the fit x-range…")
+            self._span = SpanSelector(
+                self.ax,
+                onselect,
+                "horizontal",
+                useblit=True,
+                rectprops=dict(alpha=0.15, facecolor="tab:blue"),
+            )
+
+        def on_close(_event):
+            if self._span_active:
+                _finish(False)
+                self.status_var.set("Range selection canceled.")
+
+        self._span_cids = [
+            self.canvas.mpl_connect("key_press_event", on_key),
+            self.canvas.mpl_connect("figure_leave_event", on_leave),
+            self.canvas.mpl_connect("close_event", on_close),
+        ]
 
     def apply_fit_range_from_fields(self):
         if self.x is None:
@@ -1415,11 +1521,13 @@ class PeakFitApp:
     def on_click_plot(self, event):
         if self.x is None or event.inaxes != self.ax:
             return
-        # Ignore clicks when zoom/pan active or toggle off
+        if self._span_active:
+            return
+        if getattr(event, "button", 1) != 1:
+            return
         nav = getattr(self, "nav", None)
-        active = getattr(nav, "_active", None)
-        mode = getattr(nav, "mode", "")
-        if (active in ("PAN", "ZOOM")) or ("zoom" in str(mode).lower()) or ("pan" in str(mode).lower()):
+        mode = (getattr(nav, "mode", "") or getattr(nav, "_active", "") or "").upper()
+        if "PAN" in mode or "ZOOM" in mode:
             return
         if not self.add_peaks_mode.get():
             return
