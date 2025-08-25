@@ -41,7 +41,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.widgets import SpanSelector
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext
+import threading
+import traceback
 
 from scipy.signal import find_peaks
 
@@ -127,6 +129,9 @@ DEFAULTS = {
     "batch_save_traces": False,
     # Default solver backend
     "solver_choice": "modern_vp",
+    "ui_eta": 0.5,
+    "ui_add_peaks_on_click": True,
+    "unc_method": "asymptotic",
 }
 
 def load_config():
@@ -178,6 +183,106 @@ def add_tooltip(widget, text: str) -> None:
     widget.bind("<Leave>", on_leave)
 
 
+# ---------- Scrollable frame ----------
+class ScrollableFrame(ttk.Frame):
+    """A ttk.Frame that contains a vertically scrollable interior frame."""
+
+    def __init__(self, parent, *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+
+        self.vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.interior = ttk.Frame(self.canvas)
+        self._win = self.canvas.create_window((0, 0), window=self.interior, anchor="nw")
+
+        self.interior.bind("<Configure>", self._on_interior_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Local wheel state
+        self._wheel_accum = 0
+        self._wheel_bound = False
+
+        # Bind/unbind when pointer enters/leaves the panel
+        self.interior.bind("<Enter>", self._bind_mousewheel)
+        self.interior.bind("<Leave>", self._unbind_mousewheel)
+
+    def _on_interior_configure(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self.canvas.itemconfigure(self._win, width=self.canvas.winfo_width())
+        # Re-attach wheel tag to any new children
+        if self._wheel_bound:
+            self._attach_wheel_to_descendants()
+
+    def _on_canvas_configure(self, _event=None):
+        self.canvas.itemconfigure(self._win, width=self.canvas.winfo_width())
+
+    # ---------- wheel binding (local/tag-based) ----------
+    def _bind_mousewheel(self, _event=None):
+        if self._wheel_bound:
+            return
+        self._wheel_bound = True
+
+        # Ensure tag has our handlers
+        self._ensure_panelwheel_bindings()
+
+        # Attach tag to canvas, interior, and all descendants
+        self._attach_wheel_tag(self.canvas)
+        self._attach_wheel_tag(self.interior)
+        self._attach_wheel_to_descendants()
+
+    def _unbind_mousewheel(self, _event=None):
+        if not self._wheel_bound:
+            return
+        self._wheel_bound = False
+        # Tag remains but has no active handlers
+
+    def _ensure_panelwheel_bindings(self):
+        tag = "PanelWheel"
+        self.canvas.bind_class(tag, "<MouseWheel>", self._on_mousewheel_osx_win, add=True)
+        self.canvas.bind_class(tag, "<Shift-MouseWheel>", self._on_shiftwheel_osx_win, add=True)
+        self.canvas.bind_class(tag, "<Button-4>", self._on_wheel_linux_up, add=True)
+        self.canvas.bind_class(tag, "<Button-5>", self._on_wheel_linux_down, add=True)
+
+    def _attach_wheel_to_descendants(self):
+        for w in self.interior.winfo_children():
+            self._attach_wheel_tag(w)
+            if isinstance(w, (ttk.Frame, tk.Frame, ttk.Labelframe)):
+                for c in w.winfo_children():
+                    self._attach_wheel_tag(c)
+
+    def _attach_wheel_tag(self, widget):
+        tags = list(widget.bindtags())
+        if "PanelWheel" not in tags:
+            widget.bindtags(("PanelWheel",) + tuple(tags))
+
+    # ---------- wheel handlers ----------
+    def _on_mousewheel_osx_win(self, event):
+        self._wheel_accum += event.delta
+        step = 0
+        while abs(self._wheel_accum) >= 120:
+            step += -1 if self._wheel_accum > 0 else 1
+            self._wheel_accum -= 120 * (1 if self._wheel_accum > 0 else -1)
+        if step:
+            self.canvas.yview_scroll(step, "units")
+        return "break"
+
+    def _on_shiftwheel_osx_win(self, event):
+        direction = -1 if event.delta > 0 else 1
+        self.canvas.xview_scroll(direction, "units")
+        return "break"
+
+    def _on_wheel_linux_up(self, _event):
+        self.canvas.yview_scroll(-1, "units")
+        return "break"
+
+    def _on_wheel_linux_down(self, _event):
+        self.canvas.yview_scroll(1, "units")
+        return "break"
+
 # ---------- Fitting utilities ----------
 # ---------- File loader (CSV/TXT/DAT) ----------
 def load_xy_any(path: str):
@@ -211,19 +316,26 @@ class PeakFitApp:
         self.als_asym = tk.DoubleVar(value=self.cfg["als_asym"])
         self.als_niter = tk.IntVar(value=self.cfg["als_niter"])
         self.als_thresh = tk.DoubleVar(value=self.cfg["als_thresh"])
-        self.global_eta = tk.DoubleVar(value=0.5)
+        self.global_eta = tk.DoubleVar(value=self.cfg.get("ui_eta", 0.5))
+        self.global_eta.trace_add("write", lambda *_: self._on_eta_change())
         self.auto_apply_template = tk.BooleanVar(value=bool(self.cfg.get("auto_apply_template", False)))
         self.auto_apply_template_name = tk.StringVar(value=self.cfg.get("auto_apply_template_name", ""))
 
         # Interaction
-        self.add_peaks_mode = tk.BooleanVar(value=True)  # click-to-add toggle
+        self.add_peaks_mode = tk.BooleanVar(value=bool(self.cfg.get("ui_add_peaks_on_click", True)))
 
         # Fit range (None = full)
         self.fit_xmin: Optional[float] = None
         self.fit_xmax: Optional[float] = None
         self.fit_min_var = tk.StringVar(value="")
         self.fit_max_var = tk.StringVar(value="")
-        self.span: Optional[SpanSelector] = None
+
+        # Span/interaction state
+        self._span = None
+        self._span_active = False
+        self._span_prev_click_toggle = None
+        self._span_cids: list[int] = []
+        self._cursor_before_span: str = ""
 
         # Peaks
         self.peaks: List[Peak] = []
@@ -233,6 +345,9 @@ class PeakFitApp:
 
         # Components visibility
         self.components_visible = True
+
+        # Matplotlib click binding
+        self.cid = None
 
         # Axis label
         self.x_label_var = tk.StringVar(value=str(self.cfg.get("x_label", "x")))
@@ -281,7 +396,14 @@ class PeakFitApp:
         self.snr_text = tk.StringVar(value="S/N: --")
 
         # Uncertainty and performance controls
-        self.unc_method = tk.StringVar(value="Asymptotic")
+        unc_cfg = self.cfg.get("unc_method", "asymptotic")
+        if unc_cfg == "bootstrap":
+            unc_label = f"Bootstrap (base solver = {SOLVER_LABELS[self.solver_choice.get()]})"
+        elif unc_cfg == "bayesian":
+            unc_label = "Bayesian"
+        else:
+            unc_label = "Asymptotic"
+        self.unc_method = tk.StringVar(value=unc_label)
         self.perf_numba = tk.BooleanVar(value=False)
         self.perf_gpu = tk.BooleanVar(value=False)
         self.perf_cache = tk.BooleanVar(value=True)
@@ -304,12 +426,37 @@ class PeakFitApp:
         ttk.Button(top, text="Help", command=self.show_help).pack(side=tk.LEFT, padx=(6,0))
         self.file_label = ttk.Label(top, text="No file loaded"); self.file_label.pack(side=tk.LEFT, padx=10)
 
-        paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        mid = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        left = ttk.Frame(mid)
+        right_wrapper = ttk.Frame(mid)
+
+        mid.add(left, weight=3)
+        mid.add(right_wrapper, weight=1)
+
+        # sensible limits
+        self._min_left_px = 480
+        self._max_right_px = 560
+
+        def _clamp_sash(_evt=None):
+            try:
+                total = mid.winfo_width()
+                if total <= 1:
+                    return
+                pos = mid.sashpos(0)
+                lo = self._min_left_px
+                hi = max(lo + 100, total - self._max_right_px)
+                pos = max(lo, min(pos, hi))
+                mid.sashpos(0, pos)
+            except Exception:
+                pass
+
+        mid.bind("<B1-Motion>", _clamp_sash)
+        mid.bind("<Configure>", _clamp_sash)
+        self.root.after(0, _clamp_sash)
 
         # Left: plot
-        left = ttk.Frame(paned)
-        paned.add(left, stretch="always")
         self.fig = plt.Figure(figsize=(7,5), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel(self._format_axis_label(self.x_label_var.get())); self.ax.set_ylabel("Intensity")
@@ -319,25 +466,10 @@ class PeakFitApp:
         self.cid = self.canvas.mpl_connect("button_press_event", self.on_click_plot)
 
         # Right: scrollable controls
-        right_container = ttk.Frame(paned)
-        paned.add(right_container)
-        canvas = tk.Canvas(right_container, borderwidth=0, highlightthickness=0)
-        vsb = ttk.Scrollbar(right_container, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        right = ttk.Frame(canvas, padding=6)
-        canvas.create_window((0,0), window=right, anchor="nw")
-
-        def _on_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        right.bind("<Configure>", _on_configure)
-
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        right_scroll = ScrollableFrame(right_wrapper)
+        right_scroll.pack(fill=tk.BOTH, expand=True)
+        right = right_scroll.interior
+        right.configure(padding=6)
 
         # Baseline box
         baseline_box = ttk.Labelframe(right, text="Baseline (ALS)"); baseline_box.pack(fill=tk.X, pady=4)
@@ -375,12 +507,12 @@ class PeakFitApp:
         # Peaks table
         peaks_box = ttk.Labelframe(right, text="Peaks"); peaks_box.pack(fill=tk.BOTH, expand=True, pady=4)
         cols = ("idx","center","height","fwhm","lockw","lockc")
-        self.tree = ttk.Treeview(peaks_box, columns=cols, show="headings", height=10, selectmode="browse")
+        self.tree = ttk.Treeview(peaks_box, columns=cols, show="headings", selectmode="browse")
         headers = ["#", "Center", "Height", "FWHM", "Lock W", "Lock C"]
         widths  = [30,   90,       90,       90,      70,       70]
         for c, txt, w in zip(cols, headers, widths):
             self.tree.heading(c, text=txt); self.tree.column(c, width=w, anchor="center")
-        self.tree.pack(fill=tk.BOTH, expand=True)
+        self.tree.pack(fill=tk.X, expand=False)
         self.tree.bind("<<TreeviewSelect>>", self.on_select_peak)
 
         # Edit panel
@@ -414,7 +546,13 @@ class PeakFitApp:
 
         # Interaction
         inter = ttk.Labelframe(right, text="Interaction"); inter.pack(fill=tk.X, pady=6)
-        ttk.Checkbutton(inter, text="Add peaks on click", variable=self.add_peaks_mode).pack(anchor="w")
+        self.add_peaks_checkbox = ttk.Checkbutton(
+            inter,
+            text="Add peaks on click",
+            variable=self.add_peaks_mode,
+            command=self._on_add_peaks_toggle,
+        )
+        self.add_peaks_checkbox.pack(anchor="w")
         ttk.Label(inter, text="Tip: while toolbar Zoom/Pan is active, clicks never add peaks.").pack(anchor="w")
         row_zoom = ttk.Frame(inter); row_zoom.pack(fill=tk.X, pady=(4,0))
         ttk.Button(row_zoom, text="Zoom out", command=self.zoom_out).pack(side=tk.LEFT)
@@ -560,7 +698,7 @@ class PeakFitApp:
             width=14,
         )
         self.unc_method_combo.pack(side=tk.LEFT, padx=4)
-        self.unc_method_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_unc_widgets())
+        self.unc_method_combo.bind("<<ComboboxSelected>>", self._on_unc_method_change)
 
         solver_labels = [SOLVER_LABELS[k] for k in ["classic", "modern_vp", "modern_trf"]]
         if self.has_lmfit:
@@ -626,9 +764,19 @@ class PeakFitApp:
         ttk.Label(actions, textvariable=self.solver_title).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Toggle components", command=self.toggle_components).pack(side=tk.LEFT, padx=4)
 
-        # Status
-        self.status = ttk.Label(self.root, text="Open CSV/TXT/DAT, set baseline/range, add peaks, set η, then Fit.")
-        self.status.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
+        # Status bar and log
+        bar = ttk.Frame(self.root); bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_var = tk.StringVar(value="Open CSV/TXT/DAT, set baseline/range, add peaks, set η, then Fit.")
+        ttk.Label(bar, textvariable=self.status_var).pack(side=tk.LEFT, padx=6)
+        self.log_btn = ttk.Button(bar, text="Show log \u25B8", command=self.toggle_log)
+        self.log_btn.pack(side=tk.RIGHT)
+        self.pbar = ttk.Progressbar(bar, mode="indeterminate", length=160)
+        self.pbar.pack(side=tk.RIGHT, padx=6)
+        self.log_console = None
+        self._log_visible = False
+
+        # Initial peak list height
+        self.refresh_tree()
 
     def _show_solver_opts(self):
         for f in self.solver_frames.values():
@@ -701,6 +849,87 @@ class PeakFitApp:
             self.bootstrap_solver_combo.pack(side=tk.LEFT, padx=4)
         else:
             self.bootstrap_solver_combo.pack_forget()
+
+    def _on_unc_method_change(self, _e=None):
+        label = self.unc_method.get()
+        if label.startswith("Bootstrap"):
+            self.cfg["unc_method"] = "bootstrap"
+        elif label.startswith("Bayesian"):
+            self.cfg["unc_method"] = "bayesian"
+        else:
+            self.cfg["unc_method"] = "asymptotic"
+        save_config(self.cfg)
+        self._update_unc_widgets()
+
+    def _suspend_clicks(self):
+        """Disable click-to-add regardless of checkbox state."""
+        try:
+            if getattr(self, "cid", None) is not None:
+                self.canvas.mpl_disconnect(self.cid)
+                self.cid = None
+        except Exception:
+            self.cid = None
+
+    def _restore_clicks(self):
+        """Restore click-to-add to match the current checkbox state."""
+        try:
+            if self.cid is None and self.add_peaks_mode.get():
+                self.cid = self.canvas.mpl_connect("button_press_event", self.on_click_plot)
+        except Exception:
+            self.cid = None
+
+    def _on_add_peaks_toggle(self):
+        self.cfg["ui_add_peaks_on_click"] = bool(self.add_peaks_mode.get())
+        save_config(self.cfg)
+        if self.add_peaks_mode.get():
+            self._restore_clicks()
+        else:
+            self._suspend_clicks()
+
+    def _on_eta_change(self):
+        self.cfg["ui_eta"] = float(self.global_eta.get())
+        save_config(self.cfg)
+
+    def toggle_log(self):
+        if self._log_visible:
+            if self.log_console is not None:
+                self.log_console.pack_forget()
+            self.log_btn.config(text="Show log \u25B8")
+            self._log_visible = False
+        else:
+            if self.log_console is None:
+                self.log_console = scrolledtext.ScrolledText(self.root, height=8, state="disabled")
+            self.log_console.pack(side=tk.BOTTOM, fill=tk.X)
+            self.log_btn.config(text="Hide log \u25BE")
+            self._log_visible = True
+
+    def set_busy(self, flag: bool, msg: str = ""):
+        self.status_var.set(msg or ("Working..." if flag else "Ready."))
+        if flag:
+            self.pbar.start(12)
+        else:
+            self.pbar.stop()
+        self.root.update_idletasks()
+
+    def log(self, *parts):
+        txt = " ".join(str(p) for p in parts)
+        if self.log_console is not None:
+            self.log_console.configure(state="normal")
+            self.log_console.insert("end", txt + "\n")
+            self.log_console.see("end")
+            self.log_console.configure(state="disabled")
+
+    def run_in_thread(self, fn, on_done):
+        def worker():
+            try:
+                res = fn()
+                err = None
+            except Exception as e:
+                res, err = None, e
+            def _cb():
+                on_done(res, err)
+            self.root.after(0, _cb)
+        threading.Thread(target=worker, daemon=True).start()
 
     def _new_figure(self):
         self.ax.clear()
@@ -780,7 +1009,7 @@ class PeakFitApp:
         self.refresh_tree()
         self.refresh_plot()
         self._update_template_info()
-        self.status.config(text="Loaded. Adjust baseline, (optionally) set fit range, add peaks; Fit.")
+        self.status_var.set("Loaded. Adjust baseline, (optionally) set fit range, add peaks; Fit.")
 
     # ----- Baseline -----
     def on_baseline_use_range_toggle(self):
@@ -874,34 +1103,105 @@ class PeakFitApp:
 
     # ----- Fit range helpers -----
     def enable_span(self):
-        if self.span is not None:
-            try:
-                self.span.set_active(True)
-                return
-            except Exception:
-                self.span = None
+        if self._span_active and self._span is not None:
+            return
 
-        def onselect(xmin, xmax):
-            self.fit_xmin, self.fit_xmax = float(xmin), float(xmax)
-            self.fit_min_var.set(f"{self.fit_xmin:.6g}")
-            self.fit_max_var.set(f"{self.fit_xmax:.6g}")
-            if self.span is not None:
+        self._span_prev_click_toggle = bool(self.add_peaks_mode.get())
+        self.add_peaks_checkbox.configure(state="disabled")
+        self.add_peaks_mode.set(False)
+        self._suspend_clicks()
+        self._span_active = True
+        self.status_var.set("Drag to select fit range… ESC to cancel")
+        self._span_cids = []
+        try:
+            widget = self.canvas.get_tk_widget()
+            self._cursor_before_span = widget.cget("cursor") or ""
+            widget.configure(cursor="tcross")
+        except Exception:
+            self._cursor_before_span = ""
+
+        def _finish(_ok: bool):
+            try:
+                if self._span is not None:
+                    try:
+                        self._span.set_active(False)
+                    except Exception:
+                        pass
+                    try:
+                        self._span.disconnect_events()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._span = None
+            for cid in self._span_cids:
                 try:
-                    self.span.set_active(False)
+                    self.canvas.mpl_disconnect(cid)
                 except Exception:
                     pass
-            if self.baseline_use_range.get():
-                self.compute_baseline()
-            else:
-                self.refresh_plot()
+            self._span_cids = []
+            try:
+                self.add_peaks_checkbox.configure(state="normal")
+            except Exception:
+                pass
+            self.add_peaks_mode.set(self._span_prev_click_toggle)
+            try:
+                self.canvas.get_tk_widget().configure(cursor=self._cursor_before_span)
+            except Exception:
+                pass
+            self._restore_clicks()
+            self._span_active = False
+
+        def onselect(xmin, xmax):
+            try:
+                self.fit_xmin, self.fit_xmax = float(xmin), float(xmax)
+                self.fit_min_var.set(f"{self.fit_xmin:.6g}")
+                self.fit_max_var.set(f"{self.fit_xmax:.6g}")
+                if self.baseline_use_range.get():
+                    self.compute_baseline()
+                else:
+                    self.refresh_plot()
+                self.status_var.set("Range selected.")
+            finally:
+                _finish(True)
+
+        def on_key(event):
+            if event.key == "escape" and self._span_active:
+                _finish(False)
+                self.status_var.set("Range selection canceled.")
+
+        def on_leave(_event):
+            if self._span_active:
+                _finish(False)
+                self.status_var.set("Range selection canceled.")
 
         try:
-            self.span = SpanSelector(self.ax, onselect, "horizontal", useblit=True,
-                                     props=dict(alpha=0.15, facecolor="tab:blue"))
+            self._span = SpanSelector(
+                self.ax,
+                onselect,
+                "horizontal",
+                useblit=True,
+                props=dict(alpha=0.15, facecolor="tab:blue"),
+            )
         except TypeError:
-            self.span = SpanSelector(self.ax, onselect, "horizontal", useblit=True,
-                                     rectprops=dict(alpha=0.15, facecolor="tab:blue"))
-        self.status.config(text="Drag on the plot to select the fit x-range…")
+            self._span = SpanSelector(
+                self.ax,
+                onselect,
+                "horizontal",
+                useblit=True,
+                rectprops=dict(alpha=0.15, facecolor="tab:blue"),
+            )
+
+        def on_close(_event):
+            if self._span_active:
+                _finish(False)
+                self.status_var.set("Range selection canceled.")
+
+        self._span_cids = [
+            self.canvas.mpl_connect("key_press_event", on_key),
+            self.canvas.mpl_connect("figure_leave_event", on_leave),
+            self.canvas.mpl_connect("close_event", on_close),
+        ]
 
     def apply_fit_range_from_fields(self):
         if self.x is None:
@@ -1032,7 +1332,7 @@ class PeakFitApp:
             messagebox.showinfo("Template", "Load a spectrum first (Open Data…).")
             return
         self._apply_template_list(t[name], reheight=True)
-        self.status.config(text=f"Applied template '{name}' with {len(self.peaks)} peak(s).")
+        self.status_var.set(f"Applied template '{name}' with {len(self.peaks)} peak(s).")
 
     def delete_selected_template(self):
         name = self.template_var.get()
@@ -1095,11 +1395,13 @@ class PeakFitApp:
     def on_click_plot(self, event):
         if self.x is None or event.inaxes != self.ax:
             return
-        # Ignore clicks when zoom/pan active or toggle off
+        if self._span_active:
+            return
+        if getattr(event, "button", 1) != 1:
+            return
         nav = getattr(self, "nav", None)
-        active = getattr(nav, "_active", None)
-        mode = getattr(nav, "mode", "")
-        if (active in ("PAN", "ZOOM")) or ("zoom" in str(mode).lower()) or ("pan" in str(mode).lower()):
+        mode = (getattr(nav, "mode", "") or getattr(nav, "_active", "") or "").upper()
+        if "PAN" in mode or "ZOOM" in mode:
             return
         if not self.add_peaks_mode.get():
             return
@@ -1148,6 +1450,7 @@ class PeakFitApp:
         for p in self.peaks:
             p.eta = float(np.clip(eta, 0, 1))
         self.refresh_plot()
+        self._on_eta_change()
 
     def on_select_peak(self, _evt=None):
         sel = self._selected_index()
@@ -1224,6 +1527,11 @@ class PeakFitApp:
 
     def refresh_tree(self, keep_selection: bool = False):
         prev = self._selected_index() if keep_selection else None
+        desired = max(6, len(self.peaks))
+        try:
+            self.tree.configure(height=desired)
+        except Exception:
+            pass
         for row in self.tree.get_children():
             self.tree.delete(row)
         for i, p in enumerate(self.peaks, 1):
@@ -1284,12 +1592,15 @@ class PeakFitApp:
             messagebox.showerror("Step", f"Unknown solver {solver}")
             return
 
+        self.set_busy(True, "Stepping…")
         try:
             prep = backend.prepare_state(x_fit, y_fit, self.peaks, mode, base_fit, options)
             state = prep["state"]
             state, accepted, c0, c1, info = backend.iterate(state)
         except Exception as e:  # pragma: no cover - UI feedback only
+            self.set_busy(False, "Step failed.")
             messagebox.showerror("Step", f"Step failed:\n{e}")
+            self.log("Step failed", e)
             return
 
         if accepted:
@@ -1305,16 +1616,13 @@ class PeakFitApp:
                 pk.eta = float(eta)
             self.refresh_tree(keep_selection=True)
             self.refresh_plot()
-            self.status.config(
-                text=(
-                    f"{solver} Step accepted: Δcost={c0 - c1:.3g}, "
-                    f"backtracks={info.get('backtracks',0)}, λ={info.get('lambda',0.0):.3g}"
-                )
+            msg = (
+                f"{solver} Step accepted: Δcost={c0 - c1:.3g}, "
+                f"backtracks={info.get('backtracks',0)}, λ={info.get('lambda',0.0):.3g}"
             )
         else:
-            self.status.config(
-                text=f"{solver} Step rejected (reason={info.get('reason','no_decrease')})"
-            )
+            msg = f"{solver} Step rejected (reason={info.get('reason','no_decrease')})"
+        self.set_busy(False, msg)
 
     def fit(self):
         if self.x is None or self.y_raw is None or not self.peaks:
@@ -1338,23 +1646,28 @@ class PeakFitApp:
         solver = self.solver_choice.get()
         options = self._solver_options()
         options["solver"] = solver
-        try:
-            self.step_btn.config(state=tk.DISABLED)
-            res = orchestrator.run_fit_with_fallbacks(
+
+        def work():
+            return orchestrator.run_fit_with_fallbacks(
                 x_fit, y_fit, self.peaks, mode, base_fit, options
             )
-        except Exception as e:
-            messagebox.showerror("Fit", f"Fitting failed:\n{e}")
-            self.step_btn.config(state=tk.NORMAL)
-            return
-        finally:
-            self.step_btn.config(state=tk.NORMAL)
 
-        self.peaks[:] = res.peaks_out
+        def done(res, err):
+            self.step_btn.config(state=tk.NORMAL)
+            if err or res is None:
+                self.set_busy(False, "Fit failed.")
+                if err:
+                    self.log(traceback.format_exception_only(type(err), err)[0].strip())
+                    messagebox.showerror("Fit", f"Fitting failed:\n{err}")
+                return
+            self.peaks[:] = res.peaks_out
+            self.refresh_tree(keep_selection=True)
+            self.refresh_plot()
+            self.set_busy(False, f"Fit done. RMSE {res.rmse:.4g}")
 
-        self.refresh_tree(keep_selection=True)
-        self.refresh_plot()
-        self.status.config(text="Fit complete. Edit/lock as needed; Fit again or Export.")
+        self.step_btn.config(state=tk.DISABLED)
+        self.set_busy(True, "Fitting…")
+        self.run_in_thread(work, done)
 
     def run_batch(self):
         folder = filedialog.askdirectory(title="Select folder to batch process")
@@ -1402,17 +1715,47 @@ class PeakFitApp:
             "auto_max": int(self.batch_auto_max.get()),
             solver: self._solver_options(solver),
         }
-        try:
-            batch_runner.run(patterns, cfg)
-            messagebox.showinfo("Batch", f"Summary saved:\n{out_csv}")
-        except Exception as e:
-            messagebox.showerror("Batch", f"Batch failed:\n{e}")
+
         self.cfg["batch_patterns"] = self.batch_patterns.get()
         self.cfg["batch_source"] = source
         self.cfg["batch_reheight"] = bool(self.batch_reheight.get())
         self.cfg["batch_auto_max"] = int(self.batch_auto_max.get())
         self.cfg["batch_save_traces"] = bool(self.batch_save_traces.get())
         save_config(self.cfg)
+
+        counts = {"ok": 0, "total": 0}
+
+        def work():
+            def prog(i, total, path):
+                self.root.after(0, lambda: self.status_var.set(f"Batch {i}/{total}: {Path(path).name}"))
+
+            def logger(path, fit_ok, rmse, trace_path):
+                def _log():
+                    msg = f"{Path(path).name}: {'ok' if fit_ok else 'fail'} rmse={rmse:.3g}"
+                    if trace_path:
+                        msg += f" {trace_path}"
+                    self.log(msg)
+                self.root.after(0, _log)
+                counts["total"] += 1
+                if fit_ok:
+                    counts["ok"] += 1
+
+            batch_runner.run(patterns, cfg, progress=prog, log=logger)
+            return counts["ok"], counts["total"]
+
+        def done(res, err):
+            if err or res is None:
+                self.set_busy(False, "Batch failed.")
+                if err:
+                    self.log("Batch failed", err)
+                    messagebox.showerror("Batch", f"Batch failed:\n{err}")
+                return
+            ok, total = res
+            self.set_busy(False, f"Batch done. {ok}/{total} succeeded.")
+            messagebox.showinfo("Batch", f"Summary saved:\n{out_csv}")
+
+        self.set_busy(True, "Batch running…")
+        self.run_in_thread(work, done)
 
     def run_uncertainty(self):
         if self.x is None or self.y_raw is None or not self.peaks:
@@ -1438,10 +1781,11 @@ class PeakFitApp:
         resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
         method_label = self.unc_method.get()
         method = "bootstrap" if method_label.startswith("Bootstrap") else method_label.lower()
-        try:
+
+        def work():
             if method == "asymptotic":
-                rep = asymptotic.asymptotic({"theta": theta, "jac": None}, resid_fn)
-            elif method == "bootstrap":
+                return asymptotic.asymptotic({"theta": theta, "jac": None}, resid_fn)
+            if method == "bootstrap":
                 cfg = {
                     "x": x_fit,
                     "y": y_fit,
@@ -1452,25 +1796,31 @@ class PeakFitApp:
                     "options": self._solver_options(self.bootstrap_solver_choice.get()),
                     "n": 100,
                 }
-                rep = bootstrap.bootstrap(self.bootstrap_solver_choice.get(), cfg, resid_fn)
-            elif method == "bayesian":
+                return bootstrap.bootstrap(self.bootstrap_solver_choice.get(), cfg, resid_fn)
+            if method == "bayesian":
                 init = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
                         "baseline": base_fit, "theta": theta}
-                rep = bayes.bayesian({}, "gaussian", init, {}, None)
-            else:
-                messagebox.showerror("Uncertainty", "Unknown method")
-                return
-        except Exception as e:
-            messagebox.showerror("Uncertainty", f"Failed: {e}")
-            return
+                return bayes.bayesian({}, "gaussian", init, {}, None)
+            raise RuntimeError("Unknown method")
 
-        sigmas = rep.get("params", {}).get("sigma")
-        if sigmas is not None:
-            msg = "σ: " + ", ".join(f"{s:.3g}" for s in np.ravel(sigmas))
-        else:
-            msg = f"Computed {rep.get('type')} uncertainty."
-        self.status.config(text=msg)
-        messagebox.showinfo("Uncertainty", msg)
+        def done(rep, err):
+            if err or rep is None:
+                self.set_busy(False, "Uncertainty failed.")
+                if err:
+                    self.log("Uncertainty failed", err)
+                    messagebox.showerror("Uncertainty", f"Failed: {err}")
+                return
+            sigmas = rep.get("params", {}).get("sigma")
+            if sigmas is not None:
+                msg = "σ: " + ", ".join(f"{s:.3g}" for s in np.ravel(sigmas))
+            else:
+                msg = f"Computed {rep.get('type')} uncertainty."
+            self.log(msg)
+            messagebox.showinfo("Uncertainty", msg)
+            self.set_busy(False, "Uncertainty ready (95% band).")
+
+        self.set_busy(True, "Computing uncertainty…")
+        self.run_in_thread(work, done)
 
     def apply_performance(self):
         performance.set_numba(bool(self.perf_numba.get()))
@@ -1487,7 +1837,7 @@ class PeakFitApp:
         else:
             performance.set_max_workers(0)
         performance.set_gpu_chunk(self.gpu_chunk_var.get())
-        self.status.config(text="Performance options applied.")
+        self.status_var.set("Performance options applied.")
 
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:
