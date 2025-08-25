@@ -202,51 +202,65 @@ class ScrollableFrame(ttk.Frame):
         self.interior.bind("<Configure>", self._on_interior_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
+        # Local wheel state
         self._wheel_accum = 0
         self._wheel_bound = False
+
+        # Bind/unbind when pointer enters/leaves the panel
         self.interior.bind("<Enter>", self._bind_mousewheel)
         self.interior.bind("<Leave>", self._unbind_mousewheel)
 
     def _on_interior_configure(self, _event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         self.canvas.itemconfigure(self._win, width=self.canvas.winfo_width())
+        # Re-attach wheel tag to any new children
+        if self._wheel_bound:
+            self._attach_wheel_to_descendants()
 
     def _on_canvas_configure(self, _event=None):
         self.canvas.itemconfigure(self._win, width=self.canvas.winfo_width())
 
+    # ---------- wheel binding (local/tag-based) ----------
     def _bind_mousewheel(self, _event=None):
         if self._wheel_bound:
             return
         self._wheel_bound = True
 
-        targets = (self.canvas, self.interior)
-        for w in targets:
-            w.bind("<MouseWheel>", self._on_mousewheel_win, add=True)
-            w.bind("<Shift-MouseWheel>", self._on_shift_wheel, add=True)
-            w.bind("<Button-4>", self._on_wheel_linux_up, add=True)
-            w.bind("<Button-5>", self._on_wheel_linux_down, add=True)
+        # Ensure tag has our handlers
+        self._ensure_panelwheel_bindings()
 
-        for tag in ("Treeview", "TEntry", "TCombobox", "Listbox", "Text", "TSpinbox"):
-            try:
-                self.canvas.bind_class(tag, "<MouseWheel>", self._on_mousewheel_win, add=True)
-                self.canvas.bind_class(tag, "<Shift-MouseWheel>", self._on_shift_wheel, add=True)
-                self.canvas.bind_class(tag, "<Button-4>", self._on_wheel_linux_up, add=True)
-                self.canvas.bind_class(tag, "<Button-5>", self._on_wheel_linux_down, add=True)
-            except Exception:
-                pass
+        # Attach tag to canvas, interior, and all descendants
+        self._attach_wheel_tag(self.canvas)
+        self._attach_wheel_tag(self.interior)
+        self._attach_wheel_to_descendants()
 
     def _unbind_mousewheel(self, _event=None):
         if not self._wheel_bound:
             return
         self._wheel_bound = False
-        for w in (self.canvas, self.interior):
-            w.unbind("<MouseWheel>")
-            w.unbind("<Shift-MouseWheel>")
-            w.unbind("<Button-4>")
-            w.unbind("<Button-5>")
+        # Tag remains but has no active handlers
 
-    # ---- Wheel handlers (local) ----
-    def _on_mousewheel_win(self, event):
+    def _ensure_panelwheel_bindings(self):
+        tag = "PanelWheel"
+        self.canvas.bind_class(tag, "<MouseWheel>", self._on_mousewheel_osx_win, add=True)
+        self.canvas.bind_class(tag, "<Shift-MouseWheel>", self._on_shiftwheel_osx_win, add=True)
+        self.canvas.bind_class(tag, "<Button-4>", self._on_wheel_linux_up, add=True)
+        self.canvas.bind_class(tag, "<Button-5>", self._on_wheel_linux_down, add=True)
+
+    def _attach_wheel_to_descendants(self):
+        for w in self.interior.winfo_children():
+            self._attach_wheel_tag(w)
+            if isinstance(w, (ttk.Frame, tk.Frame, ttk.Labelframe)):
+                for c in w.winfo_children():
+                    self._attach_wheel_tag(c)
+
+    def _attach_wheel_tag(self, widget):
+        tags = list(widget.bindtags())
+        if "PanelWheel" not in tags:
+            widget.bindtags(("PanelWheel",) + tuple(tags))
+
+    # ---------- wheel handlers ----------
+    def _on_mousewheel_osx_win(self, event):
         self._wheel_accum += event.delta
         step = 0
         while abs(self._wheel_accum) >= 120:
@@ -256,7 +270,7 @@ class ScrollableFrame(ttk.Frame):
             self.canvas.yview_scroll(step, "units")
         return "break"
 
-    def _on_shift_wheel(self, event):
+    def _on_shiftwheel_osx_win(self, event):
         direction = -1 if event.delta > 0 else 1
         self.canvas.xview_scroll(direction, "units")
         return "break"
