@@ -10,6 +10,7 @@ from scipy.optimize import least_squares
 from core.residuals import build_residual_jac
 from core.models import pv_design_matrix
 from core.weights import noise_weights
+from core.peaks import Peak
 from .bounds import pack_theta_bounds
 from .utils import mad_sigma, robust_cost
 from . import step_engine
@@ -83,7 +84,7 @@ def solve(
     options = options.copy()
     base = baseline if baseline is not None else 0.0
     y_target = y - base
-    weights = None if weight_mode == "none" else noise_weights(y_target, weight_mode)
+    weights = noise_weights(weight_mode, y_target)
     p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
     max_height_factor = float(options.get("max_height_factor", np.inf))
     options["max_height"] = max_height_factor * p95
@@ -231,14 +232,23 @@ def solve(
     )
 
 
-def iterate(state: dict) -> dict:
-    """Single iteration of the modern solver.
+def prepare_state(x, y, peaks, mode, baseline, opts):
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    baseline_arr = np.asarray(baseline, float) if baseline is not None else None
+    state = {
+        "x_fit": x,
+        "y_fit": y,
+        "peaks": [Peak(p.center, p.height, p.fwhm, p.eta) for p in peaks],
+        "mode": mode,
+        "baseline": baseline_arr,
+        "options": opts or {},
+    }
+    return {"state": state}
 
-    This mirrors the behaviour of :func:`step_engine.step_once` but honours the
-    solver options used by :func:`solve`.  Only a subset of the full solver
-    functionality is required for stepping, so we reuse the generic step
-    engine here.
-    """
+
+def iterate(state: dict):
+    """Single iteration of the modern solver."""
 
     x = state["x_fit"]
     y = state["y_fit"]
@@ -252,7 +262,7 @@ def iterate(state: dict) -> dict:
 
     _, bounds = pack_theta_bounds(peaks, x, options)
 
-    theta, cost, step_norm, accepted = step_engine.step_once(
+    theta, cost1, step_norm, accepted, cost0, n_bt, reason = step_engine.step_once(
         x,
         y,
         peaks,
@@ -265,11 +275,17 @@ def iterate(state: dict) -> dict:
         bounds=bounds,
         f_scale=options.get("f_scale", 1.0),
         max_backtracks=options.get("max_backtracks", 8),
+        min_step_ratio=options.get("min_step_ratio", 1e-9),
     )
 
     state["theta"] = theta
-    state["cost"] = cost
+    state["cost"] = cost1
     state["step_norm"] = step_norm
     state["accepted"] = accepted
-    return state
+    state["peaks"] = [
+        Peak(theta[4 * i], theta[4 * i + 1], theta[4 * i + 2], theta[4 * i + 3])
+        for i in range(len(peaks))
+    ]
+    info = {"backtracks": n_bt, "step_norm": step_norm, "lambda": state.get("lambda", 0.0), "reason": reason}
+    return state, accepted, cost0, cost1, info
 

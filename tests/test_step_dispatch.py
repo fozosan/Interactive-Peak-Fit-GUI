@@ -27,6 +27,6 @@ def test_iterate_dispatch_cost_decreases():
     model0 = pv_sum(x, peaks)
     cost0 = 0.5 * float(np.sum((model0 - y) ** 2))
 
-    res = iterate(state)
-    assert res["accepted"]
-    assert res["cost"] <= cost0
+    res_state, ok, c0, c1, _ = iterate(state)
+    assert ok
+    assert c1 <= cost0

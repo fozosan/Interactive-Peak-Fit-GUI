@@ -80,7 +80,7 @@ def solve(
     options = options.copy()
     base = baseline if baseline is not None else 0.0
     y_target = y - base
-    weights = None if weight_mode == "none" else noise_weights(y_target, weight_mode)
+    weights = noise_weights(weight_mode, y_target)
     p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
     max_height_factor = float(options.get("max_height_factor", np.inf))
     options["max_height"] = max_height_factor * p95
@@ -328,14 +328,23 @@ def solve(
     )
 
 
-def iterate(state: dict) -> dict:
-    """Single iteration for the variable projection solver.
+def prepare_state(x, y, peaks, mode, baseline, opts):
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    baseline_arr = np.asarray(baseline, float) if baseline is not None else None
+    state = {
+        "x_fit": x,
+        "y_fit": y,
+        "peaks": [Peak(p.center, p.height, p.fwhm, p.eta) for p in peaks],
+        "mode": mode,
+        "baseline": baseline_arr,
+        "options": opts or {},
+    }
+    return {"state": state}
 
-    This helper mirrors the behaviour of :func:`solve` but performs only a
-    single Gauss–Newton/LM step by delegating to :func:`step_engine.step_once`.
-    It accepts and returns a ``state`` dictionary similar to the other solver
-    backends.
-    """
+
+def iterate(state: dict):
+    """Single iteration for the variable projection solver."""
 
     x = state["x_fit"]
     y = state["y_fit"]
@@ -349,7 +358,7 @@ def iterate(state: dict) -> dict:
 
     _, bounds = pack_theta_bounds(peaks, x, options)
 
-    theta, cost, step_norm, accepted = step_engine.step_once(
+    theta, _cost1, step_norm, accepted, cost0, n_bt, reason = step_engine.step_once(
         x,
         y,
         peaks,
@@ -362,12 +371,13 @@ def iterate(state: dict) -> dict:
         bounds=bounds,
         f_scale=options.get("f_scale", 1.0),
         max_backtracks=options.get("max_backtracks", 8),
+        min_step_ratio=options.get("min_step_ratio", 1e-9),
     )
 
     # Re-solve heights via NNLS to mirror variable projection behaviour
     base_arr = baseline if baseline is not None else 0.0
     y_target = y - base_arr
-    weights = None if weight_mode == "none" else noise_weights(y_target, weight_mode)
+    weights = noise_weights(weight_mode, y_target)
     pk_tmp = [
         Peak(theta[4 * i + 0], 1.0, theta[4 * i + 2], theta[4 * i + 3])
         for i in range(len(peaks))
@@ -379,20 +389,32 @@ def iterate(state: dict) -> dict:
     else:
         Aw = A
         bw = y_target
-    h, _ = nnls(Aw, bw)
+    norms = np.linalg.norm(Aw, axis=0)
+    norms = np.clip(norms, 1e-6, 1e6)
+    Aw_s = Aw / norms
+    h_s, _ = nnls(Aw_s, bw)
+    h = h_s / norms
     h = np.minimum(h, options.get("max_height", np.inf))
     for i, val in enumerate(h):
         theta[4 * i + 1] = val
     model = A @ h
     r = model - y_target
-    w_noise = weights if weights is not None else np.ones_like(r)
-    w_rob = robust_weights(r, loss, options.get("f_scale", 1.0))
+    w_noise = weights
+    w_rob = robust_weights(loss, r, options.get("f_scale", 1.0))
     w = combine_weights(w_noise, w_rob)
-    r_w = r * w
-    cost = 0.5 * float(r_w @ r_w)
+    if w is None:
+        r_w = r
+    else:
+        r_w = r * w
+    cost1 = 0.5 * float(r_w @ r_w)
 
     state["theta"] = theta
-    state["cost"] = cost
+    state["cost"] = cost1
     state["step_norm"] = step_norm
     state["accepted"] = accepted
-    return state
+    state["peaks"] = [
+        Peak(theta[4 * i], theta[4 * i + 1], theta[4 * i + 2], theta[4 * i + 3])
+        for i in range(len(peaks))
+    ]
+    info = {"backtracks": n_bt, "step_norm": step_norm, "lambda": state.get("lambda", 0.0), "reason": reason}
+    return state, accepted, cost0, cost1, info

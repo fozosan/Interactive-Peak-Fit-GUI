@@ -33,7 +33,10 @@ def step_once(
     wmin_eval: float = 0.0,
     f_scale: float = 1.0,
     max_backtracks: int = 8,
-) -> tuple[np.ndarray, float, float, bool]:
+    rel_tol: float = 1e-6,
+    abs_tol: float = 1e-12,
+    min_step_ratio: float = 1e-9,
+) -> tuple[np.ndarray, float, float, bool, float, int, str]:
     """Perform one weighted Gauss-Newton/LM step with backtracking.
 
     ``weight_mode`` selects the noise-weighting strategy and ``loss`` controls
@@ -81,17 +84,31 @@ def step_once(
     y_target = y - base_arr
     r = model - y_target
 
-    w_noise = noise_weights(y_target, weight_mode)
-    w_robust = robust_weights(r, loss, f_scale)
-    w = combine_weights(w_noise, w_robust)
+    lam = float(damping)
+    for attempt in range(2):
+        w_noise = noise_weights(weight_mode, y_target)
+        w_robust = robust_weights(loss, r, f_scale)
+        w = combine_weights(w_noise, w_robust)
+        if w is None:
+            r_w = r
+            J_w = J
+        else:
+            r_w = r * w
+            J_w = J * w[:, None]
+        if np.all(np.isfinite(r_w)) and np.all(np.isfinite(J_w)):
+            break
+        lam = lam * 10 if lam else 1e-3
+    else:
+        cost0 = float("inf")
+        return _theta_from_peaks(peaks), cost0, 0.0, False, cost0, 0, "nonfinite"
 
-    r_w = r * w
-    J_w = J * w[:, None]
     cost0 = 0.5 * float(r_w @ r_w)
+    if not np.isfinite(cost0):
+        return _theta_from_peaks(peaks), float(cost0), 0.0, False, float(cost0), 0, "nonfinite"
 
     JTJ = J_w.T @ J_w
-    if damping:
-        JTJ = JTJ + np.eye(JTJ.shape[0]) * damping
+    if lam:
+        JTJ = JTJ + np.eye(JTJ.shape[0]) * lam
     rhs = -J_w.T @ r_w
     try:
         delta = np.linalg.solve(JTJ, rhs)
@@ -104,6 +121,11 @@ def step_once(
             delta *= trust_radius / norm
 
     theta0 = _theta_from_peaks(peaks)
+    norm_theta = np.linalg.norm(theta0)
+    denom = max(1.0, norm_theta)
+    if np.linalg.norm(delta) / denom < min_step_ratio:
+        cost0 = float(cost0)
+        return theta0, cost0, 0.0, False, cost0, 0, "tiny_step"
     mask = np.ones(theta0.size, dtype=bool)
     mask[3::4] = False  # do not update eta
     theta_base = theta0[mask]
@@ -118,6 +140,8 @@ def step_once(
     accepted = False
     theta_reduced = theta_base.copy()
     cost = cost0
+    n_bt = 0
+    reason = "no_decrease"
     for _ in range(max_backtracks + 1):
         theta_try = theta_base + step
         if lb is not None and ub is not None:
@@ -136,16 +160,30 @@ def step_once(
             pv, _, _ = pv_and_grads(x, h_new[i], c_new[i], f_new[i], eta_new[i])
             model_new += pv
         r_new = model_new - y_target
-        w_rob_new = robust_weights(r_new, loss, f_scale)
+        w_rob_new = robust_weights(loss, r_new, f_scale)
         w_new = combine_weights(w_noise, w_rob_new)
-        r_w_new = r_new * w_new
+        if w_new is None:
+            r_w_new = r_new
+        else:
+            r_w_new = r_new * w_new
         cost_new = 0.5 * float(r_w_new @ r_w_new)
-        if cost_new <= cost0:
+        if np.isfinite(cost_new) and cost_new < cost0 - max(abs_tol, rel_tol * cost0):
             theta_reduced = theta_try
             cost = cost_new
             accepted = True
+            reason = "accepted"
             break
+        if not np.isfinite(cost_new):
+            reason = "nonfinite"
+            break
+        if n_bt >= max_backtracks:
+            reason = "no_decrease"
+            break
+        if lb is not None and ub is not None:
+            hit = (theta_try <= lb + 1e-12) | (theta_try >= ub - 1e-12)
+            step[hit] = 0.0
         step *= 0.5
+        n_bt += 1
 
     theta_out = theta0.copy()
     if accepted:
@@ -155,4 +193,4 @@ def step_once(
         step_norm = 0.0
         cost = cost0
 
-    return theta_out, cost, step_norm, accepted
+    return theta_out, cost, step_norm, accepted, cost0, n_bt, reason

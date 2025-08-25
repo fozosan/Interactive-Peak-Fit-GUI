@@ -83,8 +83,9 @@ def _adapt_result(
     n_iter = int(meta.get("n_iter", meta.get("njev", nfev)))
     hit_bounds = bool(raw.get("hit_bounds", False))
     hit_mask = np.asarray(raw.get("hit_mask", []), dtype=bool)
+    ok = bool(raw.get("ok", raw.get("success", False)))
     return FitResult(
-        success=bool(raw.get("ok", False)),
+        success=ok,
         solver=solver_name,
         theta=theta,
         peaks_out=peaks_out,
