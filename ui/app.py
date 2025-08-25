@@ -153,6 +153,7 @@ Known limitations / tips
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -308,6 +309,49 @@ def add_tooltip(widget, text: str) -> None:
     widget.bind("<Enter>", on_enter)
     widget.bind("<Leave>", on_leave)
 
+
+# ---------- Label formatting ----------
+def format_axis_label_inline(text: str) -> str:
+    r"""Convert ``^``/``_`` fragments to inline math while preserving normal text.
+
+    Existing ``$...$`` regions are left untouched.  Braced or single-character
+    superscripts and subscripts are wrapped in ``$`` delimiters with any
+    interior whitespace trimmed.  Escaped literals ``\^`` and ``\_`` are
+    unescaped after processing and do not trigger math wrapping.
+    """
+
+    # Split into segments outside/inside existing math blocks
+    parts = re.split(r"(\$.*?\$)", text)
+    result = []
+
+    ESC_UND = "\0UND\0"
+    ESC_CARET = "\0CAR\0"
+
+    pattern = re.compile(r"([_^])\s*(\{[^}]*\}|[^\s])")
+
+    for part in parts:
+        if part.startswith("$") and part.endswith("$"):
+            # Existing math region; return as-is
+            result.append(part)
+            continue
+
+        tmp = part.replace(r"\_", ESC_UND).replace(r"\^", ESC_CARET)
+
+        def repl(match):
+            op = match.group(1)
+            token = match.group(2)
+            if token.startswith("{"):
+                content = token[1:-1].strip()
+                if len(content) == 1:
+                    return f"${op}{content}$"
+                return f"${op}{{{content}}}$"
+            return f"${op}{token}$"
+
+        converted = pattern.sub(repl, tmp)
+        converted = converted.replace(ESC_UND, "_").replace(ESC_CARET, "^")
+        result.append(converted)
+
+    return "".join(result)
 
 # ---------- Scrollable frame ----------
 class ScrollableFrame(ttk.Frame):
@@ -585,7 +629,7 @@ class PeakFitApp:
         # Left: plot
         self.fig = plt.Figure(figsize=(7,5), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_xlabel(self._format_axis_label(self.x_label_var.get())); self.ax.set_ylabel("Intensity")
+        self.ax.set_xlabel(format_axis_label_inline(self.x_label_var.get())); self.ax.set_ylabel("Intensity")
         self.canvas = FigureCanvasTkAgg(self.fig, master=left)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.nav = NavigationToolbar2Tk(self.canvas, left)
@@ -1059,7 +1103,7 @@ class PeakFitApp:
 
     def _new_figure(self):
         self.ax.clear()
-        self.ax.set_xlabel(self._format_axis_label(self.x_label_var.get())); self.ax.set_ylabel("Intensity")
+        self.ax.set_xlabel(format_axis_label_inline(self.x_label_var.get())); self.ax.set_ylabel("Intensity")
         self.ax.set_title("Open a data file to begin")
         self.canvas.draw_idle()
 
@@ -1358,17 +1402,17 @@ class PeakFitApp:
 
     # ----- Axes label helpers -----
     def insert_superscript(self):
-        self.x_label_entry.insert(tk.INSERT, "^{ }")
-        self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 2)
+        self.x_label_entry.insert(tk.INSERT, "$^{ }$")
+        self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 3)
         self.x_label_entry.focus_set()
 
     def insert_subscript(self):
-        self.x_label_entry.insert(tk.INSERT, "_{ }")
-        self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 2)
+        self.x_label_entry.insert(tk.INSERT, "$_{ }$")
+        self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 3)
         self.x_label_entry.focus_set()
 
     def apply_x_label(self):
-        label = self._format_axis_label(self.x_label_var.get())
+        label = format_axis_label_inline(self.x_label_var.get())
         self.ax.set_xlabel(label)
         self.canvas.draw_idle()
 
@@ -1376,12 +1420,6 @@ class PeakFitApp:
         self.cfg["x_label"] = self.x_label_var.get()
         save_config(self.cfg)
         messagebox.showinfo("Axes", f'Saved default x-axis label: "{self.x_label_var.get()}"')
-
-    @staticmethod
-    def _format_axis_label(text: str) -> str:
-        if "^" in text or "_" in text:
-            return f"${text}$"
-        return text
 
     # ----- Templates helpers -----
     def _templates(self) -> dict:
@@ -2047,7 +2085,7 @@ class PeakFitApp:
     def refresh_plot(self):
         LW_RAW, LW_BASE, LW_CORR, LW_COMP, LW_FIT = 1.0, 1.0, 0.9, 0.8, 1.2
         self.ax.clear()
-        self.ax.set_xlabel(self._format_axis_label(self.x_label_var.get()))
+        self.ax.set_xlabel(format_axis_label_inline(self.x_label_var.get()))
         self.ax.set_ylabel("Intensity")
         if self.x is None:
             self.ax.set_title("Open a data file to begin")
