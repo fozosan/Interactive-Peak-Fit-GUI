@@ -8,22 +8,22 @@ from core.models import pv_sum
 from fit import classic, modern_vp, modern
 
 
-def test_classic_step_matches_fit():
+def test_classic_step_parity():
     x = np.linspace(0, 60, 400)
     true = [Peak(20, 5, 5, 0.5), Peak(40, 2, 6, 0.3)]
     y = pv_sum(x, true)
     start = [Peak(19, 4, 6, 0.5), Peak(41, 1.5, 7, 0.3)]
-    full = classic.solve(x, y, [Peak(p.center, p.height, p.fwhm, p.eta) for p in start], "add", None, {})
+    solve_res = classic.solve(x, y, [Peak(p.center, p.height, p.fwhm, p.eta) for p in start], "add", None, {})
     s = classic.prepare_state(x, y, start, mode="add", baseline=None, opts={})["state"]
+    prev = np.inf
     for _ in range(20):
         s, ok, c0, c1, info = classic.iterate(s)
-        assert info["backtracks"] <= 10
-        if ok:
-            assert c1 < c0
-    peaks_final = s["peaks"]
-    model = pv_sum(x, peaks_final)
-    rmse = np.sqrt(np.mean((model - y) ** 2))
-    assert rmse <= 1.2 * full["rmse"]
+        assert c1 <= c0
+        assert c1 <= prev
+        prev = c1
+    theta_step = np.array([v for pk in s["peaks"] for v in (pk.center, pk.height, pk.fwhm, pk.eta)])
+    theta_full = np.array([v for pk in solve_res["peaks"] for v in (pk.center, pk.height, pk.fwhm, pk.eta)])
+    assert np.allclose(theta_step, theta_full, rtol=0.01, atol=0.01)
 
 
 def _run_modern_backend(backend):

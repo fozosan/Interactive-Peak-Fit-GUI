@@ -55,7 +55,7 @@ def build_help(opts: dict) -> str:
 
         Solver
         ------
-        • Classic – fast linear least squares. Option: max evals.
+        • Classic (curve_fit) – simple unweighted least squares. Option: max evals.
         • Modern – Trust Region Reflective with robust losses
           [{modern_losses}], weighting [{modern_weights}], multi-start
           restarts and optional jitter. Toggles: 'Centers in window' and

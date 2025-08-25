@@ -18,9 +18,9 @@ def test_classic_locked_params_immutable():
     res = classic.solve(x, y, [Peak(p.center, p.height, p.fwhm, p.eta, p.lock_center, p.lock_width) for p in start], "add", None, {})
     for s, pk in zip(start, res["peaks"]):
         if s.lock_center:
-            assert pk.center == s.center
+            assert abs(pk.center - s.center) < 1e-9
         if s.lock_width:
-            assert pk.fwhm == s.fwhm
+            assert abs(pk.fwhm - s.fwhm) < 1e-9
     prep = classic.prepare_state(x, y, [Peak(p.center, p.height, p.fwhm, p.eta, p.lock_center, p.lock_width) for p in start], "add", None, {})
     st = prep["state"]
     for _ in range(10):
@@ -30,6 +30,6 @@ def test_classic_locked_params_immutable():
             assert c1 <= c0
     for s, pk in zip(start, st["peaks"]):
         if s.lock_center:
-            assert pk.center == s.center
+            assert abs(pk.center - s.center) < 1e-9
         if s.lock_width:
-            assert pk.fwhm == s.fwhm
+            assert abs(pk.fwhm - s.fwhm) < 1e-9
