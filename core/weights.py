@@ -37,7 +37,10 @@ def robust_weights(resid, loss, f_scale=1.0):
         w = 1.0 / np.sqrt(1.0 + a * a)
     elif loss == "huber":
         k = 1.0
-        w = np.where(a <= k, 1.0, k / a)
+        # Avoid divide-by-zero warnings while preserving unity weights when
+        # ``a`` is below the threshold ``k``.
+        w = np.ones_like(a, dtype=float)
+        np.divide(k, a, out=w, where=(a > k))
     elif loss == "cauchy":
         w = 1.0 / (1.0 + a * a)
     else:

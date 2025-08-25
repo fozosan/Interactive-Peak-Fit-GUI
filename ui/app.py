@@ -18,7 +18,7 @@ Features:
   • Global η (Gaussian–Lorentzian shape factor) with "Apply to all"
   • Auto-seed peaks (respects fit range)
   • Choose a fit x-range (type Min/Max or drag with a SpanSelector); shaded on plot
-  • Solver selection (Classic, Modern, LMFIT) plus Step ▶ single iteration
+  • Solver selection (Classic (curve_fit), Modern, LMFIT) plus Step ▶ single iteration
   • Multiple peak templates (save as new, save changes, select/apply, delete); optional auto-apply on open
   • Zoom out & Reset view buttons
   • Supports CSV, TXT, DAT (auto delimiter detection; skips headers/comments)
@@ -69,7 +69,7 @@ MODERN_WEIGHTS = ["none", "poisson", "inv_y"]
 LMFIT_ALGOS = ["least_squares", "leastsq", "nelder", "differential_evolution"]
 
 SOLVER_LABELS = {
-    "classic": "Classic",
+    "classic": "Classic (curve_fit)",
     "modern_vp": "Modern (Variable Projection)",
     "modern_trf": "Modern (Legacy TRF)",
     "lmfit_vp": "LMFIT (Variable Projection)",

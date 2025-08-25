@@ -1,186 +1,226 @@
-"""Minimal Classic solver and stepper using plain least squares."""
+"""Simple SciPy curve_fit backend matching legacy v2.7 behaviour."""
 from __future__ import annotations
 
-from typing import Sequence, TypedDict
+from typing import Sequence
 
 import numpy as np
 from scipy.optimize import curve_fit
 
 from core.peaks import Peak
 from core.models import pv_sum
-from core.bounds_classic import make_bounds_classic
+
+W_MIN = 1e-6  # minimal physical FWHM
 
 
-class SolveResult(TypedDict):
-    success: bool
-    theta: np.ndarray
-    peaks: list[Peak]
-    cost: float
-    rmse: float
-    message: str
-    meta: dict
-
-
-def _pack_free(peaks: Sequence[Peak], *, wmin_floor: float = 1e-9):
-    """Pack free parameters into a vector with simple bounds."""
-    theta = []
-    lo = []
-    hi = []
+def _pack(
+    peaks: Sequence[Peak],
+    *,
+    centers_in_window: bool,
+    xmin: float,
+    xmax: float,
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray], list[dict]]:
+    """Flatten free parameters and construct simple bounds."""
+    theta: list[float] = []
+    lo: list[float] = []
+    hi: list[float] = []
     struct: list[dict] = []
     for pk in peaks:
-        s: dict = {}
+        s: dict = {"eta": float(pk.eta)}
+        # height always free
         s["ih"] = len(theta)
         theta.append(max(pk.height, 0.0))
         lo.append(0.0)
         hi.append(np.inf)
+        # centre
         if pk.lock_center:
             s["ic"] = None
-            s["c_fixed"] = pk.center
+            c0 = pk.center
+            if centers_in_window:
+                c0 = float(np.clip(c0, xmin, xmax))
+                s["c_lo"] = xmin
+                s["c_hi"] = xmax
+            s["c_fixed"] = c0
         else:
             s["ic"] = len(theta)
-            theta.append(pk.center)
-            lo.append(-np.inf)
-            hi.append(np.inf)
+            c0 = pk.center
+            if centers_in_window:
+                c0 = float(np.clip(c0, xmin, xmax))
+                lo.append(xmin)
+                hi.append(xmax)
+                s["c_lo"] = xmin
+                s["c_hi"] = xmax
+            else:
+                lo.append(-np.inf)
+                hi.append(np.inf)
+            theta.append(c0)
+        # width
         if pk.lock_width:
             s["iw"] = None
-            s["w_fixed"] = pk.fwhm
+            s["w_fixed"] = max(pk.fwhm, W_MIN)
         else:
             s["iw"] = len(theta)
-            theta.append(max(pk.fwhm, wmin_floor))
-            lo.append(wmin_floor)
+            theta.append(max(pk.fwhm, W_MIN))
+            lo.append(W_MIN)
             hi.append(np.inf)
-        s["eta"] = float(pk.eta)
         struct.append(s)
     return np.asarray(theta, float), (np.asarray(lo, float), np.asarray(hi, float)), struct
 
 
-def _theta_full(theta: np.ndarray, struct: Sequence[dict], wmin_eval: float) -> np.ndarray:
-    out = []
+def _theta_full(theta: np.ndarray, struct: Sequence[dict]) -> np.ndarray:
+    out: list[float] = []
     for s in struct:
         h = max(theta[s["ih"]], 0.0)
         c = s["c_fixed"] if s["ic"] is None else theta[s["ic"]]
+        c = float(np.clip(c, s.get("c_lo", -np.inf), s.get("c_hi", np.inf)))
         w = s["w_fixed"] if s["iw"] is None else theta[s["iw"]]
-        w = max(w, wmin_eval)
+        w = max(w, W_MIN)
         out.extend([c, h, w, s["eta"]])
     return np.asarray(out, float)
 
 
-def _theta_to_peaks(theta: np.ndarray, struct: Sequence[dict], wmin_eval: float) -> list[Peak]:
+def _theta_to_peaks(theta: np.ndarray, struct: Sequence[dict]) -> list[Peak]:
     out: list[Peak] = []
     for s in struct:
         h = float(max(theta[s["ih"]], 0.0))
         c = float(s["c_fixed"] if s["ic"] is None else theta[s["ic"]])
+        c = float(np.clip(c, s.get("c_lo", -np.inf), s.get("c_hi", np.inf)))
         w = float(s["w_fixed"] if s["iw"] is None else theta[s["iw"]])
-        w = max(w, wmin_eval)
-        out.append(Peak(c, h, w, float(s["eta"])) )
+        w = max(w, W_MIN)
+        out.append(
+            Peak(
+                c,
+                h,
+                w,
+                float(s["eta"]),
+                s.get("ic") is None,
+                s.get("iw") is None,
+            )
+        )
     return out
 
 
-def _residual_builder(x_fit, y_fit, base_fit, struct, *, mode: str, wmin_eval: float):
+def _build_residual(
+    x_fit: np.ndarray,
+    y_target: np.ndarray,
+    base_fit: np.ndarray | None,
+    struct: Sequence[dict],
+):
     def residual(theta_free: np.ndarray) -> np.ndarray:
         peaks = []
         for s in struct:
             h = max(theta_free[s["ih"]], 0.0)
             c = s["c_fixed"] if s["ic"] is None else theta_free[s["ic"]]
+            c = float(np.clip(c, s.get("c_lo", -np.inf), s.get("c_hi", np.inf)))
             w = s["w_fixed"] if s["iw"] is None else theta_free[s["iw"]]
-            w = max(w, wmin_eval)
+            w = max(w, W_MIN)
             peaks.append(Peak(c, h, w, s["eta"]))
         model = pv_sum(x_fit, peaks)
-        if mode == "add" and base_fit is not None:
+        if base_fit is not None:
             model = model + base_fit
-        return model - y_fit
+        return model - y_target
 
     return residual
 
 
-def solve(x, y, peaks, mode, baseline, opts) -> SolveResult:
+def solve(x, y, peaks, mode, baseline, opts):
+    """Full curve_fit solution using unweighted residuals."""
     x = np.asarray(x, float)
     y = np.asarray(y, float)
     base = np.asarray(baseline, float) if baseline is not None else None
-    y_target = y if mode == "add" else y - (base if base is not None else 0.0)
-    base_fit = base if mode == "add" else None
-    theta0, _b, struct = _pack_free(peaks)
-    lo, hi, wmin_eval = make_bounds_classic(
-        x,
-        y_target,
-        peaks,
-        centers_in_window=bool(opts.get("bound_centers_to_window", True)),
-        fwhm_min_factor=float(opts.get("fwhm_min_factor", 2.0)),
-        fwhm_max_factor=float(opts.get("fwhm_max_factor", 0.5)),
-        height_max_factor=float(opts.get("height_factor", 1.0)),
-        margin_frac=float(opts.get("margin_frac", 0.0)),
-    )
-    theta0 = np.minimum(np.maximum(theta0, lo), hi)
-    resid = _residual_builder(x, y_target, base_fit, struct, mode=mode, wmin_eval=wmin_eval)
+    if mode == "add":
+        y_target = y
+        base_fit = base
+    else:
+        y_target = y - (base if base is not None else 0.0)
+        base_fit = None
+    centers_flag = bool(opts.get("centers_in_window", True))
+    theta0, bounds, struct = _pack(peaks, centers_in_window=centers_flag, xmin=float(x.min()), xmax=float(x.max()))
+    theta0 = np.clip(theta0, bounds[0], bounds[1])
 
     def model_func(xdata, *t):
         theta = np.asarray(t, float)
-        return resid(theta) + y_target
+        peaks_loc = []
+        for s in struct:
+            h = max(theta[s["ih"]], 0.0)
+            c = s["c_fixed"] if s["ic"] is None else theta[s["ic"]]
+            c = float(np.clip(c, s.get("c_lo", -np.inf), s.get("c_hi", np.inf)))
+            w = s["w_fixed"] if s["iw"] is None else theta[s["iw"]]
+            w = max(w, W_MIN)
+            peaks_loc.append(Peak(c, h, w, s["eta"]))
+        model = pv_sum(xdata, peaks_loc)
+        if base_fit is not None:
+            model = model + base_fit
+        return model
 
-    maxfev = int(opts.get("maxfev", 2000))
-    popt, _ = curve_fit(model_func, x, y_target, p0=theta0, bounds=(lo, hi), maxfev=maxfev)
-    popt = np.minimum(np.maximum(popt, lo), hi)
-    peaks_out = _theta_to_peaks(popt, struct, wmin_eval)
-    resid_final = resid(popt)
+    maxfev = int(opts.get("maxfev", 20000))
+    popt, _ = curve_fit(model_func, x, y_target, p0=theta0, bounds=bounds, maxfev=maxfev)
+    popt = np.clip(popt, bounds[0], bounds[1])
+    resid_fun = _build_residual(x, y_target, base_fit, struct)
+    resid_final = resid_fun(popt)
     cost = 0.5 * float(resid_final @ resid_final)
-    rmse = float(np.sqrt(np.mean(resid_final ** 2)))
-    theta_full = _theta_full(popt, struct, wmin_eval)
-    return SolveResult(
-        success=True,
-        theta=theta_full,
-        peaks=peaks_out,
-        cost=cost,
-        rmse=rmse,
-        message="",
-        meta={"nfev": maxfev},
-    )
+    rmse = float(np.sqrt(np.mean(resid_final**2)))
+    peaks_out = _theta_to_peaks(popt, struct)
+    theta_full = _theta_full(popt, struct)
+    model_full = pv_sum(x, peaks_out)
+    if mode == "add" and base is not None:
+        y_fit = model_full + base
+    else:
+        y_fit = model_full
+    return {
+        "success": True,
+        "theta": theta_full,
+        "peaks": peaks_out,
+        "cost": cost,
+        "rmse": rmse,
+        "y_fit": y_fit,
+        "info": {"nfev": maxfev},
+        "meta": {"nfev": maxfev},
+    }
 
 
 def prepare_state(x, y, peaks, mode, baseline, opts):
+    """Prepare iteration state for Step ▶."""
     x = np.asarray(x, float)
     y = np.asarray(y, float)
     base = np.asarray(baseline, float) if baseline is not None else None
-    y_target = y if mode == "add" else y - (base if base is not None else 0.0)
-    base_fit = base if mode == "add" else None
-    theta0, _b, struct = _pack_free(peaks)
-    lo, hi, wmin_eval = make_bounds_classic(
-        x,
-        y_target,
-        peaks,
-        centers_in_window=bool(opts.get("bound_centers_to_window", True)),
-        fwhm_min_factor=float(opts.get("fwhm_min_factor", 2.0)),
-        fwhm_max_factor=float(opts.get("fwhm_max_factor", 0.5)),
-        height_max_factor=float(opts.get("height_factor", 1.0)),
-        margin_frac=float(opts.get("margin_frac", 0.0)),
-    )
-    theta0 = np.minimum(np.maximum(theta0, lo), hi)
-    resid = _residual_builder(x, y_target, base_fit, struct, mode=mode, wmin_eval=wmin_eval)
-    theta_full = _theta_full(theta0, struct, wmin_eval)
+    if mode == "add":
+        y_target = y
+        base_fit = base
+    else:
+        y_target = y - (base if base is not None else 0.0)
+        base_fit = None
+    centers_flag = bool(opts.get("centers_in_window", True))
+    theta0, bounds, struct = _pack(peaks, centers_in_window=centers_flag, xmin=float(x.min()), xmax=float(x.max()))
+    theta0 = np.clip(theta0, bounds[0], bounds[1])
+    resid = _build_residual(x, y_target, base_fit, struct)
+    r0 = resid(theta0)
+    cost0 = 0.5 * float(r0 @ r0)
+    theta_full = _theta_full(theta0, struct)
     state = {
         "x_fit": x,
-        "y_fit": y,
+        "y_target": y_target,
         "baseline": base,
         "mode": mode,
         "theta_free": theta0,
         "theta": theta_full,
-        "bounds": (lo, hi),
+        "bounds": bounds,
         "struct": struct,
         "residual": resid,
-        "wmin_eval": wmin_eval,
-        "lambda": opts.get("lambda", 0.0),
+        "lambda": float(opts.get("lambda", 1.0)),
         "max_backtracks": int(opts.get("max_backtracks", 10)),
         "options": opts or {},
-        "peaks": _theta_to_peaks(theta0, struct, wmin_eval),
+        "peaks": _theta_to_peaks(theta0, struct),
     }
-    return {"state": state}
+    return {"state": state, "cost": cost0}
 
 
-def iterate(state, lam=None, backtrack_max=10, min_step=1e-8):
+def iterate(state):
+    """Perform a single damped Gauss–Newton step."""
     if "theta_free" not in state or "struct" not in state:
         init = prepare_state(
             state["x_fit"],
-            state["y_fit"],
-            state["peaks"],
+            state.get("y_fit", state.get("y_target")),
+            state.get("peaks", []),
             state.get("mode", "add"),
             state.get("baseline"),
             state.get("options", {}),
@@ -191,93 +231,88 @@ def iterate(state, lam=None, backtrack_max=10, min_step=1e-8):
     lo, hi = state["bounds"]
     resid = state["residual"]
     struct = state["struct"]
-    wmin_eval = state["wmin_eval"]
-    lam = state.get("lambda", 0.0) if lam is None else lam
-    max_bt = state.get("max_backtracks", backtrack_max)
+    lam = float(state.get("lambda", 1.0))
+    max_bt = int(state.get("max_backtracks", 10))
 
-    for _ in range(2):
-        r0 = resid(theta)
-        if np.all(np.isfinite(r0)):
-            break
-        lam = lam * 10 if lam else 1e-3
-    else:
-        info = {"lambda": lam, "backtracks": 0, "step_norm": 0.0, "accepted": False, "reason": "nonfinite"}
-        state["lambda"] = lam
-        state["accepted"] = False
-        state["step_norm"] = 0.0
-        return state, False, float("inf"), float("inf"), info
-
+    r0 = resid(theta)
     cost0 = 0.5 * float(r0 @ r0)
-    if not np.isfinite(cost0):
-        info = {"lambda": lam, "backtracks": 0, "step_norm": 0.0, "accepted": False, "reason": "nonfinite"}
-        state["lambda"] = lam
-        state["accepted"] = False
-        state["step_norm"] = 0.0
-        return state, False, float(cost0), float(cost0), info
+    eps = 1e-6 * np.maximum(1.0, np.abs(theta))
 
-    eps = np.sqrt(np.finfo(float).eps)
-    J = np.empty((r0.size, theta.size))
-    for i in range(theta.size):
-        t_eps = theta.copy()
-        t_eps[i] += eps
-        r_eps = resid(t_eps)
-        J[:, i] = (r_eps - r0) / eps
-
-    JTJ = J.T @ J
-    if lam:
-        JTJ = JTJ + np.eye(JTJ.shape[0]) * lam
-    rhs = -J.T @ r0
-    try:
-        delta = np.linalg.solve(JTJ, rhs)
-    except np.linalg.LinAlgError:  # pragma: no cover
-        delta, *_ = np.linalg.lstsq(JTJ, rhs, rcond=None)
-
-    if np.linalg.norm(delta) < min_step:
-        info = {"lambda": lam, "backtracks": 0, "step_norm": 0.0, "accepted": False, "reason": "tiny_step"}
-        state["lambda"] = lam
-        state["accepted"] = False
-        state["step_norm"] = 0.0
-        return state, False, cost0, cost0, info
-
-    step = delta.copy()
+    attempt = 0
     accepted = False
     cost1 = cost0
-    n_bt = 0
+    step_norm = 0.0
     reason = "no_decrease"
-    while True:
-        theta_try = np.minimum(np.maximum(theta + step, lo), hi)
-        r1 = resid(theta_try)
-        if not np.all(np.isfinite(r1)):
-            reason = "nonfinite"
+    n_bt = 0
+    while attempt < 2:
+        J = np.empty((r0.size, theta.size))
+        good = True
+        for i in range(theta.size):
+            t_eps = theta.copy()
+            t_eps[i] += eps[i]
+            r_eps = resid(t_eps)
+            if not np.all(np.isfinite(r_eps)):
+                good = False
+                break
+            J[:, i] = (r_eps - r0) / eps[i]
+        if not good or not np.all(np.isfinite(J)):
+            good = False
+            lam *= 10.0
+            attempt += 1
+            continue
+        JTJ = J.T @ J + lam * np.eye(theta.size)
+        rhs = -J.T @ r0
+        try:
+            delta = np.linalg.solve(JTJ, rhs)
+        except np.linalg.LinAlgError:  # pragma: no cover
+            delta, *_ = np.linalg.lstsq(JTJ, rhs, rcond=None)
+        step = delta.copy()
+        n_bt = 0
+        while True:
+            theta_try = np.clip(theta + step, lo, hi)
+            r1 = resid(theta_try)
+            if not np.all(np.isfinite(r1)):
+                lam *= 10.0
+                attempt += 1
+                good = False
+                break
+            cost1 = 0.5 * float(r1 @ r1)
+            if cost1 < cost0:
+                accepted = True
+                theta = theta_try
+                step_norm = float(np.linalg.norm(step))
+                reason = "accepted"
+                break
+            n_bt += 1
+            if n_bt >= max_bt:
+                cost1 = cost0
+                reason = "no_decrease"
+                break
+            step *= 0.5
+        if good:
             break
-        cost1 = 0.5 * float(r1 @ r1)
-        if cost1 < cost0 and np.linalg.norm(step) >= min_step:
-            theta_new = theta_try
-            accepted = True
-            reason = "accepted"
+        if attempt >= 2:
             break
-        n_bt += 1
-        if n_bt >= max_bt:
-            break
-        step *= 0.5
-        lam *= 2
-
-    if accepted:
-        theta = theta_new
-    else:
+    if attempt >= 2 and not accepted and not good:
+        reason = "nonfinite"
         cost1 = cost0
-    theta_full = _theta_full(theta, struct, wmin_eval)
-    peaks = _theta_to_peaks(theta, struct, wmin_eval)
-    step_norm = float(np.linalg.norm(step)) if accepted else 0.0
+        step_norm = 0.0
+    theta_full = _theta_full(theta, struct)
+    peaks = _theta_to_peaks(theta, struct)
     state.update(
         {
             "theta_free": theta,
             "theta": theta_full,
             "peaks": peaks,
             "lambda": lam,
-            "accepted": accepted,
-            "step_norm": step_norm,
         }
     )
-    info = {"lambda": lam, "backtracks": min(n_bt, max_bt), "step_norm": step_norm, "accepted": accepted, "reason": reason}
+    info = {
+        "lambda": lam,
+        "backtracks": n_bt,
+        "step_norm": step_norm,
+        "accepted": accepted,
+        "reason": reason,
+    }
     return state, accepted, cost0, cost1, info
+
