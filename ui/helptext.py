@@ -21,78 +21,59 @@ def build_help(opts: dict) -> str:
 
     return dedent(
         f"""
-        Interactive Peak Fit 3.x – Help
-        =================================
+Interactive GL (pseudo-Voigt) Peak Fitting — Help
+==================================================
 
-        Data / File
-        ------------
-        • Open CSV, TXT or DAT spectra with two numeric columns. Delimiters are
-          detected automatically and lines starting with #, %, or // are
-          skipped.
-        • Export saves a peak table and a full trace CSV matching the v2.7
-          schema.
+1) Load data
+• “Open Data…” accepts 2-column x,y (CSV/TXT/DAT). Delimiters auto-detected. Lines with # % // or text headers are ignored.
+• Data is sorted if x is descending and non-finite values are dropped.
 
-        Baseline (ALS)
-        --------------
-        • 'Apply baseline' toggles ALS correction with parameters λ (smooth),
-          p (asymmetry), number of iterations and an early-stop threshold.
-        • 'Baseline uses fit range' computes the baseline inside the current
-          window then interpolates across the full x range.
-        • Modes: Add (fit baseline + peaks to raw data) or Subtract (fit peaks
-          to baseline‑subtracted data).
+2) Baseline (ALS)
+• λ (smooth): larger = smoother baseline.   • p (asym): pushes baseline under peaks.
+• Iterations: maximum ALS passes.           • Threshold: early-stop when updates are tiny.
+• “Baseline uses fit range”: compute ALS in the selected x-window then interpolate across the full x.
+• Modes:
+  – Add to fit  : model = baseline + Σ(peaks) (components plotted baseline-added)
+  – Subtract    : model = Σ(peaks) against (y − baseline)
 
-        Fit Range
-        ---------
-        • Enter Min/Max or drag on the plot using 'Select on plot'.
-        • 'Full range' clears the limits.
+3) Fit range
+• Enter Min/Max or “Select on plot” (drag). “Full range” clears. Shaded region = active fit window.
 
-        Peaks
-        -----
-        • Global η sets the Gaussian–Lorentzian mix; 'Apply to all' broadcasts
-          the value to every peak.
-        • The table lists center, height and FWHM with locks for width and
-          center. '➕ Add Peak' inserts a peak using the typed fields.
+4) Peaks
+• Toggle “Add peaks on click”, then click at the desired center. Height is taken from the (optionally) baseline-corrected signal.
+• Edit Center/Height/FWHM in the table; lock Width and/or Center to hold them fixed during fitting.
+• Shape factor η: 0=Gaussian, 1=Lorentzian. “Apply to all” broadcasts the current η to every peak.
+• “Auto-seed” finds prominent peaks inside the active window.
 
-        Solver
-        ------
-        • Classic (curve_fit) – simple unweighted least squares. Option: max evals.
-        • Modern – Trust Region Reflective with robust losses
-          [{modern_losses}], weighting [{modern_weights}], multi-start
-          restarts and optional jitter. Toggles: 'Centers in window' and
-          'Min FWHM ≈2×Δx'.
-        • LMFIT – interface to the optional ``lmfit`` package with algorithms
-          [{lmfit_algos}], plus 'Share FWHM' and 'Share η' constraints.
+5) Fitting methods
+• Classic (curve_fit): simple unweighted least-squares with minimal bounds; honors locks; best for clean spectra.
+• Modern TRF: robust least-squares with bounds; choose loss (linear/soft_l1/huber/cauchy) and optional weights (none/poisson/inv_y).
+• Modern VP: variable-projection—heights solved quickly; robust loss/weights supported.
+• LMFIT-VP (optional): available if lmfit is installed.
+• “Step ▶” performs a single damped Gauss–Newton/TRF update using the same residuals/bounds as Fit and only commits parameters when cost decreases.
 
-        Uncertainty
-        -----------
-        • Asymptotic – curvature of the final solution.
-        • Bootstrap – residual, wild or pairs resampling with optional
-          parallel workers and deterministic seeds.
-        • Bayesian – MCMC via ``emcee`` with Gaussian, Student‑t or Poisson
-          likelihoods.
+6) Uncertainty
+• Asymptotic: computes covariance from the Jacobian at the solution and overlays a 95% CI band.
+• Bootstrap/MCMC planned for future releases.
 
-        Performance
-        -----------
-        • Toggles for Numba JIT, GPU/CuPy acceleration, baseline caching,
-          deterministic seeds and parallel bootstrap.
-        • Configure global seed, max workers and GPU chunk size.
+7) Batch
+• Patterns like *.csv;*.txt;*.dat (semicolon-separated).
+• Peaks source: Current | Selected template | Auto-seed. Optional re-height per file.
+• Writes one summary CSV and (optionally) a per-spectrum trace CSV.
 
-        Templates
-        ---------
-        • Save current peaks as named templates, apply them later and
-          optionally auto-apply on open.
+8) Exports
+• Peak table CSV columns:
+  file, peak, center, height, fwhm, eta, lock_width, lock_center, area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax
+• Trace CSV contains both “added” and “subtracted” sections for downstream analysis.
 
-        Batch
-        -----
-        • Process folders of spectra using templates or current peaks with
-          options to re-height and save traces.
+9) Tips & troubleshooting
+• If fits look too tall in Add mode, confirm Add/Subtract is what you intend.
+• If ALS rides on peaks, increase λ and/or lower p. For spiky data use robust loss (soft_l1/huber/cauchy) and consider Poisson weights.
+• If Step is rejected, try a smaller λ or run Fit to re-linearize.
+• The right panel scrolls with the mouse wheel when your cursor is over it; the Help window has its own scroll.
 
-        Actions & Diagnostics
-        ---------------------
-        • 'Step ▶' performs one Gauss–Newton iteration.
-        • 'Fit' runs the selected solver.
-        • The status bar shows S/N estimates and solver messages; residual or
-          credible bands can be toggled when available.
+10) Persistence
+• η, “Add peaks on click”, solver choice, and uncertainty method persist across sessions. Change them, and they’ll be remembered on next launch.
         """
     ).strip()
 

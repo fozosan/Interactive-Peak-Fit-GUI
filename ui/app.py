@@ -2,27 +2,29 @@
 # -*- coding: utf-8 -*-
 """
 Interactive peak fit GUI for spectra (Gaussian–Lorentzian / pseudo-Voigt)
-Designed by Farhan Zahin
-Built with ChatGPT
+Designed by Farhan Zahin • Built with ChatGPT
 
-Build: v3
+Build: v3.2-beta
 
-Features:
-  • ALS baseline with saved defaults
-  • Baseline modes: "Add to fit" (baseline + peaks) or "Subtract" (peaks on y - baseline)
-  • Option: compute ALS baseline only within a chosen x-range, then interpolate across full x
-  • Iteration/threshold controls with S/N readout
-  • Thin plot lines; components drawn on top of baseline in "Add to fit" mode
-  • Click to add peaks (toggleable); ignores clicks while Zoom/Pan is active
-  • Lock width and/or center per-peak (applies instantly)
-  • Global η (Gaussian–Lorentzian shape factor) with "Apply to all"
-  • Auto-seed peaks (respects fit range)
-  • Choose a fit x-range (type Min/Max or drag with a SpanSelector); shaded on plot
-  • Solver selection (Classic (curve_fit), Modern, LMFIT) plus Step ▶ single iteration
-  • Multiple peak templates (save as new, save changes, select/apply, delete); optional auto-apply on open
-  • Zoom out & Reset view buttons
-  • Supports CSV, TXT, DAT (auto delimiter detection; skips headers/comments)
-  • Export peak table with metadata and full trace CSV (raw, baseline, components)
+What’s new since v3.0/v3.1
+• Reliability & parity: Modern TRF/VP stabilized (robust loss/weights, VP heights via NNLS), Classic restored to simple curve_fit with lock-aware bounds.
+• “Step ▶” parity: Step uses the same residuals/bounds as Fit (modern & classic), with damping, backtracking, and NaN/Inf guards.
+• Persisted settings: Shape factor (η), “Add peaks on click”, solver choice, and uncertainty method survive restarts.
+• UI/UX polish: Right panel scroll isolated from Help window; resizable panel with sensible min widths; status bar with progress + live log; batch streams its progress there.
+• Uncertainty (asymptotic): quick CI band from Jacobian/covariance; bootstrap/MCMC planned.
+
+Core features
+• Load 2-column CSV/TXT/DAT (x, y) with robust parsing; comments/headers ignored.
+• ALS baseline (λ, p, iterations, threshold) optionally restricted to fit window.
+• Add/Subtract fit modes; click-to-add peaks or auto-seed; lock width/center per peak; per-peak η or broadcast to all.
+• Fitting methods:
+  – Classic (curve_fit): unweighted least squares with simple bounds, honoring locks.
+  – Modern TRF/VP: robust least-squares with selectable loss & weighting, VP heights solved fast.
+  – Optional LMFIT-VP backend if lmfit is installed.
+• Batch processing: seed from current/template/auto, optional re-height, one summary CSV + optional per-spectrum traces.
+• Exports: unified peak table + full trace CSVs (added & subtracted sections).
+
+See the Help dialog (F1) for quick tips and troubleshooting.
 """
 
 import json
