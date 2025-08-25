@@ -1,139 +1,187 @@
-# Interactive-Peak-Fit-GUI
-Interactive peak fit GUI for any spectroscopy (Gaussian–Lorentzian / pseudo-Voigt)
+# Interactive Peak Fit GUI (Gaussian–Lorentzian / pseudo-Voigt)
 
-Designed by Farhan Zahin, 
-built with ChatGPT
+**Designed by** Farhan Zahin • **Built with** ChatGPT  
+**Build:** v3.2-beta
 
-Build: v3 (axes label editing with superscript/subscript, scrollable Help, ALS iterations/threshold,
-solver backends with robust losses/weights, Step iteration, uncertainty/performance panels)
+> Cross-platform Tkinter + Matplotlib desktop app for interactive spectral peak fitting with ALS baseline, robust modern solvers (TRF / Variable-Projection), a simple Classic solver (curve_fit), single-step iteration (“Step ▶”), batch processing, persisted settings, and unified exports.
 
-The previous v2.7 stable release remains available for download and can run standalone.
+---
 
-<img width="1987" height="1289" alt="main-window png" src="https://github.com/user-attachments/assets/9c0b832c-3355-49e7-9bee-01be2abbad60" />
+## Screenshot
 
-Overview
-========
-An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
+> Replace with your image or keep the path below.
 
-• Load 2-column spectra from CSV/TXT/DAT (x, y). Delimiters auto-detected; lines with #, %, // and text headers are ignored.
+![Main window](docs/main-window.png)
 
-• Estimate a baseline with ALS (λ smoothing, p asymmetry), now with:
-    - Iterations: stop after N passes (stability).
-    - Threshold: optional early-stop if the baseline changes less than a tolerance (speed).
+---
 
-• Fit either:
-    - Add to fit  : model = baseline + Σ(peaks) against raw data (WYSIWYG plotting).
-    - Subtract    : model = Σ(peaks) against (raw − baseline).
+## What’s new in v3.2-beta (vs. v3.0 / v3.1)
 
-• Optionally compute the ALS baseline **only inside** the selected fit range, then interpolate across the full x.
+- **Reliability & parity**
+  - Modern TRF/VP stabilized (robust losses/weights; VP solves heights via NNLS).
+  - **Classic** restored as a simple **SciPy `curve_fit`** backend with lock-aware bounds.
+- **“Step ▶” parity**  
+  Uses the same residuals/bounds as Fit (modern & classic), with damping, backtracking, and NaN/Inf guards. Step accepts only when cost decreases.
+- **Persisted UI settings**  
+  Shape factor (η), “Add peaks on click”, solver choice, and uncertainty method survive restarts.
+- **UI/UX polish**  
+  Right panel scroll isolated from Help window; resizable splitter with sensible min widths; bottom status bar with progress and live log; batch streams progress there.
+- **Uncertainty (asymptotic)**  
+  Quick CI band computed from the Jacobian/covariance at the solution (bootstrap/MCMC planned).
 
-• Add peaks by clicking (toggle), or auto-seed prominent peaks in the current range.
+> The previous **v2.7** stable standalone release remains available.
 
-• Lock width and/or center per peak; fit solves height + any UNLOCKED params (η is user-set per peak or broadcasted globally).
+---
 
-• Choose Gaussian–Lorentzian mix (η, 0..1). “Apply to all” copies η to every peak.
+## Features
 
-• Choose/clear a fit x-range by typing limits or dragging on the plot. Shaded region indicates the active window.
+- **Data loading**
+  - Robust import for **CSV/TXT/DAT** (2 columns x,y). Delimiters auto-detected; lines with `# % //` and text headers ignored. Data sorted if x is descending.
+- **ALS baseline (Eilers–Boelens)**
+  - Parameters: **λ (smooth)**, **p (asym)**, **Iterations**, **Threshold** (optional early stop).
+  - Optionally compute ALS **within the fit window only** then interpolate to full x.
+- **Fit modes**
+  - **Add to fit**: model = baseline + Σ(peaks) vs raw y (WYSIWYG plotting).
+  - **Subtract**: model = Σ(peaks) vs (y − baseline).
+- **Interactive peaks**
+  - Click to add peaks (toggle), or **Auto-seed** prominent peaks in the active window.
+  - Per-peak **lock Width** / **lock Center**; per-peak **η** (Gaussian–Lorentzian mix) or **Apply to all**.
+- **Solvers**
+  - **Classic (curve_fit)**: simple unweighted least squares with minimal bounds; honors locks.
+  - **Modern TRF**: SciPy Trust-Region-Reflective with bounds; **loss** (`linear`, `soft_l1`, `huber`, `cauchy`) and **weights** (`none`, `poisson`, `inv_y`).
+  - **Modern VP**: Variable-Projection — heights solved fast via NNLS; same robust loss/weights.
+  - **LMFIT-VP (optional)**: if `lmfit` is installed.
+  - **Step ▶**: one damped iteration that only commits on cost decrease (shared residuals/bounds).
+- **Batch processing**
+  - Folder patterns (`*.csv;*.txt;*.dat`), seed from current / template / auto; optional per-file **re-height**; one summary CSV; optional per-spectrum **trace CSVs**.
+- **Persisted configuration**
+  - Stored in `~/.gl_peakfit_config.json`: baseline defaults, batch defaults, templates, auto-apply, x-label, and key UI settings.
+- **Exports (unified schemas)**
+  - Peak Table CSV and Trace CSV (both single run and batch).
 
-• Thin line rendering and “Toggle components” for clarity during inspection.
+---
 
-• Select a fitting engine:
-    - **Classic** – fast linear least squares that only adjusts peak heights; ideal when the baseline is trustworthy and peaks are well seeded.
-    - **Modern** – SciPy’s Trust Region Reflective solver for full non-linear fitting with support for robust loss functions (`linear`, `soft_l1`, `huber`), optional per-point weights (`1/σ²`), configurable multi-start restarts and random jitter to escape local minima.
-    - **LMFIT** *(optional)* – leverages the `lmfit` library to impose bounds or algebraic parameter constraints and offers alternative algorithms (Levenberg–Marquardt, Nelder–Mead, differential evolution, …).
-    - **Step ▶** – executes a single Gauss–Newton iteration so you can visualize convergence step-by-step.
+## Install
 
-• Uncertainty & performance tools:
-    - **Uncertainty**
-        * *Asymptotic* – covariance from the solver’s final Jacobian.
-        * *Bootstrap* – residual resampling with configurable iterations, parallel workers and reproducible seeds.
-        * *Bayesian* – MCMC sampling via `emcee` to obtain posterior distributions and credible intervals.
-    - **Performance**
-        * Toggle Numba JIT or CuPy GPU acceleration for faster model evaluations.
-        * Cache ALS baselines between fits to skip repeated computations.
-        * Set deterministic seeds for reproducible restarts and bootstrap draws.
-        * Run bootstrap iterations in parallel to utilize multiple CPU cores.
+### Option A — pip (virtualenv recommended)
+```bash
+python -m pip install --upgrade pip
+python -m pip install numpy scipy pandas matplotlib lmfit
 
-• Axes/Labels: set a custom X-axis label with superscript/subscript helpers and save it as default (persists in ~/.gl_peakfit_config.json).
+Option B — conda
+conda install numpy scipy pandas matplotlib
+pip install lmfit
 
-• Peak templates: save as new, save changes, apply, delete; optional auto-apply on file open.
 
-• **Batch processing over folders with patterns (*.csv;*.txt;*.dat). Seed from current/template/auto. Optional re-height per file. Optional per-spectrum trace exports. One summary CSV.**
+lmfit is optional and only needed for the LMFIT backend.
 
-• Scrollable right-side control panel (mouse-wheel works anywhere on the panel).
+Run
+python run_app.py
+```
 
-• Configuration persisted in ~/.gl_peakfit_config.json (baseline defaults, batch defaults, templates, auto-apply, x-label).
+The main window opens with the plot on the left and controls on the right.
 
-Data Exports
-============
-A) Peak table CSV (single export AND batch summary; identical columns/order):
+Help dialog (F1) is scrollable and independent of the right-panel scroll.
 
-  file, peak, center, height, fwhm, eta, lock_width, lock_center,
+Quick Start
 
-  area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax
+Open Data… and select a two-column file (x,y).
 
-B) Trace CSV (per spectrum; identical schema for single and batch *_trace.csv):
+Adjust Baseline (ALS) parameters (λ, p, Iterations, Threshold).
+Optionally check “Baseline uses fit range” and set a range (drag or enter Min/Max).
 
-  x, y_raw, baseline,
+Add peaks by clicking near their centers (or use Auto-seed).
 
-  y_target_add, y_fit_add, peak1, peak2, …,
+(Optional) Lock Width or Center, set per-peak η, or Apply to all.
 
-  y_target_sub, y_fit_sub, peak1_sub, peak2_sub, …
+Choose Fit mode (Add/Subtract) and Fitting method (Classic / Modern TRF / Modern VP / LMFIT-VP).
 
-Where:
+Click Fit. Use Step ▶ to inspect single-iteration behavior.
 
-  • peakN     = baseline-ADDED component (for plotting like “Add” mode)
+Export CSV (peak table and trace CSV) or run Batch for a folder.
 
-  • peakN_sub = baseline-SUBTRACTED pure component (for calculations)
+Uncertainty
 
-Keyboard/Mouse Tips
-===================
+Asymptotic: computes covariance from the Jacobian at the solution and overlays a 95% CI band on the fitted curve.
 
-• Toolbar Zoom/Pan disables click-to-add-peaks automatically (so zooming never creates peaks).
+Bootstrap / MCMC: planned for future releases.
 
-• “Add peaks on click” is a toggle; turn it off when editing.
+Export Schemas
+A) Peak Table CSV (single & batch use the same columns and order)
+```
+file, peak, center, height, fwhm, eta, lock_width, lock_center,
+area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax
+```
 
-• Use “Select on plot” to drag a fit window; “Full range” clears it.
+area: pseudo-Voigt closed-form area
 
-• “Zoom out” and “Reset view” give quick navigation.
+area_pct: area normalized by total area
 
-Version History (high-level)
-============================
+rmse: computed over the active fit window versus the correct target (Add: raw y; Subtract: y − baseline)
 
-v3    – Superscript/subscript helpers for axis labels; scrollable Help dialog; ALS baseline exposes Iterations and Threshold; mouse-wheel scrolling on the right panel; solver backends (Classic/Modern/LMFIT), Step iteration, uncertainty and performance panels.
+B) Trace CSV (per spectrum; single & batch)
+```
+x, y_raw, baseline,
+y_target_add, y_fit_add, peak1, peak2, …,
+y_target_sub, y_fit_sub, peak1_sub, peak2_sub, …
+```
 
-v2.7  – Previous stable standalone release (still available for download).
+peakN = baseline-ADDED component (matches Add-mode display)
 
-v2.6  – Unified single/batch **peak table** schema and metadata via shared builder; identical column order everywhere.
+peakN_sub = baseline-SUBTRACTED pure component (useful for calculations)
 
-v2.5  – Trace CSV contains **both sections** (added & subtracted) in fixed order: y_target_add/y_fit_add/peakN + y_target_sub/y_fit_sub/peakN_sub.
+Batch Processing
 
-v2.4  – Single export & batch use a unified **trace builder** so formats can’t drift.
+Select folder & patterns (semicolon-separated).
 
-v2.3  – Fixed potential height inflation in Add mode during batch by always adding the baseline slice in the optimizer.
+Peaks source: Current (optionally re-height), Selected template, or Auto-seed.
 
-v2.2  – Exported both baseline-added and baseline-subtracted components.
+Writes one summary CSV and, if enabled, per-spectrum trace CSVs.
 
-v2.1  – Scrollable right-side control panel; better small-screen usability.
+Progress and per-file messages stream to the status bar log.
 
-v2.0  – Batch/mapping: folder patterns, template/current/auto seeding, re-height option, per-spectrum traces, summary CSV.
+Tips & Troubleshooting
 
-v1.9  – Click-add toggle decoupled from zoom so zooming never adds peaks by mistake.
+Add vs. Subtract: In Add mode, the baseline is added back during fitting. If fits look too tall, double-check the mode.
 
-v1.8  – “Add to fit” mode to fit **over** the baseline (WYSIWYG) in addition to subtract mode.
+ALS tuning: Increase λ (smoother) and/or decrease p (more under peaks) if ALS rides peaks.
 
-v1.7  – Zoom-out and reset-view buttons.
+Robustness: For spikes/outliers, try robust loss (soft_l1, huber, cauchy) and/or weights (poisson or inv_y).
 
-v1.6  – Multiple peak templates + “save changes” to an existing template.
+Step ▶ rejected: Try a smaller damping λ or run a full Fit to re-linearize.
 
-v1.5  – Lock **center** as well as width.
+Scroll: The right panel scrolls when the mouse is over it; the Help window has its own scroll.
 
-v1.4  – Baseline can be computed using only the selected fit range.
+Packaging (optional)
 
-v1.3  – Fit-range selection on the plot (SpanSelector) and via numeric fields.
+Create a single-file executable with PyInstaller:
 
-v1.2  – Components plotted on top of baseline in Add mode; thinner line styles for readability.
+pip install pyinstaller
+pyinstaller -F -n PeakFit --add-data "ui;ui" --add-data "docs;docs" run_app.py
+# On macOS you may prefer: pyinstaller -w -F ...
+# On Windows, ensure tcl/tk resources are found; PyInstaller usually bundles them automatically.
 
-v1.1  – Lock width; per-peak η; apply η to all peaks.
 
-v1.0  – First stable GUI with ALS baseline, GL peaks, iterative fitting, CSV export.
+The output binary will be in dist/PeakFit (or PeakFit.exe on Windows).
+
+Version History (high level)
+
+v3.2-beta – Stability and parity; Classic restored (curve_fit); Step ▶ unified & safe; settings persisted; status/log UI; asymptotic uncertainty band.
+
+v3.1 – Solver tuning: center-in-window (optional), Δx-based FWHM lower bound, parameter-wise jitter, x-scaling.
+
+v3.0 – Modern TRF with robust losses & weights; ALS iterations/threshold; scrollable Help; resizable panel; persisted x-label.
+
+v2.7 – Stable standalone release with ALS/Help/x-label persistence.
+
+… earlier versions: template system, range selection, exports, etc.
+
+License
+
+MIT — see LICENSE.
+
+Citation
+
+If this tool helps your research, please consider citing this repository:
+
+Zahin, F. (2025). Interactive Peak Fit GUI (pseudo-Voigt). GitHub repository.
