@@ -500,12 +500,12 @@ class PeakFitApp:
         # Peaks table
         peaks_box = ttk.Labelframe(right, text="Peaks"); peaks_box.pack(fill=tk.BOTH, expand=True, pady=4)
         cols = ("idx","center","height","fwhm","lockw","lockc")
-        self.tree = ttk.Treeview(peaks_box, columns=cols, show="headings", height=10, selectmode="browse")
+        self.tree = ttk.Treeview(peaks_box, columns=cols, show="headings", selectmode="browse")
         headers = ["#", "Center", "Height", "FWHM", "Lock W", "Lock C"]
         widths  = [30,   90,       90,       90,      70,       70]
         for c, txt, w in zip(cols, headers, widths):
             self.tree.heading(c, text=txt); self.tree.column(c, width=w, anchor="center")
-        self.tree.pack(fill=tk.BOTH, expand=True)
+        self.tree.pack(fill=tk.X, expand=False)
         self.tree.bind("<<TreeviewSelect>>", self.on_select_peak)
 
         # Edit panel
@@ -762,6 +762,9 @@ class PeakFitApp:
         self.pbar.pack(side=tk.RIGHT, padx=6)
         self.log_console = None
         self._log_visible = False
+
+        # Initial peak list height
+        self.refresh_tree()
 
     def _show_solver_opts(self):
         for f in self.solver_frames.values():
@@ -1418,6 +1421,11 @@ class PeakFitApp:
 
     def refresh_tree(self, keep_selection: bool = False):
         prev = self._selected_index() if keep_selection else None
+        desired = max(6, len(self.peaks))
+        try:
+            self.tree.configure(height=desired)
+        except Exception:
+            pass
         for row in self.tree.get_children():
             self.tree.delete(row)
         for i, p in enumerate(self.peaks, 1):
