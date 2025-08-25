@@ -259,6 +259,7 @@ DEFAULTS = {
     "ui_eta": 0.5,
     "ui_add_peaks_on_click": True,
     "unc_method": "asymptotic",
+    "x_label_auto_math": True,
 }
 
 def load_config():
@@ -311,47 +312,43 @@ def add_tooltip(widget, text: str) -> None:
 
 
 # ---------- Label formatting ----------
-def format_axis_label_inline(text: str) -> str:
+def format_axis_label_inline(text: str, enabled: bool = True) -> str:
     r"""Convert ``^``/``_`` fragments to inline math while preserving normal text.
 
-    Existing ``$...$`` regions are left untouched.  Braced or single-character
-    superscripts and subscripts are wrapped in ``$`` delimiters with any
-    interior whitespace trimmed.  Escaped literals ``\^`` and ``\_`` are
-    unescaped after processing and do not trigger math wrapping.
+    If ``enabled`` is ``False`` or the entire string is already a single
+    ``$...$`` math block, the text is returned unchanged.  Existing
+    ``$...$`` regions are kept as-is, and escaped literals ``\^`` and ``\_``
+    remain literal.
     """
 
-    # Split into segments outside/inside existing math blocks
-    parts = re.split(r"(\$.*?\$)", text)
-    result = []
+    if not enabled:
+        return text
+    if re.fullmatch(r"\$[^$]*\$", text.strip()):
+        return text
 
-    ESC_UND = "\0UND\0"
+    parts = re.split(r"(\$[^$]*\$)", text)
+    out = []
+
     ESC_CARET = "\0CAR\0"
-
-    pattern = re.compile(r"([_^])\s*(\{[^}]*\}|[^\s])")
+    ESC_UND = "\0UND\0"
 
     for part in parts:
         if part.startswith("$") and part.endswith("$"):
-            # Existing math region; return as-is
-            result.append(part)
+            out.append(part)
             continue
 
-        tmp = part.replace(r"\_", ESC_UND).replace(r"\^", ESC_CARET)
+        tmp = part.replace(r"\^", ESC_CARET).replace(r"\_", ESC_UND)
 
-        def repl(match):
-            op = match.group(1)
-            token = match.group(2)
-            if token.startswith("{"):
-                content = token[1:-1].strip()
-                if len(content) == 1:
-                    return f"${op}{content}$"
-                return f"${op}{{{content}}}$"
-            return f"${op}{token}$"
+        tmp = re.sub(r"(?<!\$)\^\s*\{([^{}]+)\}", lambda m: "$^{" + m.group(1) + "}$", tmp)
+        tmp = re.sub(r"(?<!\$)\^\s*([+\-]?\d+(?:\.\d+)?)", lambda m: "$^{" + m.group(1) + "}$", tmp)
+        tmp = re.sub(r"(?<!\$)\^\s*(\w+)", lambda m: "$^{" + m.group(1) + "}$", tmp)
+        tmp = re.sub(r"(?<!\$)_\s*\{([^{}]+)\}", lambda m: "$_{" + m.group(1) + "}$", tmp)
+        tmp = re.sub(r"(?<!\$)_(\w+)", lambda m: "$_{" + m.group(1) + "}$", tmp)
 
-        converted = pattern.sub(repl, tmp)
-        converted = converted.replace(ESC_UND, "_").replace(ESC_CARET, "^")
-        result.append(converted)
+        tmp = tmp.replace(ESC_CARET, "^").replace(ESC_UND, "_")
+        out.append(tmp)
 
-    return "".join(result)
+    return "".join(out)
 
 # ---------- Scrollable frame ----------
 class ScrollableFrame(ttk.Frame):
@@ -521,6 +518,7 @@ class PeakFitApp:
 
         # Axis label
         self.x_label_var = tk.StringVar(value=str(self.cfg.get("x_label", "x")))
+        self.x_label_auto_math = tk.BooleanVar(value=bool(self.cfg.get("x_label_auto_math", True)))
 
         # Batch defaults
         self.batch_patterns = tk.StringVar(value=self.cfg.get("batch_patterns", "*.csv;*.txt;*.dat"))
@@ -629,7 +627,8 @@ class PeakFitApp:
         # Left: plot
         self.fig = plt.Figure(figsize=(7,5), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_xlabel(format_axis_label_inline(self.x_label_var.get())); self.ax.set_ylabel("Intensity")
+        self.ax.set_xlabel(format_axis_label_inline(self.x_label_var.get(), self.x_label_auto_math.get()))
+        self.ax.set_ylabel("Intensity")
         self.canvas = FigureCanvasTkAgg(self.fig, master=left)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.nav = NavigationToolbar2Tk(self.canvas, left)
@@ -748,6 +747,11 @@ class PeakFitApp:
         ttk.Button(axes_box, text="Superscript", command=self.insert_superscript).pack(side=tk.LEFT, padx=2)
         ttk.Button(axes_box, text="Subscript", command=self.insert_subscript).pack(side=tk.LEFT, padx=2)
         ttk.Button(axes_box, text="Save as default", command=self.save_x_label_default).pack(side=tk.LEFT, padx=2)
+
+        row_fmt = ttk.Frame(axes_box)
+        row_fmt.pack(fill=tk.X, pady=(2, 0))
+        ttk.Checkbutton(row_fmt, text="Auto-format superscripts/subscripts", variable=self.x_label_auto_math,
+                        command=self._on_x_label_auto_math_toggle).pack(anchor="w")
 
         # Templates
         tmpl = ttk.Labelframe(right, text="Peak Templates"); tmpl.pack(fill=tk.X, pady=6)
@@ -1103,7 +1107,8 @@ class PeakFitApp:
 
     def _new_figure(self):
         self.ax.clear()
-        self.ax.set_xlabel(format_axis_label_inline(self.x_label_var.get())); self.ax.set_ylabel("Intensity")
+        self.ax.set_xlabel(format_axis_label_inline(self.x_label_var.get(), self.x_label_auto_math.get()))
+        self.ax.set_ylabel("Intensity")
         self.ax.set_title("Open a data file to begin")
         self.canvas.draw_idle()
 
@@ -1401,6 +1406,11 @@ class PeakFitApp:
             self.refresh_plot()
 
     # ----- Axes label helpers -----
+    def _on_x_label_auto_math_toggle(self):
+        self.cfg["x_label_auto_math"] = bool(self.x_label_auto_math.get())
+        save_config(self.cfg)
+        self.apply_x_label()
+
     def insert_superscript(self):
         self.x_label_entry.insert(tk.INSERT, "$^{ }$")
         self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 3)
@@ -1412,7 +1422,7 @@ class PeakFitApp:
         self.x_label_entry.focus_set()
 
     def apply_x_label(self):
-        label = format_axis_label_inline(self.x_label_var.get())
+        label = format_axis_label_inline(self.x_label_var.get(), self.x_label_auto_math.get())
         self.ax.set_xlabel(label)
         self.canvas.draw_idle()
 
@@ -2085,7 +2095,7 @@ class PeakFitApp:
     def refresh_plot(self):
         LW_RAW, LW_BASE, LW_CORR, LW_COMP, LW_FIT = 1.0, 1.0, 0.9, 0.8, 1.2
         self.ax.clear()
-        self.ax.set_xlabel(format_axis_label_inline(self.x_label_var.get()))
+        self.ax.set_xlabel(format_axis_label_inline(self.x_label_var.get(), self.x_label_auto_math.get()))
         self.ax.set_ylabel("Intensity")
         if self.x is None:
             self.ax.set_title("Open a data file to begin")
