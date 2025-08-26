@@ -1,7 +1,8 @@
-import pytest
-import numpy as np
+import os, numpy as np, pytest
 from matplotlib.collections import PolyCollection
-
+headless = (os.environ.get("DISPLAY", "") == "" and os.name != "nt")
+if headless:
+    pytest.skip("Skipping GUI tests in headless environment", allow_module_level=True)
 tk = pytest.importorskip("tkinter")
 
 from ui.app import PeakFitApp, Peak, pseudo_voigt

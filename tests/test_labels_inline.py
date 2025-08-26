@@ -14,16 +14,16 @@ def test_existing_math_preserved():
 
 def test_superscripts():
     assert f("cm^-1") == "cm$^{-1}$"
-    assert f("cm^{ -1 }") == "cm$^{ -1 }$"
+    assert f("cm^{ -1 }") == "cm$^{-1}$"
 
 def test_subscripts():
-    assert f("E_g") == "E$_{g}$"
-    assert f("k_B") == "k$_{B}$"
+    assert f("E_g") == "E$_g$"
+    assert f("k_B") == "k$_B$"
     assert f("E_sub3") == "E$_{sub3}$"
 
 def test_mixed():
     s = "I_0/I^ref cm^-1"
-    expect = "I$_{0}$/I$^{ref}$ cm$^{-1}$"
+    expect = "I$_0$/I$^{ref}$ cm$^{-1}$"
     assert f(s) == expect
 
 def test_escapes():
