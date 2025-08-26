@@ -261,10 +261,54 @@ DEFAULTS = {
     "ui_add_peaks_on_click": True,
     "unc_method": "asymptotic",
     "x_label_auto_math": True,
-    "theme": "Light",
+    "ui_theme": "Light",
 }
 
 LOG_MAX_LINES = 5000
+
+PALETTE = {
+    "Light": {
+        "bg": "#ffffff",
+        "panel": "#f3f3f3",
+        "fg": "#000000",
+        "accent": "#268bd2",
+        "grid": "#e0e0e0",
+        "line": "#000000",
+        "tick": "#000000",
+    },
+    "Dark": {
+        "bg": "#1e1e1e",
+        "panel": "#2a2a2a",
+        "fg": "#e6e6e6",
+        "accent": "#4aa3ff",
+        "grid": "#3a3a3a",
+        "line": "#e6e6e6",
+        "tick": "#e6e6e6",
+    },
+}
+
+
+def _toolbar_restyle(toolbar, pal):
+    try:
+        toolbar.configure(background=pal["panel"])
+    except Exception:
+        pass
+    for child in toolbar.winfo_children():
+        try:
+            child.configure(
+                background=pal["panel"],
+                activebackground=pal["bg"],
+                foreground=pal["fg"],
+                activeforeground=pal["fg"],
+                relief=tk.FLAT,
+                borderwidth=0,
+                highlightthickness=0,
+                padx=3,
+                pady=2,
+            )
+        except Exception:
+            pass
+
 
 def load_config():
     if CONFIG_PATH.exists():
@@ -280,9 +324,9 @@ def load_config():
                 cfg["solver_choice"] = "modern_vp"
             elif sc == "lmfit":
                 cfg["solver_choice"] = "lmfit_vp"
-            # Migration: ui_theme -> theme
-            if "theme" not in cfg and "ui_theme" in cfg:
-                cfg["theme"] = cfg["ui_theme"].title()
+            # Migration: theme -> ui_theme
+            if "ui_theme" not in cfg and "theme" in cfg:
+                cfg["ui_theme"] = str(cfg["theme"]).title()
             return cfg
         except Exception:
             return dict(DEFAULTS)
@@ -364,6 +408,7 @@ class ScrollableFrame(ttk.Frame):
     def __init__(self, parent, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
         self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        self.canvas.configure(background="#FFFFFF")
         self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.vsb.set)
 
@@ -371,6 +416,7 @@ class ScrollableFrame(ttk.Frame):
         self.canvas.pack(side="left", fill="both", expand=True)
 
         self.interior = ttk.Frame(self.canvas)
+        self.interior.configure(background="#FFFFFF")
         self._win = self.canvas.create_window((0, 0), window=self.interior, anchor="nw")
 
         self.interior.bind("<Configure>", self._on_interior_configure)
@@ -473,6 +519,8 @@ class PeakFitApp:
         self.root = root
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
 
+        self._native_theme = ttk.Style().theme_use()
+
         # Data
         self.x = None
         self.y_raw = None
@@ -497,7 +545,7 @@ class PeakFitApp:
 
         # Interaction
         self.add_peaks_mode = tk.BooleanVar(value=bool(self.cfg.get("ui_add_peaks_on_click", True)))
-        self.theme_var = tk.StringVar(value=self.cfg.get("theme", "Light"))
+        self.ui_theme = tk.StringVar(value=self.cfg.get("ui_theme", "Light"))
 
         # Fit range (None = full)
         self.fit_xmin: Optional[float] = None
@@ -595,6 +643,7 @@ class PeakFitApp:
 
         # UI
         self._build_ui()
+        self.apply_theme(self.ui_theme.get())
         self._new_figure()
         self._update_template_info()
         self.apply_theme()
@@ -770,10 +819,17 @@ class PeakFitApp:
         row_theme = ttk.Frame(axes_box)
         row_theme.pack(fill=tk.X, pady=(2, 0))
         ttk.Label(row_theme, text="Theme:").pack(side=tk.LEFT)
-        self.theme_combo = ttk.Combobox(row_theme, textvariable=self.theme_var, state="readonly", width=8,
-                                        values=["Light", "Dark"])
+        self.theme_combo = ttk.Combobox(
+            row_theme,
+            textvariable=self.ui_theme,
+            state="readonly",
+            width=8,
+            values=("Light", "Dark"),
+        )
         self.theme_combo.pack(side=tk.LEFT, padx=4)
-        self.theme_combo.bind("<<ComboboxSelected>>", self._on_theme_change)
+        self.theme_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self.apply_theme(self.ui_theme.get())
+        )
 
         # Templates
         tmpl = ttk.Labelframe(right, text="Peak Templates"); tmpl.pack(fill=tk.X, pady=6)
@@ -1067,51 +1123,96 @@ class PeakFitApp:
         save_config(self.cfg)
         self._update_unc_widgets()
 
-    def _on_theme_change(self, _e=None):
-        self.cfg["theme"] = self.theme_var.get()
-        save_config(self.cfg)
-        self.apply_theme()
-    def apply_theme(self):
-        theme = self.theme_var.get().strip().lower()
-        style = ttk.Style(self.root)
+    def _restyle_toolbar(self, pal):
+        if hasattr(self, "nav"):
+            _toolbar_restyle(self.nav, pal)
 
-        if theme == "dark":
-            bg, fg, panel, accent = "#121212", "#EAEAEA", "#1A1A1A", "#2D2D2D"
-            style.configure(".", background=panel, foreground=fg)
-            style.configure("TFrame", background=panel)
-            style.configure("TLabel", background=panel, foreground=fg)
-            style.configure("TButton", background=accent, foreground=fg)
-            style.configure("Treeview", background=panel, foreground=fg, fieldbackground=panel)
-            style.configure("Treeview.Heading", background=accent, foreground=fg)
-
-            self.fig.patch.set_facecolor(bg)
-            self.ax.set_facecolor("#0E0E0E")
-            for spine in self.ax.spines.values():
-                spine.set_color(fg)
-            self.ax.tick_params(colors=fg)
-            self.ax.xaxis.label.set_color(fg)
-            self.ax.yaxis.label.set_color(fg)
-            leg = self.ax.get_legend()
-            if leg:
-                leg.get_frame().set_facecolor("#1A1A1A")
-                for txt in leg.get_texts():
-                    txt.set_color(fg)
+    def apply_theme(self, mode: str):
+        pal = PALETTE.get(mode, PALETTE["Light"])
+        style = ttk.Style()
+        if mode == "Light":
+            style.theme_use(self._native_theme)
+            for sty in (
+                "TFrame",
+                "TLabelframe",
+                "TLabelframe.Label",
+                "TLabel",
+                "TButton",
+                "TCheckbutton",
+                "TRadiobutton",
+                "TEntry",
+                "TCombobox",
+                "Vertical.TScrollbar",
+                "Horizontal.TScrollbar",
+                "Treeview",
+                "Treeview.Heading",
+                "TProgressbar",
+            ):
+                style.configure(sty, background="", foreground="", fieldbackground="", insertcolor="", troughcolor="")
+                style.map(sty, background=[], foreground=[])
+            self.root.option_add("*TCombobox*Listbox*Background", "")
+            self.root.option_add("*TCombobox*Listbox*Foreground", "")
         else:
-            style.theme_use(style.theme_use())
-            self.fig.patch.set_facecolor("white")
-            self.ax.set_facecolor("white")
-            for spine in self.ax.spines.values():
-                spine.set_color("black")
-            self.ax.tick_params(colors="black")
-            self.ax.xaxis.label.set_color("black")
-            self.ax.yaxis.label.set_color("black")
-            leg = self.ax.get_legend()
-            if leg:
-                leg.get_frame().set_facecolor("white")
-                for txt in leg.get_texts():
-                    txt.set_color("black")
+            style.theme_use("clam")
+            style.configure("TFrame", background=pal["panel"])
+            style.configure("TLabelframe", background=pal["panel"], foreground=pal["fg"])
+            style.configure("TLabelframe.Label", background=pal["panel"], foreground=pal["fg"])
+            style.configure("TLabel", background=pal["panel"], foreground=pal["fg"])
+            style.configure("TButton", background=pal["panel"], foreground=pal["fg"], padding=(6, 3))
+            style.map("TButton", background=[("active", pal["bg"])])
+            style.configure("TCheckbutton", background=pal["panel"], foreground=pal["fg"])
+            style.configure("TRadiobutton", background=pal["panel"], foreground=pal["fg"])
+            style.configure("TEntry", fieldbackground=pal["bg"], foreground=pal["fg"])
+            style.configure(
+                "TCombobox",
+                fieldbackground=pal["bg"],
+                foreground=pal["fg"],
+                background=pal["panel"],
+            )
+            style.configure("Vertical.TScrollbar", background=pal["panel"])
+            style.configure("Horizontal.TScrollbar", background=pal["panel"])
+            style.configure(
+                "Treeview",
+                background=pal["bg"],
+                fieldbackground=pal["bg"],
+                foreground=pal["fg"],
+            )
+            style.configure(
+                "Treeview.Heading",
+                background=pal["panel"],
+                foreground=pal["fg"],
+            )
+            style.configure("TProgressbar", background=pal["accent"], troughcolor=pal["panel"])
+            self.root.option_add("*TCombobox*Listbox*Background", pal["bg"])
+            self.root.option_add("*TCombobox*Listbox*Foreground", pal["fg"])
 
+        try:
+            self.right_scroll.canvas.configure(background=pal["panel"])
+            self.right_scroll.interior.configure(style="TFrame")
+        except Exception:
+            pass
+        try:
+            self.root.configure(background=pal["bg"])
+        except Exception:
+            pass
+        if getattr(self, "_log_console", None) is not None:
+            try:
+                self._log_console.configure(background=pal["panel"], foreground=pal["fg"])
+            except Exception:
+                pass
+        self.fig.patch.set_facecolor(pal["bg"])
+        self.ax.set_facecolor(pal["bg"])
+        self.ax.tick_params(colors=pal["tick"])
+        for spine in self.ax.spines.values():
+            spine.set_color(pal["fg"])
+        self.ax.xaxis.label.set_color(pal["fg"])
+        self.ax.yaxis.label.set_color(pal["fg"])
+        self.ax.title.set_color(pal["fg"])
+        self.ax.grid(color=pal["grid"])
+        self._restyle_toolbar(pal)
         self.canvas.draw_idle()
+        self.cfg["ui_theme"] = mode
+        save_config(self.cfg)
 
     def _suspend_clicks(self):
         """Disable click-to-add regardless of checkbox state."""
