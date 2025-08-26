@@ -261,6 +261,7 @@ DEFAULTS = {
     "ui_add_peaks_on_click": True,
     "unc_method": "asymptotic",
     "x_label_auto_math": True,
+    "theme": "Light",
 }
 
 LOG_MAX_LINES = 5000
@@ -279,6 +280,9 @@ def load_config():
                 cfg["solver_choice"] = "modern_vp"
             elif sc == "lmfit":
                 cfg["solver_choice"] = "lmfit_vp"
+            # Migration: ui_theme -> theme
+            if "theme" not in cfg and "ui_theme" in cfg:
+                cfg["theme"] = cfg["ui_theme"].title()
             return cfg
         except Exception:
             return dict(DEFAULTS)
@@ -493,6 +497,7 @@ class PeakFitApp:
 
         # Interaction
         self.add_peaks_mode = tk.BooleanVar(value=bool(self.cfg.get("ui_add_peaks_on_click", True)))
+        self.theme_var = tk.StringVar(value=self.cfg.get("theme", "Light"))
 
         # Fit range (None = full)
         self.fit_xmin: Optional[float] = None
@@ -592,6 +597,7 @@ class PeakFitApp:
         self._build_ui()
         self._new_figure()
         self._update_template_info()
+        self.apply_theme()
 
     # ----- UI -----
     def _build_ui(self):
@@ -644,6 +650,7 @@ class PeakFitApp:
         # Right: scrollable controls
         right_scroll = ScrollableFrame(right_wrapper)
         right_scroll.pack(fill=tk.BOTH, expand=True)
+        self.right_scroll = right_scroll
         right = right_scroll.interior
         right.configure(padding=6)
 
@@ -759,6 +766,14 @@ class PeakFitApp:
         row_fmt.pack(fill=tk.X, pady=(2, 0))
         ttk.Checkbutton(row_fmt, text="Auto-format superscripts/subscripts", variable=self.x_label_auto_math,
                         command=self._on_x_label_auto_math_toggle).pack(anchor="w")
+
+        row_theme = ttk.Frame(axes_box)
+        row_theme.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(row_theme, text="Theme:").pack(side=tk.LEFT)
+        self.theme_combo = ttk.Combobox(row_theme, textvariable=self.theme_var, state="readonly", width=8,
+                                        values=["Light", "Dark"])
+        self.theme_combo.pack(side=tk.LEFT, padx=4)
+        self.theme_combo.bind("<<ComboboxSelected>>", self._on_theme_change)
 
         # Templates
         tmpl = ttk.Labelframe(right, text="Peak Templates"); tmpl.pack(fill=tk.X, pady=6)
@@ -1052,6 +1067,52 @@ class PeakFitApp:
         save_config(self.cfg)
         self._update_unc_widgets()
 
+    def _on_theme_change(self, _e=None):
+        self.cfg["theme"] = self.theme_var.get()
+        save_config(self.cfg)
+        self.apply_theme()
+    def apply_theme(self):
+        theme = self.theme_var.get().strip().lower()
+        style = ttk.Style(self.root)
+
+        if theme == "dark":
+            bg, fg, panel, accent = "#121212", "#EAEAEA", "#1A1A1A", "#2D2D2D"
+            style.configure(".", background=panel, foreground=fg)
+            style.configure("TFrame", background=panel)
+            style.configure("TLabel", background=panel, foreground=fg)
+            style.configure("TButton", background=accent, foreground=fg)
+            style.configure("Treeview", background=panel, foreground=fg, fieldbackground=panel)
+            style.configure("Treeview.Heading", background=accent, foreground=fg)
+
+            self.fig.patch.set_facecolor(bg)
+            self.ax.set_facecolor("#0E0E0E")
+            for spine in self.ax.spines.values():
+                spine.set_color(fg)
+            self.ax.tick_params(colors=fg)
+            self.ax.xaxis.label.set_color(fg)
+            self.ax.yaxis.label.set_color(fg)
+            leg = self.ax.get_legend()
+            if leg:
+                leg.get_frame().set_facecolor("#1A1A1A")
+                for txt in leg.get_texts():
+                    txt.set_color(fg)
+        else:
+            style.theme_use(style.theme_use())
+            self.fig.patch.set_facecolor("white")
+            self.ax.set_facecolor("white")
+            for spine in self.ax.spines.values():
+                spine.set_color("black")
+            self.ax.tick_params(colors="black")
+            self.ax.xaxis.label.set_color("black")
+            self.ax.yaxis.label.set_color("black")
+            leg = self.ax.get_legend()
+            if leg:
+                leg.get_frame().set_facecolor("white")
+                for txt in leg.get_texts():
+                    txt.set_color("black")
+
+        self.canvas.draw_idle()
+
     def _suspend_clicks(self):
         """Disable click-to-add regardless of checkbox state."""
         try:
@@ -1080,6 +1141,37 @@ class PeakFitApp:
     def _toggle_ci_band(self):
         self.show_ci_band = bool(self.show_ci_band_var.get())
         self.refresh_plot()
+
+    def _fd_jacobian(self, residual, p0):
+        p0 = np.asarray(p0, float)
+        r0 = residual(p0)
+        J = np.empty((r0.size, p0.size), float)
+        for j in range(p0.size):
+            step = 1e-6 * max(1.0, abs(p0[j]))
+            tp = p0.copy()
+            tp[j] += step
+            J[:, j] = (residual(tp) - r0) / step
+        return J, r0
+
+    @staticmethod
+    def _svd_cov_from_jacobian(J: np.ndarray, rss: float, m: int) -> tuple[np.ndarray, int, float]:
+        """Return PSD covariance via SVD of the Jacobian."""
+        U, s, Vt = np.linalg.svd(J, full_matrices=False)
+        tol = max(J.shape) * np.finfo(float).eps * (s[0] if s.size else 0.0)
+        nz = s > tol
+        rank = int(np.count_nonzero(nz))
+        dof = max(1, m - rank)
+        sigma2 = rss / dof
+        inv_s2 = np.zeros_like(s)
+        inv_s2[nz] = 1.0 / (s[nz] ** 2)
+        cov = (Vt.T * inv_s2) @ Vt
+        cond = float(s[nz].max() / s[nz].min()) if rank > 0 else np.inf
+        return sigma2 * cov, rank, cond
+
+    @staticmethod
+    def _safe_sqrt_vec(x: np.ndarray) -> np.ndarray:
+        """Clip negatives to zero before sqrt to avoid warnings."""
+        return np.sqrt(np.clip(x, 0.0, np.inf))
 
     def _on_eta_change(self):
         self.cfg["ui_eta"] = float(self.global_eta.get())
@@ -1142,24 +1234,31 @@ class PeakFitApp:
         self._log_buffer.append(line)
         if len(self._log_buffer) > LOG_MAX_LINES:
             del self._log_buffer[: len(self._log_buffer) - LOG_MAX_LINES]
-        if hasattr(self, "status_var"):
-            self.status_var.set(line[:120])
-        if self._log_console is not None:
-            try:
-                self._log_console.configure(state="normal")
-                self._log_console.insert("end", line + "\n")
-                self._log_console.see("end")
-                self._log_console.configure(state="disabled")
-            except Exception:
-                pass
-        level_u = level.upper()
-        if (level_u == "WARN" and self._auto_show_log_on_warn) or (
-            level_u == "ERROR" and self._auto_show_log_on_error
-        ):
-            self._ensure_log_panel_visible()
+
+        def ui_update():
+            if hasattr(self, "status_var"):
+                self.status_var.set(line[:120])
+            if self._log_console is not None:
+                try:
+                    self._log_console.configure(state="normal")
+                    self._log_console.insert("end", line + "\n")
+                    self._log_console.see("end")
+                    self._log_console.configure(state="disabled")
+                except Exception:
+                    pass
+            level_u = level.upper()
+            if (level_u == "WARN" and self._auto_show_log_on_warn) or (
+                level_u == "ERROR" and self._auto_show_log_on_error
+            ):
+                self._ensure_log_panel_visible()
+
+        try:
+            self.root.after(0, ui_update)
+        except Exception:
+            ui_update()
 
     def log_threadsafe(self, msg: str, level: str = "INFO"):
-        self.root.after(0, lambda: self.log(msg, level))
+        self.log(msg, level)
 
     def run_in_thread(self, fn, on_done):
         def worker():
@@ -2015,64 +2114,95 @@ class PeakFitApp:
         theta = []
         for p in self.peaks:
             theta.extend([p.center, p.height, p.fwhm, p.eta])
-        theta = np.asarray(theta, dtype=float)
+        theta = np.asarray(theta, float)
 
         resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
-        rep = asymptotic.asymptotic({"theta": theta, "jac": None}, resid_fn)
-        cov = rep["params"]["cov"]
-        r = resid_fn(theta)
-        rss = float(np.dot(r, r))
-        dof = max(r.size - theta.size, 1)
-        rmse = math.sqrt(rss / r.size)
+        J, r0 = self._fd_jacobian(resid_fn, theta)
+        rss = float(np.dot(r0, r0))
+        m = r0.size
+        cov, rank, cond = self._svd_cov_from_jacobian(J, rss, m)
+        self.param_sigma = self._safe_sqrt_vec(np.diag(cov))
 
-        def model_fn(th):
-            total = np.zeros_like(x_fit)
+        x_all = self.x
+        base_all = self.baseline if (base_applied and add_mode) else None
+
+        def ymodel(th):
+            total = np.zeros_like(x_all)
             for i in range(len(self.peaks)):
                 c, h, fw, eta = th[4 * i : 4 * i + 4]
-                total += pseudo_voigt(x_fit, h, c, fw, eta)
-            if base_applied and add_mode and base_fit is not None:
-                total = total + base_fit
+                total += pseudo_voigt(x_all, h, c, fw, eta)
+            if base_all is not None:
+                total = total + base_all
             return total
 
-        j = jacobian_fd(model_fn, theta)
-        model0 = model_fn(theta)
-        var = np.einsum("ij,jk,ik->i", j, cov, j)
-        sigma = np.sqrt(np.maximum(var, 0.0))
-        self.ci_band = (x_fit, model0 - 1.96 * sigma, model0 + 1.96 * sigma)
-        return cov, theta, rss, dof, rmse
+        y0 = ymodel(theta)
+        G = np.empty((x_all.size, theta.size), float)
+        for j in range(theta.size):
+            step = 1e-6 * max(1.0, abs(theta[j]))
+            tp = theta.copy()
+            tp[j] += step
+            G[:, j] = (ymodel(tp) - y0) / step
 
-    def _format_asymptotic_summary(self, cov, theta, rss, dof, rmse, band):
+        var = np.einsum('ij,jk,ik->i', G, cov, G)
+        band_std = self._safe_sqrt_vec(var)
+        z = 1.96
+        lo = y0 - z * band_std
+        hi = y0 + z * band_std
+        warn_nonfinite = False
+        if not np.all(np.isfinite(lo)) or not np.all(np.isfinite(hi)):
+            lo = np.nan_to_num(lo)
+            hi = np.nan_to_num(hi)
+            warn_nonfinite = True
+        self.ci_band = (x_all, lo, hi)
+
+        bw = (hi - lo)[mask]
+        bw_stats = (float(np.min(bw)), float(np.median(bw)), float(np.max(bw)))
+
+        info = {
+            "m": m,
+            "n": theta.size,
+            "rank": rank,
+            "dof": m - rank,
+            "cond": cond,
+            "rmse": math.sqrt(rss / m),
+            "bw": bw_stats,
+            "warn_nonfinite": warn_nonfinite,
+        }
+        return cov, theta, info
+
+    def _format_asymptotic_summary(self, cov, theta, info, band):
         lines: list[str] = []
-        cond_h = float(np.linalg.cond(np.linalg.pinv(cov)))
         lines.append(
-            f"Uncertainty (asymptotic): RMSE={rmse:.4g}, dof={dof}, method=JᵀJ⁻¹·RSS/dof"
+            f"Uncertainty (asymptotic): m={info['m']}, n={info['n']}, rank={info['rank']}, dof={info['dof']}, cond={info['cond']:.3g}"
         )
-        xb, lob, hib = band
-        bw = hib - lob
+        bw_min, bw_med, bw_max = info["bw"]
         lines.append(
-            f"Band width (95% CI): median={np.median(bw):.3g}, max={np.max(bw):.3g}"
+            f"Band width (95% CI): min={bw_min:.3g}, median={bw_med:.3g}, max={bw_max:.3g}"
         )
         warns: list[str] = []
-        if cond_h > 1e8:
+        if info['rank'] < info['n']:
+            warns.append("rank-deficient Jacobian; intervals may be wide.")
+        if info.get('cond', np.inf) > 1e8:
             warns.append(
-                f"Ill-conditioning detected: cond(JᵀJ)={cond_h:.3g}; some σ may be inflated (consider locking or narrowing range)"
+                f"Ill-conditioning detected: cond(JᵀJ)={info['cond']:.3g}; some σ may be inflated (consider locking or narrowing range)"
             )
-        std = np.sqrt(np.diag(cov))
+        if info.get('warn_nonfinite'):
+            warns.append("CI band contained non-finite values; replaced with zeros.")
+        std = self._safe_sqrt_vec(np.diag(cov))
         for i, _p in enumerate(self.peaks, 1):
             idx = 4 * (i - 1)
-            c, h, w = theta[idx : idx + 3]
-            sc, sh, sw = std[idx : idx + 3]
+            c, h, w = theta[idx: idx + 3]
+            sc, sh, sw = std[idx: idx + 3]
             lines.append(
                 f"Peak {i} @ center={c:.5g} ± {sc:.3g}; height={h:.3g} ± {sh:.3g}; FWHM={w:.3g} ± {sw:.3g} (CI95 ≈ ±1.96σ)"
             )
         if np.any(~np.isfinite(std)):
-            warns.append(
-                "Uncertain parameter(s) due to poor conditioning; try adjusting locks, range, or η."
-            )
+            warns.append("Uncertain parameter(s) due to poor conditioning; try adjusting locks, range, or η.")
         lines.append(
             "Tip: σ is the standard error of the fitted parameter. CI95 ≈ ±1.96σ assumes local linearity near the solution."
         )
         return lines, warns
+
     def run_uncertainty(self):
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Uncertainty", "Load data and perform a fit first.")
@@ -2128,11 +2258,11 @@ class PeakFitApp:
                     messagebox.showerror("Uncertainty", f"Failed: {err}")
                 return
             if method == "asymptotic":
-                cov, theta, rss, dof, rmse = res
+                cov, theta, info = res
                 self.show_ci_band = True
                 self.show_ci_band_var.set(True)
                 self.refresh_plot()
-                lines, warns = self._format_asymptotic_summary(cov, theta, rss, dof, rmse, self.ci_band)
+                lines, warns = self._format_asymptotic_summary(cov, theta, info, self.ci_band)
                 for ln in lines:
                     self.log(ln)
                 for ln in warns:
@@ -2288,9 +2418,7 @@ class PeakFitApp:
 
         if self.show_ci_band and self.ci_band is not None:
             xb, lob, hib = self.ci_band
-            self.ax.fill_between(xb, lob, hib, alpha=0.25, linewidth=0, zorder=0.5, label="Uncertainty band")
-            self.ax.relim()
-            self.ax.autoscale_view()
+            self.ax.fill_between(xb, lob, hib, alpha=0.18, label="Uncertainty band")
 
         self.ax.legend(loc="best")
         self.canvas.draw_idle()

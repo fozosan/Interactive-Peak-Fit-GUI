@@ -50,10 +50,11 @@ def test_format_asymptotic_summary():
     app.peaks = [Peak(1.0, 2.0, 3.0, 0.5)]
     cov = np.diag([0.04, 0.25, 0.01, 0.0])
     theta = np.array([1.0, 2.0, 3.0, 0.5])
-    rss, dof, rmse = 0.1, 10, 0.1
+    rmse = 0.1
     band = (np.array([0.0, 1.0]), np.array([0.0, 0.0]), np.array([1.0, 1.0]))
-    lines, warns = app._format_asymptotic_summary(cov, theta, rss, dof, rmse, band)
-    assert any("RMSE" in ln and "dof" in ln for ln in lines)
+    info = {"m": 12, "n": 4, "rank": 4, "dof": 8, "cond": 1.0, "rmse": rmse, "bw": (0.1, 0.2, 0.3), "warn_nonfinite": False}
+    lines, warns = app._format_asymptotic_summary(cov, theta, info, band)
+    assert any("RMSE" in ln and "dof" in ln and "rank" in ln for ln in lines)
     assert any("Band width" in ln for ln in lines)
     assert any("Peak 1" in ln and "±" in ln for ln in lines)
     assert isinstance(warns, list)
