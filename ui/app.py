@@ -535,6 +535,8 @@ class PeakFitApp:
 
         self._native_theme = ttk.Style().theme_use()
 
+        self._native_theme = ttk.Style().theme_use()
+
         # Data
         self.x = None
         self.y_raw = None
@@ -559,7 +561,7 @@ class PeakFitApp:
 
         # Interaction
         self.add_peaks_mode = tk.BooleanVar(value=bool(self.cfg.get("ui_add_peaks_on_click", True)))
-        self.ui_theme = tk.StringVar(value=self.cfg.get("ui_theme", "Light"))
+        self.ui_theme_var = tk.StringVar(value=str(self.cfg.get("ui_theme", "Light")))
 
         # Fit range (None = full)
         self.fit_xmin: Optional[float] = None
@@ -657,7 +659,7 @@ class PeakFitApp:
 
         # UI
         self._build_ui()
-        self.apply_theme(self.ui_theme.get())
+        self.apply_theme()
         self._new_figure()
         self._update_template_info()
         self.apply_theme()
@@ -842,14 +844,14 @@ class PeakFitApp:
         ttk.Label(row_theme, text="Theme:").pack(side=tk.LEFT)
         self.theme_combo = ttk.Combobox(
             row_theme,
-            textvariable=self.ui_theme,
+            textvariable=self.ui_theme_var,
             state="readonly",
             width=8,
             values=("Light", "Dark"),
         )
         self.theme_combo.pack(side=tk.LEFT, padx=4)
         self.theme_combo.bind(
-            "<<ComboboxSelected>>", lambda _e: self.apply_theme(self.ui_theme.get())
+            "<<ComboboxSelected>>", lambda _e: self.apply_theme()
         )
 
         # Templates
@@ -1148,7 +1150,22 @@ class PeakFitApp:
         if hasattr(self, "nav"):
             _toolbar_restyle(self.nav, pal)
 
-    def apply_theme(self, mode: str):
+    def apply_theme(self, mode: str | None = None):
+        """Apply Light/Dark theme. Mode may be None to infer from UI/config."""
+        if mode is None:
+            if hasattr(self, "ui_theme_var") and isinstance(self.ui_theme_var, tk.StringVar):
+                mode = self.ui_theme_var.get()
+            else:
+                mode = str(self.cfg.get("ui_theme", "Light"))
+        mode = "Dark" if str(mode).lower().startswith("dark") else "Light"
+
+        # Persist selection and keep UI variable in sync
+        self.cfg["ui_theme"] = mode
+        save_config(self.cfg)
+        if hasattr(self, "ui_theme_var") and isinstance(self.ui_theme_var, tk.StringVar):
+            if self.ui_theme_var.get() != mode:
+                self.ui_theme_var.set(mode)
+
         pal = PALETTE.get(mode, PALETTE["Light"])
         style = ttk.Style()
         if mode == "Light":
@@ -1208,7 +1225,7 @@ class PeakFitApp:
             self.root.option_add("*TCombobox*Listbox*Foreground", pal["fg"])
 
         panel_bg = pal.get("panel", "#FFFFFF")
-        if hasattr(self, "right_scroll"):
+        if hasattr(self, "right_scroll") and hasattr(self.right_scroll, "set_background"):
             try:
                 self.right_scroll.set_background(panel_bg)
             except Exception:
@@ -1238,8 +1255,6 @@ class PeakFitApp:
         self.ax.grid(color=pal["grid"])
         self._restyle_toolbar(pal)
         self.canvas.draw_idle()
-        self.cfg["ui_theme"] = mode
-        save_config(self.cfg)
 
     def _suspend_clicks(self):
         """Disable click-to-add regardless of checkbox state."""
