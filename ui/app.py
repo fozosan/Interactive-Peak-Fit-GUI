@@ -408,15 +408,14 @@ class ScrollableFrame(ttk.Frame):
     def __init__(self, parent, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
         self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
-        self.canvas.configure(background="#FFFFFF")
         self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.vsb.set)
 
         self.vsb.pack(side="right", fill="y")
         self.canvas.pack(side="left", fill="both", expand=True)
 
-        self.interior = ttk.Frame(self.canvas)
-        self.interior.configure(background="#FFFFFF")
+        # Use tk.Frame so we can safely control background (ttk.Frame doesn't accept 'background')
+        self.interior = tk.Frame(self.canvas, bg=self.canvas.cget("bg"))
         self._win = self.canvas.create_window((0, 0), window=self.interior, anchor="nw")
 
         self.interior.bind("<Configure>", self._on_interior_configure)
@@ -439,6 +438,17 @@ class ScrollableFrame(ttk.Frame):
 
     def _on_canvas_configure(self, _event=None):
         self.canvas.itemconfigure(self._win, width=self.canvas.winfo_width())
+
+    def set_background(self, bg: str):
+        """Set the background color for the scrollable panel (canvas + interior)."""
+        try:
+            self.canvas.configure(bg=bg)
+        except Exception:
+            pass
+        try:
+            self.interior.configure(bg=bg)
+        except Exception:
+            pass
 
     # ---------- wheel binding (local/tag-based) ----------
     def _bind_mousewheel(self, _event=None):
@@ -518,6 +528,8 @@ class PeakFitApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
+
+        self._native_theme = ttk.Style().theme_use()
 
         self._native_theme = ttk.Style().theme_use()
 
@@ -1187,8 +1199,7 @@ class PeakFitApp:
             self.root.option_add("*TCombobox*Listbox*Foreground", pal["fg"])
 
         try:
-            self.right_scroll.canvas.configure(background=pal["panel"])
-            self.right_scroll.interior.configure(style="TFrame")
+            self.right_scroll.set_background(pal["panel"])
         except Exception:
             pass
         try:
