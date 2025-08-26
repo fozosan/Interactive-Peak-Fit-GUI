@@ -175,7 +175,7 @@ import traceback
 from scipy.signal import find_peaks
 
 from core import signals
-from core.residuals import build_residual
+from core.residuals import build_residual, jacobian_fd
 from fit import orchestrator, classic, modern_vp, modern
 try:  # optional
     from fit import lmfit_backend
@@ -563,6 +563,10 @@ class PeakFitApp:
         self.lmfit_share_eta = tk.BooleanVar(value=False)
         self.snr_text = tk.StringVar(value="S/N: --")
 
+        self.show_ci_band = False
+        self.ci_band = None
+        self.show_ci_band_var = tk.BooleanVar(value=False)
+
         # Uncertainty and performance controls
         unc_cfg = self.cfg.get("unc_method", "asymptotic")
         if unc_cfg == "bootstrap":
@@ -889,6 +893,12 @@ class PeakFitApp:
             lambda _e: self._on_bootstrap_solver_change(),
         )
         ttk.Button(unc_box, text="Run", command=self.run_uncertainty).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(
+            unc_box,
+            text="Show uncertainty band",
+            variable=self.show_ci_band_var,
+            command=self._toggle_ci_band,
+        ).pack(anchor="w", padx=4)
         self._update_unc_widgets()
 
         # Performance panel
@@ -1059,6 +1069,10 @@ class PeakFitApp:
             self._restore_clicks()
         else:
             self._suspend_clicks()
+
+    def _toggle_ci_band(self):
+        self.show_ci_band = bool(self.show_ci_band_var.get())
+        self.refresh_plot()
 
     def _on_eta_change(self):
         self.cfg["ui_eta"] = float(self.global_eta.get())
@@ -1836,6 +1850,12 @@ class PeakFitApp:
                 return
             self.peaks[:] = res.peaks_out
             self.refresh_tree(keep_selection=True)
+            if self.show_ci_band:
+                self._run_asymptotic_uncertainty()
+            else:
+                self.ci_band = None
+                self.show_ci_band = False
+                self.show_ci_band_var.set(False)
             self.refresh_plot()
             self.set_busy(False, f"Fit done. RMSE {res.rmse:.4g}")
 
@@ -1931,6 +1951,45 @@ class PeakFitApp:
         self.set_busy(True, "Batch running…")
         self.run_in_thread(work, done)
 
+    def _run_asymptotic_uncertainty(self) -> None:
+        if self.x is None or self.y_raw is None or not self.peaks:
+            self.ci_band = None
+            return
+        mask = self.current_fit_mask()
+        if mask is None or not np.any(mask):
+            self.ci_band = None
+            return
+        x_fit = self.x[mask]
+        y_fit = self.get_fit_target()[mask]
+        base_applied = self.use_baseline.get() and self.baseline is not None
+        add_mode = (self.baseline_mode.get() == "add")
+        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
+        mode = "add" if add_mode else "subtract"
+
+        theta = []
+        for p in self.peaks:
+            theta.extend([p.center, p.height, p.fwhm, p.eta])
+        theta = np.asarray(theta, dtype=float)
+
+        resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
+        rep = asymptotic.asymptotic({"theta": theta, "jac": None}, resid_fn)
+        cov = rep["params"]["cov"]
+
+        def model_fn(th):
+            total = np.zeros_like(x_fit)
+            for i in range(len(self.peaks)):
+                c, h, fw, eta = th[4 * i : 4 * i + 4]
+                total += pseudo_voigt(x_fit, h, c, fw, eta)
+            if base_applied and add_mode and base_fit is not None:
+                total = total + base_fit
+            return total
+
+        j = jacobian_fd(model_fn, theta)
+        model0 = model_fn(theta)
+        var = np.einsum("ij,jk,ik->i", j, cov, j)
+        sigma = np.sqrt(np.maximum(var, 0.0))
+        self.ci_band = (x_fit, model0 - 1.96 * sigma, model0 + 1.96 * sigma)
+
     def run_uncertainty(self):
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Uncertainty", "Load data and perform a fit first.")
@@ -1991,6 +2050,11 @@ class PeakFitApp:
                 msg = f"Computed {rep.get('type')} uncertainty."
             self.log(msg)
             messagebox.showinfo("Uncertainty", msg)
+            if method == "asymptotic":
+                self._run_asymptotic_uncertainty()
+                self.show_ci_band = True
+                self.show_ci_band_var.set(True)
+                self.refresh_plot()
             self.set_busy(False, "Uncertainty ready (95% band).")
 
         self.set_busy(True, "Computing uncertainty…")
@@ -2131,6 +2195,12 @@ class PeakFitApp:
         if self.fit_xmin is not None and self.fit_xmax is not None:
             lo, hi = sorted((self.fit_xmin, self.fit_xmax))
             self.ax.axvspan(lo, hi, color="0.8", alpha=0.25, lw=0)
+
+        if self.show_ci_band and self.ci_band is not None:
+            xb, lob, hib = self.ci_band
+            self.ax.fill_between(xb, lob, hib, alpha=0.25, linewidth=0, zorder=0.5, label="Uncertainty band")
+            self.ax.relim()
+            self.ax.autoscale_view()
 
         self.ax.legend(loc="best")
         self.canvas.draw_idle()
