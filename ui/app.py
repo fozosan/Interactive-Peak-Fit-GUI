@@ -154,6 +154,7 @@ Known limitations / tips
 import json
 import math
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -261,6 +262,8 @@ DEFAULTS = {
     "unc_method": "asymptotic",
     "x_label_auto_math": True,
 }
+
+LOG_MAX_LINES = 5000
 
 def load_config():
     if CONFIG_PATH.exists():
@@ -956,8 +959,12 @@ class PeakFitApp:
         self.log_btn.pack(side=tk.RIGHT)
         self.pbar = ttk.Progressbar(bar, mode="indeterminate", length=160)
         self.pbar.pack(side=tk.RIGHT, padx=6)
-        self.log_console = None
+        self._log_console = None
         self._log_visible = False
+        self._log_frame = None
+        self._log_buffer: list[str] = []
+        self._auto_show_log_on_warn = True
+        self._auto_show_log_on_error = True
 
         # Initial peak list height
         self.refresh_tree()
@@ -1080,16 +1087,45 @@ class PeakFitApp:
 
     def toggle_log(self):
         if self._log_visible:
-            if self.log_console is not None:
-                self.log_console.pack_forget()
+            if self._log_console is not None and self._log_frame is not None:
+                self._log_frame.pack_forget()
             self.log_btn.config(text="Show log \u25B8")
             self._log_visible = False
         else:
-            if self.log_console is None:
-                self.log_console = scrolledtext.ScrolledText(self.root, height=8, state="disabled")
-            self.log_console.pack(side=tk.BOTTOM, fill=tk.X)
-            self.log_btn.config(text="Hide log \u25BE")
-            self._log_visible = True
+            self._ensure_log_panel_visible()
+
+    def _ensure_log_panel_visible(self):
+        if self._log_console is None:
+            self._log_frame = ttk.Frame(self.root)
+            btns = ttk.Frame(self._log_frame)
+            ttk.Button(btns, text="Copy log", command=self._copy_log).pack(side=tk.LEFT)
+            ttk.Button(btns, text="Save log…", command=self._save_log).pack(side=tk.LEFT)
+            btns.pack(fill=tk.X)
+            self._log_console = scrolledtext.ScrolledText(self._log_frame, height=8, state="disabled")
+            self._log_console.pack(fill=tk.BOTH, expand=True)
+        self._log_console.configure(state="normal")
+        self._log_console.delete("1.0", "end")
+        if self._log_buffer:
+            self._log_console.insert("end", "\n".join(self._log_buffer) + "\n")
+        self._log_console.configure(state="disabled")
+        self._log_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        self.log_btn.config(text="Hide log \u25BE")
+        self._log_visible = True
+
+    def _copy_log(self):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(self._log_buffer))
+        except Exception:
+            pass
+
+    def _save_log(self):
+        path = filedialog.asksaveasfilename(title="Save log", defaultextension=".txt")
+        if path:
+            try:
+                Path(path).write_text("\n".join(self._log_buffer), encoding="utf-8")
+            except Exception as e:
+                messagebox.showwarning("Log", f"Could not save log: {e}")
 
     def set_busy(self, flag: bool, msg: str = ""):
         self.status_var.set(msg or ("Working..." if flag else "Ready."))
@@ -1099,13 +1135,31 @@ class PeakFitApp:
             self.pbar.stop()
         self.root.update_idletasks()
 
-    def log(self, *parts):
-        txt = " ".join(str(p) for p in parts)
-        if self.log_console is not None:
-            self.log_console.configure(state="normal")
-            self.log_console.insert("end", txt + "\n")
-            self.log_console.see("end")
-            self.log_console.configure(state="disabled")
+    def log(self, msg: str, level: str = "INFO"):
+        ts = time.strftime("%H:%M:%S")
+        glyph = {"INFO": "\u2139", "WARN": "\u26A0", "ERROR": "\u2716"}.get(level.upper(), "\u2139")
+        line = f"[{ts}] {glyph} {level.upper()} \u2014 {msg}"
+        self._log_buffer.append(line)
+        if len(self._log_buffer) > LOG_MAX_LINES:
+            del self._log_buffer[: len(self._log_buffer) - LOG_MAX_LINES]
+        if hasattr(self, "status_var"):
+            self.status_var.set(line[:120])
+        if self._log_console is not None:
+            try:
+                self._log_console.configure(state="normal")
+                self._log_console.insert("end", line + "\n")
+                self._log_console.see("end")
+                self._log_console.configure(state="disabled")
+            except Exception:
+                pass
+        level_u = level.upper()
+        if (level_u == "WARN" and self._auto_show_log_on_warn) or (
+            level_u == "ERROR" and self._auto_show_log_on_error
+        ):
+            self._ensure_log_panel_visible()
+
+    def log_threadsafe(self, msg: str, level: str = "INFO"):
+        self.root.after(0, lambda: self.log(msg, level))
 
     def run_in_thread(self, fn, on_done):
         def worker():
@@ -1788,7 +1842,7 @@ class PeakFitApp:
         except Exception as e:  # pragma: no cover - UI feedback only
             self.set_busy(False, "Step failed.")
             messagebox.showerror("Step", f"Step failed:\n{e}")
-            self.log("Step failed", e)
+            self.log(f"Step failed: {e}", level="ERROR")
             return
 
         if accepted:
@@ -1811,6 +1865,7 @@ class PeakFitApp:
         else:
             msg = f"{solver} Step rejected (reason={info.get('reason','no_decrease')})"
         self.set_busy(False, msg)
+        self.log(msg)
 
     def fit(self):
         if self.x is None or self.y_raw is None or not self.peaks:
@@ -1845,7 +1900,7 @@ class PeakFitApp:
             if err or res is None:
                 self.set_busy(False, "Fit failed.")
                 if err:
-                    self.log(traceback.format_exception_only(type(err), err)[0].strip())
+                    self.log(traceback.format_exception_only(type(err), err)[0].strip(), level="ERROR")
                     messagebox.showerror("Fit", f"Fitting failed:\n{err}")
                 return
             self.peaks[:] = res.peaks_out
@@ -1858,6 +1913,10 @@ class PeakFitApp:
                 self.show_ci_band_var.set(False)
             self.refresh_plot()
             self.set_busy(False, f"Fit done. RMSE {res.rmse:.4g}")
+            npts = int(np.count_nonzero(mask))
+            self.log(
+                f"Fit finished: RMSE={res.rmse:.4g} over {npts} pts (peaks={len(self.peaks)})"
+            )
 
         self.step_btn.config(state=tk.DISABLED)
         self.set_busy(True, "Fitting…")
@@ -1917,48 +1976,35 @@ class PeakFitApp:
         self.cfg["batch_save_traces"] = bool(self.batch_save_traces.get())
         save_config(self.cfg)
 
-        counts = {"ok": 0, "total": 0}
-
         def work():
             def prog(i, total, path):
                 self.root.after(0, lambda: self.status_var.set(f"Batch {i}/{total}: {Path(path).name}"))
 
-            def logger(path, fit_ok, rmse, trace_path):
-                def _log():
-                    msg = f"{Path(path).name}: {'ok' if fit_ok else 'fail'} rmse={rmse:.3g}"
-                    if trace_path:
-                        msg += f" {trace_path}"
-                    self.log(msg)
-                self.root.after(0, _log)
-                counts["total"] += 1
-                if fit_ok:
-                    counts["ok"] += 1
-
-            batch_runner.run(patterns, cfg, progress=prog, log=logger)
-            return counts["ok"], counts["total"]
+            return batch_runner.run(patterns, cfg, progress=prog, log=self.log_threadsafe)
 
         def done(res, err):
             if err or res is None:
                 self.set_busy(False, "Batch failed.")
                 if err:
-                    self.log("Batch failed", err)
+                    self.log(f"Batch failed: {err}", level="ERROR")
                     messagebox.showerror("Batch", f"Batch failed:\n{err}")
                 return
             ok, total = res
             self.set_busy(False, f"Batch done. {ok}/{total} succeeded.")
+            self.log(f"Batch done: {ok}/{total} succeeded.")
             messagebox.showinfo("Batch", f"Summary saved:\n{out_csv}")
 
         self.set_busy(True, "Batch running…")
         self.run_in_thread(work, done)
 
-    def _run_asymptotic_uncertainty(self) -> None:
+    def _run_asymptotic_uncertainty(self):
         if self.x is None or self.y_raw is None or not self.peaks:
             self.ci_band = None
-            return
+            return None
         mask = self.current_fit_mask()
         if mask is None or not np.any(mask):
             self.ci_band = None
-            return
+            return None
         x_fit = self.x[mask]
         y_fit = self.get_fit_target()[mask]
         base_applied = self.use_baseline.get() and self.baseline is not None
@@ -1974,6 +2020,10 @@ class PeakFitApp:
         resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
         rep = asymptotic.asymptotic({"theta": theta, "jac": None}, resid_fn)
         cov = rep["params"]["cov"]
+        r = resid_fn(theta)
+        rss = float(np.dot(r, r))
+        dof = max(r.size - theta.size, 1)
+        rmse = math.sqrt(rss / r.size)
 
         def model_fn(th):
             total = np.zeros_like(x_fit)
@@ -1989,7 +2039,40 @@ class PeakFitApp:
         var = np.einsum("ij,jk,ik->i", j, cov, j)
         sigma = np.sqrt(np.maximum(var, 0.0))
         self.ci_band = (x_fit, model0 - 1.96 * sigma, model0 + 1.96 * sigma)
+        return cov, theta, rss, dof, rmse
 
+    def _format_asymptotic_summary(self, cov, theta, rss, dof, rmse, band):
+        lines: list[str] = []
+        cond_h = float(np.linalg.cond(np.linalg.pinv(cov)))
+        lines.append(
+            f"Uncertainty (asymptotic): RMSE={rmse:.4g}, dof={dof}, method=JᵀJ⁻¹·RSS/dof"
+        )
+        xb, lob, hib = band
+        bw = hib - lob
+        lines.append(
+            f"Band width (95% CI): median={np.median(bw):.3g}, max={np.max(bw):.3g}"
+        )
+        warns: list[str] = []
+        if cond_h > 1e8:
+            warns.append(
+                f"Ill-conditioning detected: cond(JᵀJ)={cond_h:.3g}; some σ may be inflated (consider locking or narrowing range)"
+            )
+        std = np.sqrt(np.diag(cov))
+        for i, _p in enumerate(self.peaks, 1):
+            idx = 4 * (i - 1)
+            c, h, w = theta[idx : idx + 3]
+            sc, sh, sw = std[idx : idx + 3]
+            lines.append(
+                f"Peak {i} @ center={c:.5g} ± {sc:.3g}; height={h:.3g} ± {sh:.3g}; FWHM={w:.3g} ± {sw:.3g} (CI95 ≈ ±1.96σ)"
+            )
+        if np.any(~np.isfinite(std)):
+            warns.append(
+                "Uncertain parameter(s) due to poor conditioning; try adjusting locks, range, or η."
+            )
+        lines.append(
+            "Tip: σ is the standard error of the fitted parameter. CI95 ≈ ±1.96σ assumes local linearity near the solution."
+        )
+        return lines, warns
     def run_uncertainty(self):
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Uncertainty", "Load data and perform a fit first.")
@@ -2012,12 +2095,13 @@ class PeakFitApp:
         theta = np.asarray(theta, dtype=float)
 
         resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
+
         method_label = self.unc_method.get()
         method = "bootstrap" if method_label.startswith("Bootstrap") else method_label.lower()
 
         def work():
             if method == "asymptotic":
-                return asymptotic.asymptotic({"theta": theta, "jac": None}, resid_fn)
+                return self._run_asymptotic_uncertainty()
             if method == "bootstrap":
                 cfg = {
                     "x": x_fit,
@@ -2033,28 +2117,34 @@ class PeakFitApp:
             if method == "bayesian":
                 init = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
                         "baseline": base_fit, "theta": theta}
-                return bayes.bayesian({}, "gaussian", init, {}, None)
+                return bayes.bayesian({}, "gaussian", init, {}, resid_fn)
             raise RuntimeError("Unknown method")
 
-        def done(rep, err):
-            if err or rep is None:
+        def done(res, err):
+            if err or res is None:
                 self.set_busy(False, "Uncertainty failed.")
                 if err:
-                    self.log("Uncertainty failed", err)
+                    self.log(f"Uncertainty failed: {err}", level="ERROR")
                     messagebox.showerror("Uncertainty", f"Failed: {err}")
                 return
-            sigmas = rep.get("params", {}).get("sigma")
-            if sigmas is not None:
-                msg = "σ: " + ", ".join(f"{s:.3g}" for s in np.ravel(sigmas))
-            else:
-                msg = f"Computed {rep.get('type')} uncertainty."
-            self.log(msg)
-            messagebox.showinfo("Uncertainty", msg)
             if method == "asymptotic":
-                self._run_asymptotic_uncertainty()
+                cov, theta, rss, dof, rmse = res
                 self.show_ci_band = True
                 self.show_ci_band_var.set(True)
                 self.refresh_plot()
+                lines, warns = self._format_asymptotic_summary(cov, theta, rss, dof, rmse, self.ci_band)
+                for ln in lines:
+                    self.log(ln)
+                for ln in warns:
+                    self.log(ln, level="WARN")
+            else:
+                sigmas = res.get("params", {}).get("sigma") if isinstance(res, dict) else None
+                if sigmas is not None:
+                    msg = "σ: " + ", ".join(f"{s:.3g}" for s in np.ravel(sigmas))
+                else:
+                    msg = f"Computed {getattr(res, 'type', 'unknown')} uncertainty."
+                self.log(msg)
+                messagebox.showinfo("Uncertainty", msg)
             self.set_busy(False, "Uncertainty ready (95% band).")
 
         self.set_busy(True, "Computing uncertainty…")

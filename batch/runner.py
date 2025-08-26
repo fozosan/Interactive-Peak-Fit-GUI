@@ -80,6 +80,7 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
     auto_max = int(config.get("auto_max", 5))
 
     records = []
+    ok = 0
 
     for i, path in enumerate(files, 1):
         if progress:
@@ -154,9 +155,15 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
             with trace_path.open("w", encoding="utf-8") as fh:
                 fh.write(trace_csv)
         if log:
-            log(path, bool(res.success), rmse, str(trace_path) if trace_path else "")
+            msg = f"{Path(path).name}: {'ok' if res.success else 'fail'} rmse={rmse:.3g}"
+            if trace_path:
+                msg += f" {trace_path}"
+            log(msg)
+        if res.success:
+            ok += 1
 
     peak_csv = data_io.build_peak_table(records)
     with open(peak_output, "w", encoding="utf-8") as fh:
         fh.write(peak_csv)
 
+    return ok, total
