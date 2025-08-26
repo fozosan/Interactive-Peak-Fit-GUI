@@ -266,6 +266,8 @@ DEFAULTS = {
     "ui_add_peaks_on_click": True,
     "unc_method": "asymptotic",
     "x_label_auto_math": True,
+    "ui_show_legend": True,
+    "legend_center_sigfigs": 6,
 }
 
 LOG_MAX_LINES = 5000
@@ -537,6 +539,8 @@ class PeakFitApp:
         # Axis label
         self.x_label_var = tk.StringVar(value=str(self.cfg.get("x_label", "x")))
         self.x_label_auto_math = tk.BooleanVar(value=bool(self.cfg.get("x_label_auto_math", True)))
+        self.show_legend_var = tk.BooleanVar(value=bool(self.cfg.get("ui_show_legend", True)))
+        self.legend_center_sigfigs = tk.IntVar(value=int(self.cfg.get("legend_center_sigfigs", 6)))
 
         # Batch defaults
         self.batch_patterns = tk.StringVar(value=self.cfg.get("batch_patterns", "*.csv;*.txt;*.dat"))
@@ -763,22 +767,6 @@ class PeakFitApp:
         ttk.Button(fr, text="Select on plot", command=self.enable_span).grid(row=1, column=1, columnspan=2, pady=2)
         ttk.Button(fr, text="Full range", command=self.clear_fit_range).grid(row=1, column=3, pady=2)
 
-        # Axes / label controls
-        axes_box = ttk.Labelframe(right, text="Axes / Labels")
-        axes_box.pack(fill=tk.X, pady=6)
-        ttk.Label(axes_box, text="X-axis label:").pack(side=tk.LEFT)
-        self.x_label_entry = ttk.Entry(axes_box, width=16, textvariable=self.x_label_var)
-        self.x_label_entry.pack(side=tk.LEFT, padx=4)
-        ttk.Button(axes_box, text="Apply", command=self.apply_x_label).pack(side=tk.LEFT, padx=2)
-        ttk.Button(axes_box, text="Superscript", command=self.insert_superscript).pack(side=tk.LEFT, padx=2)
-        ttk.Button(axes_box, text="Subscript", command=self.insert_subscript).pack(side=tk.LEFT, padx=2)
-        ttk.Button(axes_box, text="Save as default", command=self.save_x_label_default).pack(side=tk.LEFT, padx=2)
-
-        row_fmt = ttk.Frame(axes_box)
-        row_fmt.pack(fill=tk.X, pady=(2, 0))
-        ttk.Checkbutton(row_fmt, text="Auto-format superscripts/subscripts", variable=self.x_label_auto_math,
-                        command=self._on_x_label_auto_math_toggle).pack(anchor="w")
-
         # Templates
         tmpl = ttk.Labelframe(right, text="Peak Templates"); tmpl.pack(fill=tk.X, pady=6)
         self.template_info = ttk.Label(tmpl, text="Templates: 0")
@@ -922,6 +910,42 @@ class PeakFitApp:
             command=self._toggle_ci_band,
         ).pack(anchor="w", padx=4)
         self._update_unc_widgets()
+
+        # Axes / label controls (moved here)
+        axes_box = ttk.Labelframe(right, text="Axes / Labels")
+        axes_box.pack(fill=tk.X, pady=6)
+
+        ttk.Label(axes_box, text="X-axis label:").pack(side=tk.LEFT)
+        self.x_label_entry = ttk.Entry(axes_box, width=16, textvariable=self.x_label_var)
+        self.x_label_entry.pack(side=tk.LEFT, padx=4)
+        ttk.Button(axes_box, text="Apply", command=self.apply_x_label).pack(side=tk.LEFT, padx=2)
+        ttk.Button(axes_box, text="Superscript", command=self.insert_superscript).pack(side=tk.LEFT, padx=2)
+        ttk.Button(axes_box, text="Subscript", command=self.insert_subscript).pack(side=tk.LEFT, padx=2)
+        ttk.Button(axes_box, text="Save as default", command=self.save_x_label_default).pack(side=tk.LEFT, padx=2)
+
+        row_fmt = ttk.Frame(axes_box); row_fmt.pack(fill=tk.X, pady=(2, 0))
+        ttk.Checkbutton(row_fmt, text="Auto-format superscripts/subscripts",
+                        variable=self.x_label_auto_math,
+                        command=self._on_x_label_auto_math_toggle).pack(side=tk.LEFT)
+
+        # Legend controls
+        row_leg = ttk.Frame(axes_box)
+        row_leg.pack(fill=tk.X, pady=(4, 0))
+        ttk.Checkbutton(
+            row_leg,
+            text="Show legend",
+            variable=self.show_legend_var,
+            command=self._on_legend_toggle,
+        ).pack(side=tk.LEFT)
+        ttk.Label(row_leg, text="Center sig figs:").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Spinbox(
+            row_leg,
+            from_=3,
+            to=10,
+            width=4,
+            textvariable=self.legend_center_sigfigs,
+            command=self._on_legend_sigfigs_change,
+        ).pack(side=tk.LEFT)
 
         # Performance panel
         perf_box = ttk.Labelframe(right, text="Performance"); perf_box.pack(fill=tk.X, pady=4)
@@ -1556,6 +1580,20 @@ class PeakFitApp:
         self.cfg["x_label"] = self.x_label_var.get()
         save_config(self.cfg)
         messagebox.showinfo("Axes", f'Saved default x-axis label: "{self.x_label_var.get()}"')
+
+    def _on_legend_toggle(self):
+        self.cfg["ui_show_legend"] = bool(self.show_legend_var.get())
+        save_config(self.cfg)
+        self.refresh_plot()
+
+    def _on_legend_sigfigs_change(self):
+        try:
+            val = int(self.legend_center_sigfigs.get())
+        except Exception:
+            val = 6
+        self.cfg["legend_center_sigfigs"] = val
+        save_config(self.cfg)
+        self.refresh_plot()
 
     # ----- Templates helpers -----
     def _templates(self) -> dict:
@@ -2358,11 +2396,13 @@ class PeakFitApp:
         if self.peaks:
             total_peaks = np.zeros_like(self.x)
             if self.components_visible:
+                sig = int(self.legend_center_sigfigs.get())
                 for i, p in enumerate(self.peaks, 1):
                     comp = pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
                     total_peaks += comp
                     comp_plot = (base + comp) if (base_applied and add_mode) else comp
-                    self.ax.plot(self.x, comp_plot, lw=LW_COMP, alpha=0.6, label=f"Peak {i}")
+                    label = f"Peak {i} @ {p.center:.{sig}g}"
+                    self.ax.plot(self.x, comp_plot, lw=LW_COMP, alpha=0.6, label=label)
             else:
                 for p in self.peaks:
                     total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
@@ -2379,7 +2419,19 @@ class PeakFitApp:
             xb, lob, hib = self.ci_band
             self.ax.fill_between(xb, lob, hib, alpha=0.18, label="Uncertainty band")
 
-        self.ax.legend(loc="best")
+        # Legend toggle
+        leg = self.ax.get_legend()
+        if self.show_legend_var.get():
+            try:
+                self.ax.legend(loc="best")
+            except Exception:
+                pass
+        else:
+            if leg is not None:
+                try:
+                    leg.remove()
+                except Exception:
+                    pass
         self.canvas.draw_idle()
 
     # ----- Help -----
