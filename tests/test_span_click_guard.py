@@ -1,8 +1,9 @@
-import pytest
-import pathlib, sys, types
-import numpy as np
-
+import os, sys, types, numpy as np, pytest
+headless = (os.environ.get("DISPLAY", "") == "" and os.name != "nt")
+if headless:
+    pytest.skip("Skipping GUI tests in headless environment", allow_module_level=True)
 tk = pytest.importorskip("tkinter")
+import pathlib
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 from ui.app import PeakFitApp

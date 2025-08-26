@@ -162,8 +162,12 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
+import os
 import matplotlib
-matplotlib.use("TkAgg")
+if os.environ.get("DISPLAY", "") == "" and os.name != "nt":
+    matplotlib.use("Agg")
+else:
+    matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 matplotlib.rcdefaults()
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -345,11 +349,19 @@ def format_axis_label_inline(text: str, enabled: bool = True) -> str:
 
         tmp = part.replace(r"\^", ESC_CARET).replace(r"\_", ESC_UND)
 
-        tmp = re.sub(r"(?<!\$)\^\s*\{([^{}]+)\}", lambda m: "$^{" + m.group(1) + "}$", tmp)
+        tmp = re.sub(r"(?<!\$)\^\s*\{([^{}]+)\}", lambda m: "$^{" + m.group(1).strip() + "}$", tmp)
         tmp = re.sub(r"(?<!\$)\^\s*([+\-]?\d+(?:\.\d+)?)", lambda m: "$^{" + m.group(1) + "}$", tmp)
         tmp = re.sub(r"(?<!\$)\^\s*(\w+)", lambda m: "$^{" + m.group(1) + "}$", tmp)
-        tmp = re.sub(r"(?<!\$)_\s*\{([^{}]+)\}", lambda m: "$_{" + m.group(1) + "}$", tmp)
-        tmp = re.sub(r"(?<!\$)_(\w+)", lambda m: "$_{" + m.group(1) + "}$", tmp)
+        tmp = re.sub(
+            r"(?<!\$)_\s*\{([^{}]+)\}",
+            lambda m: ("$_" + val + "$") if (val := m.group(1).strip()).isalnum() else ("$_{" + val + "}$"),
+            tmp,
+        )
+        tmp = re.sub(
+            r"(?<!\$)_(\w+)",
+            lambda m: ("$_" + m.group(1) + "$") if len(m.group(1)) == 1 else ("$_{" + m.group(1) + "}$"),
+            tmp,
+        )
 
         tmp = tmp.replace(ESC_CARET, "^").replace(ESC_UND, "_")
         out.append(tmp)
@@ -472,15 +484,6 @@ class PeakFitApp:
         self.root = root
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
 
-        self._native_theme = ttk.Style().theme_use()
-
-        self._native_theme = ttk.Style().theme_use()
-
-        self._native_theme = ttk.Style().theme_use()
-
-        self._native_theme = ttk.Style().theme_use()
-
-
         # Data
         self.x = None
         self.y_raw = None
@@ -602,10 +605,8 @@ class PeakFitApp:
 
         # UI
         self._build_ui()
-        self.apply_theme()
         self._new_figure()
         self._update_template_info()
-        self.apply_theme()
 
     # ----- UI -----
     def _build_ui(self):

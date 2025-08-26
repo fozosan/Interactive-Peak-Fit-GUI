@@ -1,7 +1,8 @@
-import os
+import os, numpy as np, pytest
+headless = (os.environ.get("DISPLAY", "") == "" and os.name != "nt")
+if headless:
+    pytest.skip("Skipping GUI tests in headless environment", allow_module_level=True)
 import tkinter as tk
-import numpy as np
-import pytest
 
 from ui.app import PeakFitApp, Peak
 
