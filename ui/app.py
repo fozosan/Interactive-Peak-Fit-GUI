@@ -2,27 +2,153 @@
 # -*- coding: utf-8 -*-
 """
 Interactive peak fit GUI for spectra (Gaussian–Lorentzian / pseudo-Voigt)
-Designed by Farhan Zahin
-Built with ChatGPT
+Designed by Farhan Zahin • Built with ChatGPT
 
-Build: v3
+Build: v3.2-beta
 
-Features:
-  • ALS baseline with saved defaults
-  • Baseline modes: "Add to fit" (baseline + peaks) or "Subtract" (peaks on y - baseline)
-  • Option: compute ALS baseline only within a chosen x-range, then interpolate across full x
-  • Iteration/threshold controls with S/N readout
-  • Thin plot lines; components drawn on top of baseline in "Add to fit" mode
-  • Click to add peaks (toggleable); ignores clicks while Zoom/Pan is active
-  • Lock width and/or center per-peak (applies instantly)
-  • Global η (Gaussian–Lorentzian shape factor) with "Apply to all"
-  • Auto-seed peaks (respects fit range)
-  • Choose a fit x-range (type Min/Max or drag with a SpanSelector); shaded on plot
-  • Solver selection (Classic (curve_fit), Modern, LMFIT) plus Step ▶ single iteration
-  • Multiple peak templates (save as new, save changes, select/apply, delete); optional auto-apply on open
-  • Zoom out & Reset view buttons
-  • Supports CSV, TXT, DAT (auto delimiter detection; skips headers/comments)
-  • Export peak table with metadata and full trace CSV (raw, baseline, components)
+What’s new since v3.0 / v3.1
+• Reliability & parity: Classic is restored as a simple SciPy curve_fit backend (lock-aware, minimal bounds). Modern TRF/VP stabilized (robust losses/weights; VP heights via NNLS).
+• “Step ▶” parity: Step uses the same residual/bounds as Fit and reports damping λ, backtracks, step_norm, and accept/reject reasons. Non-finite guards prevent freezes.
+• Persisted settings: Shape factor η, “Add peaks on click”, solver choice, and uncertainty method are saved to ~/.gl_peakfit_config.json.
+• UI/UX: Right panel scrolling is independent from the Help window; the splitter enforces sensible min widths; status bar with progress + collapsible log; batch streams progress.
+• Uncertainty (asymptotic): fast CI band via Jacobian/covariance & delta method. Bootstrap/Bayesian planned.
+
+Overview (user workflow)
+========================
+• Load 2-column spectra (x, y) from CSV/TXT/DAT. Delimiters auto-detected; lines starting with #, %, // and text headers are ignored. Non-finite rows dropped; x is sorted if needed.
+• Baseline (ALS): choose λ (smoothness), p (asymmetry), max iterations, and an early-stop threshold. Optionally compute ALS only on the selected fit window and interpolate across full x.
+• Fit modes:
+  – Add: model = baseline + Σ peaks, fitted directly to raw y (WYSIWYG).
+  – Subtract: model = Σ peaks, fitted to (y − baseline).
+• Peaks: click to add (height auto-initialized from local signal), or auto-seed prominent peaks in the fit window. Lock width and/or center per peak. η is per-peak but can be broadcast.
+• Solvers:
+  – Classic (curve_fit): simple unweighted LSQ with minimal bounds; respects locks.
+  – Modern TRF: robust least_squares (loss = linear/soft_l1/huber/cauchy), optional per-point noise weights (none/poisson/inv_y).
+  – Modern VP: variable-projection; heights by nonnegative LS (NNLS), centers/widths by Gauss–Newton with backtracking.
+  – LMFIT-VP (optional): if lmfit is installed, exposes a comparable VP pipeline.
+• Step ▶: one iteration of the currently selected solver; same residuals/weights/bounds; acceptance with backtracking & λ diagnostics.
+• Batch: process folders with patterns; seed from current/template/auto; optional re-height per file; optional per-spectrum traces; unified summary CSV.
+• Exports: unified peak table (single & batch share schema) + trace CSVs (both “added” and “subtracted” sections).
+
+Mathematical model
+==================
+Pseudo-Voigt peak:
+  g(x; h, c, w, η) = h * [(1−η) * exp(−4 ln 2 * ((x−c)/w)^2)  +  η * 1/(1 + 4((x−c)/w)^2)]
+where h≥0 is height, c is center, w>0 is FWHM, and η∈[0,1] is the GL mix factor (0=Gaussian, 1=Lorentzian).
+
+Model & residuals:
+• Let P(x; θ) = Σ_j g_j(x; h_j, c_j, w_j, η_j).
+• Add mode:    y_fit = baseline + P,     r = (y_fit − y_raw).
+• Subtract:    y_fit = P,                r = (y_fit − (y_raw − baseline)).
+• Locks: if a peak has lock_center/lock_width, that parameter is held constant and not optimized.
+• Bounds: heights ≥ 0; widths ≥ eps_w (data-driven or 1e−6); centers optionally clamped to the fit window for Classic. Centers/widths for Modern use solver bounds directly.
+
+Noise / robust weighting
+========================
+• Noise weights (optional): w_noise ∈ {none, poisson, inv_y}.
+  – poisson: w_i = 1 / √max(|y_target_i|, ε)   (ε avoids division by zero)
+  – inv_y:   w_i = 1 / max(|y_target_i|, ε)
+• Robust losses (Modern/TRF): SciPy least_squares with loss ∈ {linear, soft_l1, huber, cauchy} and f_scale.
+  – Residuals are internally scaled by f_scale per SciPy’s robust formulation; J and the solver handle the M-estimator.
+• Combined weights: residuals and Jacobians are premultiplied by diag(w_noise) before calling the solver. IRLS passes (when enabled) recompute weights after trial steps/backtracks.
+
+Solvers (implementation details)
+================================
+Classic (SciPy curve_fit)
+• Pack only free parameters (heights always free; c/w free unless locked).
+• Build the unweighted residual r(θ) consistent with the chosen mode (Add/Subtract) and baseline slice on the fit window.
+• Bounds: h ≥ 0, w ≥ eps_w; centers optionally restricted to the window. curve_fit handles Jacobians by finite differences.
+• On success, unpack θ back to peaks. The Step ▶ path mirrors the same residual/bounds and performs a single damped Gauss–Newton step with backtracking (accept on cost↓).
+
+Modern TRF (SciPy least_squares)
+• The same residual r(θ) but weighted and with robust loss. Parameters are scaled (x_scale) for conditioning.
+• Jacobian: finite differences by default (good stability with TRF). Optional analytic blocks can be injected when available.
+• Backtracking & damping handled by least_squares; Step ▶ uses a single internal iteration with the same objective.
+
+Modern VP (variable-projection)
+• Split parameters into linear (heights) and nonlinear (centers/widths). Given current (c,w), form a design matrix A with columns A[:,j] = g_j(x; h=1, c_j, w_j, η_j).
+• Solve heights by **NNLS** on the weighted system:  h = argmin_{h≥0} || W(A h − y_target) ||_2.
+• With heights fixed, update (c,w) via a Gauss–Newton step on the reduced objective; step-halving backtracking; bounds/locks respected.
+• Jacobians: columns for ∂P/∂c_j and ∂P/∂w_j are approximated via finite differences of g_j with unit height (stable and simple); analytics can be plugged in later.
+• Step ▶ calls the same VP iterate once, with the same weighting and backtracking rules.
+
+LMFIT-VP (optional)
+• If lmfit is installed, a thin wrapper builds Parameters for the same θ packing and uses its least_squares engine. Heights may be solved by LS per iteration or via NNLS when enabled.
+
+ALS baseline (Eilers & Boelens)
+================================
+We solve z = argmin ||W(y − z)||^2 + λ ||D^2 z||^2 with asymmetric weights W from p (pushes baseline under peaks). Sparse tri-diagonal operator D^2 is used; we iterate:
+1) Solve (W + λ DᵀD + εI) z = W y
+2) Update W_i = p if y_i > z_i else (1−p)
+3) Stop when max|Δz| / (max|z_old|+1e−12) ≤ threshold or when max iterations reached.
+If “baseline uses fit window” is enabled, we compute z only on the window and interpolate over full x (constant extrapolation at ends).
+
+Step ▶ engine (shared contract)
+===============================
+Given state (θ, residual function r(θ), bounds, weights), perform one iteration:
+1) Compute J and r at θ (finite differences unless analytic is available).
+2) Try a damped Gauss–Newton / LM step: solve (JᵀJ + λI) δ = −Jᵀr for δ (stable solve with lstsq fallback).
+3) Backtracking: evaluate cost at θ+δ; if not decreased, increase λ (and/or halve the step) and retry up to max_backtracks.
+4) Accept if cost↓ and δ not tiny; return diagnostics: accepted flag, λ_used, backtracks, step_norm, and reason (“ok”, “tiny_step”, “nan_guard”, “max_backtracks”).
+The engine shares residuals/weights/bounds with the full Fit so Step ▶ visually “walks” the same path.
+
+Uncertainty (asymptotic)
+========================
+• At the current solution θ*, compute the (possibly weighted) Jacobian J on the fit window and residual vector r.
+• Estimate σ² = RSS / dof, where RSS = ||r||² and dof = max(1, m − n).
+• Covariance ≈ σ² (JᵀJ)⁻¹  (with tiny Tikhonov if needed).
+• Delta method for the predicted curve ŷ(x): form G = ∂ŷ/∂θ (FD on the full x). Var[ŷ] = diag(G Cov Gᵀ); 95% CI = ŷ ± 1.96 √Var.
+
+Locks, bounds, and parameter packing
+====================================
+• Each peak has (h, c, w, η). η is not varied by the solvers (user-set), but may be broadcast. Locked parameters are not included in θ and are kept fixed.
+• Bounds: Classic uses minimal bounds (h≥0, w≥eps_w, centers optional window clamp). Modern solvers supply scipy bounds directly; heights are constrained non-negative in VP via NNLS.
+• All solvers unpack θ back to peaks in a lock-aware order; Step ▶ uses the same pack/unpack.
+
+File I/O
+========
+Import
+• Robust reader tries pandas with sep=None (auto detect), coerces numerics, drops non-numeric/text columns, and filters non-finite rows. If pandas fails, a manual parser strips comments (#, %, //) and whitespace/semicolon delimiters.
+• x is sorted ascending if needed. A two-column numeric dataset is required.
+
+Export (single & batch share formats)
+• Peak table CSV columns (fixed order):
+  file, peak, center, height, fwhm, eta, lock_width, lock_center,
+  area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax
+  – area: closed-form pseudo-Voigt area combining Gaussian and Lorentzian parts
+  – area_pct: 100 × area / Σ area
+  – rmse: computed on the active fit window against the proper target (Add: raw; Subtract: raw − baseline)
+  – mode: "add" or "subtract"; als_* are the baseline parameters used; fit_x* are the window limits (or empty if full range)
+
+• Trace CSV columns (fixed order):
+  x, y_raw, baseline,
+  y_target_add, y_fit_add, peak1, peak2, …,
+  y_target_sub, y_fit_sub, peak1_sub, peak2_sub, …
+  – peakN      = baseline-ADDED component (for plotting like “Add” mode)
+  – peakN_sub  = baseline-SUBTRACTED pure component (for calculations)
+  The “added” block appears first to match the display; the “subtracted” block follows.
+
+Persistence & defaults
+======================
+The configuration file (~/.gl_peakfit_config.json) stores: ALS defaults (λ, p, iterations, threshold), solver choice & options, uncertainty method, click-to-add toggle, global η, batch defaults, x-label, and templates (including auto-apply preference). Settings update on change and are loaded at startup.
+
+Performance notes
+=================
+• Conditioning: TRF uses x_scale to normalize parameter sensitivities; Classic keeps minimal bounds for speed.
+• VP reduces ill-conditioning by solving linear heights separately via NNLS at each nonlinear update.
+• Baseline solves use sparse operators; IRLS converges quickly for reasonable λ/p. Early-stop threshold avoids unnecessary passes.
+
+Testing & reproducibility
+=========================
+• Regression tests enforce that Modern TRF/VP and (optionally) LMFIT-VP reproduce reference costs/θ on fixtures; Classic has dedicated lock/bounds and step-vs-solve parity tests.
+• Batch smoke tests ensure a summary CSV is produced; solver hash and diagnostics can be printed for integrity checks.
+• For restarts/jitter paths, a fixed RNG seed can be used to make outcomes reproducible.
+
+Known limitations / tips
+========================
+• Classic is intentionally simple (no robust loss/weights). Use Modern TRF for outliers/heavy tails or Modern VP for overlapped peaks.
+• If Step ▶ is repeatedly rejected, try a smaller λ or a better start; for VP, ensure heights remain non-negative and widths above eps_w.
+• If ALS rides peak tops, increase λ and/or decrease p. Using the fit window for ALS often improves local baselines.
 """
 
 import json
@@ -344,7 +470,15 @@ def load_xy_any(path: str):
 class PeakFitApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Origin-like Peak Fit (pseudo-Voigt)")
+        self.root.title("Interactive Peak Fit (pseudo-Voigt)")
+
+        self._native_theme = ttk.Style().theme_use()
+
+        self._native_theme = ttk.Style().theme_use()
+
+        self._native_theme = ttk.Style().theme_use()
+
+        self._native_theme = ttk.Style().theme_use()
 
 
         # Data
@@ -468,8 +602,10 @@ class PeakFitApp:
 
         # UI
         self._build_ui()
+        self.apply_theme()
         self._new_figure()
         self._update_template_info()
+        self.apply_theme()
 
     # ----- UI -----
     def _build_ui(self):
@@ -1401,13 +1537,13 @@ class PeakFitApp:
         self.apply_x_label()
 
     def insert_superscript(self):
-        self.x_label_entry.insert(tk.INSERT, "^{ }")
-        self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 2)
+        self.x_label_entry.insert(tk.INSERT, "$^{ }$")
+        self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 3)
         self.x_label_entry.focus_set()
 
     def insert_subscript(self):
-        self.x_label_entry.insert(tk.INSERT, "_{ }")
-        self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 2)
+        self.x_label_entry.insert(tk.INSERT, "$_{ }$")
+        self.x_label_entry.icursor(self.x_label_entry.index(tk.INSERT) - 3)
         self.x_label_entry.focus_set()
 
     def apply_x_label(self):
