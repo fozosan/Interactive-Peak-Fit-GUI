@@ -935,7 +935,7 @@ class PeakFitApp:
             row_leg,
             text="Show legend",
             variable=self.show_legend_var,
-            command=self._on_show_legend_toggle,
+            command=self._on_legend_toggle,
         ).pack(side=tk.LEFT)
         ttk.Label(row_leg, text="Center sig figs:").pack(side=tk.LEFT, padx=(8, 2))
         ttk.Spinbox(
@@ -1581,7 +1581,7 @@ class PeakFitApp:
         save_config(self.cfg)
         messagebox.showinfo("Axes", f'Saved default x-axis label: "{self.x_label_var.get()}"')
 
-    def _on_show_legend_toggle(self):
+    def _on_legend_toggle(self):
         self.cfg["ui_show_legend"] = bool(self.show_legend_var.get())
         save_config(self.cfg)
         self.refresh_plot()
@@ -2396,11 +2396,7 @@ class PeakFitApp:
         if self.peaks:
             total_peaks = np.zeros_like(self.x)
             if self.components_visible:
-                sig = (
-                    int(self.legend_center_sigfigs.get())
-                    if hasattr(self, "legend_center_sigfigs")
-                    else 6
-                )
+                sig = int(self.legend_center_sigfigs.get())
                 for i, p in enumerate(self.peaks, 1):
                     comp = pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
                     total_peaks += comp
