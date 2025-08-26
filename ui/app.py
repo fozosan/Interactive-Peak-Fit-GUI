@@ -533,6 +533,8 @@ class PeakFitApp:
 
         self._native_theme = ttk.Style().theme_use()
 
+        self._native_theme = ttk.Style().theme_use()
+
         # Data
         self.x = None
         self.y_raw = None
@@ -710,10 +712,17 @@ class PeakFitApp:
 
         # Right: scrollable controls
         right_scroll = ScrollableFrame(right_wrapper)
-        right_scroll.pack(fill=tk.BOTH, expand=True)
+        right_scroll.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.right_scroll = right_scroll
-        right = right_scroll.interior
-        right.configure(padding=6)
+        # Content wrapper to emulate padding inside the scrollable area
+        self.right_content = tk.Frame(
+            right_scroll.interior,
+            bd=0,
+            highlightthickness=0,
+            bg=right_scroll.interior.cget("bg"),
+        )
+        self.right_content.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        right = self.right_content
 
         # Baseline box
         baseline_box = ttk.Labelframe(right, text="Baseline (ALS)"); baseline_box.pack(fill=tk.X, pady=4)
@@ -1198,10 +1207,17 @@ class PeakFitApp:
             self.root.option_add("*TCombobox*Listbox*Background", pal["bg"])
             self.root.option_add("*TCombobox*Listbox*Foreground", pal["fg"])
 
-        try:
-            self.right_scroll.set_background(pal["panel"])
-        except Exception:
-            pass
+        panel_bg = pal.get("panel", "#FFFFFF")
+        if hasattr(self, "right_scroll"):
+            try:
+                self.right_scroll.set_background(panel_bg)
+            except Exception:
+                pass
+        if hasattr(self, "right_content"):
+            try:
+                self.right_content.configure(bg=panel_bg)
+            except Exception:
+                pass
         try:
             self.root.configure(background=pal["bg"])
         except Exception:
