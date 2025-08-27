@@ -699,6 +699,18 @@ class PeakFitApp:
             side=tk.LEFT, padx=2
         )
 
+        ttk.Separator(self.action_bar, orient=tk.VERTICAL).pack(
+            side=tk.LEFT, fill=tk.Y, padx=3
+        )
+
+        help_seg = ttk.Frame(self.action_bar)
+        help_seg.pack(side=tk.LEFT)
+        ttk.Button(help_seg, text="Help", command=self.show_help).pack(
+            side=tk.LEFT, padx=2
+        )
+
+        self.root.bind("<F1>", lambda e: self.show_help())
+
         self._update_file_label(None)
 
         mid = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
