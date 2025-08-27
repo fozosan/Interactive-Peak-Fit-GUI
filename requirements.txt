@@ -1,0 +1,10 @@
+numpy
+scipy
+pandas
+matplotlib
+lmfit #optional
+numba
+# choose one that matches your CUDA runtime:
+cupy-cuda13x
+cupy-cuda12x
+# cupy-cuda11x
