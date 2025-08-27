@@ -8,7 +8,6 @@ def test_exports_no_blank_lines(two_peak_data, tmp_path, no_blank_lines):
     df_fit = pd.DataFrame({"theta": res["theta"]})
     data_io.write_dataframe(df_fit, paths["fit"])
     unc = uncertainty.asymptotic_ci(res["theta"], res["residual_fn"], res["jacobian"], res["ymodel_fn"])
-    df_unc = pd.DataFrame({"theta": unc["param_mean"], "se": unc["param_std"]})
-    data_io.write_dataframe(df_unc, paths["unc_csv"])
+    data_io.write_uncertainty_csv(paths["unc_csv"], unc)
     assert no_blank_lines(paths["fit"])
     assert no_blank_lines(paths["unc_csv"])

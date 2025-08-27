@@ -1,5 +1,7 @@
 import hashlib
 import pandas as pd
+import hashlib
+import numpy as np
 from core import fit_api, uncertainty, data_io
 
 
@@ -7,8 +9,12 @@ def _export(path_base, theta, std):
     paths = data_io.derive_export_paths(str(path_base))
     df_fit = pd.DataFrame({"theta": theta})
     data_io.write_dataframe(df_fit, paths["fit"])
-    df_unc = pd.DataFrame({"theta": theta, "se": std})
-    data_io.write_dataframe(df_unc, paths["unc_csv"])
+    unc = {
+        "method": "asymptotic",
+        "params": {f"p{i}": {"mean": float(theta[i]), "std": float(std[i]), "q05": float(theta[i]-1.96*std[i]), "q50": float(theta[i]), "q95": float(theta[i]+1.96*std[i])} for i in range(len(theta))},
+        "diagnostics": {"ess": None, "rhat": None, "n_samples": None},
+    }
+    data_io.write_uncertainty_csv(paths["unc_csv"], unc)
     return (
         hashlib.md5(paths["fit"].read_bytes()).hexdigest(),
         hashlib.md5(paths["unc_csv"].read_bytes()).hexdigest(),
@@ -36,3 +42,13 @@ def test_seeded_determinism(two_peak_data, tmp_path, no_blank_lines):
     assert no_blank_lines(p1_unc)
     assert no_blank_lines(p2_fit)
     assert no_blank_lines(p2_unc)
+
+    # Bayesian determinism when backend available
+    fit = fit_api.run_fit_consistent(
+        **two_peak_data, return_jacobian=True, return_predictors=True
+    )
+    b1 = uncertainty.bayesian_ci(fit, seed=123, n_steps=20, n_burn=10, n_walkers=8)
+    b2 = uncertainty.bayesian_ci(fit, seed=123, n_steps=20, n_burn=10, n_walkers=8)
+    if b1.get("method") != "NotAvailable":
+        assert np.allclose(b1["param_mean"], b2["param_mean"])
+        assert np.allclose(b1["param_std"], b2["param_std"])

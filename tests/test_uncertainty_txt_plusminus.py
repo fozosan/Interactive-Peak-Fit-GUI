@@ -29,30 +29,13 @@ def test_uncertainty_txt_plusminus(tmp_path):
 
     paths = data_io.derive_export_paths(str(tmp_path / "out.csv"))
 
-    z = 1.96
-    params = ["center", "height", "fwhm", "eta"]
-    with paths["unc_txt"].open("w", encoding="utf-8") as fh:
-        fh.write("Method: Asymptotic\n")
-        for i, name in enumerate(params):
-            std = float(unc["param_std"][i])
-            fh.write(f"{name} ± {std:.3g}\n")
-
-    df = pd.DataFrame(
-        {
-            "param": params,
-            "mean": res["theta"][:4],
-            "std": unc["param_std"][:4],
-            "lower": res["theta"][:4] - z * unc["param_std"][:4],
-            "upper": res["theta"][:4] + z * unc["param_std"][:4],
-            "method": ["asymptotic"] * 4,
-        }
-    )
-    data_io.write_dataframe(df, paths["unc_csv"])
+    data_io.write_uncertainty_csv(paths["unc_csv"], unc)
+    data_io.write_uncertainty_txt(paths["unc_txt"], unc)
 
     text = paths["unc_txt"].read_text(encoding="utf-8")
-    for pname in ("height", "fwhm", "center", "eta"):
-        assert f"{pname} ±" in text
+    for pname in ("p0", "p1", "p2", "p3"):
+        assert f"{pname} =" in text and "±" in text
 
     df2 = pd.read_csv(paths["unc_csv"])
-    assert set(df2.columns) == {"param", "mean", "std", "lower", "upper", "method"}
+    assert set(df2.columns) == {"param", "mean", "std", "q05", "q50", "q95", "method", "ess", "rhat"}
 

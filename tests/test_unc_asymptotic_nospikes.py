@@ -8,7 +8,8 @@ def test_unc_asymptotic_nospikes(two_peak_data):
         res["theta"], res["residual_fn"], res["jacobian"], res["ymodel_fn"],
         alpha=0.05, svd_rcond=1e-10, grad_mode="complex"
     )
-    x, lo, hi = unc["band"]
+    band = unc["band"]
+    x, lo, hi = band["x"], band["lo"], band["hi"]
     width = hi - lo
     assert np.all(np.isfinite(width))
     assert np.all(width >= 0)
