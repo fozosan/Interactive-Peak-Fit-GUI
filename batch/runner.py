@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterable, Sequence, List
 
 import math
+import csv
 import numpy as np
 import pandas as pd
 
@@ -125,10 +126,18 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
     mode = config.get("mode", "add")
     base_cfg = config.get("baseline", {})
     save_traces = bool(config.get("save_traces", False))
-    peak_output = config.get("peak_output", "peaks.csv")
     source = config.get("source", "template")
     reheight = bool(config.get("reheight", False))
     auto_max = int(config.get("auto_max", 5))
+
+    out_dir = Path(config.get("output_dir", Path(config.get("peak_output", "peaks.csv")).parent))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base_name = config.get("output_base")
+    if base_name is None:
+        peak_output_cfg = config.get("peak_output", out_dir / "batch_fit.csv")
+        base_name = Path(peak_output_cfg).stem.replace("_fit", "")
+    peak_output = out_dir / f"{base_name}_fit.csv"
+    unc_output = out_dir / f"{base_name}_uncertainty.csv"
 
     records = []
     unc_rows = []
@@ -138,13 +147,39 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
         if progress:
             progress(i, total, path)
         x, y = data_io.load_xy(path)
-        baseline = signals.als_baseline(
-            y,
-            lam=base_cfg.get("lam", 1e5),
-            p=base_cfg.get("p", 0.001),
-            niter=base_cfg.get("niter", 10),
-            tol=base_cfg.get("thresh", 0.0),
-        )
+        use_slice = bool(config.get("baseline_uses_fit_range", True))
+        xmin = config.get("fit_xmin")
+        xmax = config.get("fit_xmax")
+        if use_slice and xmin is not None and xmax is not None:
+            lo, hi = sorted((float(xmin), float(xmax)))
+            mask = (x >= lo) & (x <= hi)
+            if np.any(mask):
+                x_sub = x[mask]
+                y_sub = y[mask]
+                z_sub = signals.als_baseline(
+                    y_sub,
+                    lam=base_cfg.get("lam", 1e5),
+                    p=base_cfg.get("p", 0.001),
+                    niter=base_cfg.get("niter", 10),
+                    tol=base_cfg.get("thresh", 0.0),
+                )
+                baseline = np.interp(x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
+            else:
+                baseline = signals.als_baseline(
+                    y,
+                    lam=base_cfg.get("lam", 1e5),
+                    p=base_cfg.get("p", 0.001),
+                    niter=base_cfg.get("niter", 10),
+                    tol=base_cfg.get("thresh", 0.0),
+                )
+        else:
+            baseline = signals.als_baseline(
+                y,
+                lam=base_cfg.get("lam", 1e5),
+                p=base_cfg.get("p", 0.001),
+                niter=base_cfg.get("niter", 10),
+                tol=base_cfg.get("thresh", 0.0),
+            )
 
         if source == "auto":
             template = _auto_seed(x, y, baseline, max_peaks=auto_max)
@@ -189,6 +224,8 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
         )
         med_dx = float(np.median(np.diff(np.sort(x)))) if x.size > 1 else 0.0
         fwhm_lo = opts.get("min_fwhm", max(1e-6, 2.0 * med_dx))
+        fit_lo = float(config.get("fit_xmin", x[0]))
+        fit_hi = float(config.get("fit_xmax", x[-1]))
         for idx, (p, area) in enumerate(zip(fitted, areas), start=1):
             records.append(
                 {
@@ -207,8 +244,8 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                     "mode": mode,
                     "als_lam": base_cfg.get("lam"),
                     "als_p": base_cfg.get("p"),
-                    "fit_xmin": float(x[0]),
-                    "fit_xmax": float(x[-1]),
+                    "fit_xmin": fit_lo,
+                    "fit_xmax": fit_hi,
                     "solver_choice": solver_name,
                     "solver_loss": opts.get("loss", np.nan),
                     "solver_weight": opts.get("weights", np.nan),
@@ -243,6 +280,7 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
             sc = sigma[4 * (idx - 1)] if sigma.size >= 4 * idx else np.nan
             sh = sigma[4 * (idx - 1) + 1] if sigma.size >= 4 * idx + 1 else np.nan
             sf = sigma[4 * (idx - 1) + 2] if sigma.size >= 4 * idx + 2 else np.nan
+            se = sigma[4 * (idx - 1) + 3] if sigma.size >= 4 * idx + 3 else np.nan
             if p.lock_center:
                 sc = np.nan
             if p.lock_width:
@@ -251,7 +289,7 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                 ("center", p.center, sc, not p.lock_center),
                 ("height", p.height, sh, True),
                 ("fwhm", p.fwhm, sf, not p.lock_width),
-                ("eta", p.eta, np.nan, False),
+                ("eta", p.eta, se, True),
             ]
             for pname, val, std, free in params:
                 if free and np.isfinite(std):
@@ -264,6 +302,7 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                         "peak": idx,
                         "param": pname,
                         "value": val,
+                        "stderr": std if np.isfinite(std) else np.nan,
                         "ci_lo": ci_lo,
                         "ci_hi": ci_hi,
                         "method": "asymptotic",
@@ -274,12 +313,18 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
 
         trace_path = None
         if save_traces:
-            trace_csv = data_io.build_trace_table(
-                x, y, baseline, fitted
-            )
-            trace_path = Path(path).with_suffix(Path(path).suffix + ".trace.csv")
-            with trace_path.open("w", encoding="utf-8") as fh:
+            trace_csv = data_io.build_trace_table(x, y, baseline, fitted)
+            trace_path = out_dir / f"{Path(path).stem}_trace.csv"
+            with trace_path.open("w", encoding="utf-8", newline="") as fh:
                 fh.write(trace_csv)
+        if _band is not None:
+            xb, lob, hib, yfit = _band
+            band_path = out_dir / f"{Path(path).stem}_uncertainty_band.csv"
+            with band_path.open("w", newline="", encoding="utf-8") as fh:
+                bw = csv.writer(fh, lineterminator="\n")
+                bw.writerow(["x", "y_fit", "y_lo95", "y_hi95"])
+                for xi, yi, lo, hi in zip(xb, yfit, lob, hib):
+                    bw.writerow([xi, yi, lo, hi])
         if log:
             msg = f"{Path(path).name}: {'ok' if res.success else 'fail'} rmse={rmse:.3g}"
             if trace_path:
@@ -289,11 +334,8 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
             ok += 1
 
     peak_csv = data_io.build_peak_table(records)
-    with open(peak_output, "w", encoding="utf-8") as fh:
+    with peak_output.open("w", encoding="utf-8", newline="") as fh:
         fh.write(peak_csv)
-    unc_output = config.get("unc_output")
-    if not unc_output:
-        unc_output = Path(peak_output).with_name(Path(peak_output).stem + "_uncertainty.csv")
-    pd.DataFrame(unc_rows).to_csv(unc_output, index=False)
+    data_io.write_dataframe(pd.DataFrame(unc_rows), unc_output)
 
     return ok, total

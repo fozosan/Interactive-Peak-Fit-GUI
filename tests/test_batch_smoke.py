@@ -18,13 +18,13 @@ def test_batch_smoke():
             data = np.column_stack([xs, ys])
             np.savetxt(os.path.join(td, f"s{i}.csv"), data, delimiter=",", header="x,y", comments="")
 
-        out_csv = os.path.join(td, "out.csv")
         cfg = {
             "peaks": [{"center": 20, "height": 5, "fwhm": 5, "eta": 0.5}],
             "solver": "classic",
             "mode": "add",
             "baseline": {"lam": 1e5, "p": 0.001},
-            "peak_output": out_csv,
+            "output_dir": td,
+            "output_base": "out",
         }
         runner.run([os.path.join(td, "*.csv")], cfg)
-        assert os.path.exists(out_csv)
+        assert os.path.exists(os.path.join(td, "out_fit.csv"))

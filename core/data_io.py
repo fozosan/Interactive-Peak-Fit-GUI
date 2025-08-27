@@ -11,7 +11,9 @@ import csv
 import io
 import re
 from pathlib import Path
+
 import numpy as np
+import pandas as pd
 
 
 def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -62,8 +64,8 @@ def derive_export_paths(user_path: str) -> dict:
     """Return canonical export file paths based on ``user_path``.
 
     ``user_path`` may have any extension; the returned paths drop the
-    extension and append ``_fit.csv``, ``_trace.csv`` and
-    ``_uncertainty.txt``.
+    extension and append ``_fit.csv``, ``_trace.csv`` and the uncertainty
+    artefacts.
     """
 
     p = Path(user_path)
@@ -72,6 +74,8 @@ def derive_export_paths(user_path: str) -> dict:
         "fit": base.with_name(base.name + "_fit.csv"),
         "trace": base.with_name(base.name + "_trace.csv"),
         "unc_txt": base.with_name(base.name + "_uncertainty.txt"),
+        "unc_csv": base.with_name(base.name + "_uncertainty.csv"),
+        "unc_band": base.with_name(base.name + "_uncertainty_band.csv"),
     }
 
 
@@ -125,7 +129,9 @@ def build_peak_table(records: Iterable[dict]) -> str:
         "x_scale",
     ]
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
+    writer = csv.DictWriter(
+        buf, fieldnames=headers, extrasaction="ignore", lineterminator="\n"
+    )
     writer.writeheader()
     for rec in records:
         writer.writerow(rec)
@@ -167,7 +173,7 @@ def build_trace_table(
     headers += [f"peak{i+1}_sub" for i in range(comps_arr.shape[0])]
 
     buf = io.StringIO()
-    writer = csv.writer(buf)
+    writer = csv.writer(buf, lineterminator="\n")
     writer.writerow(headers)
     for idx in range(x.size):
         row = [
@@ -183,4 +189,12 @@ def build_trace_table(
         row.extend(comps_arr[:, idx] if comps else [])
         writer.writerow(row)
     return buf.getvalue()
+
+
+def write_dataframe(df: pd.DataFrame, path: Path) -> None:
+    """Write ``df`` to ``path`` without introducing extra blank lines."""
+
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        df.to_csv(fh, index=False, lineterminator="\n")
+
 

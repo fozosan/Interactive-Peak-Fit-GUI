@@ -54,5 +54,16 @@ def test_batch_uncertainty_summary(tmp_path):
         assert col in fit_df.columns
 
     unc_df = pd.read_csv(tmp_path / "batch_uncertainty.csv")
-    assert set(unc_df.columns) == {"file", "peak", "param", "value", "ci_lo", "ci_hi", "method", "rmse", "dof"}
+    assert set(unc_df.columns) == {
+        "file",
+        "peak",
+        "param",
+        "value",
+        "stderr",
+        "ci_lo",
+        "ci_hi",
+        "method",
+        "rmse",
+        "dof",
+    }
     assert len(unc_df) == 2 * 1 * 4
