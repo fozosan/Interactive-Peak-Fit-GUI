@@ -15,12 +15,12 @@ from typing import Iterable, Sequence, List
 import math
 import csv
 import os
+import copy
 import numpy as np
 import pandas as pd
 
-from core import data_io, models, peaks, signals
+from core import data_io, models, peaks, signals, fit_api
 from core.residuals import build_residual, jacobian_fd
-from fit import orchestrator
 from uncertainty import bootstrap
 
 
@@ -210,31 +210,26 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
         if progress:
             progress(i, total, path)
         x, y = data_io.load_xy(path)
-        use_slice = bool(config.get("baseline_uses_fit_range", True))
         xmin = config.get("fit_xmin")
         xmax = config.get("fit_xmax")
-        if use_slice and xmin is not None and xmax is not None:
+        if xmin is not None and xmax is not None:
             lo, hi = sorted((float(xmin), float(xmax)))
             mask = (x >= lo) & (x <= hi)
-            if np.any(mask):
-                x_sub = x[mask]
-                y_sub = y[mask]
-                z_sub = signals.als_baseline(
-                    y_sub,
-                    lam=base_cfg.get("lam", 1e5),
-                    p=base_cfg.get("p", 0.001),
-                    niter=base_cfg.get("niter", 10),
-                    tol=base_cfg.get("thresh", 0.0),
-                )
-                baseline = np.interp(x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
-            else:
-                baseline = signals.als_baseline(
-                    y,
-                    lam=base_cfg.get("lam", 1e5),
-                    p=base_cfg.get("p", 0.001),
-                    niter=base_cfg.get("niter", 10),
-                    tol=base_cfg.get("thresh", 0.0),
-                )
+        else:
+            mask = np.ones_like(x, bool)
+
+        use_slice = bool(config.get("baseline_uses_fit_range", True))
+        if use_slice and np.any(mask) and not np.all(mask):
+            x_sub = x[mask]
+            y_sub = y[mask]
+            z_sub = signals.als_baseline(
+                y_sub,
+                lam=base_cfg.get("lam", 1e5),
+                p=base_cfg.get("p", 0.001),
+                niter=base_cfg.get("niter", 10),
+                tol=base_cfg.get("thresh", 0.0),
+            )
+            baseline = np.interp(x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
         else:
             baseline = signals.als_baseline(
                 y,
@@ -251,26 +246,38 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                 peaks.Peak(p.center, p.height, p.fwhm, p.eta, p.lock_center, p.lock_width)
                 for p in base_template
             ]
-            if reheight:
-                sig = y - baseline
-                for tpl in template:
-                    idx_near = int(np.argmin(np.abs(x - tpl.center)))
-                    tpl.height = float(max(sig[idx_near], 1e-6))
 
-        opts = dict(config.get(solver_name, {}))
-        opts["solver"] = solver_name
-        res = orchestrator.run_fit_with_fallbacks(
-            x, y, template, mode, baseline, opts
+        peaks_in = copy.deepcopy(template)
+        seed = (
+            abs(hash(str(Path(path).resolve()))) & 0xFFFFFFFF
+            if config.get("perf_seed_all", False)
+            else None
+        )
+        res = fit_api.run_fit_consistent(
+            x,
+            y,
+            peaks_in,
+            config,
+            baseline,
+            mode,
+            mask,
+            reheight=reheight,
+            rng_seed=seed,
+            verbose=bool(log),
         )
 
-        theta = np.asarray(res.theta, dtype=float)  # noqa: F841 - for debugging
-        fitted = res.peaks_out
-
-        model = models.pv_sum(x, fitted)
-        resid = model + (baseline if mode == "add" else 0.0) - (
-            y if mode == "add" else y - baseline
-        )
-        rmse = float(np.sqrt(np.mean(resid**2)))
+        fitted = res["peaks_out"]
+        theta = np.asarray(res["theta"], dtype=float)  # noqa: F841 - for debugging
+        rmse = float(res["rmse"])
+        if os.environ.get("IPF_SHADOW") == "1":
+            x_fit = x[mask]
+            y_fit = (y if mode == "add" else y - baseline)[mask]
+            base_fit = baseline[mask] if mode == "add" else None
+            resid_fn = build_residual(x_fit, y_fit, fitted, mode, base_fit, "linear", None)
+            r = resid_fn(theta)
+            rmse_shadow = float(np.sqrt(np.mean(r * r))) if r.size else float("nan")
+            if abs(rmse_shadow - rmse) > 1e-8 and log:
+                log(f"shadow rmse diff {rmse_shadow - rmse}")
         areas = [models.pv_area(p.height, p.fwhm, p.eta) for p in fitted]
         total = sum(areas) or 1.0
         perf_extras = {
@@ -280,13 +287,17 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
             "perf_seed_all": bool(config.get("perf_seed_all", False)),
             "perf_max_workers": int(config.get("perf_max_workers", 0)),
         }
+        solver_opts = dict(config.get(solver_name, {}))
         center_bounds = (
             (float(x[0]), float(x[-1]))
-            if (opts.get("centers_in_window") or opts.get("bound_centers_to_window"))
+            if (
+                solver_opts.get("centers_in_window")
+                or solver_opts.get("bound_centers_to_window")
+            )
             else (np.nan, np.nan)
         )
         med_dx = float(np.median(np.diff(np.sort(x)))) if x.size > 1 else 0.0
-        fwhm_lo = opts.get("min_fwhm", max(1e-6, 2.0 * med_dx))
+        fwhm_lo = solver_opts.get("min_fwhm", max(1e-6, 2.0 * med_dx))
         fit_lo = float(config.get("fit_xmin", x[0]))
         fit_hi = float(config.get("fit_xmax", x[-1]))
         for idx, (p, area) in enumerate(zip(fitted, areas), start=1):
@@ -303,19 +314,19 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                     "area": area,
                     "area_pct": 100.0 * area / total,
                     "rmse": rmse,
-                    "fit_ok": bool(res.success),
+                    "fit_ok": bool(res["fit_ok"]),
                     "mode": mode,
                     "als_lam": base_cfg.get("lam"),
                     "als_p": base_cfg.get("p"),
                     "fit_xmin": fit_lo,
                     "fit_xmax": fit_hi,
                     "solver_choice": solver_name,
-                    "solver_loss": opts.get("loss", np.nan),
-                    "solver_weight": opts.get("weights", np.nan),
-                    "solver_fscale": opts.get("f_scale", np.nan),
-                    "solver_maxfev": opts.get("maxfev", np.nan),
-                    "solver_restarts": opts.get("restarts", np.nan),
-                    "solver_jitter_pct": opts.get("jitter_pct", np.nan),
+                    "solver_loss": config.get("solver_loss", np.nan),
+                    "solver_weight": config.get("solver_weight", np.nan),
+                    "solver_fscale": config.get("solver_fscale", np.nan),
+                    "solver_maxfev": config.get("solver_maxfev", np.nan),
+                    "solver_restarts": config.get("solver_restarts", np.nan),
+                    "solver_jitter_pct": config.get("solver_jitter_pct", np.nan),
                     "use_baseline": True,
                     "baseline_mode": mode,
                     "baseline_uses_fit_range": bool(config.get("baseline_uses_fit_range", True)),
@@ -327,22 +338,23 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                     "bounds_fwhm_lo": fwhm_lo,
                     "bounds_height_lo": 0.0,
                     "bounds_height_hi": np.nan,
-                    "x_scale": opts.get("x_scale", np.nan),
+                    "x_scale": np.nan,
                 }
             )
 
-        if res.success:
-            y_target = y if mode == "add" else y - baseline
-            base_resid = baseline if mode == "add" else None
+        if res["fit_ok"]:
+            x_fit = x[mask]
+            y_target = (y if mode == "add" else y - baseline)[mask]
+            base_resid = baseline[mask] if mode == "add" else None
             if unc_method == "bootstrap":
                 try:
                     theta = []
                     for pk in fitted:
                         theta.extend([pk.center, pk.height, pk.fwhm, pk.eta])
                     theta = np.asarray(theta, float)
-                    resid_fn = build_residual(x, y_target, fitted, mode, base_resid, "linear", None)
+                    resid_fn = build_residual(x_fit, y_target, fitted, mode, base_resid, "linear", None)
                     cfg_boot = {
-                        "x": x,
+                        "x": x_fit,
                         "y": y_target,
                         "peaks": fitted,
                         "mode": mode,
@@ -362,7 +374,7 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                     info = {"dof": np.nan, "rmse": rmse}
                     _band = None
             else:
-                sigma, _band, info = _asymptotic_uncertainty(x, y_target, base_resid, fitted, mode)
+                sigma, _band, info = _asymptotic_uncertainty(x_fit, y_target, base_resid, fitted, mode)
         else:
             sigma = np.full(4 * len(fitted), np.nan)
             info = {"dof": np.nan, "rmse": rmse}
@@ -418,11 +430,11 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                 for xi, yi, lo, hi in zip(xb, yfit, lob, hib):
                     bw.writerow([xi, yi, lo, hi])
         if log:
-            msg = f"{Path(path).name}: {'ok' if res.success else 'fail'} rmse={rmse:.3g}"
+            msg = f"{Path(path).name}: {'ok' if res['fit_ok'] else 'fail'} rmse={rmse:.3g}"
             if trace_path:
                 msg += f" {trace_path}"
             log(msg)
-        if res.success:
+        if res["fit_ok"]:
             ok += 1
 
     peak_csv = data_io.build_peak_table(records)
