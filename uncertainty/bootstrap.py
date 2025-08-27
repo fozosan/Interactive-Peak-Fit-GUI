@@ -5,6 +5,7 @@ from typing import Sequence, TypedDict
 
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
+import os
 
 from core.peaks import Peak
 from infra import performance
@@ -103,7 +104,10 @@ def bootstrap(base_solver: str, resample_cfg: dict, residual_builder) -> UncRepo
     seed_base = resample_cfg.get("seed")
     start_peaks = _peaks_from_theta(theta, peaks)
 
-    max_workers = performance.get_max_workers()
+    max_workers = int(resample_cfg.get("workers", 0))
+    if max_workers <= 0:
+        mw = performance.get_max_workers()
+        max_workers = mw if mw > 0 else (os.cpu_count() or 1)
     args_common = (base_solver, x, fitted, r, start_peaks, mode, baseline, options, seed_base)
     if max_workers > 1:
         with ProcessPoolExecutor(max_workers=max_workers) as ex:

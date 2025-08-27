@@ -14,12 +14,14 @@ from typing import Iterable, Sequence, List
 
 import math
 import csv
+import os
 import numpy as np
 import pandas as pd
 
 from core import data_io, models, peaks, signals
 from core.residuals import build_residual, jacobian_fd
 from fit import orchestrator
+from uncertainty import bootstrap
 
 
 def _asymptotic_uncertainty(x, y_target, baseline, fitted, mode):
@@ -129,6 +131,10 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
     source = config.get("source", "template")
     reheight = bool(config.get("reheight", False))
     auto_max = int(config.get("auto_max", 5))
+    unc_method = config.get("unc_method", "asymptotic")
+    unc_workers = int(config.get("unc_workers", 0))
+    if unc_workers <= 0:
+        unc_workers = int(config.get("perf_max_workers", 0)) or os.cpu_count() or 1
 
     out_dir = Path(config.get("output_dir", Path(config.get("peak_output", "peaks.csv")).parent))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -271,10 +277,39 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
         if res.success:
             y_target = y if mode == "add" else y - baseline
             base_resid = baseline if mode == "add" else None
-            sigma, _band, info = _asymptotic_uncertainty(x, y_target, base_resid, fitted, mode)
+            if unc_method == "bootstrap":
+                try:
+                    theta = []
+                    for pk in fitted:
+                        theta.extend([pk.center, pk.height, pk.fwhm, pk.eta])
+                    theta = np.asarray(theta, float)
+                    resid_fn = build_residual(x, y_target, fitted, mode, base_resid, "linear", None)
+                    cfg_boot = {
+                        "x": x,
+                        "y": y_target,
+                        "peaks": fitted,
+                        "mode": mode,
+                        "baseline": base_resid,
+                        "theta": theta,
+                        "options": config.get(solver_name, {}),
+                        "n": 100,
+                        "workers": unc_workers,
+                    }
+                    boot_res = bootstrap.bootstrap(solver_name, cfg_boot, resid_fn)
+                    cov = boot_res["params"].get("cov", np.zeros((theta.size, theta.size)))
+                    sigma = np.sqrt(np.diag(cov)) if cov.size else np.full(theta.size, np.nan)
+                    info = {"dof": np.nan, "rmse": boot_res.get("meta", {}).get("rmse", rmse)}
+                    _band = None
+                except Exception:
+                    sigma = np.full(4 * len(fitted), np.nan)
+                    info = {"dof": np.nan, "rmse": rmse}
+                    _band = None
+            else:
+                sigma, _band, info = _asymptotic_uncertainty(x, y_target, base_resid, fitted, mode)
         else:
             sigma = np.full(4 * len(fitted), np.nan)
             info = {"dof": np.nan, "rmse": rmse}
+            _band = None
         z = 1.96
         for idx, p in enumerate(fitted, start=1):
             sc = sigma[4 * (idx - 1)] if sigma.size >= 4 * idx else np.nan

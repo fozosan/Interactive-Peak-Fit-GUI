@@ -183,10 +183,10 @@ def build_trace_table(
             y_target_add[idx],
             y_fit_add[idx],
         ]
-        row.extend(comps_arr[:, idx] if comps else [])
+        row.extend((base[idx] + comps_arr[:, idx]).tolist() if comps else [])
         row.append(y_target_sub[idx])
         row.append(y_fit_sub[idx])
-        row.extend(comps_arr[:, idx] if comps else [])
+        row.extend(comps_arr[:, idx].tolist() if comps else [])
         writer.writerow(row)
     return buf.getvalue()
 
