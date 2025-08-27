@@ -33,9 +33,12 @@ def test_uncertainty_txt_plusminus(tmp_path):
     data_io.write_uncertainty_txt(paths["unc_txt"], unc)
 
     text = paths["unc_txt"].read_text(encoding="utf-8")
+    assert any(m in text for m in ("Asymptotic", "Bootstrap", "Bayesian"))
     for pname in ("p0", "p1", "p2", "p3"):
-        assert f"{pname} =" in text and "±" in text
+        assert f"{pname}:" in text and "±" in text
 
     df2 = pd.read_csv(paths["unc_csv"])
-    assert set(df2.columns) == {"param", "mean", "std", "q05", "q50", "q95", "method", "ess", "rhat"}
+    for pname in ("p0", "p1", "p2", "p3"):
+        assert f"{pname}_sd" in df2.columns
+        assert np.isfinite(df2.loc[0, f"{pname}_sd"])
 

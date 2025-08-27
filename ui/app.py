@@ -213,6 +213,7 @@ import traceback
 from scipy.signal import find_peaks
 
 from core import signals, data_io
+from core.uncertainty import UncertaintyResult
 from core.residuals import build_residual, jacobian_fd
 from core.fit_api import (
     classic_step,
@@ -2441,11 +2442,28 @@ class PeakFitApp:
                 for ln in warns:
                     self.log(ln, level="WARN")
             else:
-                sigmas = res.get("params", {}).get("sigma") if isinstance(res, dict) else None
-                if sigmas is not None:
-                    msg = "σ: " + ", ".join(f"{s:.3g}" for s in np.ravel(sigmas))
+                if isinstance(res, UncertaintyResult):
+                    if res.band is not None:
+                        self.ci_band = res.band
+                        self.show_ci_band = True
+                    extra = ""
+                    if res.method == "bootstrap":
+                        n = res.meta.get("n_resamples")
+                        seed = res.meta.get("seed")
+                        extra = f" (n={n}, seed={seed})" if n is not None else ""
+                    elif res.method == "bayesian":
+                        n_samples = res.meta.get("n_samples")
+                        n_chains = res.meta.get("n_chains")
+                        ess = res.meta.get("ess") or {}
+                        rhat = res.meta.get("rhat") or {}
+                        if ess and rhat:
+                            extra = (
+                                f" (draws={n_samples}, chains={n_chains}; min ESS={min(ess.values()):.0f}, "
+                                f"max R̂={max(rhat.values()):.3f})"
+                            )
+                    msg = f"Computed {res.method_label} uncertainty{extra}"
                 else:
-                    msg = f"Computed {getattr(res, 'type', 'unknown')} uncertainty."
+                    msg = "Bayesian MCMC requires emcee. Skipping." if res is None else f"Computed {getattr(res, 'method', 'unknown')} uncertainty."
                 self.log(msg)
                 messagebox.showinfo("Uncertainty", msg)
             self.set_busy(False, "Uncertainty ready (95% band).")
