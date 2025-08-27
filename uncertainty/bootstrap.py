@@ -4,8 +4,10 @@ from __future__ import annotations
 from typing import Sequence, TypedDict
 
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor
 
 from core.peaks import Peak
+from infra import performance
 
 
 class UncReport(TypedDict):
@@ -22,6 +24,45 @@ def _peaks_from_theta(theta: np.ndarray, template: Sequence[Peak]) -> list[Peak]
         c, h, fw, eta = theta[4 * i : 4 * (i + 1)]
         pk.append(Peak(c, h, fw, eta, tpl.lock_center, tpl.lock_width))
     return pk
+
+
+def _bootstrap_worker(args):
+    (
+        base_solver,
+        x,
+        fitted,
+        resid,
+        start_peaks,
+        mode,
+        baseline,
+        options,
+        seed_base,
+        idx,
+    ) = args
+
+    if performance._SEED is not None:
+        np.random.seed(performance._SEED + idx)
+
+    if base_solver == "classic":
+        from fit.classic import solve as solver
+    elif base_solver == "modern_vp":
+        from fit.modern_vp import solve as solver
+    elif base_solver == "modern_trf":
+        from fit.modern import solve as solver
+    elif base_solver == "lmfit_vp":
+        from fit.lmfit_backend import solve as solver
+    else:  # pragma: no cover - unknown solver
+        raise ValueError("unknown solver")
+
+    rng = np.random.default_rng(seed_base + idx if seed_base is not None else None)
+    resampled = rng.choice(resid, size=resid.size, replace=True)
+    y_boot = fitted - resampled
+    pk_copy = [
+        Peak(p.center, p.height, p.fwhm, p.eta, p.lock_center, p.lock_width)
+        for p in start_peaks
+    ]
+    res = solver(x, y_boot, pk_copy, mode, baseline, options)
+    return np.asarray(res["theta"], dtype=float)
 
 
 def bootstrap(base_solver: str, resample_cfg: dict, residual_builder) -> UncReport:
@@ -42,17 +83,6 @@ def bootstrap(base_solver: str, resample_cfg: dict, residual_builder) -> UncRepo
         problem described in ``resample_cfg``.
     """
 
-    if base_solver == "classic":
-        from fit.classic import solve as solver
-    elif base_solver == "modern_vp":
-        from fit.modern_vp import solve as solver
-    elif base_solver == "modern_trf":
-        from fit.modern import solve as solver
-    elif base_solver == "lmfit_vp":
-        from fit.lmfit_backend import solve as solver
-    else:  # pragma: no cover - unknown solver
-        raise ValueError("unknown solver")
-
     x = np.asarray(resample_cfg["x"], dtype=float)
     y = np.asarray(resample_cfg["y"], dtype=float)
     peaks = list(resample_cfg["peaks"])  # template peaks
@@ -70,16 +100,19 @@ def bootstrap(base_solver: str, resample_cfg: dict, residual_builder) -> UncRepo
     r = resid_fn(theta)
     fitted = y + r
 
-    rng = np.random.default_rng(resample_cfg.get("seed"))
-    samples = []
+    seed_base = resample_cfg.get("seed")
     start_peaks = _peaks_from_theta(theta, peaks)
-    for _ in range(n):
-        resampled = rng.choice(r, size=r.size, replace=True)
-        y_boot = fitted - resampled
-        res = solver(x, y_boot, start_peaks, mode, baseline, options)
-        samples.append(np.asarray(res["theta"], dtype=float))
 
-    samples = np.vstack(samples) if samples else np.empty((0, theta.size))
+    max_workers = performance.get_max_workers()
+    args_common = (base_solver, x, fitted, r, start_peaks, mode, baseline, options, seed_base)
+    if max_workers > 1:
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            iter_args = (args_common + (i,) for i in range(n))
+            samples_list = list(ex.map(_bootstrap_worker, iter_args))
+    else:
+        samples_list = [_bootstrap_worker(args_common + (i,)) for i in range(n)]
+
+    samples = np.vstack(samples_list) if samples_list else np.empty((0, theta.size))
     mean_theta = samples.mean(axis=0) if samples.size else theta
     cov = (
         np.cov(samples, rowvar=False, ddof=1)

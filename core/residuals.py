@@ -9,9 +9,9 @@ try:  # optional CuPy support
 except Exception:  # pragma: no cover - CuPy may be absent
     cp = None  # type: ignore
 
-from .models import pv_sum
 from .jacobians import pv_and_grads
 from .peaks import Peak
+from infra import performance as perf
 
 
 def build_residual(
@@ -43,13 +43,12 @@ def build_residual(
         pk = []
         for i in range(len(peaks)):
             c, h, fw, eta = theta[4 * i : 4 * (i + 1)]
-            pk.append(Peak(c, h, fw, eta))
-        model = pv_sum(x, pk)
+            pk.append((h, c, fw, eta))
+        model = perf.eval_total(x, pk)
+        base = baseline if baseline is not None else 0.0
         if mode == "add":
-            base = baseline if baseline is not None else 0.0
             r = model + base - y
         elif mode == "subtract":
-            base = baseline if baseline is not None else 0.0
             r = model - (y - base)
         else:  # pragma: no cover - unknown mode
             raise ValueError("unknown mode")
@@ -110,13 +109,14 @@ def build_residual_jac(
         if wmin_eval > 0.0:
             f = np.maximum(f, wmin_eval)
 
-        model = np.zeros_like(x)
+        pk_tuples = [(h[i], c[i], f[i], e[i]) for i in range(n)]
+        unit_peaks = [(1.0, c[i], f[i], e[i]) for i in range(n)]
+        comps_unit = perf.eval_components(x, unit_peaks)
+        model = perf.eval_total(x, pk_tuples)
         cols = []
         for i in range(n):
-            pv, d_dc, d_df = pv_and_grads(x, h[i], c[i], f[i], e[i])
-            model += pv
-            base = pv / h[i] if h[i] != 0 else pv_and_grads(x, 1.0, c[i], f[i], e[i])[0]
-            cols.append(base)
+            _, d_dc, d_df = pv_and_grads(x, h[i], c[i], f[i], e[i])
+            cols.append(comps_unit[i])
             if not lock_c[i]:
                 cols.append(d_dc)
             if not lock_w[i]:

@@ -6,7 +6,8 @@ from typing import Optional, Sequence, TypedDict
 import numpy as np
 from scipy.optimize import nnls
 
-from core.models import pv_design_matrix, pv_sum_with_jac
+from core.models import pv_sum_with_jac
+from infra import performance as perf
 from core.weights import noise_weights, robust_weights, combine_weights
 from core.peaks import Peak
 from .bounds import pack_theta_bounds
@@ -93,7 +94,8 @@ def solve(
     all_locked = all(p.lock_center and p.lock_width for p in peaks)
 
     if all_locked:
-        A = pv_design_matrix(x, peaks)
+        unit_peaks = [(1.0, p.center, p.fwhm, p.eta) for p in peaks]
+        A = perf.design_matrix(x, unit_peaks)
         b = y_target
         if weights is not None:
             Aw = A * weights[:, None]
@@ -150,7 +152,8 @@ def solve(
     for nfev in range(1, maxfev + 1):
         c, f = unpack(theta)
         pk_iter = [Peak(c[i], 1.0, f[i], peaks[i].eta) for i in range(len(peaks))]
-        A = pv_design_matrix(x, pk_iter)
+        unit_peaks = [(1.0, p.center, p.fwhm, p.eta) for p in pk_iter]
+        A = perf.design_matrix(x, unit_peaks)
         b = y_target
         if weights is not None:
             Aw = A * weights[:, None]
@@ -217,7 +220,8 @@ def solve(
         theta_new = np.minimum(np.maximum(theta + step, lb), ub)
         c_new, f_new = unpack(theta_new)
         pk_new = [Peak(c_new[i], 1.0, f_new[i], peaks[i].eta) for i in range(len(peaks))]
-        A_new = pv_design_matrix(x, pk_new)
+        unit_new = [(1.0, p.center, p.fwhm, p.eta) for p in pk_new]
+        A_new = perf.design_matrix(x, unit_new)
         if weights is not None:
             Aw_new = A_new * weights[:, None]
             bw = b * weights
@@ -236,7 +240,8 @@ def solve(
             theta_new = np.minimum(np.maximum(theta + step, lb), ub)
             c_new, f_new = unpack(theta_new)
             pk_new = [Peak(c_new[i], 1.0, f_new[i], peaks[i].eta) for i in range(len(peaks))]
-            A_new = pv_design_matrix(x, pk_new)
+            unit_new = [(1.0, p.center, p.fwhm, p.eta) for p in pk_new]
+            A_new = perf.design_matrix(x, unit_new)
             if weights is not None:
                 Aw_new = A_new * weights[:, None]
             else:
@@ -257,7 +262,8 @@ def solve(
     # final solve with accepted parameters
     c, f = unpack(theta)
     pk_final = [Peak(c[i], 1.0, f[i], peaks[i].eta) for i in range(len(peaks))]
-    A = pv_design_matrix(x, pk_final)
+    unit_final = [(1.0, p.center, p.fwhm, p.eta) for p in pk_final]
+    A = perf.design_matrix(x, unit_final)
     if weights is not None:
         Aw = A * weights[:, None]
         bw = b * weights
@@ -382,7 +388,8 @@ def iterate(state: dict):
         Peak(theta[4 * i + 0], 1.0, theta[4 * i + 2], theta[4 * i + 3])
         for i in range(len(peaks))
     ]
-    A = pv_design_matrix(x, pk_tmp)
+    unit_tmp = [(1.0, p.center, p.fwhm, p.eta) for p in pk_tmp]
+    A = perf.design_matrix(x, unit_tmp)
     if weights is not None:
         Aw = A * weights[:, None]
         bw = y_target * weights

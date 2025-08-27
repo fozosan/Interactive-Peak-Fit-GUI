@@ -8,7 +8,7 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from core.residuals import build_residual_jac
-from core.models import pv_design_matrix
+from infra import performance as perf
 from core.weights import noise_weights
 from core.peaks import Peak
 from .bounds import pack_theta_bounds
@@ -96,7 +96,8 @@ def solve(
 
     all_locked = all(p.lock_center and p.lock_width for p in peaks)
     if all_locked:
-        A = pv_design_matrix(x, peaks)
+        unit_peaks = [(1.0, p.center, p.fwhm, p.eta) for p in peaks]
+        A = perf.design_matrix(x, unit_peaks)
         if weights is not None:
             Aw = A * weights[:, None]
             yw = y_target * weights
