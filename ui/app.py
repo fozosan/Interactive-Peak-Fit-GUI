@@ -180,7 +180,7 @@ import traceback
 
 from scipy.signal import find_peaks
 
-from core import signals
+from core import signals, data_io
 from core.residuals import build_residual, jacobian_fd
 from fit import orchestrator, classic, modern_vp, modern
 try:  # optional
@@ -268,6 +268,14 @@ DEFAULTS = {
     "x_label_auto_math": True,
     "ui_show_legend": True,
     "legend_center_sigfigs": 6,
+    # Uncertainty and performance defaults
+    "show_uncertainty_band": True,
+    "baseline_uses_fit_range": True,
+    "perf_numba": False,
+    "perf_gpu": False,
+    "perf_cache_baseline": True,
+    "perf_seed_all": False,
+    "perf_max_workers": 0,
 }
 
 LOG_MAX_LINES = 5000
@@ -497,7 +505,7 @@ class PeakFitApp:
         # Baseline mode: "add" (fit over baseline) or "subtract"
         self.baseline_mode = tk.StringVar(value="add")
         # Option: compute ALS baseline only from fit range
-        self.baseline_use_range = tk.BooleanVar(value=False)
+        self.baseline_use_range = tk.BooleanVar(value=bool(self.cfg.get("baseline_uses_fit_range", True)))
 
         # Config
         self.cfg = load_config()
@@ -587,9 +595,9 @@ class PeakFitApp:
         self.lmfit_share_eta = tk.BooleanVar(value=False)
         self.snr_text = tk.StringVar(value="S/N: --")
 
-        self.show_ci_band = False
+        self.show_ci_band = bool(self.cfg.get("show_uncertainty_band", True))
         self.ci_band = None
-        self.show_ci_band_var = tk.BooleanVar(value=False)
+        self.show_ci_band_var = tk.BooleanVar(value=self.show_ci_band)
 
         # Uncertainty and performance controls
         unc_cfg = self.cfg.get("unc_method", "asymptotic")
@@ -600,27 +608,37 @@ class PeakFitApp:
         else:
             unc_label = "Asymptotic"
         self.unc_method = tk.StringVar(value=unc_label)
-        self.perf_numba = tk.BooleanVar(value=False)
-        self.perf_gpu = tk.BooleanVar(value=False)
-        self.perf_cache = tk.BooleanVar(value=True)
-        self.perf_deterministic = tk.BooleanVar(value=False)
-        self.perf_parallel = tk.BooleanVar(value=False)
+        self.perf_numba = tk.BooleanVar(value=bool(self.cfg.get("perf_numba", False)))
+        self.perf_gpu = tk.BooleanVar(value=bool(self.cfg.get("perf_gpu", False)))
+        self.perf_cache_baseline = tk.BooleanVar(value=bool(self.cfg.get("perf_cache_baseline", True)))
+        self.perf_seed_all = tk.BooleanVar(value=bool(self.cfg.get("perf_seed_all", False)))
+        self.perf_max_workers = tk.IntVar(value=int(self.cfg.get("perf_max_workers", 0)))
         self.seed_var = tk.StringVar(value="")
-        self.workers_var = tk.IntVar(value=0)
         self.gpu_chunk_var = tk.IntVar(value=262144)
 
         # UI
         self._build_ui()
         self._new_figure()
         self._update_template_info()
+        self.apply_performance()
 
     # ----- UI -----
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=6); top.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(top, text="Open Data…", command=self.on_open).pack(side=tk.LEFT)
-        ttk.Button(top, text="Export CSV…", command=self.on_export).pack(side=tk.LEFT, padx=(6,0))
-        ttk.Button(top, text="Help", command=self.show_help).pack(side=tk.LEFT, padx=(6,0))
-        self.file_label = ttk.Label(top, text="No file loaded"); self.file_label.pack(side=tk.LEFT, padx=10)
+        top = ttk.Frame(self.root, padding=6)
+        top.pack(side=tk.TOP, fill=tk.X)
+        self.file_label = ttk.Label(top, text="No file loaded")
+        self.file_label.pack(side=tk.LEFT)
+        actions = ttk.Frame(top)
+        actions.pack(side=tk.RIGHT)
+        ttk.Button(actions, text="Open", command=self.on_open).pack(side=tk.LEFT, padx=2)
+        self.step_btn = ttk.Button(actions, text="Step", command=self.step_once)
+        self.step_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Export", command=self.on_export).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Uncert", command=self.run_uncertainty).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Batch…", command=self.run_batch).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Comp", command=self.toggle_components).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Legend", command=self._toggle_legend_action).pack(side=tk.LEFT, padx=2)
 
         mid = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -913,41 +931,22 @@ class PeakFitApp:
         ).pack(anchor="w", padx=4)
         self._update_unc_widgets()
 
-        # Axes / label controls (moved here)
+        # Axes / label controls
         axes_box = ttk.Labelframe(right, text="Axes / Labels")
         axes_box.pack(fill=tk.X, pady=6)
-
-        ttk.Label(axes_box, text="X-axis label:").pack(side=tk.LEFT)
-        self.x_label_entry = ttk.Entry(axes_box, width=16, textvariable=self.x_label_var)
+        row1 = ttk.Frame(axes_box); row1.pack(fill=tk.X)
+        ttk.Label(row1, text="X-axis label:").pack(side=tk.LEFT)
+        self.x_label_entry = ttk.Entry(row1, width=16, textvariable=self.x_label_var)
         self.x_label_entry.pack(side=tk.LEFT, padx=4)
-        ttk.Button(axes_box, text="Apply", command=self.apply_x_label).pack(side=tk.LEFT, padx=2)
-        ttk.Button(axes_box, text="Superscript", command=self.insert_superscript).pack(side=tk.LEFT, padx=2)
-        ttk.Button(axes_box, text="Subscript", command=self.insert_subscript).pack(side=tk.LEFT, padx=2)
-        ttk.Button(axes_box, text="Save as default", command=self.save_x_label_default).pack(side=tk.LEFT, padx=2)
-
-        row_fmt = ttk.Frame(axes_box); row_fmt.pack(fill=tk.X, pady=(2, 0))
-        ttk.Checkbutton(row_fmt, text="Auto-format superscripts/subscripts",
-                        variable=self.x_label_auto_math,
-                        command=self._on_x_label_auto_math_toggle).pack(side=tk.LEFT)
-
-        # Legend controls
-        row_leg = ttk.Frame(axes_box)
-        row_leg.pack(fill=tk.X, pady=(4, 0))
-        ttk.Checkbutton(
-            row_leg,
-            text="Show legend",
-            variable=self.show_legend_var,
-            command=self._on_legend_toggle,
-        ).pack(side=tk.LEFT)
-        ttk.Label(row_leg, text="Center sig figs:").pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Spinbox(
-            row_leg,
-            from_=3,
-            to=10,
-            width=4,
-            textvariable=self.legend_center_sigfigs,
-            command=self._on_legend_sigfigs_change,
-        ).pack(side=tk.LEFT)
+        ttk.Button(row1, text="Apply", command=self.apply_x_label).pack(side=tk.LEFT, padx=2)
+        row2 = ttk.Frame(axes_box); row2.pack(fill=tk.X, pady=(2,0))
+        ttk.Button(row2, text="Superscript", command=self.insert_superscript).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text="Subscript", command=self.insert_subscript).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(row2, text="Auto-format", variable=self.x_label_auto_math,
+                        command=self._on_x_label_auto_math_toggle).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text="Save as default", command=self.save_x_label_default).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(row2, text="Show legend", variable=self.show_legend_var,
+                        command=self._on_legend_toggle).pack(side=tk.LEFT, padx=2)
 
         # Performance panel
         perf_box = ttk.Labelframe(right, text="Performance"); perf_box.pack(fill=tk.X, pady=4)
@@ -955,17 +954,15 @@ class PeakFitApp:
                         command=self.apply_performance).pack(anchor="w")
         ttk.Checkbutton(perf_box, text="GPU", variable=self.perf_gpu,
                         command=self.apply_performance).pack(anchor="w")
-        ttk.Checkbutton(perf_box, text="Cache baseline", variable=self.perf_cache,
+        ttk.Checkbutton(perf_box, text="Cache baseline", variable=self.perf_cache_baseline,
                         command=self.apply_performance).pack(anchor="w")
-        ttk.Checkbutton(perf_box, text="Deterministic seeds", variable=self.perf_deterministic,
-                        command=self.apply_performance).pack(anchor="w")
-        ttk.Checkbutton(perf_box, text="Parallel bootstrap", variable=self.perf_parallel,
+        ttk.Checkbutton(perf_box, text="Seed all", variable=self.perf_seed_all,
                         command=self.apply_performance).pack(anchor="w")
         rowp = ttk.Frame(perf_box); rowp.pack(fill=tk.X, pady=2)
         ttk.Label(rowp, text="Seed:").pack(side=tk.LEFT)
         ttk.Entry(rowp, width=8, textvariable=self.seed_var).pack(side=tk.LEFT, padx=4)
         ttk.Label(rowp, text="Max workers:").pack(side=tk.LEFT, padx=(8,0))
-        ttk.Spinbox(rowp, from_=0, to=64, textvariable=self.workers_var, width=5).pack(side=tk.LEFT)
+        ttk.Spinbox(rowp, from_=0, to=64, textvariable=self.perf_max_workers, width=5).pack(side=tk.LEFT)
         ttk.Label(rowp, text="GPU chunk:").pack(side=tk.LEFT, padx=(8,0))
         ttk.Entry(rowp, width=7, textvariable=self.gpu_chunk_var).pack(side=tk.LEFT, padx=2)
         ttk.Button(rowp, text="Apply", command=self.apply_performance).pack(side=tk.LEFT, padx=4)
@@ -986,15 +983,6 @@ class PeakFitApp:
         ttk.Label(rowb3, text="Auto max:").pack(side=tk.LEFT, padx=(8,0))
         ttk.Spinbox(rowb3, from_=1, to=20, textvariable=self.batch_auto_max, width=5).pack(side=tk.LEFT)
         ttk.Button(batch_box, text="Run Batch…", command=self.run_batch).pack(side=tk.LEFT, pady=4)
-
-        # Actions
-        actions = ttk.Labelframe(right, text="Actions"); actions.pack(fill=tk.X, pady=4)
-        ttk.Button(actions, text="Auto-seed", command=self.auto_seed).pack(side=tk.LEFT)
-        self.step_btn = ttk.Button(actions, text="Step \u25B6", command=self.step_once)
-        self.step_btn.pack(side=tk.LEFT, padx=4)
-        ttk.Button(actions, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=4)
-        ttk.Label(actions, textvariable=self.solver_title).pack(side=tk.LEFT, padx=4)
-        ttk.Button(actions, text="Toggle components", command=self.toggle_components).pack(side=tk.LEFT, padx=4)
 
         # Status bar and log
         bar = ttk.Frame(self.root); bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1125,7 +1113,13 @@ class PeakFitApp:
 
     def _toggle_ci_band(self):
         self.show_ci_band = bool(self.show_ci_band_var.get())
+        self.cfg["show_uncertainty_band"] = self.show_ci_band
+        save_config(self.cfg)
         self.refresh_plot()
+
+    def _toggle_legend_action(self):
+        self.show_legend_var.set(not self.show_legend_var.get())
+        self._on_legend_toggle()
 
     def _fd_jacobian(self, residual, p0):
         p0 = np.asarray(p0, float)
@@ -1340,6 +1334,8 @@ class PeakFitApp:
 
     # ----- Baseline -----
     def on_baseline_use_range_toggle(self):
+        self.cfg["baseline_uses_fit_range"] = bool(self.baseline_use_range.get())
+        save_config(self.cfg)
         if self.y_raw is None:
             return
         self.compute_baseline()
@@ -2003,12 +1999,11 @@ class PeakFitApp:
                 return
             self.peaks[:] = res.peaks_out
             self.refresh_tree(keep_selection=True)
-            if self.show_ci_band:
+            try:
                 self._run_asymptotic_uncertainty()
-            else:
-                self.ci_band = None
-                self.show_ci_band = False
-                self.show_ci_band_var.set(False)
+            except Exception as e:
+                self.log(f"Uncertainty failed: {e}", level="WARN")
+            self.show_ci_band = bool(self.show_ci_band_var.get())
             self.refresh_plot()
             self.set_busy(False, f"Fit done. RMSE {res.rmse:.4g}")
             npts = int(np.count_nonzero(mask))
@@ -2065,6 +2060,12 @@ class PeakFitApp:
             "reheight": bool(self.batch_reheight.get()),
             "auto_max": int(self.batch_auto_max.get()),
             solver: self._solver_options(solver),
+            "baseline_uses_fit_range": bool(self.baseline_use_range.get()),
+            "perf_numba": bool(self.perf_numba.get()),
+            "perf_gpu": bool(self.perf_gpu.get()),
+            "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
+            "perf_seed_all": bool(self.perf_seed_all.get()),
+            "perf_max_workers": int(self.perf_max_workers.get()),
         }
 
         self.cfg["batch_patterns"] = self.batch_patterns.get()
@@ -2153,20 +2154,24 @@ class PeakFitApp:
             hi = np.nan_to_num(hi)
             warn_nonfinite = True
         self.ci_band = (x_all, lo, hi)
+        self.show_ci_band = True
 
         bw = (hi - lo)[mask]
         bw_stats = (float(np.min(bw)), float(np.median(bw)), float(np.max(bw)))
 
+        dof = max(m - rank, 1)
         info = {
             "m": m,
             "n": theta.size,
             "rank": rank,
-            "dof": m - rank,
+            "dof": dof,
             "cond": cond,
             "rmse": math.sqrt(rss / m),
+            "s2": rss / dof,
             "bw": bw_stats,
             "warn_nonfinite": warn_nonfinite,
         }
+        self.unc_info = info
         return cov, theta, info
 
     def _format_asymptotic_summary(self, cov, theta, info, band):
@@ -2282,20 +2287,93 @@ class PeakFitApp:
     def apply_performance(self):
         performance.set_numba(bool(self.perf_numba.get()))
         performance.set_gpu(bool(self.perf_gpu.get()))
-        performance.set_cache_baseline(bool(self.perf_cache.get()))
+        performance.set_cache_baseline(bool(self.perf_cache_baseline.get()))
         seed_txt = self.seed_var.get().strip()
         seed = int(seed_txt) if seed_txt else None
-        if self.perf_deterministic.get():
+        if self.perf_seed_all.get():
             performance.set_seed(seed)
         else:
             performance.set_seed(None)
-        if self.perf_parallel.get():
-            performance.set_max_workers(self.workers_var.get())
-        else:
-            performance.set_max_workers(0)
+        performance.set_max_workers(int(self.perf_max_workers.get()))
         performance.set_gpu_chunk(self.gpu_chunk_var.get())
+        self.cfg["perf_numba"] = bool(self.perf_numba.get())
+        self.cfg["perf_gpu"] = bool(self.perf_gpu.get())
+        self.cfg["perf_cache_baseline"] = bool(self.perf_cache_baseline.get())
+        self.cfg["perf_seed_all"] = bool(self.perf_seed_all.get())
+        self.cfg["perf_max_workers"] = int(self.perf_max_workers.get())
+        save_config(self.cfg)
         self.log(f"Backend: {performance.which_backend()} | workers={performance.get_max_workers()}")
         self.status_var.set("Performance options applied.")
+
+    def _build_uncertainty_rows(self, file_path, rmse):
+        rows = []
+        sigma = getattr(self, "param_sigma", None)
+        info = getattr(self, "unc_info", {})
+        dof = info.get("dof", np.nan)
+        s2 = info.get("s2", np.nan)
+        mode = self.baseline_mode.get()
+        xmin = self.fit_xmin if self.fit_xmin is not None else float(np.min(self.x))
+        xmax = self.fit_xmax if self.fit_xmax is not None else float(np.max(self.x))
+        z = 1.96
+        for i, p in enumerate(self.peaks, 1):
+            idx = 4 * (i - 1)
+            sc = sigma[idx] if sigma is not None else np.nan
+            sh = sigma[idx + 1] if sigma is not None else np.nan
+            sf = sigma[idx + 2] if sigma is not None else np.nan
+            if p.lock_center:
+                sc = np.nan
+            if p.lock_width:
+                sf = np.nan
+            row = {
+                "file": Path(file_path).name if file_path else "",
+                "peak": i,
+                "center": p.center,
+                "height": p.height,
+                "fwhm": p.fwhm,
+                "eta": p.eta,
+                "lock_center": p.lock_center,
+                "lock_width": p.lock_width,
+                "stderr_height": sh,
+                "ci95_height_lo": p.height - z * sh if np.isfinite(sh) else np.nan,
+                "ci95_height_hi": p.height + z * sh if np.isfinite(sh) else np.nan,
+                "stderr_center": sc,
+                "ci95_center_lo": p.center - z * sc if np.isfinite(sc) else np.nan,
+                "ci95_center_hi": p.center + z * sc if np.isfinite(sc) else np.nan,
+                "stderr_fwhm": sf,
+                "ci95_fwhm_lo": p.fwhm - z * sf if np.isfinite(sf) else np.nan,
+                "ci95_fwhm_hi": p.fwhm + z * sf if np.isfinite(sf) else np.nan,
+                "rmse": rmse,
+                "dof": dof,
+                "s2": s2,
+                "method": "asymptotic",
+                "mode": mode,
+                "fit_xmin": xmin,
+                "fit_xmax": xmax,
+            }
+            rows.append(row)
+        return rows
+
+    def _maybe_export_uncertainty(self, basepath: Path, rmse: float) -> None:
+        try:
+            if self.ci_band is None:
+                try:
+                    self._run_asymptotic_uncertainty()
+                except Exception as e:
+                    self.log(f"Uncertainty failed: {e}", level="WARN")
+            rows = self._build_uncertainty_rows(basepath.name, rmse)
+            pd.DataFrame(rows).to_csv(str(basepath) + "_uncertainty.csv", index=False)
+            if self.ci_band is not None:
+                xb, lob, hib = self.ci_band
+                total = np.zeros_like(self.x)
+                for p in self.peaks:
+                    total += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
+                base = self.baseline if (self.use_baseline.get() and self.baseline is not None and self.baseline_mode.get() == "add") else 0.0
+                y_fit = total + base
+                df = pd.DataFrame({"x": xb, "y_fit": y_fit, "y_lo95": lob, "y_hi95": hib})
+                df.to_csv(str(basepath) + "_uncertainty_band.csv", index=False)
+        except Exception as e:  # pragma: no cover - defensive
+            self.log(f"Uncertainty export failed: {e}", level="WARN")
+            self.status_var.set("Uncertainty export failed.")
 
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:
@@ -2333,8 +2411,23 @@ class PeakFitApp:
 
         rows = []
         fname = self.file_label.cget("text")
+        opts = self._solver_options()
+        solver = self.solver_choice.get()
+        perf_extras = {
+            "perf_numba": bool(self.perf_numba.get()),
+            "perf_gpu": bool(self.perf_gpu.get()),
+            "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
+            "perf_seed_all": bool(self.perf_seed_all.get()),
+            "perf_max_workers": int(self.perf_max_workers.get()),
+        }
+        center_bounds = (self.fit_xmin, self.fit_xmax) if (opts.get("centers_in_window") or opts.get("bound_centers_to_window")) else (np.nan, np.nan)
+        if self.x is not None and self.x.size > 1:
+            med_dx = float(np.median(np.diff(np.sort(self.x))))
+        else:
+            med_dx = 0.0
+        fwhm_lo = opts.get("min_fwhm", max(1e-6, 2.0 * med_dx))
         for i, (p, a) in enumerate(zip(self.peaks, areas), 1):
-            rows.append({
+            row = {
                 "file": fname,
                 "peak": i,
                 "center": p.center,
@@ -2352,8 +2445,30 @@ class PeakFitApp:
                 "als_p": float(self.als_asym.get()),
                 "fit_xmin": self.fit_xmin if self.fit_xmin is not None else float(self.x.min()),
                 "fit_xmax": self.fit_xmax if self.fit_xmax is not None else float(self.x.max()),
-            })
-        pd.DataFrame(rows).to_csv(out_csv, index=False)
+                "solver_choice": solver,
+                "solver_loss": opts.get("loss", np.nan),
+                "solver_weight": opts.get("weights", np.nan),
+                "solver_fscale": opts.get("f_scale", np.nan),
+                "solver_maxfev": opts.get("maxfev", np.nan),
+                "solver_restarts": opts.get("restarts", np.nan),
+                "solver_jitter_pct": opts.get("jitter_pct", np.nan),
+                "use_baseline": bool(self.use_baseline.get()),
+                "baseline_mode": self.baseline_mode.get(),
+                "baseline_uses_fit_range": bool(self.baseline_use_range.get()),
+                "als_niter": int(self.als_niter.get()),
+                "als_thresh": float(self.als_thresh.get()),
+                **perf_extras,
+                "bounds_center_lo": center_bounds[0],
+                "bounds_center_hi": center_bounds[1],
+                "bounds_fwhm_lo": fwhm_lo,
+                "bounds_height_lo": 0.0,
+                "bounds_height_hi": np.nan,
+                "x_scale": opts.get("x_scale", np.nan),
+            }
+            rows.append(row)
+        peak_csv = data_io.build_peak_table(rows)
+        with open(out_csv, "w", encoding="utf-8") as fh:
+            fh.write(peak_csv)
 
         # Trace CSV
         trace_path = str(Path(out_csv).with_name(Path(out_csv).stem + "_trace.csv"))
@@ -2368,6 +2483,11 @@ class PeakFitApp:
         for k, v in comp_cols.items():
             df[k] = v
         df.to_csv(trace_path, index=False)
+
+        try:
+            self._maybe_export_uncertainty(Path(out_csv).with_suffix(""), rmse)
+        except Exception as e:  # pragma: no cover - defensive
+            self.log(f"Uncertainty export failed: {e}", level="WARN")
 
         messagebox.showinfo("Export", f"Saved:\n{out_csv}\n{trace_path}")
 
