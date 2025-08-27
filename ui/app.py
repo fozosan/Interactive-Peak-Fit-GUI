@@ -509,6 +509,7 @@ class PeakFitApp:
         self.cfg.setdefault("perf_cache_baseline", True)
         self.cfg.setdefault("perf_seed_all", False)
         self.cfg.setdefault("perf_max_workers", 0)
+        self.cfg.setdefault("unc_workers", 0)
         save_config(self.cfg)
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
 
@@ -630,6 +631,8 @@ class PeakFitApp:
         else:
             unc_label = "Asymptotic"
         self.unc_method = tk.StringVar(value=unc_label)
+        self.unc_workers_var = tk.IntVar(value=int(self.cfg.get("unc_workers", 0)))
+        self.unc_workers_var.trace_add("write", lambda *_: self._on_unc_workers_change())
         self.perf_numba = tk.BooleanVar(value=bool(self.cfg.get("perf_numba", False)))
         self.perf_gpu = tk.BooleanVar(value=bool(self.cfg.get("perf_gpu", False)))
         self.perf_cache_baseline = tk.BooleanVar(value=bool(self.cfg.get("perf_cache_baseline", True)))
@@ -978,6 +981,17 @@ class PeakFitApp:
             "<<ComboboxSelected>>",
             lambda _e: self._on_bootstrap_solver_change(),
         )
+        self.unc_workers_frame = ttk.Frame(unc_box)
+        self.unc_workers_label = ttk.Label(self.unc_workers_frame, text="Bootstrap workers:")
+        self.unc_workers_label.pack(side=tk.LEFT)
+        self.unc_workers_spin = ttk.Spinbox(
+            self.unc_workers_frame,
+            from_=0,
+            to=64,
+            textvariable=self.unc_workers_var,
+            width=5,
+        )
+        self.unc_workers_spin.pack(side=tk.LEFT, padx=2)
         ttk.Button(unc_box, text="Run", command=self.run_uncertainty).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(
             unc_box,
@@ -1122,8 +1136,10 @@ class PeakFitApp:
             self.unc_method.set(f"Bootstrap (base solver = {label})")
         if self.unc_method.get().startswith("Bootstrap"):
             self.bootstrap_solver_combo.pack(side=tk.LEFT, padx=4)
+            self.unc_workers_frame.pack(side=tk.LEFT, padx=4)
         else:
             self.bootstrap_solver_combo.pack_forget()
+            self.unc_workers_frame.pack_forget()
 
     def _on_unc_method_change(self, _e=None):
         label = self.unc_method.get()
@@ -1135,6 +1151,18 @@ class PeakFitApp:
             self.cfg["unc_method"] = "asymptotic"
         save_config(self.cfg)
         self._update_unc_widgets()
+
+    def _on_unc_workers_change(self, *_):
+        self.cfg["unc_workers"] = int(self.unc_workers_var.get())
+        save_config(self.cfg)
+
+    def _resolve_unc_workers(self) -> int:
+        w = int(self.unc_workers_var.get())
+        if w <= 0:
+            w = int(self.perf_max_workers.get())
+            if w <= 0:
+                w = os.cpu_count() or 1
+        return w
 
 
     def _suspend_clicks(self):
@@ -2141,6 +2169,8 @@ class PeakFitApp:
             "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
             "perf_seed_all": bool(self.perf_seed_all.get()),
             "perf_max_workers": int(self.perf_max_workers.get()),
+            "unc_method": self.cfg.get("unc_method", "asymptotic"),
+            "unc_workers": int(self.cfg.get("unc_workers", 0)),
             "output_dir": str(output_dir),
             "output_base": output_base,
         }
@@ -2327,6 +2357,7 @@ class PeakFitApp:
                     "theta": theta,
                     "options": self._solver_options(self.bootstrap_solver_choice.get()),
                     "n": 100,
+                    "workers": self._resolve_unc_workers(),
                 }
                 return bootstrap.bootstrap(self.bootstrap_solver_choice.get(), cfg, resid_fn)
             if method == "bayesian":
@@ -2425,22 +2456,11 @@ class PeakFitApp:
             rows = []
             fname = self.current_file.name if self.current_file else ""
             for i, p in enumerate(self.peaks, 1):
+                lines.append(f"Peak {i}")
                 sc = sigma[4 * (i - 1)] if sigma.size >= 4 * i else np.nan
                 sh = sigma[4 * (i - 1) + 1] if sigma.size >= 4 * i + 1 else np.nan
                 sf = sigma[4 * (i - 1) + 2] if sigma.size >= 4 * i + 2 else np.nan
                 se = sigma[4 * (i - 1) + 3] if sigma.size >= 4 * i + 3 else np.nan
-                c_lo = p.center - z * sc if np.isfinite(sc) and not p.lock_center else np.nan
-                c_hi = p.center + z * sc if np.isfinite(sc) and not p.lock_center else np.nan
-                h_lo = p.height - z * sh if np.isfinite(sh) else np.nan
-                h_hi = p.height + z * sh if np.isfinite(sh) else np.nan
-                f_lo = p.fwhm - z * sf if np.isfinite(sf) and not p.lock_width else np.nan
-                f_hi = p.fwhm + z * sf if np.isfinite(sf) and not p.lock_width else np.nan
-                lines.append(
-                    f"  #{i} center={p.center:.5g}, 95% CI [{c_lo:.5g}, {c_hi:.5g}]; "
-                    f"height={p.height:.5g}, 95% CI [{h_lo:.5g}, {h_hi:.5g}]; "
-                    f"fwhm={p.fwhm:.5g}, 95% CI [{f_lo:.5g}, {f_hi:.5g}]; "
-                    f"eta={p.eta:.5g}(fixed)"
-                )
                 params = [
                     ("center", p.center, sc, not p.lock_center),
                     ("height", p.height, sh, True),
@@ -2448,22 +2468,42 @@ class PeakFitApp:
                     ("eta", p.eta, se, True),
                 ]
                 for pname, val, std, free in params:
-                    ci_lo = val - z * std if free and np.isfinite(std) else np.nan
-                    ci_hi = val + z * std if free and np.isfinite(std) else np.nan
-                    rows.append(
-                        {
-                            "file": fname,
-                            "peak": i,
-                            "param": pname,
-                            "value": val,
-                            "stderr": std if np.isfinite(std) else np.nan,
-                            "ci_lo": ci_lo,
-                            "ci_hi": ci_hi,
-                            "method": "asymptotic",
-                            "rmse": rmse,
-                            "dof": dof,
-                        }
-                    )
+                    if free and np.isfinite(std):
+                        ci_lo = val - z * std
+                        ci_hi = val + z * std
+                        lines.append(
+                            f"  {pname:<7}= {val:.6g} ± {std:.3g}   (95% CI: [{ci_lo:.6g}, {ci_hi:.6g}])"
+                        )
+                        rows.append(
+                            {
+                                "file": fname,
+                                "peak": i,
+                                "param": pname,
+                                "value": val,
+                                "stderr": std,
+                                "ci_lo": ci_lo,
+                                "ci_hi": ci_hi,
+                                "method": "asymptotic",
+                                "rmse": rmse,
+                                "dof": dof,
+                            }
+                        )
+                    else:
+                        lines.append(f"  {pname:<7}= {val:.6g} (fixed)")
+                        rows.append(
+                            {
+                                "file": fname,
+                                "peak": i,
+                                "param": pname,
+                                "value": val,
+                                "stderr": np.nan,
+                                "ci_lo": np.nan,
+                                "ci_hi": np.nan,
+                                "method": "asymptotic",
+                                "rmse": rmse,
+                                "dof": dof,
+                            }
+                        )
 
             lines.append(f"Fit quality: RMSE={rmse:.5g}, DOF={dof}")
             with txt_path.open("w", encoding="utf-8", newline="") as fh:
