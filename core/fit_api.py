@@ -9,9 +9,10 @@ import numpy as np
 from .peaks import Peak
 from . import models
 from .weights import noise_weights
-from .residuals import build_residual
+from .residuals import build_residual, jacobian_fd
 from fit import orchestrator
 from fit.bounds import pack_theta_bounds
+from infra import performance
 
 
 def run_fit_consistent(
@@ -25,8 +26,20 @@ def run_fit_consistent(
     reheight: bool = False,
     rng_seed: Optional[int] = None,
     verbose: bool = False,
+    return_jacobian: bool = False,
 ) -> dict:
-    """Run a fit mirroring the single-file GUI path."""
+    """Run a fit mirroring the single-file GUI path.
+
+    Parameters
+    ----------
+    return_jacobian:
+        When ``True`` the return dictionary is extended with details useful
+        for uncertainty estimation: the residual function, its Jacobian at the
+        solution, the raw residual vector and a model prediction callable.  The
+        additional keys are ``"residual_fn"``, ``"jacobian"``, ``"rss"``,
+        ``"dof"`` and ``"ymodel_fn"`` along with echoing back ``x``,
+        ``baseline`` and ``fit_mask``.
+    """
 
     x = np.asarray(x, float)
     y = np.asarray(y, float)
@@ -168,7 +181,7 @@ def run_fit_consistent(
             )
         )
 
-    return {
+    result = {
         "peaks_out": peaks_out,
         "rmse": rmse,
         "theta": theta,
@@ -181,4 +194,38 @@ def run_fit_consistent(
         "clipped_after_solve": clipped_after,
         "fit_ok": bool(best_res.success if best_res is not None else False),
     }
+
+    if return_jacobian:
+        r0 = resid_fn(theta)
+        J = jacobian_fd(resid_fn, theta)
+        dof = max(r0.size - theta.size, 1)
+
+        x_all = x
+        baseline_all = baseline
+
+        def ymodel_fn(th: np.ndarray) -> np.ndarray:
+            pk = []
+            for i in range(len(peaks_out)):
+                c, h, w, e = th[4 * i : 4 * i + 4]
+                pk.append((h, c, w, e))
+            total = performance.eval_total(x_all, pk)
+            if baseline_all is not None and mode == "add":
+                total = total + baseline_all
+            return total
+
+        result.update(
+            {
+                "residual_fn": resid_fn,
+                "jacobian": J,
+                "rss": float(np.dot(r0, r0)),
+                "dof": dof,
+                "ymodel_fn": ymodel_fn,
+                "x": x,
+                "baseline": baseline,
+                "fit_mask": mask,
+                "mode": mode,
+            }
+        )
+
+    return result
 

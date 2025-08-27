@@ -19,6 +19,9 @@ import copy
 import numpy as np
 import pandas as pd
 
+if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safeguard
+    os.environ.setdefault("MPLBACKEND", "Agg")
+
 from core import data_io, models, peaks, signals, fit_api
 from core.residuals import build_residual, jacobian_fd
 from uncertainty import bootstrap
@@ -162,6 +165,11 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
         and ``auto_max`` controlling the maximum auto-seeded peaks.
     """
 
+    if os.environ.get("SMOKE_MODE") == "1":
+        config["perf_gpu"] = False
+        config["perf_numba"] = False
+        config["perf_max_workers"] = 0
+
     files: list[str] = []
     for pattern in patterns:
         files.extend(sorted(glob.glob(pattern)))
@@ -300,47 +308,48 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
         fwhm_lo = solver_opts.get("min_fwhm", max(1e-6, 2.0 * med_dx))
         fit_lo = float(config.get("fit_xmin", x[0]))
         fit_hi = float(config.get("fit_xmax", x[-1]))
+        local_records = []
         for idx, (p, area) in enumerate(zip(fitted, areas), start=1):
-            records.append(
-                {
-                    "file": Path(path).name,
-                    "peak": idx,
-                    "center": p.center,
-                    "height": p.height,
-                    "fwhm": p.fwhm,
-                    "eta": p.eta,
-                    "lock_width": p.lock_width,
-                    "lock_center": p.lock_center,
-                    "area": area,
-                    "area_pct": 100.0 * area / total,
-                    "rmse": rmse,
-                    "fit_ok": bool(res["fit_ok"]),
-                    "mode": mode,
-                    "als_lam": base_cfg.get("lam"),
-                    "als_p": base_cfg.get("p"),
-                    "fit_xmin": fit_lo,
-                    "fit_xmax": fit_hi,
-                    "solver_choice": solver_name,
-                    "solver_loss": config.get("solver_loss", np.nan),
-                    "solver_weight": config.get("solver_weight", np.nan),
-                    "solver_fscale": config.get("solver_fscale", np.nan),
-                    "solver_maxfev": config.get("solver_maxfev", np.nan),
-                    "solver_restarts": config.get("solver_restarts", np.nan),
-                    "solver_jitter_pct": config.get("solver_jitter_pct", np.nan),
-                    "use_baseline": True,
-                    "baseline_mode": mode,
-                    "baseline_uses_fit_range": bool(config.get("baseline_uses_fit_range", True)),
-                    "als_niter": base_cfg.get("niter"),
-                    "als_thresh": base_cfg.get("thresh"),
-                    **perf_extras,
-                    "bounds_center_lo": center_bounds[0],
-                    "bounds_center_hi": center_bounds[1],
-                    "bounds_fwhm_lo": fwhm_lo,
-                    "bounds_height_lo": 0.0,
-                    "bounds_height_hi": np.nan,
-                    "x_scale": np.nan,
-                }
-            )
+            rec = {
+                "file": Path(path).name,
+                "peak": idx,
+                "center": p.center,
+                "height": p.height,
+                "fwhm": p.fwhm,
+                "eta": p.eta,
+                "lock_width": p.lock_width,
+                "lock_center": p.lock_center,
+                "area": area,
+                "area_pct": 100.0 * area / total,
+                "rmse": rmse,
+                "fit_ok": bool(res["fit_ok"]),
+                "mode": mode,
+                "als_lam": base_cfg.get("lam"),
+                "als_p": base_cfg.get("p"),
+                "fit_xmin": fit_lo,
+                "fit_xmax": fit_hi,
+                "solver_choice": solver_name,
+                "solver_loss": config.get("solver_loss", np.nan),
+                "solver_weight": config.get("solver_weight", np.nan),
+                "solver_fscale": config.get("solver_fscale", np.nan),
+                "solver_maxfev": config.get("solver_maxfev", np.nan),
+                "solver_restarts": config.get("solver_restarts", np.nan),
+                "solver_jitter_pct": config.get("solver_jitter_pct", np.nan),
+                "use_baseline": True,
+                "baseline_mode": mode,
+                "baseline_uses_fit_range": bool(config.get("baseline_uses_fit_range", True)),
+                "als_niter": base_cfg.get("niter"),
+                "als_thresh": base_cfg.get("thresh"),
+                **perf_extras,
+                "bounds_center_lo": center_bounds[0],
+                "bounds_center_hi": center_bounds[1],
+                "bounds_fwhm_lo": fwhm_lo,
+                "bounds_height_lo": 0.0,
+                "bounds_height_hi": np.nan,
+                "x_scale": np.nan,
+            }
+            records.append(rec)
+            local_records.append(rec)
 
         if res["fit_ok"]:
             x_fit = x[mask]
@@ -380,6 +389,7 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
             info = {"dof": np.nan, "rmse": rmse}
             _band = None
         z = 1.96
+        unc_rows_file = []
         for idx, p in enumerate(fitted, start=1):
             sc = sigma[4 * (idx - 1)] if sigma.size >= 4 * idx else np.nan
             sh = sigma[4 * (idx - 1) + 1] if sigma.size >= 4 * idx + 1 else np.nan
@@ -400,20 +410,37 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                     ci_lo, ci_hi = val - z * std, val + z * std
                 else:
                     ci_lo = ci_hi = np.nan
-                unc_rows.append(
-                    {
-                        "file": Path(path).name,
-                        "peak": idx,
-                        "param": pname,
-                        "value": val,
-                        "stderr": std if np.isfinite(std) else np.nan,
-                        "ci_lo": ci_lo,
-                        "ci_hi": ci_hi,
-                        "method": "asymptotic",
-                        "rmse": rmse,
-                        "dof": info.get("dof", np.nan),
-                    }
-                )
+                row_unc = {
+                    "file": Path(path).name,
+                    "peak": idx,
+                    "param": pname,
+                    "value": val,
+                    "stderr": std if np.isfinite(std) else np.nan,
+                    "ci_lo": ci_lo,
+                    "ci_hi": ci_hi,
+                    "method": "asymptotic",
+                    "rmse": rmse,
+                    "dof": info.get("dof", np.nan),
+                }
+                unc_rows.append(row_unc)
+                unc_rows_file.append(row_unc)
+
+        fit_csv = data_io.build_peak_table(local_records)
+        with (out_dir / f"{Path(path).stem}_fit.csv").open("w", encoding="utf-8", newline="") as fh:
+            fh.write(fit_csv)
+        data_io.write_dataframe(pd.DataFrame(unc_rows_file), out_dir / f"{Path(path).stem}_uncertainty.csv")
+        lines = [f"File: {Path(path).name}", "Uncertainty method: Asymptotic"]
+        seen_peaks: set[int] = set()
+        for row in unc_rows_file:
+            if row["peak"] not in seen_peaks:
+                lines.append(f"Peak {row['peak']}")
+                seen_peaks.add(row["peak"])
+            if np.isfinite(row["stderr"]):
+                lines.append(f"  {row['param']} \u00b1 {row['stderr']:.3g}")
+            else:
+                lines.append(f"  {row['param']} (fixed)")
+        with (out_dir / f"{Path(path).stem}_uncertainty.txt").open("w", encoding="utf-8", newline="") as fh:
+            fh.write("\n".join(lines) + "\n")
 
         trace_path = None
         if save_traces:
@@ -443,3 +470,54 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
     data_io.write_dataframe(pd.DataFrame(unc_rows), unc_output)
 
     return ok, total
+
+
+def run_batch(
+    *,
+    input_dir: str,
+    pattern: str = "*.csv",
+    output_dir: str,
+    source_mode: str = "current",
+    reheight: bool = False,
+    seed: int | None = None,
+    workers: int = 0,
+    perf_overrides: dict | None = None,
+    files_filter: list[str] | None = None,
+):
+    """Convenience wrapper used by smoke tests.
+
+    Parameters mirror :func:`run` but expose a directory+pattern interface. Only
+    a very small subset of configuration options is supported. This helper
+    exists purely for test and tooling purposes and does not aim to cover the
+    full batch runner feature set.
+    """
+
+    if files_filter:
+        patterns = [os.path.join(input_dir, f) for f in files_filter]
+    else:
+        patterns = [os.path.join(input_dir, pattern)]
+
+    cfg = {
+        "peaks": [],
+        "solver": "modern_vp",
+        "mode": "add",
+        "baseline": {"lam": 1e5, "p": 0.001, "niter": 10, "thresh": 0.0},
+        "output_dir": output_dir,
+        "output_base": "batch",
+        "save_traces": True,
+        "source": source_mode,
+        "reheight": reheight,
+        "perf_seed_all": True,
+        "perf_max_workers": workers,
+    }
+
+    if perf_overrides:
+        cfg.update(perf_overrides)
+
+    if os.environ.get("SMOKE_MODE") == "1":
+        cfg["perf_gpu"] = False
+        cfg["perf_numba"] = False
+        cfg["perf_max_workers"] = 0
+
+    run(patterns, cfg)
+
