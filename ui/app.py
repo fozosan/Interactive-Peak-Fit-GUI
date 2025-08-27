@@ -186,6 +186,7 @@ from scipy.signal import find_peaks
 
 from core import signals, data_io
 from core.residuals import build_residual, jacobian_fd
+from core.fit_api import build_residual_and_jacobian
 from fit import orchestrator, classic, modern_vp, modern
 try:  # optional
     from fit import lmfit_backend
@@ -2021,41 +2022,59 @@ class PeakFitApp:
         solver = self.solver_choice.get()
         options["solver"] = solver
 
-        backend = BACKENDS.get(solver)
-        if backend is None:  # pragma: no cover
-            messagebox.showerror("Step", f"Unknown solver {solver}")
-            return
-
         self.set_busy(True, "Stepping…")
+        payload = {
+            "x": x_fit,
+            "y": y_fit,
+            "peaks": self.peaks,
+            "mode": mode,
+            "baseline": base_fit,
+            "options": options,
+        }
         try:
-            prep = backend.prepare_state(x_fit, y_fit, self.peaks, mode, base_fit, options)
-            state = prep["state"]
-            state, accepted, c0, c1, info = backend.iterate(state)
+            info = build_residual_and_jacobian(payload, solver)
+            theta = info["theta"]
+            lo, hi = info["bounds"]
+            locked = info["locked_mask"]
+            r0, J0 = info["residual_jac"](theta)
         except Exception as e:  # pragma: no cover - UI feedback only
             self.set_busy(False, "Step failed.")
             messagebox.showerror("Step", f"Step failed:\n{e}")
             self.log(f"Step failed: {e}", level="ERROR")
             return
 
-        if accepted:
-            theta = state.get("theta")
+        lam = 1.0
+        cost0 = 0.5 * float(r0 @ r0)
+        free = ~locked
+        Jf = J0[:, free]
+        try:
+            delta_f = np.linalg.solve(Jf.T @ Jf + lam * np.eye(Jf.shape[1]), -Jf.T @ r0)
+        except np.linalg.LinAlgError:  # pragma: no cover - fallback
+            delta_f, *_ = np.linalg.lstsq(
+                Jf.T @ Jf + lam * np.eye(Jf.shape[1]), -Jf.T @ r0, rcond=None
+            )
+        delta = np.zeros_like(theta)
+        delta[free] = delta_f
+        theta_try = np.clip(theta + delta, lo, hi)
+        r1, _ = info["residual_jac"](theta_try)
+        cost1 = 0.5 * float(r1 @ r1)
+
+        if cost1 < cost0:
             j = 0
             for pk in self.peaks:
-                c, h, w, eta = theta[j:j+4]; j += 4
+                c, h, w, eta = theta_try[j:j+4]; j += 4
                 if not pk.lock_center:
                     pk.center = float(c)
                 pk.height = float(h)
                 if not pk.lock_width:
-                    pk.fwhm = float(abs(w))
+                    pk.fwhm = float(w)
                 pk.eta = float(eta)
             self.refresh_tree(keep_selection=True)
             self.refresh_plot()
-            msg = (
-                f"{solver} Step accepted: Δcost={c0 - c1:.3g}, "
-                f"backtracks={info.get('backtracks',0)}, λ={info.get('lambda',0.0):.3g}"
-            )
+            msg = f"{solver} Step accepted: Δcost={cost0 - cost1:.3g}, λ={lam:.3g}"
         else:
-            msg = f"{solver} Step rejected (reason={info.get('reason','no_decrease')})"
+            msg = f"{solver} Step rejected; try increasing λ"
+
         self.set_busy(False, msg)
         self.log(msg)
 

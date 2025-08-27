@@ -198,3 +198,53 @@ def write_dataframe(df: pd.DataFrame, path: Path) -> None:
         df.to_csv(fh, index=False, lineterminator="\n")
 
 
+def write_uncertainty_csv(path: Path, unc: dict) -> None:
+    """Write uncertainty statistics to ``path``.
+
+    The CSV schema is: ``param, mean, std, q05, q50, q95, method, ess, rhat``.
+    Global diagnostics (``ess``/``rhat``) are repeated on every row for ease of
+    inspection.
+    """
+
+    rows = []
+    diag = unc.get("diagnostics", {})
+    ess = diag.get("ess")
+    rhat = diag.get("rhat")
+    for name, stats in unc.get("params", {}).items():
+        rows.append(
+            {
+                "param": name,
+                "mean": stats.get("mean"),
+                "std": stats.get("std"),
+                "q05": stats.get("q05"),
+                "q50": stats.get("q50"),
+                "q95": stats.get("q95"),
+                "method": unc.get("method"),
+                "ess": ess,
+                "rhat": rhat,
+            }
+        )
+    df = pd.DataFrame(rows, columns=["param", "mean", "std", "q05", "q50", "q95", "method", "ess", "rhat"])
+    write_dataframe(df, path)
+
+
+def write_uncertainty_txt(path: Path, unc: dict) -> None:
+    """Write a human readable uncertainty summary to ``path``."""
+
+    lines = [f"Method: {unc.get('method', 'unknown').capitalize()}"]
+    params = unc.get("params", {})
+    for name, stats in params.items():
+        mean = stats.get("mean")
+        std = stats.get("std")
+        lo = stats.get("q05")
+        hi = stats.get("q95")
+        lines.append(f"{name} = {mean:.6g} ± {std:.6g} (95% CI: [{lo:.6g}, {hi:.6g}])")
+    diag = unc.get("diagnostics", {})
+    if diag.get("ess") is not None:
+        lines.append(f"ESS ≈ {diag['ess']:.1f}")
+    if diag.get("rhat") is not None:
+        lines.append(f"R-hat ≈ {diag['rhat']:.3f}")
+    text = "\n".join(lines) + "\n"
+    path.write_text(text, encoding="utf-8")
+
+

@@ -27,6 +27,7 @@ def run_fit_consistent(
     rng_seed: Optional[int] = None,
     verbose: bool = False,
     return_jacobian: bool = False,
+    return_predictors: bool = False,
 ) -> dict:
     """Run a fit mirroring the single-file GUI path.
 
@@ -34,11 +35,13 @@ def run_fit_consistent(
     ----------
     return_jacobian:
         When ``True`` the return dictionary is extended with details useful
-        for uncertainty estimation: the residual function, its Jacobian at the
-        solution, the raw residual vector and a model prediction callable.  The
-        additional keys are ``"residual_fn"``, ``"jacobian"``, ``"rss"``,
-        ``"dof"`` and ``"ymodel_fn"`` along with echoing back ``x``,
-        ``baseline`` and ``fit_mask``.
+        for uncertainty estimation.  The keys ``"jacobian"`` and
+        ``"residual"`` are added together with parameter meta data.
+    return_predictors:
+        When also ``True`` prediction helpers ``predict_fit`` and
+        ``predict_full`` are included.  These mirror the behaviour of the
+        model used during fitting and are suitable for uncertainty band
+        calculations.
     """
 
     x = np.asarray(x, float)
@@ -152,6 +155,16 @@ def run_fit_consistent(
     resid_fn = build_residual(x_fit, y_fit, peaks_out, mode, base_fit, "linear", None)
     rmse = float(np.sqrt(np.mean(resid_fn(theta) ** 2))) if theta.size else float("nan")
 
+    def ymodel_fn(th: np.ndarray) -> np.ndarray:
+        pk = []
+        for i in range(len(peaks_out)):
+            c, h, fw, eta = th[4 * i : 4 * i + 4]
+            pk.append((h, c, fw, eta))
+        total = performance.eval_total(x, pk)
+        if baseline is not None and mode == "add":
+            total = total + baseline
+        return total
+
     baseline_cfg = cfg.get("baseline", {})
     baseline_params = {
         "lam": baseline_cfg.get("lam"),
@@ -200,32 +213,143 @@ def run_fit_consistent(
         J = jacobian_fd(resid_fn, theta)
         dof = max(r0.size - theta.size, 1)
 
-        x_all = x
-        baseline_all = baseline
-
-        def ymodel_fn(th: np.ndarray) -> np.ndarray:
-            pk = []
-            for i in range(len(peaks_out)):
-                c, h, w, e = th[4 * i : 4 * i + 4]
-                pk.append((h, c, w, e))
-            total = performance.eval_total(x_all, pk)
-            if baseline_all is not None and mode == "add":
-                total = total + baseline_all
-            return total
+        # parameter meta information
+        names: list[str] = []
+        locked: list[bool] = []
+        for i, pk in enumerate(peaks_out):
+            names.extend([f"center{i+1}", f"height{i+1}", f"fwhm{i+1}", f"eta{i+1}"])
+            locked.extend([pk.lock_center, False, pk.lock_width, False])
 
         result.update(
             {
-                "residual_fn": resid_fn,
                 "jacobian": J,
+                "residual": r0,
+                "param_names": names,
+                "locked_mask": np.array(locked, bool),
+                "bounds": (lo, hi),
+                "mask_fit": mask,
                 "rss": float(np.dot(r0, r0)),
                 "dof": dof,
-                "ymodel_fn": ymodel_fn,
                 "x": x,
                 "baseline": baseline,
-                "fit_mask": mask,
                 "mode": mode,
+                "x_all": x,
+                "base_all": baseline,
+                "add_mode": mode == "add",
+                "residual_fn": resid_fn,
+                "ymodel_fn": ymodel_fn,
             }
         )
 
+        if return_predictors:
+            x_all = x
+            baseline_all = baseline
+            x_fit = x[mask]
+            baseline_fit = baseline[mask] if (baseline is not None and mode == "add") else None
+
+            def predict_full(th: np.ndarray) -> np.ndarray:
+                return ymodel_fn(th)
+
+            def predict_fit(th: np.ndarray) -> np.ndarray:
+                pk = []
+                for i in range(len(peaks_out)):
+                    c, h, w, e = th[4 * i : 4 * i + 4]
+                    pk.append((h, c, w, e))
+                total = performance.eval_total(x_fit, pk)
+                if baseline_fit is not None:
+                    total = total + baseline_fit
+                return total
+
+            result.update({"predict_fit": predict_fit, "predict_full": predict_full})
+
     return result
+
+
+def _loss_weights(r: np.ndarray, loss: str, f_scale: float) -> np.ndarray:
+    """Return square-root robust loss weights for residual ``r``.
+
+    Parameters
+    ----------
+    r:
+        Weighted residual vector.
+    loss:
+        Loss name (``linear``, ``soft_l1``, ``huber`` or ``cauchy``).
+    f_scale:
+        Robust loss scale parameter.
+    """
+
+    if loss == "linear" or f_scale <= 0:
+        return np.ones_like(r)
+    z = r / float(f_scale)
+    if loss == "soft_l1":
+        return (1.0 / np.sqrt(1.0 + z * z)) ** 0.5
+    if loss == "huber":
+        w = np.ones_like(z)
+        mask = np.abs(z) > 1.0
+        w[mask] = 1.0 / np.sqrt(np.abs(z[mask]))
+        return w
+    if loss == "cauchy":
+        return 1.0 / np.sqrt(1.0 + z * z)
+    return np.ones_like(r)
+
+
+def build_residual_and_jacobian(payload: dict, solver_choice: str) -> dict:
+    """Construct residual/Jacobian consistent with the solver settings.
+
+    Parameters
+    ----------
+    payload:
+        Dictionary containing ``x``, ``y``, ``peaks``, ``mode``, ``baseline`` and
+        ``options``.  ``options`` may include ``loss``, ``weights`` and
+        ``f_scale``.
+    solver_choice:
+        Name of the active solver (``classic``, ``modern_trf`` or ``lmfit``).
+
+    Returns
+    -------
+    dict
+        ``theta`` initial parameters, ``bounds`` tuple, ``locked_mask`` boolean
+        mask and ``residual_jac`` callable returning weighted residuals and
+        Jacobian for a given ``theta``.
+    """
+
+    x = np.asarray(payload["x"], float)
+    y = np.asarray(payload["y"], float)
+    peaks = payload.get("peaks", [])
+    baseline = payload.get("baseline")
+    mode = payload.get("mode", "add")
+    opts = dict(payload.get("options", {}))
+
+    theta0, (lo, hi) = pack_theta_bounds(peaks, x, opts)
+
+    # locked mask in GUI order [c, h, w, e]*n
+    locked: list[bool] = []
+    for p in peaks:
+        locked.extend([p.lock_center, False, p.lock_width, False])
+    locked_mask = np.array(locked, dtype=bool)
+
+    # base residual without any weighting / robust scaling
+    resid_base = build_residual(x, y, peaks, mode, baseline, "linear", None)
+
+    weights = noise_weights(y - (baseline if baseline is not None and mode == "add" else 0.0), opts.get("weights", "none"))
+    loss = opts.get("loss", "linear")
+    f_scale = float(opts.get("f_scale", 1.0))
+
+    def residual_jac(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        r = resid_base(theta)
+        J = jacobian_fd(resid_base, theta)
+        if weights is not None:
+            r = r * weights
+            J = J * weights[:, None]
+        lw = _loss_weights(r, loss, f_scale)
+        r = r * lw
+        J = J * lw[:, None]
+        return r, J
+
+    return {
+        "theta": theta0,
+        "bounds": (lo, hi),
+        "locked_mask": locked_mask,
+        "residual_jac": residual_jac,
+    }
 
