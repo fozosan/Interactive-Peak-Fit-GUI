@@ -6,6 +6,6 @@ needing to know the submodule structure. Importing here also helps static
 analyzers resolve these symbols.
 """
 
-from . import data_io, models, peaks, residuals, signals
+from . import data_io, models, peaks, residuals, signals, uncertainty
 
-__all__ = ["data_io", "models", "peaks", "residuals", "signals"]
+__all__ = ["data_io", "models", "peaks", "residuals", "signals", "uncertainty"]
