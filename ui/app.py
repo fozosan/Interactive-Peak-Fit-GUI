@@ -486,6 +486,8 @@ class PeakFitApp:
         self.root = root
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
 
+        performance.set_logger(self.log_threadsafe)
+
         # Data
         self.x = None
         self.y_raw = None
@@ -2292,6 +2294,7 @@ class PeakFitApp:
         else:
             performance.set_max_workers(0)
         performance.set_gpu_chunk(self.gpu_chunk_var.get())
+        self.log(f"Backend: {performance.which_backend()} | workers={performance.get_max_workers()}")
         self.status_var.set("Performance options applied.")
 
     def on_export(self):

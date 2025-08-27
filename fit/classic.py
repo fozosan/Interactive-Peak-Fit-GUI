@@ -7,7 +7,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 
 from core.peaks import Peak
-from core.models import pv_sum
+from infra import performance as perf
 
 W_MIN = 1e-6  # minimal physical FWHM
 
@@ -114,7 +114,8 @@ def _build_residual(
             w = s["w_fixed"] if s["iw"] is None else theta_free[s["iw"]]
             w = max(w, W_MIN)
             peaks.append(Peak(c, h, w, s["eta"]))
-        model = pv_sum(x_fit, peaks)
+        pk_tuples = [(p.height, p.center, p.fwhm, p.eta) for p in peaks]
+        model = perf.eval_total(x_fit, pk_tuples)
         if base_fit is not None:
             model = model + base_fit
         return model - y_target
@@ -147,7 +148,8 @@ def solve(x, y, peaks, mode, baseline, opts):
             w = s["w_fixed"] if s["iw"] is None else theta[s["iw"]]
             w = max(w, W_MIN)
             peaks_loc.append(Peak(c, h, w, s["eta"]))
-        model = pv_sum(xdata, peaks_loc)
+        pk_tuples = [(p.height, p.center, p.fwhm, p.eta) for p in peaks_loc]
+        model = perf.eval_total(xdata, pk_tuples)
         if base_fit is not None:
             model = model + base_fit
         return model
@@ -161,7 +163,8 @@ def solve(x, y, peaks, mode, baseline, opts):
     rmse = float(np.sqrt(np.mean(resid_final**2)))
     peaks_out = _theta_to_peaks(popt, struct)
     theta_full = _theta_full(popt, struct)
-    model_full = pv_sum(x, peaks_out)
+    pk_tuples = [(p.height, p.center, p.fwhm, p.eta) for p in peaks_out]
+    model_full = perf.eval_total(x, pk_tuples)
     if mode == "add" and base is not None:
         y_fit = model_full + base
     else:
