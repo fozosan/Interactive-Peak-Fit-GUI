@@ -1,18 +1,32 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import replace
-from typing import List, Optional
+from dataclasses import dataclass, replace
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 from .peaks import Peak
 from . import models
 from .weights import noise_weights
-from .residuals import build_residual, jacobian_fd
+from .residuals import build_residual, jacobian_fd, build_residual_jac
 from fit import orchestrator
 from fit.bounds import pack_theta_bounds
 from infra import performance
+from fit import classic, modern, modern_vp, lmfit_backend
+from fit.utils import mad_sigma, robust_cost
+from scipy.optimize import least_squares, nnls
+
+
+@dataclass
+class StepResult:
+    accepted: bool
+    cost0: float
+    cost1: float
+    step_norm: float
+    lambda_used: float | None
+    backtracks: int
+    reason: str
 
 
 def run_fit_consistent(
@@ -352,4 +366,235 @@ def build_residual_and_jacobian(payload: dict, solver_choice: str) -> dict:
         "locked_mask": locked_mask,
         "residual_jac": residual_jac,
     }
+
+
+# ---- Step adapters ------------------------------------------------------
+
+
+def classic_step(payload: dict) -> Tuple[np.ndarray, StepResult]:
+    """Perform one Classic solver iteration."""
+
+    x = np.asarray(payload["x"], float)
+    y = np.asarray(payload["y"], float)
+    peaks = payload.get("peaks", [])
+    mode = payload.get("mode", "add")
+    baseline = payload.get("baseline")
+    opts = dict(payload.get("options", {}))
+
+    init = classic.prepare_state(x, y, peaks, mode, baseline, opts)
+    state = init["state"]
+    cost0 = float(init.get("cost", 0.0))
+    state, accepted, cost0, cost1, info = classic.iterate(state)
+    theta = state.get("theta", np.array([]))
+    res = StepResult(
+        accepted=bool(info.get("accepted", False)),
+        cost0=float(cost0),
+        cost1=float(cost1 if accepted else cost0),
+        step_norm=float(info.get("step_norm", 0.0)),
+        lambda_used=float(info.get("lambda", 0.0)),
+        backtracks=int(info.get("backtracks", 0)),
+        reason=str(info.get("reason", "ok" if accepted else "no_decrease")),
+    )
+    return theta, res
+
+
+def _trf_prepare(payload: dict):
+    x = np.asarray(payload["x"], float)
+    y = np.asarray(payload["y"], float)
+    peaks = payload.get("peaks", [])
+    mode = payload.get("mode", "add")
+    baseline = payload.get("baseline")
+    opts = dict(payload.get("options", {}))
+
+    theta_full0, bounds_full = pack_theta_bounds(peaks, x, opts)
+    dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
+    fwhm_min = max(float(opts.get("min_fwhm", 1e-6)), 2.0 * dx_med)
+    theta0, bounds, x_scale, indices = modern._to_solver_vectors(
+        theta_full0, bounds_full, peaks, fwhm_min
+    )
+    base = baseline if baseline is not None else 0.0
+    y_target = y - base
+    weights = noise_weights(y_target, opts.get("weights", "none"))
+    resid_jac = build_residual_jac(x, y, peaks, mode, baseline, weights)
+    return theta0, bounds, x_scale, indices, theta_full0, resid_jac, opts
+
+
+def modern_trf_step(payload: dict) -> Tuple[np.ndarray, StepResult]:
+    theta0, bounds, x_scale, indices, theta_full0, resid_jac, opts = _trf_prepare(payload)
+    loss = opts.get("loss", "linear")
+    f_scale = float(opts.get("f_scale", 1.0))
+    r0, _ = resid_jac(theta0)
+    if loss != "linear" and (not np.isfinite(f_scale) or f_scale <= 0):
+        sigma = mad_sigma(r0)
+        f_scale = max(sigma, 1e-12)
+    cost0 = robust_cost(r0, loss, f_scale)
+
+    def fun(t):
+        r, _ = resid_jac(t)
+        return r
+
+    def jac(t):
+        _, J = resid_jac(t)
+        return J
+
+    res = least_squares(
+        fun,
+        theta0,
+        jac=jac,
+        method="trf",
+        loss=loss,
+        f_scale=f_scale,
+        bounds=bounds,
+        x_scale=x_scale,
+        max_nfev=2,
+    )
+
+    r1, _ = resid_jac(res.x)
+    cost1 = robust_cost(r1, loss, f_scale)
+    delta = res.x - theta0
+    step_norm = float(np.linalg.norm(delta))
+    accepted = np.isfinite(cost1) and cost1 < cost0 and step_norm > 1e-14
+
+    theta_full = theta_full0.copy()
+    if accepted:
+        theta_full[indices] = res.x
+    else:
+        cost1 = cost0
+        step_norm = 0.0
+
+    result = StepResult(
+        accepted=accepted,
+        cost0=float(cost0),
+        cost1=float(cost1),
+        step_norm=step_norm,
+        lambda_used=None,
+        backtracks=0,
+        reason="ok" if accepted else "no_decrease",
+    )
+    return theta_full, result
+
+
+def _vp_initial_cost(x, y, peaks, baseline, opts):
+    base = baseline if baseline is not None else 0.0
+    y_target = y - base
+    weights = noise_weights(y_target, opts.get("weights", "none"))
+    unit = [(1.0, p.center, p.fwhm, p.eta) for p in peaks]
+    A = performance.design_matrix(x, unit)
+    if weights is not None:
+        Aw = A * weights[:, None]
+        bw = y_target * weights
+    else:
+        Aw = A
+        bw = y_target
+    h, _ = nnls(Aw, bw)
+    h = np.minimum(h, opts.get("max_height", np.inf))
+    r = A @ h - y_target
+    if weights is not None:
+        r = r * weights
+    loss = opts.get("loss", "linear")
+    f_scale_opt = float(opts.get("f_scale", 0.0))
+    sigma = 1.0
+    if loss != "linear" and f_scale_opt <= 0:
+        sigma = mad_sigma(r)
+        fs = max(sigma, 1e-12)
+    else:
+        fs = f_scale_opt if f_scale_opt > 0 else sigma
+    cost = robust_cost(r, loss, fs)
+    return cost
+
+
+def modern_vp_step(payload: dict) -> Tuple[np.ndarray, StepResult]:
+    x = np.asarray(payload["x"], float)
+    y = np.asarray(payload["y"], float)
+    peaks = payload.get("peaks", [])
+    mode = payload.get("mode", "add")
+    baseline = payload.get("baseline")
+    opts = dict(payload.get("options", {}))
+
+    base = baseline if baseline is not None else 0.0
+    y_target = y - base
+    weight_mode = opts.get("weights", "none")
+    weights = noise_weights(y_target, weight_mode)
+    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
+    max_height_factor = float(opts.get("max_height_factor", np.inf))
+    opts["max_height"] = max_height_factor * p95
+    opts["max_fwhm"] = opts.get("max_fwhm", 0.5 * (x.max() - x.min()))
+
+    cost0 = _vp_initial_cost(x, y, peaks, baseline, opts)
+    theta0_full, _ = pack_theta_bounds(peaks, x, opts)
+
+    opts1 = dict(opts)
+    opts1["maxfev"] = 1
+    res = modern_vp.solve(x, y, [Peak(p.center, p.height, p.fwhm, p.eta) for p in peaks], mode, baseline, opts1)
+    theta_full = res.get("theta", theta0_full)
+    cost1 = float(res.get("cost", cost0))
+    delta = theta_full - theta0_full
+    step_norm = float(np.linalg.norm(delta))
+    accepted = np.isfinite(cost1) and cost1 < cost0 and step_norm > 1e-14
+    if not accepted:
+        theta_full = theta0_full
+        cost1 = cost0
+        step_norm = 0.0
+    result = StepResult(
+        accepted=accepted,
+        cost0=float(cost0),
+        cost1=float(cost1),
+        step_norm=step_norm,
+        lambda_used=None,
+        backtracks=int(bool(res.get("meta", {}).get("backtracked", False))),
+        reason="ok" if accepted else "no_decrease",
+    )
+    return theta_full, result
+
+
+def lmfit_step(payload: dict) -> Tuple[np.ndarray, StepResult]:
+    x = np.asarray(payload["x"], float)
+    y = np.asarray(payload["y"], float)
+    peaks = payload.get("peaks", [])
+    mode = payload.get("mode", "add")
+    baseline = payload.get("baseline")
+    opts = dict(payload.get("options", {}))
+
+    base = baseline if baseline is not None else 0.0
+    y_target = y - base
+    weight_mode = opts.get("weights", "none")
+    weights = noise_weights(y_target, weight_mode)
+    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
+    max_height_factor = float(opts.get("max_height_factor", np.inf))
+    opts["max_height"] = max_height_factor * p95
+    opts["max_fwhm"] = opts.get("max_fwhm", 0.5 * (x.max() - x.min()))
+
+    cost0 = _vp_initial_cost(x, y, peaks, baseline, opts)
+    theta0_full, _ = pack_theta_bounds(peaks, x, opts)
+
+    opts1 = dict(opts)
+    opts1["maxfev"] = 1
+    res = lmfit_backend.solve(
+        x,
+        y,
+        [Peak(p.center, p.height, p.fwhm, p.eta) for p in peaks],
+        mode,
+        baseline,
+        opts1,
+    )
+    theta_full = res.get("theta", theta0_full)
+    cost1 = float(res.get("cost", cost0))
+    delta = theta_full - theta0_full
+    step_norm = float(np.linalg.norm(delta))
+    accepted = np.isfinite(cost1) and cost1 < cost0 and step_norm > 1e-14
+    if not accepted:
+        theta_full = theta0_full
+        cost1 = cost0
+        step_norm = 0.0
+    result = StepResult(
+        accepted=accepted,
+        cost0=float(cost0),
+        cost1=float(cost1),
+        step_norm=step_norm,
+        lambda_used=None,
+        backtracks=0,
+        reason="ok" if accepted else "no_decrease",
+    )
+    return theta_full, result
+
 
