@@ -9,26 +9,30 @@ Build: v3.2-beta
 What’s new since v3.0 / v3.1
 • Reliability & parity: Classic is restored as a simple SciPy curve_fit backend (lock-aware, minimal bounds). Modern TRF/VP stabilized (robust losses/weights; VP heights via NNLS).
 • “Step ▶” parity: Step uses the same residual/bounds as Fit and reports damping λ, backtracks, step_norm, and accept/reject reasons. Non-finite guards prevent freezes.
-• Persisted settings: Shape factor η, “Add peaks on click”, solver choice, and uncertainty method are saved to ~/.gl_peakfit_config.json.
-• UI/UX: Right panel scrolling is independent from the Help window; the splitter enforces sensible min widths; status bar with progress + collapsible log; batch streams progress.
-• Uncertainty (asymptotic): fast CI band via Jacobian/covariance & delta method. Bootstrap/Bayesian planned.
+• Persisted settings: Shape factor η, “Add peaks on click”, solver choice, uncertainty method, performance toggles, legend visibility, and defaults (e.g., labels) are saved to ~/.gl_peakfit_config.json.
+• UI/UX: Segmented action bar (File | Fit | Plot | Help) is always visible; F1 opens Help. Right panel scrolling is independent from the Help window; splitter enforces sensible min widths; status bar with progress + collapsible green-on-black log; batch streams progress.
+• Defaults: “Show uncertainty band” = ON. “Baseline uses fit range” = ON. Performance toggles persist (Numba/CuPy/cache/seed/workers).
+• Legend: Toggleable legend with peak centers in labels; legend font set to Arial.
+• Export parity: Canonical per-file outputs with no blank lines — *_fit.csv, *_trace.csv, *_uncertainty.csv, *_uncertainty.txt — identical schemas for single and batch; batch writes to the chosen output folder plus a batch summary.
+• Uncertainty: Asymptotic band via SVD covariance (smoothed prediction band), Bootstrap (residual resampling with seeded determinism and worker cap), and optional Bayesian (emcee) with ESS/R-hat diagnostics and smoothed bands.
+• Batch parity fixes: deep-copy seeds, enforce locks/bounds, deterministic jitter respecting locks, per-file baseline computed inside the fit window; single–batch RMSE/θ parity verified on fixtures.
 
 Overview (user workflow)
 ========================
 • Load 2-column spectra (x, y) from CSV/TXT/DAT. Delimiters auto-detected; lines starting with #, %, // and text headers are ignored. Non-finite rows dropped; x is sorted if needed.
-• Baseline (ALS): choose λ (smoothness), p (asymmetry), max iterations, and an early-stop threshold. Optionally compute ALS only on the selected fit window and interpolate across full x.
+• Baseline (ALS): choose λ (smoothness), p (asymmetry), max iterations, and an early-stop threshold. By default ALS is computed ONLY on the selected fit window and interpolated across full x.
 • Fit modes:
   – Add: model = baseline + Σ peaks, fitted directly to raw y (WYSIWYG).
   – Subtract: model = Σ peaks, fitted to (y − baseline).
-• Peaks: click to add (height auto-initialized from local signal), or auto-seed prominent peaks in the fit window. Lock width and/or center per peak. η is per-peak but can be broadcast.
+• Peaks: click to add (height auto-initialized from local signal), or auto-seed prominent peaks in the fit window. Lock width and/or center per peak. η is per-peak but can be broadcast to all.
 • Solvers:
   – Classic (curve_fit): simple unweighted LSQ with minimal bounds; respects locks.
   – Modern TRF: robust least_squares (loss = linear/soft_l1/huber/cauchy), optional per-point noise weights (none/poisson/inv_y).
   – Modern VP: variable-projection; heights by nonnegative LS (NNLS), centers/widths by Gauss–Newton with backtracking.
   – LMFIT-VP (optional): if lmfit is installed, exposes a comparable VP pipeline.
 • Step ▶: one iteration of the currently selected solver; same residuals/weights/bounds; acceptance with backtracking & λ diagnostics.
-• Batch: process folders with patterns; seed from current/template/auto; optional re-height per file; optional per-spectrum traces; unified summary CSV.
-• Exports: unified peak table (single & batch share schema) + trace CSVs (both “added” and “subtracted” sections).
+• Batch: process folders with patterns; seed from current/template/auto (templates auto-apply); optional re-height per file; optional per-spectrum traces; unified summary CSV.
+• Exports: unified peak table (single & batch share schema) + trace CSVs (both “added” and “subtracted” sections) + uncertainty CSV/TXT with ±.
 
 Mathematical model
 ==================
@@ -36,7 +40,8 @@ Pseudo-Voigt peak:
   g(x; h, c, w, η) = h * [(1−η) * exp(−4 ln 2 * ((x−c)/w)^2)  +  η * 1/(1 + 4((x−c)/w)^2)]
 where h≥0 is height, c is center, w>0 is FWHM, and η∈[0,1] is the GL mix factor (0=Gaussian, 1=Lorentzian).
 
-Model & residuals:
+Model & residuals
+=================
 • Let P(x; θ) = Σ_j g_j(x; h_j, c_j, w_j, η_j).
 • Add mode:    y_fit = baseline + P,     r = (y_fit − y_raw).
 • Subtract:    y_fit = P,                r = (y_fit − (y_raw − baseline)).
@@ -92,16 +97,24 @@ Given state (θ, residual function r(θ), bounds, weights), perform one iteratio
 4) Accept if cost↓ and δ not tiny; return diagnostics: accepted flag, λ_used, backtracks, step_norm, and reason (“ok”, “tiny_step”, “nan_guard”, “max_backtracks”).
 The engine shares residuals/weights/bounds with the full Fit so Step ▶ visually “walks” the same path.
 
-Uncertainty (asymptotic)
-========================
-• At the current solution θ*, compute the (possibly weighted) Jacobian J on the fit window and residual vector r.
-• Estimate σ² = RSS / dof, where RSS = ||r||² and dof = max(1, m − n).
-• Covariance ≈ σ² (JᵀJ)⁻¹  (with tiny Tikhonov if needed).
-• Delta method for the predicted curve ŷ(x): form G = ∂ŷ/∂θ (FD on the full x). Var[ŷ] = diag(G Cov Gᵀ); 95% CI = ŷ ± 1.96 √Var.
+Uncertainty (asymptotic, bootstrap, Bayesian)
+=============================================
+Asymptotic (default band ON):
+• At the current solution θ*, compute J on the fit window and residual vector r (with the chosen weights).
+• Estimate σ² = RSS / dof, where RSS = ||r||² and dof = max(1, m − n); Cov ≈ σ² (JᵀJ)⁻¹ with tiny Tikhonov if needed.
+• Delta method for the predicted curve ŷ(x): form G = ∂ŷ/∂θ (FD on full x). Var[Ŷ] = diag(G Cov Gᵀ); 95% CI = ŷ ± 1.96 √Var (band is lightly smoothed for display).
+
+Bootstrap:
+• Residual bootstrap with refits: y* = y_fit + rⱼ* (resampled residuals) on the fit window; refit to obtain θ* draws and optional ŷ* bands.
+• Reproducible with fixed seeds; uses the configured worker cap; respects locks/bounds and baseline-in-window behavior.
+
+Bayesian (optional; emcee):
+• MCMC over free parameters; reports posterior mean/SD and 95% credible intervals, plus convergence diagnostics (ESS/R-hat).
+• Prediction band from posterior predictive; band lightly smoothed. If emcee is absent a “NotAvailable” status is returned.
 
 Locks, bounds, and parameter packing
 ====================================
-• Each peak has (h, c, w, η). η is not varied by the solvers (user-set), but may be broadcast. Locked parameters are not included in θ and are kept fixed.
+• Each peak has (h, c, w, η). η is user-set (not varied by solvers) but may be broadcast. Locked parameters are not included in θ and are kept fixed.
 • Bounds: Classic uses minimal bounds (h≥0, w≥eps_w, centers optional window clamp). Modern solvers supply scipy bounds directly; heights are constrained non-negative in VP via NNLS.
 • All solvers unpack θ back to peaks in a lock-aware order; Step ▶ uses the same pack/unpack.
 
@@ -111,10 +124,14 @@ Import
 • Robust reader tries pandas with sep=None (auto detect), coerces numerics, drops non-numeric/text columns, and filters non-finite rows. If pandas fails, a manual parser strips comments (#, %, //) and whitespace/semicolon delimiters.
 • x is sorted ascending if needed. A two-column numeric dataset is required.
 
-Export (single & batch share formats)
+Export (single & batch share formats; no blank lines)
 • Peak table CSV columns (fixed order):
   file, peak, center, height, fwhm, eta, lock_width, lock_center,
-  area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax
+  area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax,
+  solver_choice, solver_loss, solver_weight, solver_fscale, solver_maxfev,
+  solver_restarts, solver_jitter_pct, step_lambda,
+  baseline_uses_fit_range, perf_numba, perf_gpu, perf_cache_baseline,
+  perf_seed_all, perf_max_workers
   – area: closed-form pseudo-Voigt area combining Gaussian and Lorentzian parts
   – area_pct: 100 × area / Σ area
   – rmse: computed on the active fit window against the proper target (Add: raw; Subtract: raw − baseline)
@@ -128,27 +145,38 @@ Export (single & batch share formats)
   – peakN_sub  = baseline-SUBTRACTED pure component (for calculations)
   The “added” block appears first to match the display; the “subtracted” block follows.
 
+• Uncertainty outputs:
+  – *_uncertainty.csv: tabular parameter stats (mean, sd, CI) and, when requested, band summaries.
+  – *_uncertainty.txt: human-readable report with ± values and notes about the method/diagnostics.
+
 Persistence & defaults
 ======================
-The configuration file (~/.gl_peakfit_config.json) stores: ALS defaults (λ, p, iterations, threshold), solver choice & options, uncertainty method, click-to-add toggle, global η, batch defaults, x-label, and templates (including auto-apply preference). Settings update on change and are loaded at startup.
+The configuration file (~/.gl_peakfit_config.json) stores: ALS defaults (λ, p, iterations, threshold), solver choice & options (loss/weights/f_scale/maxfev/restarts/jitter/step_lambda), uncertainty method, click-to-add toggle, global η, performance toggles (numba/gpu/cache/seed_all/max_workers), batch defaults, x-label, legend visibility, and templates (including auto-apply). Settings update on change and are loaded at startup.
+
+UI details
+==========
+• Action bar: File [Open, Export, Batch] | Fit [Step, Fit] | Plot [Uncertainty, Legend, Components] | Help (F1).
+• Legend font is Arial. Log uses green text on black. The right-hand control panel is fully scrollable.
 
 Performance notes
 =================
 • Conditioning: TRF uses x_scale to normalize parameter sensitivities; Classic keeps minimal bounds for speed.
 • VP reduces ill-conditioning by solving linear heights separately via NNLS at each nonlinear update.
 • Baseline solves use sparse operators; IRLS converges quickly for reasonable λ/p. Early-stop threshold avoids unnecessary passes.
+• Optional Numba/CuPy accelerations and caching are available with safe fallbacks; shadow-compare is used in tests for safety.
 
 Testing & reproducibility
 =========================
 • Regression tests enforce that Modern TRF/VP and (optionally) LMFIT-VP reproduce reference costs/θ on fixtures; Classic has dedicated lock/bounds and step-vs-solve parity tests.
-• Batch smoke tests ensure a summary CSV is produced; solver hash and diagnostics can be printed for integrity checks.
-• For restarts/jitter paths, a fixed RNG seed can be used to make outcomes reproducible.
+• Single–batch parity tests confirm equivalent RMSE/parameters; exports are checked to have no blank lines and stable schemas.
+• For restarts/jitter paths, fix RNG seeds for reproducibility; batch honors per-file baseline windows and seed handling.
 
 Known limitations / tips
 ========================
 • Classic is intentionally simple (no robust loss/weights). Use Modern TRF for outliers/heavy tails or Modern VP for overlapped peaks.
 • If Step ▶ is repeatedly rejected, try a smaller λ or a better start; for VP, ensure heights remain non-negative and widths above eps_w.
 • If ALS rides peak tops, increase λ and/or decrease p. Using the fit window for ALS often improves local baselines.
+• If uncertainty bands show spikes, narrow the fit window, lock weakly determined parameters, try robust losses, or increase bootstrap samples; Bayesian requires emcee and adequate sampling.
 """
 
 import json

@@ -4,7 +4,9 @@ pandas
 matplotlib
 lmfit #optional
 numba
-# choose one that matches your CUDA runtime:
-cupy-cuda13x
-cupy-cuda12x
-# cupy-cuda11x
+emcee
+# choose one that matches your CUDA runtime: (check for your specific graphics card)
+#cupy
+#cupy-cuda13x
+#cupy-cuda12x
+#cupy-cuda11x

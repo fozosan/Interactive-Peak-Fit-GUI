@@ -25,148 +25,214 @@ def build_help(opts: dict) -> str:
     return dedent(
         f"""
         Interactive GL (pseudo-Voigt) Peak Fitting — Help
-        ==================================================
+        ================================================
+
+        What this app does
+        ------------------
+        Fit 1D spectra with sums of pseudo-Voigt peaks on top of an ALS baseline.
+        You can work interactively (single file) or batch a whole folder, and export
+        a peak table, full traces, and uncertainty reports with consistent schemas.
+
+        TL;DR Flow (beginner road map)
+        ------------------------------
+                         ┌─────────────┐
+                         │  Open data  │  CSV/TXT/DAT with 2 columns (x,y)
+                         └──────┬──────┘
+                                ▼
+                      ┌──────────────────┐
+                      │ Pick fit window  │  drag on plot or type limits
+                      └────────┬─────────┘
+                               ▼
+                      ┌──────────────────┐
+                      │ Compute baseline │  ALS (λ smooth, p asym); by default uses the window
+                      └────────┬─────────┘
+                               ▼
+                      ┌──────────────────┐
+                      │ Add / auto-seed  │  click on plot, edit params, lock width/center as needed
+                      └────────┬─────────┘
+                               ▼
+                      ┌──────────────────┐
+                      │ Choose solver    │  Classic / Modern TRF / Modern VP / LMFIT-VP*
+                      └────────┬─────────┘
+                               ▼
+                      ┌──────────────────┐
+                      │ Step ▶ (optional)│  watch one iteration, tune if needed
+                      └────────┬─────────┘
+                               ▼
+                      ┌──────────────────┐
+                      │ Fit              │  inspect residuals / RMSE
+                      └────────┬─────────┘
+                               ▼
+                      ┌──────────────────┐
+                      │ Uncertainty      │  95% CI band (asymptotic/boot/Bayes†)
+                      └────────┬─────────┘
+                               ▼
+                      ┌──────────────────┐
+                      │ Export           │  *_fit.csv, *_trace.csv, *_uncertainty.csv/txt
+                      └──────────────────┘
+                      * if lmfit installed  †Bayes requires emcee
 
         Quick start
         -----------
-        1. Open a 2-column file (x, y). Optionally pick a fit window.
-        2. Compute the ALS baseline (defaults usually work).
-        3. Add peaks: click on the plot or auto-seed.
-        4. Choose a solver (Classic / Modern TRF / Modern VP / LMFIT-VP if installed).
-        5. Fit. Use Step ▶ to watch single iterations. Export peaks/trace CSVs.
+        1) Open a 2-column file (x, y). Lines with #, %, // and text headers are ignored.
+        2) Select a fit window (drag on plot) — baseline uses the window by default.
+        3) Click “Recompute baseline” (defaults are usually OK: larger λ = smoother; smaller p hugs under peaks).
+        4) Add peaks (click), or “Auto-seed” within the window. Lock width/center where appropriate.
+        5) Choose a solver:
+           • Classic: fast, simple least-squares (good for clean data)
+           • Modern TRF: robust loss + noise weights (outliers/heavy-tails)
+           • Modern VP: stable on overlaps (heights via NNLS)
+           • LMFIT-VP: optional if lmfit is present
+        6) Fit. Optionally Step ▶ first to see one iteration.
+        7) Run Uncertainty (defaults to Asymptotic; Bootstrap/Bayesian available if configured).
+        8) Export: *_fit.csv, *_trace.csv, *_uncertainty.csv, *_uncertainty.txt (± values).
 
         Data loading
         ------------
-        • “Open Data…” reads CSV/TXT/DAT with 2 numeric columns (x, y).
-        • Delimiters auto-detected; lines with #, %, // (or text headers) are ignored.
-        • Non-finite rows are dropped. If x is descending, it is sorted ascending.
+        • Delimiters auto-detected (comma/tab/space/semicolon); non-numeric columns dropped.
+        • Non-finite rows removed; x is sorted ascending if needed.
 
         Baseline (ALS)
         --------------
-        • λ (smooth): larger ⇒ smoother baseline (stiffer).
-        • p (asym): pushes baseline underneath peaks (smaller p hugs under peaks).
-        • Iterations: maximum IRLS passes. Threshold: early-stop when Δbaseline is tiny.
-        • “Baseline uses fit range”: estimate z(x) only in the selected window, then
-          interpolate/extrapolate across full x (constant beyond ends).
+        • λ (smoothness): larger ⇒ smoother baseline.
+        • p (asymmetry): pushes baseline below peaks; smaller p hugs under peaks.
+        • Iterations: max IRLS passes. Threshold: early stop when Δz is tiny.
+        • “Baseline uses fit range”: ON by default. Compute within the window, then interpolate across full x
+          (constant beyond ends).
         • Modes:
-          – Add:    model = baseline + Σ peaks, residuals compared to raw y.
-          – Subtract: model = Σ peaks, residuals compared to y − baseline.
-
-        Fit window
-        ----------
-        • Enter Min/Max or “Select on plot” and drag. “Full range” clears it.
-        • The shaded region shows the active window (affects ALS if enabled).
+          – Add     : model = baseline + Σ peaks; residuals vs raw y.
+          – Subtract: model = Σ peaks; residuals vs (y − baseline).
 
         Peaks: add, edit, lock
         ----------------------
-        • “Add peaks on click”: click at the desired center. Height is initialized from
-          the (optionally) baseline-corrected signal near the click.
-        • Edit per-peak Center / Height / FWHM. Lock width and/or center to keep them fixed.
-        • Shape factor η (0=Gaussian, 1=Lorentzian). Use “Apply to all” to broadcast η.
-        • “Auto-seed” finds prominent peaks within the active window.
+        • “Add peaks on click” toggles interactive placement at the click x.
+        • Edit Center / Height / FWHM. Lock width and/or center to keep them fixed.
+        • Shape factor η per peak (0=Gaussian, 1=Lorentzian). “Apply to all” broadcasts η.
+        • Auto-seed finds prominent peaks within the window (baseline-aware).
 
         Solvers — when to use what
         ---------------------------
         Classic (curve_fit):
           • Simple, unweighted least-squares with minimal bounds; respects locks.
-          • Best for clean spectra or quick checks. Fast and interpretable.
+          • Best for clean spectra or quick checks.
 
         Modern TRF (robust least_squares):
-          • For outliers, spikes, or heteroscedastic noise. Supports robust loss and weights.
-          • Loss choices: {modern_losses}.
-          • Noise weights: {modern_weights}.
-          • Under the hood: SciPy’s trust-region reflective algorithm with bounds. We premultiply
-            residuals/Jacobian by noise weights; robust loss is handled by the solver’s M-estimator.
+          • For outliers/heteroscedastic noise. Robust loss and per-point noise weights.
+          • Loss: {modern_losses}
+          • Weights: {modern_weights}  (poisson ≈ 1/√max(|y|,ε); inv_y ≈ 1/max(|y|,ε))
+          • Uses SciPy’s trust-region reflective algorithm with bounds. Residuals & Jacobian are premultiplied by
+            noise weights; robust loss is handled internally by the solver.
 
         Modern VP (variable projection):
-          • For overlapped peaks and stability. Splits parameters into linear (heights) and
-            nonlinear (centers/widths).
-          • At each iterate, heights are solved by **non-negative least squares (NNLS)** on the
-            current design matrix; then centers/widths take a Gauss–Newton step with backtracking.
-          • Jacobians (∂P/∂center, ∂P/∂width) use stable finite-difference columns on unit-height shapes.
+          • For overlapped peaks and stability.
+          • At each iterate: heights by **non-negative least squares (NNLS)** on the current design matrix; then
+            centers/widths step via Gauss–Newton with backtracking. Bounds/locks respected.
 
-        LMFIT-VP (optional, if lmfit installed):
-          • A thin wrapper using lmfit’s least_squares backend with the same packing/locks. Algorithms: {lmfit_algos}.
+        LMFIT-VP (optional):
+          • Thin wrapper over lmfit with the same packing/locks. Algorithms: {lmfit_algos}
 
         Step ▶ (single iteration)
         -------------------------
-        • Runs exactly one solver update with the same residuals/weights/bounds used by Fit.
-        • Reports damping λ, backtracks, step_norm, acceptance, and reason.
-        • Tips: If steps are rejected often, decrease λ, improve initial guesses, or run a full Fit to re-linearize.
+        • Runs exactly one solver update with the SAME residuals/weights/bounds used by Fit.
+        • Reports λ (damping), backtracks, step_norm, accept/reject, and reason.
+        • If steps are rejected often: decrease λ, refine seeds (centers/FWHM), or run a full Fit to re-linearize.
 
-        Uncertainty (current: asymptotic)
-        ---------------------------------
-        • Computes the Jacobian J at the solution on the fit window. With RSS = ||r||² and dof = m−n:
-            σ² = RSS / dof, Cov(θ) ≈ σ² (JᵀJ)⁻¹  (tiny Tikhonov if needed).
-          A 95% CI band for ŷ(x) uses the delta method: Var[ŷ] = diag(G Cov Gᵀ) with G = ∂ŷ/∂θ.
-        • Bootstrap/MCMC are planned for future versions.
+        Uncertainty (bands & stats)
+        ---------------------------
+        • Asymptotic (default band ON): fast covariance-based CIs using JᵀJ; prediction band via delta method; lightly smoothed.
+        • Bootstrap: residual resampling → refit → parameter distributions; seeded for reproducibility; respects locks/bounds.
+        • Bayesian (emcee): posterior mean/SD and 95% credible intervals; ESS/R-hat diagnostics; band from posterior predictive.
+          (If emcee is not installed, the app reports “NotAvailable”.)
 
         Batch processing
         ----------------
         • Choose folder + patterns (semicolon-separated), e.g., *.csv;*.txt;*.dat
-        • Peaks source: Current | Selected template | Auto-seed. “Re-height per file” adapts heights from each file’s signal.
-        • Writes a summary CSV plus optional per-spectrum trace CSVs. Progress and messages stream to the status/log panel.
+        • Peaks source: Current | Template (templates auto-apply) | Auto-seed
+        • Options: re-height per file; per-spectrum trace exports; chosen output directory.
+        • The batch runner deep-copies seeds, recomputes the baseline inside each file’s window, enforces locks/bounds,
+          and matches single-file RMSE/parameters.
 
-        Exports (schemas are fixed across single & batch)
-        -------------------------------------------------
-        Peak table CSV columns (fixed order):
-          file, peak, center, height, fwhm, eta, lock_width, lock_center,
-          area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax
-          – area: closed-form pseudo-Voigt area (Gaussian+Lorentzian mix)
-          – area_pct: 100 × area / Σ area
-          – rmse: computed on the active window against the correct target (Add: raw; Subtract: raw − baseline)
+        Exports (single & batch share formats; no blank lines)
+        ------------------------------------------------------
+        • *_fit.csv        : peak table with solver/baseline/perf metadata
+          Columns (fixed order):
+            file, peak, center, height, fwhm, eta, lock_width, lock_center,
+            area, area_pct, rmse, fit_ok, mode, als_lam, als_p, fit_xmin, fit_xmax,
+            solver_choice, solver_loss, solver_weight, solver_fscale, solver_maxfev,
+            solver_restarts, solver_jitter_pct, step_lambda,
+            baseline_uses_fit_range, perf_numba, perf_gpu, perf_cache_baseline,
+            perf_seed_all, perf_max_workers
+        • *_trace.csv      : full traces with BOTH sections:
+            x, y_raw, baseline,
+            y_target_add, y_fit_add, peak1, peak2, …,
+            y_target_sub, y_fit_sub, peak1_sub, peak2_sub, …
+          – peakN      = baseline-ADDED (matches Add-mode display)
+          – peakN_sub  = baseline-SUBTRACTED (pure components)
+        • *_uncertainty.csv: tabular parameter stats (mean, sd, CI) and optional band summaries
+        • *_uncertainty.txt: human-readable report with “±” values and method notes
+        • Batch also writes a summary CSV; all files go to the output folder you select.
 
-        Trace CSV columns (fixed order):
-          x, y_raw, baseline,
-          y_target_add, y_fit_add, peak1, peak2, …,
-          y_target_sub, y_fit_sub,  peak1_sub, peak2_sub, …
-          – peakN     = baseline-ADDED curve (for WYSIWYG plotting in Add mode)
-          – peakN_sub = baseline-SUBTRACTED pure component (for calculations)
-
-        Status bar & log (what you’ll see)
-        ----------------------------------
-        • Progress indicator: shows long tasks (batch, uncertainty).
-        • Log console: collapsible panel with per-step messages, solver diagnostics, and batch outcomes.
-
-        Keyboard & mouse
-        ----------------
-        • Zoom/Pan tools temporarily disable click-to-add (so zooming never adds peaks).
-        • Mouse-wheel over the right panel scrolls that panel; the Help window scrolls independently.
-        • “Reset view” and “Zoom out” help you navigate quickly.
+        Action bar, legend, and log
+        ---------------------------
+        • Action bar: File [Open, Export, Batch] | Fit [Step, Fit] | Plot [Uncertainty, Legend, Components] | Help (F1).
+        • Legend: toggle on/off; entries include peak centers; font is Arial.
+        • Log: collapsible green-on-black console with solver/uncertainty/batch diagnostics.
 
         Persistence
         -----------
-        • The app remembers: global η, “Add peaks on click”, solver selection, and uncertainty method,
-          plus ALS defaults, batch defaults, x-label, and templates. Stored in ~/.gl_peakfit_config.json.
+        • Saved in ~/.gl_peakfit_config.json: ALS defaults, solver choice & options, uncertainty method, click-to-add,
+          global η, performance toggles (Numba/CuPy/cache/seed_all/max_workers), batch defaults, x-label, legend visibility,
+          and templates (including auto-apply).
 
-        Numerical notes (for the curious)
-        ---------------------------------
-        • Pseudo-Voigt: g(x; h,c,w,η) = h * [(1−η) * exp(−4 ln 2 ((x−c)/w)²) + η / (1 + 4((x−c)/w)²)].
-        • Variable projection (VP): build A with unit-height peak columns; solve h ≥ 0 via NNLS on W(Ah − y).
-          Then step (c,w) using a Gauss–Newton update on the reduced objective; halve/backtrack if cost increases.
-        • TRF robust loss: {modern_losses}. Noise weights: {modern_weights}.
-          Poisson ≈ 1/√max(|y|, ε). inv_y ≈ 1/max(|y|, ε). Residuals/Jacobians are premultiplied by W.
+        Practical tips
+        --------------
+        • If fits look too tall, verify you intended Add vs Subtract mode.
+        • If ALS rides peak tops, increase λ and/or decrease p; “baseline uses fit range” often helps.
+        • For spiky residuals/heavy tails, switch to TRF with soft_l1/huber/cauchy and try Poisson weights.
+        • For overlapped peaks, VP is often more stable (heights via NNLS).
+        • If the CI band has “spikes”: lock weakly determined params, narrow the window, or increase bootstrap samples.
+
+        Nerd corner (math & algorithms)
+        -------------------------------
+        Pseudo-Voigt:
+            g(x; h,c,w,η) = h * [(1−η) * exp(−4 ln 2 * ((x−c)/w)^2) + η / (1 + 4((x−c)/w)^2)]
+        Model:
+            P(x; θ) = Σ_j g_j(x; h_j, c_j, w_j, η_j),   y_fit = baseline + P (Add)  or  y_fit = P (Subtract)
+        Residuals:
+            r = y_fit − y_target,   where y_target = y_raw (Add) or (y_raw − baseline) (Subtract)
+        Weighting:
+            W_noise = diag(w_i),  w_i ∈ {{ {modern_weights} }}
+            TRF robust loss ∈ {{ {modern_losses} }} handled by SciPy’s M-estimator; we premultiply residuals/J by W_noise.
+        ALS baseline:
+            z = argmin ||W(y − z)||² + λ ||D² z||²,  W from p via IRLS. Solve (W + λ DᵀD + εI)z = Wy until Δz small.
+        Variable projection (VP):
+            A[:,j] = g_j(x; h=1, c_j, w_j, η_j).  Solve h ≥ 0 by NNLS on W(Ah − y).  Update (c,w) by Gauss–Newton on the
+            reduced objective; step-halve (backtrack) if cost↑. Bounds/locks applied each step.
+        Step ▶ (damped GN/LM):
+            Solve (JᵀJ + λI)δ = −Jᵀr.  Accept if cost↓; otherwise increase λ or halve δ and retry (bounded backtracks).
+        Asymptotic CI (delta method):
+            σ² = RSS / dof,  Cov ≈ σ² (JᵀJ)⁻¹ (tiny Tikhonov if ill-conditioned),
+            Var[ŷ] = diag(G Cov Gᵀ), 95% band = ŷ ± 1.96√Var. Bands lightly smoothed for display.
+        Bootstrap CI:
+            Residual resampling: y* = y_fit + r*; refit to get θ* draws → parameter stats and optional predictive band.
+        Bayesian CI (emcee):
+            Posterior over free params; report mean/SD/95% CI; check ESS and R-hat; predictive band from posterior draws.
 
         Troubleshooting
         ---------------
-        • Fit looks too tall in Add mode → verify you intended “Add” (baseline is included) vs “Subtract”.
-        • ALS hugging peak tops → increase λ and/or reduce p; enable “baseline uses fit range”.
-        • Step ▶ keeps getting rejected → reduce λ, refine initial peaks, or run a full Fit to re-linearize.
-        • Heavy tails/outliers → use Modern TRF with soft_l1 / huber / cauchy; try Poisson weights.
-        • Overlapped peaks → Modern VP is often more stable (heights from NNLS).
-        • Poor scaling → widen the fit window a touch or seed widths closer to visual FWHM.
+        • “Rank-deficient Jacobian” in uncertainty: some params are weakly identified. Lock them or narrow the window.
+        • “Ill-conditioning” warning: try TRF with x_scale (default), or VP; seed widths closer to visual FWHM.
+        • Single vs batch mismatch: ensure templates auto-apply and “baseline uses fit range” is ON (default). Our runner
+          already deep-copies seeds and enforces locks/bounds.
 
         FAQ
         ---
-        Q: Which solver should I start with?
-           Classic for quick/clean cases, TRF for robustness, VP for overlapped peaks. LMFIT-VP if you prefer lmfit’s tooling.
-        Q: Do locks apply to all solvers?
-           Yes—locked centers/widths are fixed throughout Fit and Step ▶.
-        Q: Can I see uncertainty?
-           Yes—choose “Asymptotic” and run uncertainty to overlay a 95% CI band.
+        • Which solver should I try first?  Classic for clean data, TRF for robustness, VP for overlaps.
+        • Do locks apply everywhere?       Yes, for Fit and Step ▶ across all solvers.
+        • Can I reproduce results?         Yes—set a seed; batch uses per-file seeds and fixed worker caps.
 
         Credits
         -------
-        Designed by Farhan Zahin • Built with ChatGPT (v3.2-beta)
+        Designed by Farhan Zahin • Built with ChatGPT (v3.2)
         """
     ).strip()
