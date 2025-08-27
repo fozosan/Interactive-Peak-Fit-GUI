@@ -72,6 +72,54 @@ def _asymptotic_uncertainty(x, y_target, baseline, fitted, mode):
         return np.full(4 * len(fitted), np.nan), None, {"dof": np.nan, "s2": np.nan, "rmse": np.nan}
 
 
+def _asymptotic_uncertainty(x, y_target, baseline, fitted, mode):
+    try:
+        theta = []
+        for p in fitted:
+            theta.extend([p.center, p.height, p.fwhm, p.eta])
+        theta = np.asarray(theta, float)
+        resid_fn = build_residual(x, y_target, fitted, mode, baseline, "linear", None)
+        J = jacobian_fd(resid_fn, theta)
+        r0 = resid_fn(theta)
+        rss = float(np.dot(r0, r0))
+        m = r0.size
+        jtj = J.T @ J
+        try:
+            cov = np.linalg.inv(jtj)
+        except np.linalg.LinAlgError:
+            cov = np.linalg.pinv(jtj)
+        dof = max(m - theta.size, 1)
+        sigma2 = rss / dof
+        cov *= sigma2
+        sigma = np.sqrt(np.diag(cov))
+
+        def ymodel(th):
+            tmp = []
+            for i in range(len(fitted)):
+                c, h, w, e = th[4 * i : 4 * i + 4]
+                tmp.append(peaks.Peak(c, h, w, e))
+            total = models.pv_sum(x, tmp)
+            if baseline is not None:
+                total = total + baseline
+            return total
+
+        y0 = ymodel(theta)
+        G = np.empty((x.size, theta.size), float)
+        for j in range(theta.size):
+            step = 1e-6 * max(1.0, abs(theta[j]))
+            tp = theta.copy()
+            tp[j] += step
+            G[:, j] = (ymodel(tp) - y0) / step
+        var = np.einsum('ij,jk,ik->i', G, cov, G)
+        band_std = np.sqrt(np.maximum(var, 0.0))
+        z = 1.96
+        lo = y0 - z * band_std
+        hi = y0 + z * band_std
+        return sigma, (x, lo, hi, y0), {"dof": dof, "s2": sigma2, "rmse": math.sqrt(rss / m)}
+    except Exception:
+        return np.full(4 * len(fitted), np.nan), None, {"dof": np.nan, "s2": np.nan, "rmse": np.nan}
+
+
 def _auto_seed(x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: int = 5) -> List[peaks.Peak]:
     """Return up to ``max_peaks`` automatically seeded peaks."""
 
@@ -135,6 +183,15 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
     unc_workers = int(config.get("unc_workers", 0))
     if unc_workers <= 0:
         unc_workers = int(config.get("perf_max_workers", 0)) or os.cpu_count() or 1
+
+    out_dir = Path(config.get("output_dir", Path(config.get("peak_output", "peaks.csv")).parent))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base_name = config.get("output_base")
+    if base_name is None:
+        peak_output_cfg = config.get("peak_output", out_dir / "batch_fit.csv")
+        base_name = Path(peak_output_cfg).stem.replace("_fit", "")
+    peak_output = out_dir / f"{base_name}_fit.csv"
+    unc_output = out_dir / f"{base_name}_uncertainty.csv"
 
     out_dir = Path(config.get("output_dir", Path(config.get("peak_output", "peaks.csv")).parent))
     out_dir.mkdir(parents=True, exist_ok=True)
