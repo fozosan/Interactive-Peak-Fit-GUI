@@ -231,9 +231,13 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                 }
             )
 
-        y_target = y if mode == "add" else y - baseline
-        base_resid = baseline if mode == "add" else None
-        sigma, band, info = _asymptotic_uncertainty(x, y_target, base_resid, fitted, mode)
+        if res.success:
+            y_target = y if mode == "add" else y - baseline
+            base_resid = baseline if mode == "add" else None
+            sigma, _band, info = _asymptotic_uncertainty(x, y_target, base_resid, fitted, mode)
+        else:
+            sigma = np.full(4 * len(fitted), np.nan)
+            info = {"dof": np.nan, "rmse": rmse}
         z = 1.96
         for idx, p in enumerate(fitted, start=1):
             sc = sigma[4 * (idx - 1)] if sigma.size >= 4 * idx else np.nan
@@ -243,50 +247,35 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
                 sc = np.nan
             if p.lock_width:
                 sf = np.nan
-            unc_rows.append(
-                {
-                    "file": Path(path).name,
-                    "peak": idx,
-                    "center": p.center,
-                    "height": p.height,
-                    "fwhm": p.fwhm,
-                    "eta": p.eta,
-                    "lock_center": p.lock_center,
-                    "lock_width": p.lock_width,
-                    "stderr_height": sh,
-                    "ci95_height_lo": p.height - z * sh if np.isfinite(sh) else np.nan,
-                    "ci95_height_hi": p.height + z * sh if np.isfinite(sh) else np.nan,
-                    "stderr_center": sc,
-                    "ci95_center_lo": p.center - z * sc if np.isfinite(sc) else np.nan,
-                    "ci95_center_hi": p.center + z * sc if np.isfinite(sc) else np.nan,
-                    "stderr_fwhm": sf,
-                    "ci95_fwhm_lo": p.fwhm - z * sf if np.isfinite(sf) else np.nan,
-                    "ci95_fwhm_hi": p.fwhm + z * sf if np.isfinite(sf) else np.nan,
-                    "rmse": rmse,
-                    "dof": info.get("dof", np.nan),
-                    "s2": info.get("s2", np.nan),
-                    "method": "asymptotic",
-                    "mode": mode,
-                    "fit_xmin": float(x[0]),
-                    "fit_xmax": float(x[-1]),
-                }
-            )
-
-        if band is not None:
-            xb, lob, hib, y0 = band
-            try:
-                pd.DataFrame({"x": xb, "y_fit": y0, "y_lo95": lob, "y_hi95": hib}).to_csv(
-                    Path(path).with_name(Path(path).stem + "_uncertainty_band.csv"),
-                    index=False,
+            params = [
+                ("center", p.center, sc, not p.lock_center),
+                ("height", p.height, sh, True),
+                ("fwhm", p.fwhm, sf, not p.lock_width),
+                ("eta", p.eta, np.nan, False),
+            ]
+            for pname, val, std, free in params:
+                if free and np.isfinite(std):
+                    ci_lo, ci_hi = val - z * std, val + z * std
+                else:
+                    ci_lo = ci_hi = np.nan
+                unc_rows.append(
+                    {
+                        "file": Path(path).name,
+                        "peak": idx,
+                        "param": pname,
+                        "value": val,
+                        "ci_lo": ci_lo,
+                        "ci_hi": ci_hi,
+                        "method": "asymptotic",
+                        "rmse": rmse,
+                        "dof": info.get("dof", np.nan),
+                    }
                 )
-            except Exception:
-                if log:
-                    log(f"{Path(path).name}: uncertainty band export failed",)
 
         trace_path = None
         if save_traces:
             trace_csv = data_io.build_trace_table(
-                x, y, baseline, fitted, mode=mode
+                x, y, baseline, fitted
             )
             trace_path = Path(path).with_suffix(Path(path).suffix + ".trace.csv")
             with trace_path.open("w", encoding="utf-8") as fh:
@@ -302,7 +291,9 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
     peak_csv = data_io.build_peak_table(records)
     with open(peak_output, "w", encoding="utf-8") as fh:
         fh.write(peak_csv)
-    unc_output = Path(peak_output).with_name(Path(peak_output).stem + "_uncertainty.csv")
+    unc_output = config.get("unc_output")
+    if not unc_output:
+        unc_output = Path(peak_output).with_name(Path(peak_output).stem + "_uncertainty.csv")
     pd.DataFrame(unc_rows).to_csv(unc_output, index=False)
 
     return ok, total

@@ -23,7 +23,8 @@ def test_batch_uncertainty_summary(tmp_path):
         "mode": "add",
         "baseline": {"lam": 1e5, "p": 0.001, "niter": 10, "thresh": 0.0},
         "save_traces": False,
-        "peak_output": str(tmp_path / "batch.csv"),
+        "peak_output": str(tmp_path / "batch_fit.csv"),
+        "unc_output": str(tmp_path / "batch_uncertainty.csv"),
         "source": "template",
         "reheight": False,
         "auto_max": 5,
@@ -38,7 +39,7 @@ def test_batch_uncertainty_summary(tmp_path):
 
     runner.run([str(tmp_path / "*.csv")], cfg)
 
-    fit_df = pd.read_csv(tmp_path / "batch.csv")
+    fit_df = pd.read_csv(tmp_path / "batch_fit.csv")
     for col in [
         "solver_choice",
         "solver_loss",
@@ -53,17 +54,5 @@ def test_batch_uncertainty_summary(tmp_path):
         assert col in fit_df.columns
 
     unc_df = pd.read_csv(tmp_path / "batch_uncertainty.csv")
-    assert len(set(unc_df["file"])) == 2
-    for col in [
-        "stderr_height",
-        "ci95_height_lo",
-        "ci95_height_hi",
-        "rmse",
-        "dof",
-        "s2",
-    ]:
-        assert col in unc_df.columns
-
-    for i in range(2):
-        assert (tmp_path / f"s{i}_uncertainty_band.csv").exists()
-
+    assert set(unc_df.columns) == {"file", "peak", "param", "value", "ci_lo", "ci_hi", "method", "rmse", "dof"}
+    assert len(unc_df) == 2 * 1 * 4

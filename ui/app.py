@@ -160,7 +160,6 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-import pandas as pd
 
 import os
 import matplotlib
@@ -169,12 +168,16 @@ if os.environ.get("DISPLAY", "") == "" and os.name != "nt":
 else:
     matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+from matplotlib.font_manager import FontProperties
 matplotlib.rcdefaults()
+matplotlib.rcParams["font.family"] = "Arial"
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.widgets import SpanSelector
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext
+import tkinter.font as tkfont
 import threading
 import traceback
 
@@ -209,6 +212,11 @@ SOLVER_LABELS = {
     "modern_trf": "Modern (Legacy TRF)",
     "lmfit_vp": "LMFIT (Variable Projection)",
 }
+
+STEP_ICON_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAATElEQVR4nM3TOQ4AIAwDQYL4/5ehoskh26HBVYS00zHGT9udaCaIBHlAhiqAhhAAIRYoIRUI0GoCdg8V"
+    "MP/AAiFkgTJEAAyztf7C8w5Q0w4YsEzvsQAAAABJRU5ErkJggg=="
+)
 SOLVER_LABELS_INV = {v: k for k, v in SOLVER_LABELS.items()}
 
 
@@ -505,6 +513,8 @@ class PeakFitApp:
 
         performance.set_logger(self.log_threadsafe)
 
+        self.default_font = tkfont.nametofont("TkDefaultFont")
+
         # Data
         self.x = None
         self.y_raw = None
@@ -550,7 +560,7 @@ class PeakFitApp:
         self.template_var = tk.StringVar(value=self.auto_apply_template_name.get())
 
         # Components visibility
-        self.components_visible = True
+        self.components_visible = bool(self.cfg.get("ui_show_components", True))
 
         # Matplotlib click binding
         self.cid = None
@@ -643,17 +653,35 @@ class PeakFitApp:
         top.pack(side=tk.TOP, fill=tk.X)
         self.file_label = ttk.Label(top, text="No file loaded")
         self.file_label.pack(side=tk.LEFT)
-        actions = ttk.Frame(top)
-        actions.pack(side=tk.RIGHT)
-        ttk.Button(actions, text="Open", command=self.on_open).pack(side=tk.LEFT, padx=2)
-        self.step_btn = ttk.Button(actions, text="Step", command=self.step_once)
+
+        self.action_bar = ttk.Frame(top)
+        self.action_bar.pack(side=tk.RIGHT)
+
+        file_seg = ttk.Frame(self.action_bar)
+        file_seg.pack(side=tk.LEFT)
+        ttk.Button(file_seg, text="Open", command=self.on_open).pack(side=tk.LEFT, padx=2)
+        ttk.Button(file_seg, text="Export", command=self.on_export).pack(side=tk.LEFT, padx=2)
+        ttk.Button(file_seg, text="Batch", command=self.run_batch).pack(side=tk.LEFT, padx=2)
+
+        ttk.Separator(self.action_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=3)
+
+        fit_seg = ttk.Frame(self.action_bar)
+        fit_seg.pack(side=tk.LEFT)
+        try:
+            self.step_icon = tk.PhotoImage(data=STEP_ICON_B64)
+            self.step_btn = ttk.Button(fit_seg, image=self.step_icon, command=self.step_once)
+        except Exception:
+            self.step_btn = ttk.Button(fit_seg, text="Step", command=self.step_once)
         self.step_btn.pack(side=tk.LEFT, padx=2)
-        ttk.Button(actions, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=2)
-        ttk.Button(actions, text="Export", command=self.on_export).pack(side=tk.LEFT, padx=2)
-        ttk.Button(actions, text="Uncert", command=self.run_uncertainty).pack(side=tk.LEFT, padx=2)
-        ttk.Button(actions, text="Batch…", command=self.run_batch).pack(side=tk.LEFT, padx=2)
-        ttk.Button(actions, text="Comp", command=self.toggle_components).pack(side=tk.LEFT, padx=2)
-        ttk.Button(actions, text="Legend", command=self._toggle_legend_action).pack(side=tk.LEFT, padx=2)
+        ttk.Button(fit_seg, text="Fit", command=self.fit).pack(side=tk.LEFT, padx=2)
+
+        ttk.Separator(self.action_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=3)
+
+        graph_seg = ttk.Frame(self.action_bar)
+        graph_seg.pack(side=tk.LEFT)
+        ttk.Button(graph_seg, text="Uncertainty", command=lambda: self.show_ci_band_var.set(not self.show_ci_band_var.get())).pack(side=tk.LEFT, padx=2)
+        ttk.Button(graph_seg, text="Legend", command=self._toggle_legend_action).pack(side=tk.LEFT, padx=2)
+        ttk.Button(graph_seg, text="Components", command=self.toggle_components).pack(side=tk.LEFT, padx=2)
 
         mid = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -1182,6 +1210,9 @@ class PeakFitApp:
             ttk.Button(btns, text="Save log…", command=self._save_log).pack(side=tk.LEFT)
             btns.pack(fill=tk.X)
             self._log_console = scrolledtext.ScrolledText(self._log_frame, height=8, state="disabled")
+            self._log_console.configure(
+                bg="#000000", fg="#00ff66", insertbackground="#00ff66", font=self.default_font
+            )
             self._log_console.pack(fill=tk.BOTH, expand=True)
         self._log_console.configure(state="normal")
         self._log_console.delete("1.0", "end")
@@ -2036,6 +2067,10 @@ class PeakFitApp:
         )
         if not out_csv:
             return
+        p = Path(out_csv)
+        base = p.with_suffix("")
+        fit_path = base.with_name(base.name + "_fit.csv")
+        unc_path = base.with_name(base.name + "_uncertainty.csv")
         patterns = [p.strip() for p in self.batch_patterns.get().split(";") if p.strip()]
         if not patterns:
             patterns = ["*.csv", "*.txt", "*.dat"]
@@ -2064,7 +2099,8 @@ class PeakFitApp:
                 "thresh": float(self.als_thresh.get()),
             },
             "save_traces": bool(self.batch_save_traces.get()),
-            "peak_output": out_csv,
+            "peak_output": str(fit_path),
+            "unc_output": str(unc_path),
             "source": source,
             "reheight": bool(self.batch_reheight.get()),
             "auto_max": int(self.batch_auto_max.get()),
@@ -2100,7 +2136,7 @@ class PeakFitApp:
             ok, total = res
             self.set_busy(False, f"Batch done. {ok}/{total} succeeded.")
             self.log(f"Batch done: {ok}/{total} succeeded.")
-            messagebox.showinfo("Batch", f"Summary saved:\n{out_csv}")
+            messagebox.showinfo("Batch", f"Summary saved:\n{fit_path}")
 
         self.set_busy(True, "Batch running…")
         self.run_in_thread(work, done)
@@ -2314,72 +2350,60 @@ class PeakFitApp:
         self.log(f"Backend: {performance.which_backend()} | workers={performance.get_max_workers()}")
         self.status_var.set("Performance options applied.")
 
-    def _build_uncertainty_rows(self, file_path, rmse):
-        rows = []
-        sigma = getattr(self, "param_sigma", None)
-        info = getattr(self, "unc_info", {})
-        dof = info.get("dof", np.nan)
-        s2 = info.get("s2", np.nan)
-        mode = self.baseline_mode.get()
-        xmin = self.fit_xmin if self.fit_xmin is not None else float(np.min(self.x))
-        xmax = self.fit_xmax if self.fit_xmax is not None else float(np.max(self.x))
-        z = 1.96
-        for i, p in enumerate(self.peaks, 1):
-            idx = 4 * (i - 1)
-            sc = sigma[idx] if sigma is not None else np.nan
-            sh = sigma[idx + 1] if sigma is not None else np.nan
-            sf = sigma[idx + 2] if sigma is not None else np.nan
-            if p.lock_center:
-                sc = np.nan
-            if p.lock_width:
-                sf = np.nan
-            row = {
-                "file": Path(file_path).name if file_path else "",
-                "peak": i,
-                "center": p.center,
-                "height": p.height,
-                "fwhm": p.fwhm,
-                "eta": p.eta,
-                "lock_center": p.lock_center,
-                "lock_width": p.lock_width,
-                "stderr_height": sh,
-                "ci95_height_lo": p.height - z * sh if np.isfinite(sh) else np.nan,
-                "ci95_height_hi": p.height + z * sh if np.isfinite(sh) else np.nan,
-                "stderr_center": sc,
-                "ci95_center_lo": p.center - z * sc if np.isfinite(sc) else np.nan,
-                "ci95_center_hi": p.center + z * sc if np.isfinite(sc) else np.nan,
-                "stderr_fwhm": sf,
-                "ci95_fwhm_lo": p.fwhm - z * sf if np.isfinite(sf) else np.nan,
-                "ci95_fwhm_hi": p.fwhm + z * sf if np.isfinite(sf) else np.nan,
-                "rmse": rmse,
-                "dof": dof,
-                "s2": s2,
-                "method": "asymptotic",
-                "mode": mode,
-                "fit_xmin": xmin,
-                "fit_xmax": xmax,
-            }
-            rows.append(row)
-        return rows
-
-    def _maybe_export_uncertainty(self, basepath: Path, rmse: float) -> None:
+    def _maybe_export_uncertainty(self, path: Path, rmse: float) -> None:
         try:
             if self.ci_band is None:
                 try:
                     self._run_asymptotic_uncertainty()
                 except Exception as e:
                     self.log(f"Uncertainty failed: {e}", level="WARN")
-            rows = self._build_uncertainty_rows(basepath.name, rmse)
-            pd.DataFrame(rows).to_csv(str(basepath) + "_uncertainty.csv", index=False)
-            if self.ci_band is not None:
-                xb, lob, hib = self.ci_band
-                total = np.zeros_like(self.x)
-                for p in self.peaks:
-                    total += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
-                base = self.baseline if (self.use_baseline.get() and self.baseline is not None and self.baseline_mode.get() == "add") else 0.0
-                y_fit = total + base
-                df = pd.DataFrame({"x": xb, "y_fit": y_fit, "y_lo95": lob, "y_hi95": hib})
-                df.to_csv(str(basepath) + "_uncertainty_band.csv", index=False)
+
+            opts = self._solver_options()
+            solver = self.solver_choice.get()
+            lines = []
+            fname = self.file_label.cget("text") or "(unsaved)"
+            lines.append(f"File: {fname}")
+            lines.append("Uncertainty method: Asymptotic (95% CI, z=1.96)")
+            lines.append(
+                "Solver: "
+                f"{solver}, loss={opts.get('loss', '')}, weight={opts.get('weights', '')}, "
+                f"f_scale={opts.get('f_scale', '')}, maxfev={opts.get('maxfev', '')}, "
+                f"restarts={opts.get('restarts', '')}, jitter_pct={opts.get('jitter_pct', '')}"
+            )
+            lines.append(
+                "Baseline: "
+                f"uses_fit_range={bool(self.baseline_use_range.get())}, "
+                f"lam={self.als_lam.get()}, p={self.als_asym.get()}, "
+                f"niter={self.als_niter.get()}, thresh={self.als_thresh.get()}"
+            )
+            lines.append(
+                "Performance: "
+                f"numba={bool(self.perf_numba.get())}, gpu={bool(self.perf_gpu.get())}, "
+                f"cache_baseline={bool(self.perf_cache_baseline.get())}, "
+                f"seed_all={bool(self.perf_seed_all.get())}, max_workers={int(self.perf_max_workers.get())}"
+            )
+            lines.append("Peaks:")
+            z = 1.96
+            for i, p in enumerate(self.peaks, 1):
+                sc = self.param_sigma[4 * (i - 1)] if getattr(self, "param_sigma", None) is not None and self.param_sigma.size >= 4 * i else np.nan
+                sh = self.param_sigma[4 * (i - 1) + 1] if getattr(self, "param_sigma", None) is not None and self.param_sigma.size >= 4 * i + 1 else np.nan
+                sf = self.param_sigma[4 * (i - 1) + 2] if getattr(self, "param_sigma", None) is not None and self.param_sigma.size >= 4 * i + 2 else np.nan
+                c_lo = p.center - z * sc if np.isfinite(sc) and not p.lock_center else np.nan
+                c_hi = p.center + z * sc if np.isfinite(sc) and not p.lock_center else np.nan
+                h_lo = p.height - z * sh if np.isfinite(sh) else np.nan
+                h_hi = p.height + z * sh if np.isfinite(sh) else np.nan
+                f_lo = p.fwhm - z * sf if np.isfinite(sf) and not p.lock_width else np.nan
+                f_hi = p.fwhm + z * sf if np.isfinite(sf) and not p.lock_width else np.nan
+                lines.append(
+                    f"  #{i} center={p.center:.5g}, 95% CI [{c_lo:.5g}, {c_hi:.5g}]; "
+                    f"height={p.height:.5g}, 95% CI [{h_lo:.5g}, {h_hi:.5g}]; "
+                    f"fwhm={p.fwhm:.5g}, 95% CI [{f_lo:.5g}, {f_hi:.5g}]; "
+                    f"eta={p.eta:.5g}(fixed)"
+                )
+            dof = getattr(self, "unc_info", {}).get("dof", np.nan)
+            lines.append(f"Fit quality: RMSE={rmse:.5g}, DOF={dof}")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
         except Exception as e:  # pragma: no cover - defensive
             self.log(f"Uncertainty export failed: {e}", level="WARN")
             self.status_var.set("Uncertainty export failed.")
@@ -2389,12 +2413,13 @@ class PeakFitApp:
             messagebox.showinfo("Export", "Load data and perform a fit first.")
             return
         out_csv = filedialog.asksaveasfilename(
-            title="Save peak table as CSV",
+            title="Save export base name",
             defaultextension=".csv",
             filetypes=[("CSV","*.csv")]
         )
         if not out_csv:
             return
+        paths = data_io.derive_export_paths(out_csv)
 
         areas = [pseudo_voigt_area(p.height, p.fwhm, p.eta) for p in self.peaks]
         total_area = float(np.sum(areas)) if areas else 1.0
@@ -2476,33 +2501,27 @@ class PeakFitApp:
             }
             rows.append(row)
         peak_csv = data_io.build_peak_table(rows)
-        with open(out_csv, "w", encoding="utf-8") as fh:
+        with open(paths["fit"], "w", encoding="utf-8") as fh:
             fh.write(peak_csv)
 
-        # Trace CSV
-        trace_path = str(Path(out_csv).with_name(Path(out_csv).stem + "_trace.csv"))
-        df = pd.DataFrame({
-            "x": self.x,
-            "y_raw": self.y_raw,
-            "baseline": base,
-            "y_corr": y_corr,
-            "y_target": y_target,   # data actually used for fitting
-            "y_fit": y_fit
-        })
-        for k, v in comp_cols.items():
-            df[k] = v
-        df.to_csv(trace_path, index=False)
+        trace_csv = data_io.build_trace_table(
+            self.x, self.y_raw, base if self.use_baseline.get() else None, self.peaks
+        )
+        with open(paths["trace"], "w", encoding="utf-8") as fh:
+            fh.write(trace_csv)
 
         try:
-            self._maybe_export_uncertainty(Path(out_csv).with_suffix(""), rmse)
+            self._maybe_export_uncertainty(Path(paths["unc_txt"]), rmse)
         except Exception as e:  # pragma: no cover - defensive
             self.log(f"Uncertainty export failed: {e}", level="WARN")
 
-        messagebox.showinfo("Export", f"Saved:\n{out_csv}\n{trace_path}")
+        messagebox.showinfo("Export", f"Saved:\n{paths['fit']}\n{paths['trace']}\n{paths['unc_txt']}")
 
     # ----- Plot -----
     def toggle_components(self):
         self.components_visible = not self.components_visible
+        self.cfg["ui_show_components"] = self.components_visible
+        save_config(self.cfg)
         self.refresh_plot()
 
     def refresh_plot(self):
@@ -2555,7 +2574,7 @@ class PeakFitApp:
         leg = self.ax.get_legend()
         if self.show_legend_var.get():
             try:
-                self.ax.legend(loc="best")
+                self.ax.legend(loc="best", prop=FontProperties(family="Arial"))
             except Exception:
                 pass
         else:

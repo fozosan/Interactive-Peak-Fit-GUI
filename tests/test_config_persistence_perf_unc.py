@@ -24,11 +24,14 @@ def test_config_persistence_perf_unc(tmp_path, monkeypatch):
     app.perf_cache_baseline.set(False)
     app.perf_seed_all.set(True)
     app.perf_max_workers.set(5)
-    app.apply_performance()
-
     app.show_ci_band_var.set(False)
-    app.baseline_use_range.set(False)
+    app.toggle_components()
+    app.show_legend_var.set(False)
+    app._on_legend_toggle()
+    root.destroy()
 
+    root2 = tk.Tk(); root2.withdraw()
+    app2 = app_module.PeakFitApp(root2)
     cfg = app_module.load_config()
     assert cfg["perf_numba"] is True
     assert cfg["perf_gpu"] is True
@@ -36,6 +39,9 @@ def test_config_persistence_perf_unc(tmp_path, monkeypatch):
     assert cfg["perf_seed_all"] is True
     assert cfg["perf_max_workers"] == 5
     assert cfg["ui_show_uncertainty_band"] is False
-    assert cfg["baseline_uses_fit_range"] is False
-    root.destroy()
-
+    assert cfg["ui_show_components"] is False
+    assert cfg["ui_show_legend"] is False
+    assert app2.show_ci_band_var.get() is False
+    assert app2.components_visible is False
+    assert app2.show_legend_var.get() is False
+    root2.destroy()
