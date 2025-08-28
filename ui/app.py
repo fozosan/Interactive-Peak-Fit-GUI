@@ -538,6 +538,158 @@ def load_xy_any(path: str):
     return data_io.load_xy(path)
 
 
+def _unc_method_label(res: Any) -> str:
+    for k in ("method_label", "label", "method", "type"):
+        v = getattr(res, k, None) if not isinstance(res, dict) else res.get(k)
+        if isinstance(v, str) and v.strip():
+            m = v.strip()
+            break
+    else:
+        return "Unknown"
+    m_low = m.lower()
+    return {
+        "asymptotic": "Asymptotic (JᵀJ)",
+        "bootstrap": "Bootstrap (residual)",
+        "bayesian": "Bayesian (MCMC)",
+    }.get(m_low, m)
+
+
+def _coerce_param_stats(res: Any) -> Dict[str, Dict[str, Any]]:
+    """Return normalized parameter stats mapping."""
+
+    def _norm_map(d: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        nested = True
+        for v in d.values():
+            if not isinstance(v, dict):
+                nested = False
+                break
+        if nested:
+            for p, inner in d.items():
+                if not isinstance(inner, dict):
+                    continue
+                est = inner.get("est") or inner.get("mean") or inner.get("median")
+                sd = inner.get("sd") or inner.get("stderr") or inner.get("sigma")
+                p25 = (
+                    inner.get("p2_5")
+                    or inner.get("p025")
+                    or inner.get("q2_5")
+                    or inner.get("q025")
+                )
+                p975 = (
+                    inner.get("p97_5")
+                    or inner.get("p975")
+                    or inner.get("q97_5")
+                    or inner.get("q975")
+                )
+                out[p] = {"est": est, "sd": sd, "p2_5": p25, "p97_5": p975}
+            return out
+
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for k, v in d.items():
+            if not isinstance(k, str) or "_" not in k:
+                continue
+            base, suffix = k.rsplit("_", 1)
+            suffix = suffix.lower()
+            if suffix not in (
+                "est",
+                "mean",
+                "median",
+                "sd",
+                "stderr",
+                "sigma",
+                "p2",
+                "p2_5",
+                "p025",
+                "p97",
+                "p97_5",
+                "p975",
+                "q2_5",
+                "q025",
+                "q97_5",
+                "q975",
+            ):
+                continue
+            b = buckets.setdefault(base, {})
+            b[suffix] = v
+
+        for base, inner in buckets.items():
+            est = inner.get("est") or inner.get("mean") or inner.get("median")
+            sd = inner.get("sd") or inner.get("stderr") or inner.get("sigma")
+            p25 = inner.get("p2_5") or inner.get("p025") or inner.get("p2") or inner.get("q2_5") or inner.get("q025")
+            p975 = (
+                inner.get("p97_5")
+                or inner.get("p975")
+                or inner.get("p97")
+                or inner.get("q97_5")
+                or inner.get("q975")
+            )
+            out[base] = {"est": est, "sd": sd, "p2_5": p25, "p97_5": p975}
+        return out
+
+    if isinstance(res, dict):
+        for key in ("param_stats", "params", "parameters", "stats"):
+            if key in res and isinstance(res[key], dict):
+                return _norm_map(res[key])
+        return _norm_map(res)
+    else:
+        for key in ("param_stats", "params", "parameters", "stats"):
+            if hasattr(res, key):
+                val = getattr(res, key)
+                if isinstance(val, dict):
+                    return _norm_map(val)
+        if hasattr(res, "to_dict"):
+            maybe = res.to_dict()
+            if isinstance(maybe, dict):
+                return _norm_map(maybe)
+    return {}
+
+
+def _iter_peakwise(stats_map: Dict[str, Dict[str, Any]], n_peaks: int) -> Iterable[Tuple[int, Dict[str, Any]]]:
+    def _get(param: str):
+        return stats_map.get(param) or stats_map.get(param.rstrip("s"))
+
+    rows = []
+    for i in range(n_peaks):
+        row: Dict[str, Any] = {}
+        for pname in ("center", "fwhm", "height"):
+            rec = _get(pname)
+            if not rec:
+                continue
+
+            def pick(x):
+                if isinstance(x, (list, tuple, np.ndarray)):
+                    return x[i] if i < len(x) else None
+                return x
+
+            row[pname] = {
+                "est": pick(rec.get("est")),
+                "sd": pick(rec.get("sd")),
+                "p2_5": pick(rec.get("p2_5")),
+                "p97_5": pick(rec.get("p97_5")),
+            }
+        rows.append((i + 1, row))
+    return rows
+
+
+def _format_unc_row(i: int, row: Dict[str, Any]) -> str:
+    def fmt(name: str) -> str:
+        v = row.get(name) or {}
+        est = v.get("est")
+        sd = v.get("sd")
+        if est is None or sd is None:
+            return f"{name} = n/a"
+        s = f"{name} = {est:.6g} ± {sd:.2g}"
+        p25 = v.get("p2_5")
+        p975 = v.get("p97_5")
+        if p25 is not None and p975 is not None:
+            s += f" (2.5%={p25:.6g}, 97.5%={p975:.6g})"
+        return s
+
+    parts = [fmt("center"), fmt("fwhm"), fmt("height")]
+    return f"Peak {i}: " + " | ".join(parts)
+
+
 # ---------- Main GUI ----------
 class PeakFitApp:
     def __init__(self, root, cfg=None):
