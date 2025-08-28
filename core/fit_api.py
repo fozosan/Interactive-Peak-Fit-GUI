@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable, Dict, Any
 
 import numpy as np
 
@@ -179,6 +179,13 @@ def run_fit_consistent(
             total = total + baseline
         return total
 
+    def _model_peaks(x_data: np.ndarray, *theta_vec: np.ndarray) -> np.ndarray:
+        pk = []
+        for i in range(len(peaks_out)):
+            c, h, fw, eta = theta_vec[4 * i : 4 * i + 4]
+            pk.append((h, c, fw, eta))
+        return performance.eval_total(x_data, pk)
+
     baseline_cfg = cfg.get("baseline", {})
     baseline_params = {
         "lam": baseline_cfg.get("lam"),
@@ -255,14 +262,40 @@ def run_fit_consistent(
             }
         )
 
+        def _make_predict_full(
+            x_all: np.ndarray,
+            base_all: np.ndarray,
+            add_mode: bool,
+            model_peaks: Callable[..., np.ndarray],
+        ) -> Callable[[np.ndarray], np.ndarray]:
+            def predict_full(theta_vec: np.ndarray) -> np.ndarray:
+                theta_vec = np.asarray(theta_vec, float)
+                y_peaks = model_peaks(x_all, *theta_vec)
+                return (base_all + y_peaks) if add_mode else y_peaks
+
+            return predict_full
+
+        base_all = baseline if baseline is not None else np.zeros_like(x)
+        fit_ctx: Dict[str, Any] = {
+            "x_all": np.asarray(x, float),
+            "predict_full": _make_predict_full(
+                np.asarray(x, float),
+                np.asarray(base_all, float),
+                bool(mode == "add"),
+                _model_peaks,
+            ),
+            "theta_hat": np.asarray(theta, float),
+            "param_names": list(names),
+        }
+        result["fit_ctx"] = fit_ctx
+
         if return_predictors:
             x_all = x
             baseline_all = baseline
             x_fit = x[mask]
             baseline_fit = baseline[mask] if (baseline is not None and mode == "add") else None
 
-            def predict_full(th: np.ndarray) -> np.ndarray:
-                return ymodel_fn(th)
+            predict_full = fit_ctx["predict_full"]
 
             def predict_fit(th: np.ndarray) -> np.ndarray:
                 pk = []
