@@ -186,7 +186,7 @@ import time
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 import numpy as np
 
@@ -687,6 +687,11 @@ class PeakFitApp:
         self._update_template_info()
         self.apply_performance()
 
+        # Uncertainty job tracking / last log
+        self._unc_job_id = 0
+        self._unc_running = False
+        self._last_unc_log = None
+
     # ----- UI -----
     def _build_ui(self):
         top = ttk.Frame(self.root, padding=6)
@@ -1099,11 +1104,13 @@ class PeakFitApp:
         # Status bar and log
         bar = ttk.Frame(self.root); bar.pack(side=tk.BOTTOM, fill=tk.X)
         self.status_var = tk.StringVar(value="Open CSV/TXT/DAT, set baseline/range, add peaks, set η, then Fit.")
-        ttk.Label(bar, textvariable=self.status_var).pack(side=tk.LEFT, padx=6)
+        self.status = ttk.Label(bar, textvariable=self.status_var)
+        self.status.pack(side=tk.LEFT, padx=6)
         self.log_btn = ttk.Button(bar, text="Show log \u25B8", command=self.toggle_log)
         self.log_btn.pack(side=tk.RIGHT)
         self.pbar = ttk.Progressbar(bar, mode="indeterminate", length=160)
         self.pbar.pack(side=tk.RIGHT, padx=6)
+        self.progress = self.pbar
         self._log_console = None
         self._log_visible = False
         self._log_frame = None
@@ -1367,6 +1374,151 @@ class PeakFitApp:
 
     def log_threadsafe(self, msg: str, level: str = "INFO"):
         self.log(msg, level)
+
+    def log_info(self, msg: str) -> None:
+        self.log(msg, "INFO")
+
+    def log_warn(self, msg: str) -> None:
+        self.log(msg, "WARN")
+
+    def log_error(self, msg: str) -> None:
+        self.log(msg, "ERROR")
+
+    # --- Status + progress helpers (UI-safe, no-ops if widgets missing) ---
+    def status_info(self, msg: str) -> None:
+        try:
+            if hasattr(self, "status") and self.status:
+                self.status.config(text=msg)
+            if hasattr(self, "status_var") and self.status_var:
+                self.status_var.set(msg)
+        except Exception:
+            pass
+        cb = getattr(self, "log_info", None)
+        if callable(cb):
+            try:
+                cb(msg)
+                return
+            except Exception:
+                pass
+        print(msg)
+
+    def status_warn(self, msg: str) -> None:
+        try:
+            if hasattr(self, "status") and self.status:
+                self.status.config(text=msg)
+            if hasattr(self, "status_var") and self.status_var:
+                self.status_var.set(msg)
+        except Exception:
+            pass
+        cb = getattr(self, "log_warn", None)
+        if callable(cb):
+            try:
+                cb(msg)
+                return
+            except Exception:
+                pass
+        print("WARN:", msg)
+
+    def status_error(self, msg: str) -> None:
+        try:
+            if hasattr(self, "status") and self.status:
+                self.status.config(text=msg)
+            if hasattr(self, "status_var") and self.status_var:
+                self.status_var.set(msg)
+        except Exception:
+            pass
+        cb = getattr(self, "log_error", None)
+        if callable(cb):
+            try:
+                cb(msg)
+                return
+            except Exception:
+                pass
+        print("ERROR:", msg)
+
+    def _progress_begin(self, tag: str = "task") -> None:
+        # Start progressbar if present; tolerate absence.
+        try:
+            if getattr(self, "_progress_depth", None) is None:
+                self._progress_depth = 0
+            self._progress_depth += 1
+            pb = getattr(self, "progress", None)
+            if pb and hasattr(pb, "start"):
+                # Use a small interval; Tk handles animation.
+                pb.start(10)
+        except Exception:
+            pass
+
+    def _progress_end(self, tag: str = "task") -> None:
+        # Stop progressbar if present; tolerate absence.
+        try:
+            if getattr(self, "_progress_depth", None) is None:
+                self._progress_depth = 0
+            self._progress_depth = max(0, self._progress_depth - 1)
+            if self._progress_depth == 0:
+                pb = getattr(self, "progress", None)
+                if pb and hasattr(pb, "stop"):
+                    pb.stop()
+        except Exception:
+            pass
+
+    def _unc_pretty_label(self, obj) -> str:
+        # Accept UncertaintyResult-like, SimpleNamespace, or dict
+        try:
+            lbl = getattr(obj, "label", None) or getattr(obj, "method_label", None)
+            if not lbl:
+                lbl = getattr(obj, "method", None) or getattr(obj, "type", None)
+        except Exception:
+            lbl = None
+        if not lbl and isinstance(obj, dict):
+            lbl = obj.get("label") or obj.get("method") or obj.get("type")
+        text = (str(lbl) if lbl else "").lower()
+
+        # Map common aliases
+        if "asym" in text or "j^t" in text or "jtj" in text:
+            return "Asymptotic (JᵀJ)"
+        if "boot" in text or "resid" in text:
+            return "Bootstrap (residual)"
+        if "bayes" in text or "mcmc" in text:
+            return "Bayesian (MCMC)"
+        # Fallback to original label or generic
+        return str(lbl) if lbl else "Unknown"
+
+    def _unc_extract_band(self, obj):
+        import numpy as np
+        # return (x, lo, hi) or None
+        # Attribute forms
+        for attr in ("band", "prediction_band"):
+            xlh = getattr(obj, attr, None)
+            if xlh:
+                try:
+                    x, lo, hi = xlh
+                    x = np.asarray(x); lo = np.asarray(lo); hi = np.asarray(hi)
+                    if x.shape == lo.shape == hi.shape and x.size > 0:
+                        return (x, lo, hi)
+                except Exception:
+                    pass
+        # Dict forms
+        if isinstance(obj, dict):
+            # Combined
+            if "band" in obj:
+                try:
+                    x, lo, hi = obj["band"]
+                    x = np.asarray(x); lo = np.asarray(lo); hi = np.asarray(hi)
+                    if x.shape == lo.shape == hi.shape and x.size > 0:
+                        return (x, lo, hi)
+                except Exception:
+                    pass
+            # Split keys
+            keys = obj.keys()
+            if {"band_x", "band_lo", "band_hi"} <= set(keys):
+                try:
+                    x = np.asarray(obj["band_x"]); lo = np.asarray(obj["band_lo"]); hi = np.asarray(obj["band_hi"])
+                    if x.shape == lo.shape == hi.shape and x.size > 0:
+                        return (x, lo, hi)
+                except Exception:
+                    pass
+        return None
 
     def run_in_thread(self, fn, on_done):
         def worker():
@@ -2404,7 +2556,22 @@ class PeakFitApp:
 
         def work():
             if method == "asymptotic":
-                return self._run_asymptotic_uncertainty()
+                res = self._run_asymptotic_uncertainty()
+                if res is None:
+                    return None
+                cov, th, _info = res
+                sigma = self._safe_sqrt_vec(np.diag(np.asarray(cov, float)))
+                param_stats = {
+                    "center": {"est": [p.center for p in self.peaks], "sd": sigma[0::4]},
+                    "fwhm": {"est": [p.fwhm for p in self.peaks], "sd": sigma[2::4]},
+                    "height": {"est": [p.height for p in self.peaks], "sd": sigma[1::4]},
+                }
+                return {
+                    "method": "asymptotic",
+                    "method_label": "Asymptotic (JᵀJ)",
+                    "band": self.ci_band[:3] if self.ci_band else None,
+                    "param_stats": param_stats,
+                }
             if method == "bootstrap":
                 cfg = {
                     "x": x_fit,
@@ -2417,58 +2584,214 @@ class PeakFitApp:
                     "n": 100,
                     "workers": self._resolve_unc_workers(),
                 }
-                return bootstrap.bootstrap(self.bootstrap_solver_choice.get(), cfg, resid_fn)
+                res = bootstrap.bootstrap(self.bootstrap_solver_choice.get(), cfg, resid_fn)
+                if isinstance(res, dict):
+                    cb = res.get("curve_band") or {}
+                    if isinstance(cb, dict) and {"x", "lo", "hi"} <= set(cb.keys()):
+                        res["band"] = (cb.get("x"), cb.get("lo"), cb.get("hi"))
+                    if "params" in res and "param_stats" not in res:
+                        try:
+                            params = res.get("params", {})
+                            th = np.asarray(params.get("theta", []), float)
+                            cov = params.get("cov")
+                            sd = (
+                                np.sqrt(np.diag(np.asarray(cov, float)))
+                                if cov is not None and np.size(cov) > 0
+                                else None
+                            )
+                            samples = params.get("samples")
+                            p_lo = p_hi = None
+                            if samples is not None and np.size(samples) > 0:
+                                samp = np.asarray(samples, float)
+                                p_lo = np.quantile(samp, 0.025, axis=0)
+                                p_hi = np.quantile(samp, 0.975, axis=0)
+
+                            def slice_stats(idx: int) -> Dict[str, Any]:
+                                est = th[idx::4] if th.size else None
+                                sd_i = sd[idx::4] if sd is not None else None
+                                d: Dict[str, Any] = {"est": est, "sd": sd_i}
+                                if p_lo is not None and p_hi is not None:
+                                    d["p2_5"] = p_lo[idx::4]
+                                    d["p97_5"] = p_hi[idx::4]
+                                return d
+
+                            res["param_stats"] = {
+                                "center": slice_stats(0),
+                                "height": slice_stats(1),
+                                "fwhm": slice_stats(2),
+                            }
+                        except Exception:
+                            pass
+                return res
             if method == "bayesian":
                 init = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
                         "baseline": base_fit, "theta": theta}
-                return bayes.bayesian({}, "gaussian", init, {}, resid_fn)
+                res = bayes.bayesian({}, "gaussian", init, {}, resid_fn)
+                if isinstance(res, dict):
+                    cb = res.get("curve_band") or {}
+                    if isinstance(cb, dict) and {"x", "lo", "hi"} <= set(cb.keys()):
+                        res["band"] = (cb.get("x"), cb.get("lo"), cb.get("hi"))
+                    if "params" in res and "param_stats" not in res:
+                        try:
+                            params = res.get("params", {})
+                            th = np.asarray(params.get("theta", []), float)
+                            cov = params.get("cov")
+                            sd = (
+                                np.sqrt(np.diag(np.asarray(cov, float)))
+                                if cov is not None and np.size(cov) > 0
+                                else None
+                            )
+                            samples = params.get("samples")
+                            p_lo = p_hi = None
+                            if samples is not None and np.size(samples) > 0:
+                                samp = np.asarray(samples, float)
+                                p_lo = np.quantile(samp, 0.025, axis=0)
+                                p_hi = np.quantile(samp, 0.975, axis=0)
+
+                            def slice_stats(idx: int) -> Dict[str, Any]:
+                                est = th[idx::4] if th.size else None
+                                sd_i = sd[idx::4] if sd is not None else None
+                                d: Dict[str, Any] = {"est": est, "sd": sd_i}
+                                if p_lo is not None and p_hi is not None:
+                                    d["p2_5"] = p_lo[idx::4]
+                                    d["p97_5"] = p_hi[idx::4]
+                                return d
+
+                            res["param_stats"] = {
+                                "center": slice_stats(0),
+                                "height": slice_stats(1),
+                                "fwhm": slice_stats(2),
+                            }
+                        except Exception:
+                            pass
+                return res
             raise RuntimeError("Unknown method")
 
-        def done(res, err):
-            if err or res is None:
-                self.set_busy(False, "Uncertainty failed.")
-                if err:
-                    self.log(f"Uncertainty failed: {err}", level="ERROR")
-                    messagebox.showerror("Uncertainty", f"Failed: {err}")
-                return
-            if method == "asymptotic":
-                cov, theta, info = res
-                self.show_ci_band = True
-                self.show_ci_band_var.set(True)
-                self.refresh_plot()
-                lines, warns = self._format_asymptotic_summary(cov, theta, info, self.ci_band)
-                for ln in lines:
-                    self.log(ln)
-                for ln in warns:
-                    self.log(ln, level="WARN")
-            else:
-                if isinstance(res, UncertaintyResult):
-                    if res.band is not None:
-                        self.ci_band = res.band
-                        self.show_ci_band = True
-                    extra = ""
-                    if res.method == "bootstrap":
-                        n = res.meta.get("n_resamples")
-                        seed = res.meta.get("seed")
-                        extra = f" (n={n}, seed={seed})" if n is not None else ""
-                    elif res.method == "bayesian":
-                        n_samples = res.meta.get("n_samples")
-                        n_chains = res.meta.get("n_chains")
-                        ess = res.meta.get("ess") or {}
-                        rhat = res.meta.get("rhat") or {}
-                        if ess and rhat:
-                            extra = (
-                                f" (draws={n_samples}, chains={n_chains}; min ESS={min(ess.values()):.0f}, "
-                                f"max R̂={max(rhat.values()):.3f})"
-                            )
-                    msg = f"Computed {res.method_label} uncertainty{extra}"
-                else:
-                    msg = "Bayesian MCMC requires emcee. Skipping." if res is None else f"Computed {getattr(res, 'method', 'unknown')} uncertainty."
-                self.log(msg)
-                messagebox.showinfo("Uncertainty", msg)
-            self.set_busy(False, "Uncertainty ready (95% band).")
+        def done(result, error):
+            # Always stop the spinner and mark idle
+            try:
+                self._unc_running = False
+            except Exception:
+                pass
+            self._progress_end("uncertainty")
 
-        self.set_busy(True, "Computing uncertainty…")
+            if error is not None:
+                self.status_error(f"Uncertainty failed: {error}")
+                return
+
+            # Pretty label
+            label = self._unc_pretty_label(result)
+
+            # De-duplicate identical completion logs for this job
+            jid = getattr(self, "_unc_job_id", 0)
+            if getattr(self, "_last_unc_log", None) == (jid, label):
+                # Same job + label already reported; ignore duplicate callback
+                return
+            self._last_unc_log = (jid, label)
+
+            # Try to extract and show band
+            band = self._unc_extract_band(result)
+            if band is not None:
+                self.ci_band = band
+                try:
+                    self.show_ci_band = True
+                except Exception:
+                    pass
+                # Redraw
+                try:
+                    self.refresh_plot()
+                except Exception:
+                    pass
+                self.status_info(f"Computed {label} uncertainty.")
+            else:
+                self.status_info(f"Computed {label} uncertainty. (no band)")
+
+            # Optional: log per-peak stats if present (robust to shapes)
+            try:
+                stats = None
+                # attribute forms
+                for attr in ("stats", "parameters", "param_stats"):
+                    if hasattr(result, attr):
+                        stats = getattr(result, attr)
+                        break
+                # dict forms
+                if stats is None and isinstance(result, dict):
+                    for k in ("stats", "parameters", "param_stats"):
+                        if k in result:
+                            stats = result[k]
+                            break
+                # stats expected as list[dict] per-peak or dict of lists
+                if stats:
+                    # normalize to list-of-dicts per peak
+                    if isinstance(stats, dict):
+                        # Convert columnar dict -> per-peak dicts (best-effort)
+                        n = 0
+                        for v in stats.values():
+                            try:
+                                n = max(n, len(v))
+                            except Exception:
+                                pass
+                        rows = []
+                        for i in range(n):
+                            row = {}
+                            for k, v in stats.items():
+                                try:
+                                    row[k] = v[i]
+                                except Exception:
+                                    pass
+                            rows.append(row)
+                        stats_rows = rows
+                    else:
+                        stats_rows = list(stats)
+
+                    def _get(row, *keys, default="n/a"):
+                        for k in keys:
+                            if k in row and row[k] is not None:
+                                return row[k]
+                        return default
+
+                    for i, row in enumerate(stats_rows, 1):
+                        c_est = _get(row, "center_est", "center", default="n/a")
+                        c_sd  = _get(row, "center_sd", "center_std", "center_se", default="n/a")
+                        h_est = _get(row, "height_est", "height", default="n/a")
+                        h_sd  = _get(row, "height_sd", "height_std", "height_se", default="n/a")
+                        w_est = _get(row, "fwhm_est", "fwhm", default="n/a")
+                        w_sd  = _get(row, "fwhm_sd", "fwhm_std", "fwhm_se", default="n/a")
+                        try:
+                            c_est = f"{float(c_est):.6g}" if c_est != "n/a" else c_est
+                        except Exception:
+                            pass
+                        try:
+                            c_sd  = f"{float(c_sd):.3g}" if c_sd  != "n/a" else c_sd
+                        except Exception:
+                            pass
+                        try:
+                            h_est = f"{float(h_est):.6g}" if h_est != "n/a" else h_est
+                        except Exception:
+                            pass
+                        try:
+                            h_sd  = f"{float(h_sd):.3g}" if h_sd  != "n/a" else h_sd
+                        except Exception:
+                            pass
+                        try:
+                            w_est = f"{float(w_est):.6g}" if w_est != "n/a" else w_est
+                        except Exception:
+                            pass
+                        try:
+                            w_sd  = f"{float(w_sd):.3g}" if w_sd  != "n/a" else w_sd
+                        except Exception:
+                            pass
+                        self.status_info(
+                            f"Peak {i}: center={c_est} ± {c_sd} | height={h_est} ± {h_sd} | FWHM={w_est} ± {w_sd}"
+                        )
+            except Exception as _e:
+                # Don't crash UI if stats shape is unexpected
+                self.status_warn(f"Uncertainty stats formatting skipped ({_e.__class__.__name__}).")
+
+        self._unc_running = True
+        self._unc_job_id += 1
+        self._progress_begin("uncertainty")
+        self.status_info("Computing uncertainty…")
         self.run_in_thread(work, done)
 
     def apply_performance(self):

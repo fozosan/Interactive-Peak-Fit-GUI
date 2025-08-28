@@ -200,28 +200,67 @@ def write_dataframe(df: pd.DataFrame, path: Path) -> None:
         df.to_csv(fh, index=False, lineterminator="\n")
 
 
+class _DictResult(UncertaintyResult):
+    """Shim exposing custom method labels for legacy dict results."""
+
+    def __init__(
+        self,
+        method: str,
+        band,
+        param_stats: Dict[str, Dict[str, float]],
+        meta: Dict[str, object],
+        label: str,
+    ) -> None:
+        super().__init__(method, band, param_stats, meta)
+        self._label = label
+
+    @property
+    def method_label(self) -> str:  # type: ignore[override]
+        return self._label
+
+
 def _ensure_result(unc: Union[UncertaintyResult, dict]) -> UncertaintyResult:
     if isinstance(unc, UncertaintyResult):
         return unc
-    # minimal adapter from legacy dicts
+
+    method = str(unc.get("method") or unc.get("type") or "unknown").lower()
+    if method == "asymptotic":
+        method_label = "Asymptotic (JᵀJ)"
+    elif method == "bootstrap":
+        method_label = "Bootstrap (residual)"
+    elif method == "bayesian":
+        method_label = "Bayesian (MCMC)"
+    else:
+        method_label = "unknown"
+
     params: Dict[str, Dict[str, float]] = {}
     for name, stats in unc.get("params", {}).items():
-        params[name] = {
-            "est": stats.get("mean"),
-            "sd": stats.get("std"),
-        }
-        if stats.get("q05") is not None and stats.get("q95") is not None:
-            params[name]["p2.5"] = stats.get("q05")
-            params[name]["p97.5"] = stats.get("q95")
+        est = stats.get("est") or stats.get("mean") or stats.get("median")
+        sd = stats.get("sd") or stats.get("stderr") or stats.get("sigma")
+        p2 = stats.get("p2.5") or stats.get("p2_5") or stats.get("q05")
+        p97 = stats.get("p97.5") or stats.get("p97_5") or stats.get("q95")
+        params[name] = {"est": est, "sd": sd}
+        if p2 is not None and p97 is not None:
+            params[name]["p2.5"] = p2
+            params[name]["p97.5"] = p97
+
     band = None
-    if unc.get("band"):
-        b = unc["band"]
-        band = (np.asarray(b["x"]), np.asarray(b["lo"]), np.asarray(b["hi"]))
+    b = unc.get("band") or unc.get("curve_band")
+    if b:
+        if isinstance(b, dict):
+            band = (
+                np.asarray(b.get("x")),
+                np.asarray(b.get("lo")),
+                np.asarray(b.get("hi")),
+            )
+        elif isinstance(b, (tuple, list)) and len(b) == 3:
+            band = tuple(np.asarray(part) for part in b)
+
     meta = {
         "ess": unc.get("diagnostics", {}).get("ess"),
         "rhat": unc.get("diagnostics", {}).get("rhat"),
     }
-    return UncertaintyResult(str(unc.get("method", "unknown")), band, params, meta)
+    return _DictResult(method, band, params, meta, method_label)
 
 
 def write_uncertainty_csv(path: Path, unc: Union[UncertaintyResult, dict]) -> None:
