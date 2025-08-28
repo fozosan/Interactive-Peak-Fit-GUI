@@ -678,8 +678,8 @@ def _format_unc_row(i: int, row: Dict[str, Any]) -> str:
         est = v.get("est")
         sd = v.get("sd")
         if est is None or sd is None:
-            return f"{name}=n/a"
-        s = f"{name}={est:.6g} ± {sd:.3g}"
+            return f"{name} = n/a"
+        s = f"{name} = {est:.6g} ± {sd:.2g}"
         p25 = v.get("p2_5")
         p975 = v.get("p97_5")
         if p25 is not None and p975 is not None:
@@ -1257,8 +1257,7 @@ class PeakFitApp:
         # Status bar and log
         bar = ttk.Frame(self.root); bar.pack(side=tk.BOTTOM, fill=tk.X)
         self.status_var = tk.StringVar(value="Open CSV/TXT/DAT, set baseline/range, add peaks, set η, then Fit.")
-        self.status = ttk.Label(bar, textvariable=self.status_var)
-        self.status.pack(side=tk.LEFT, padx=6)
+        ttk.Label(bar, textvariable=self.status_var).pack(side=tk.LEFT, padx=6)
         self.log_btn = ttk.Button(bar, text="Show log \u25B8", command=self.toggle_log)
         self.log_btn.pack(side=tk.RIGHT)
         self.pbar = ttk.Progressbar(bar, mode="indeterminate", length=160)
@@ -1526,37 +1525,6 @@ class PeakFitApp:
 
     def log_threadsafe(self, msg: str, level: str = "INFO"):
         self.log(msg, level)
-
-    def _status(self, msg: str, level: str) -> None:
-        try:
-            if getattr(self, "status", None) is not None:
-                self.status.config(text=msg)
-        except Exception:
-            pass
-        if getattr(self, "status_var", None) is not None:
-            try:
-                self.status_var.set(msg)
-            except Exception:
-                pass
-        fn_name = {"INFO": "log_info", "WARN": "log_warn", "ERROR": "log_error"}.get(level)
-        fn = getattr(self, fn_name, None)
-        if callable(fn):
-            fn(msg)
-        elif hasattr(self, "log_threadsafe"):
-            self.log_threadsafe(msg, level)
-        elif hasattr(self, "log"):
-            self.log(msg, level)
-        else:
-            print(msg)
-
-    def status_info(self, msg: str) -> None:
-        self._status(msg, "INFO")
-
-    def status_warn(self, msg: str) -> None:
-        self._status(msg, "WARN")
-
-    def status_error(self, msg: str) -> None:
-        self._status(msg, "ERROR")
 
     def run_in_thread(self, fn, on_done):
         def worker():
@@ -2616,32 +2584,28 @@ class PeakFitApp:
 
         def done(res, err):
             if err or res is None:
-                self.set_busy(False)
+                self.set_busy(False, "Uncertainty failed.")
                 if err:
-                    self.status_error("Uncertainty failed.")
                     self.log(f"Uncertainty failed: {err}", level="ERROR")
                     messagebox.showerror("Uncertainty", f"Failed: {err}")
                 return
-
-            if method == "asymptotic" and res is not None:
+            if method == "asymptotic":
                 cov, theta, info = res
-                sigma = self._safe_sqrt_vec(np.diag(np.asarray(cov, float)))
-                param_stats = {
-                    "center": {"est": [p.center for p in self.peaks], "sd": sigma[0::4]},
-                    "fwhm": {"est": [p.fwhm for p in self.peaks], "sd": sigma[2::4]},
-                    "height": {"est": [p.height for p in self.peaks], "sd": sigma[1::4]},
-                }
+                self.show_ci_band_var.set(True)
+                lines, warns = self._format_asymptotic_summary(cov, theta, info, self.ci_band)
+                for ln in lines:
+                    self.log(ln)
+                for ln in warns:
+                    self.log(ln, level="WARN")
                 res = {
                     "method": "asymptotic",
                     "method_label": "Asymptotic (JᵀJ)",
                     "band": self.ci_band[:3] if self.ci_band else None,
-                    "param_stats": param_stats,
                 }
 
             if isinstance(res, NotAvailable):
                 msg = "Bayesian MCMC requires emcee. Skipping. Details: " + str(getattr(res, "msg", "emcee not installed"))
-                self.set_busy(False)
-                self.status_warn(msg)
+                self.log("ℹ INFO — " + msg)
                 return
 
             if isinstance(res, dict) and "params" in res and "param_stats" not in res:
@@ -2675,52 +2639,39 @@ class PeakFitApp:
                         "height": slice_stats(1),
                         "fwhm": slice_stats(2),
                     }
-                except Exception as e:
-                    self.status_warn(f"Could not derive parameter stats: {e}")
+                except Exception as e:  # pragma: no cover - safe guard
+                    self.log(f"Could not derive parameter stats: {e}", level="WARN")
 
             label = _unc_method_label(res)
-
-            band = getattr(res, "band", None) or getattr(res, "prediction_band", None)
-            if band is None and isinstance(res, dict):
-                band = res.get("band") or res.get("prediction_band")
-            if band is None:
-                x_b = getattr(res, "band_x", None)
-                lo_b = getattr(res, "band_lo", None)
-                hi_b = getattr(res, "band_hi", None)
-                if isinstance(res, dict):
-                    x_b = x_b or res.get("band_x")
-                    lo_b = lo_b or res.get("band_lo")
-                    hi_b = hi_b or res.get("band_hi")
-                if x_b is not None and lo_b is not None and hi_b is not None:
-                    band = (x_b, lo_b, hi_b)
-
-            band_ok = False
-            if band is not None:
-                try:
-                    x_b, lo_b, hi_b = band
-                    x_arr = np.asarray(x_b)
-                    lo_arr = np.asarray(lo_b)
-                    hi_arr = np.asarray(hi_b)
-                    if x_arr.shape == lo_arr.shape == hi_arr.shape:
-                        self.ci_band = (x_arr, lo_arr, hi_arr)
-                        self.show_ci_band = True
-                        self.refresh_plot()
-                        band_ok = True
-                except Exception as e:
-                    self.status_warn(f"Could not render uncertainty band: {e}")
-
-            self.last_uncertainty = res
-            self.set_busy(False)
-            self.status_info(f"Computed {label} uncertainty." + (" (no band)" if not band_ok else ""))
+            if isinstance(res, dict):
+                res.setdefault("method_label", label)
+            msg = f"Computed {label} uncertainty."
+            self.log_threadsafe(msg, "INFO")
+            self.status_info(msg)
 
             try:
                 stats_map = _coerce_param_stats(res)
                 if stats_map:
-                    n_peaks = len(self.peaks)
+                    n_peaks = len(self.peaks) if hasattr(self, "peaks") else 0
                     for i, row in _iter_peakwise(stats_map, n_peaks):
                         self.log(_format_unc_row(i, row))
-            except Exception as e:
-                self.status_warn(f"Could not format uncertainty values: {e}")
+            except Exception as e:  # pragma: no cover - formatting guard
+                self.log(f"Could not format uncertainty values: {e}", level="WARN")
+
+            band = getattr(res, "band", None)
+            if band is None and isinstance(res, dict):
+                band = res.get("band") or res.get("curve_band")
+
+            if band and isinstance(band, (tuple, list)) and len(band) == 3:
+                try:
+                    self.ci_band = band
+                    self.show_ci_band = True
+                    self.refresh_plot()
+                except Exception as e:
+                    self.log(f"⚠ WARN — Could not render uncertainty band: {e}")
+
+            self.last_uncertainty = res
+            self.set_busy(False, "Uncertainty ready (95% band).")
 
         self.set_busy(True, "Computing uncertainty…")
         self.run_in_thread(work, done)
