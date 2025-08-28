@@ -213,7 +213,13 @@ import traceback
 from scipy.signal import find_peaks
 
 from core import signals, data_io
-from core.uncertainty import UncertaintyResult
+try:
+    from core.uncertainty import UncertaintyResult, NotAvailable
+except Exception:  # pragma: no cover - NotAvailable may be absent
+    from core.uncertainty import UncertaintyResult  # type: ignore
+
+    class NotAvailable:  # pragma: no cover - fallback placeholder
+        pass
 from core.residuals import build_residual, jacobian_fd
 from core.fit_api import (
     classic_step,
@@ -2433,39 +2439,45 @@ class PeakFitApp:
                 return
             if method == "asymptotic":
                 cov, theta, info = res
-                self.show_ci_band = True
                 self.show_ci_band_var.set(True)
-                self.refresh_plot()
                 lines, warns = self._format_asymptotic_summary(cov, theta, info, self.ci_band)
                 for ln in lines:
                     self.log(ln)
                 for ln in warns:
                     self.log(ln, level="WARN")
-            else:
-                if isinstance(res, UncertaintyResult):
-                    if res.band is not None:
-                        self.ci_band = res.band
-                        self.show_ci_band = True
-                    extra = ""
-                    if res.method == "bootstrap":
-                        n = res.meta.get("n_resamples")
-                        seed = res.meta.get("seed")
-                        extra = f" (n={n}, seed={seed})" if n is not None else ""
-                    elif res.method == "bayesian":
-                        n_samples = res.meta.get("n_samples")
-                        n_chains = res.meta.get("n_chains")
-                        ess = res.meta.get("ess") or {}
-                        rhat = res.meta.get("rhat") or {}
-                        if ess and rhat:
-                            extra = (
-                                f" (draws={n_samples}, chains={n_chains}; min ESS={min(ess.values()):.0f}, "
-                                f"max R̂={max(rhat.values()):.3f})"
-                            )
-                    msg = f"Computed {res.method_label} uncertainty{extra}"
-                else:
-                    msg = "Bayesian MCMC requires emcee. Skipping." if res is None else f"Computed {getattr(res, 'method', 'unknown')} uncertainty."
-                self.log(msg)
-                messagebox.showinfo("Uncertainty", msg)
+                res = {
+                    "method": "asymptotic",
+                    "method_label": "Asymptotic",
+                    "band": self.ci_band[:3] if self.ci_band else None,
+                }
+
+            def _unc_label(obj):
+                if hasattr(obj, "method_label") and getattr(obj, "method_label"):
+                    return getattr(obj, "method_label")
+                if hasattr(obj, "method") and getattr(obj, "method"):
+                    return getattr(obj, "method")
+                if isinstance(obj, dict):
+                    return obj.get("method_label") or obj.get("method")
+                return None
+
+            if isinstance(res, NotAvailable):
+                msg = "Bayesian MCMC requires emcee. Skipping. Details: " + str(getattr(res, "msg", "emcee not installed"))
+                self.log("ℹ INFO — " + msg)
+                return
+
+            label = _unc_label(res) or "unknown"
+
+            band = getattr(res, "band", None)
+            if band and self.show_ci_band:
+                try:
+                    x_b, lo_b, hi_b = band
+                    self.ci_band = (x_b, lo_b, hi_b)
+                    self.refresh_plot()
+                except Exception as e:
+                    self.log(f"⚠ WARN — Could not render uncertainty band: {e}")
+
+            self.last_uncertainty = res
+            self.log(f"ℹ INFO — Computed {label} uncertainty.")
             self.set_busy(False, "Uncertainty ready (95% band).")
 
         self.set_busy(True, "Computing uncertainty…")
