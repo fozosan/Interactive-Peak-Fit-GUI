@@ -2451,33 +2451,55 @@ class PeakFitApp:
                     "band": self.ci_band[:3] if self.ci_band else None,
                 }
 
-            def _unc_label(obj):
-                if hasattr(obj, "method_label") and getattr(obj, "method_label"):
-                    return getattr(obj, "method_label")
-                if hasattr(obj, "method") and getattr(obj, "method"):
-                    return getattr(obj, "method")
-                if isinstance(obj, dict):
-                    return obj.get("method_label") or obj.get("method")
-                return None
-
             if isinstance(res, NotAvailable):
                 msg = "Bayesian MCMC requires emcee. Skipping. Details: " + str(getattr(res, "msg", "emcee not installed"))
                 self.log("ℹ INFO — " + msg)
                 return
 
-            label = _unc_label(res) or "unknown"
+            def _label_from_unc(res_obj):
+                if hasattr(res_obj, "method_label") and res_obj.method_label:
+                    m = str(res_obj.method_label).lower()
+                    return {
+                        "asymptotic": "Asymptotic (JᵀJ)",
+                        "bootstrap": "Bootstrap (residual)",
+                        "bayesian": "Bayesian (MCMC)",
+                    }.get(m, res_obj.method_label)
+                if hasattr(res_obj, "method") and res_obj.method:
+                    m = str(res_obj.method).lower()
+                    return {
+                        "asymptotic": "Asymptotic (JᵀJ)",
+                        "bootstrap": "Bootstrap (residual)",
+                        "bayesian": "Bayesian (MCMC)",
+                    }.get(m, m)
+                if isinstance(res_obj, dict):
+                    m = str(res_obj.get("type") or res_obj.get("method") or "").lower()
+                    return {
+                        "asymptotic": "Asymptotic (JᵀJ)",
+                        "bootstrap": "Bootstrap (residual)",
+                        "bayesian": "Bayesian (MCMC)",
+                    }.get(m, "unknown")
+                return "unknown"
 
-            band = getattr(res, "band", None)
-            if band and self.show_ci_band:
+            label = _label_from_unc(res)
+            msg = f"Computed {label} uncertainty."
+            self.log_threadsafe(msg, "INFO")
+            self.status_info(msg)
+
+            band = None
+            if hasattr(res, "band"):
+                band = res.band
+            elif isinstance(res, dict):
+                band = res.get("band") or res.get("curve_band")
+
+            if band and isinstance(band, (tuple, list)) and len(band) == 3:
                 try:
-                    x_b, lo_b, hi_b = band
-                    self.ci_band = (x_b, lo_b, hi_b)
+                    self.ci_band = band
+                    self.show_ci_band = True
                     self.refresh_plot()
                 except Exception as e:
                     self.log(f"⚠ WARN — Could not render uncertainty band: {e}")
 
             self.last_uncertainty = res
-            self.log(f"ℹ INFO — Computed {label} uncertainty.")
             self.set_busy(False, "Uncertainty ready (95% band).")
 
         self.set_busy(True, "Computing uncertainty…")
