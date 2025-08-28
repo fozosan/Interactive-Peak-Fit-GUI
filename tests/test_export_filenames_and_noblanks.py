@@ -26,7 +26,7 @@ def test_export_filenames_and_noblanks(two_peak_data, tmp_path, no_blank_lines):
         assert no_blank_lines(paths[key])
 
     df = pd.read_csv(paths["unc_csv"])
-    for pname in unc.params.keys():
+    for pname in unc.param_stats.keys():
         assert f"{pname}_sd" in df.columns
     text = paths["unc_txt"].read_text(encoding="utf-8")
     assert "±" in text
