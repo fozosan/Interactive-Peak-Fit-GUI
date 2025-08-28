@@ -7,7 +7,8 @@ rather than ultimate statistical rigour.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Sequence, Union
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import logging
 import warnings
@@ -15,9 +16,109 @@ import warnings
 import numpy as np
 import pandas as pd
 
-__all__ = ["asymptotic_ci", "bootstrap_ci", "bayesian_ci"]
+__all__ = ["asymptotic_ci", "bootstrap_ci", "bayesian_ci", "UncertaintyResult"]
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class UncertaintyResult:
+    """Light weight container for uncertainty estimates with legacy dict access."""
+
+    method: str
+    method_label: str
+    params: Dict[str, Dict[str, float]]
+    band: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+    diagnostics: Dict[str, object] = field(default_factory=dict)
+    _legacy_cache: Dict[str, Any] | None = field(default=None, init=False, repr=False)
+
+    # -- Backwards compatibility -------------------------------------------------
+    def _legacy(self) -> Dict[str, Any]:
+        if self._legacy_cache is not None:
+            return self._legacy_cache
+
+        params: Dict[str, Dict[str, float]] = {}
+        names: list[str] = []
+        means: list[float] = []
+        stds: list[float] = []
+        q05: list[float] = []
+        q95: list[float] = []
+        for name, st in self.params.items():
+            est = float(st.get("est", np.nan))
+            sd = float(st.get("sd", np.nan))
+            lo = st.get("p2_5")
+            if lo is None:
+                lo = st.get("p2.5")
+            hi = st.get("p97_5")
+            if hi is None:
+                hi = st.get("p97.5")
+            params[name] = {
+                "mean": est,
+                "std": sd,
+                "q05": lo,
+                "q50": est,
+                "q95": hi,
+            }
+            names.append(name)
+            means.append(est)
+            stds.append(sd)
+            q05.append(lo if lo is not None else np.nan)
+            q95.append(hi if hi is not None else np.nan)
+
+        band_dict = None
+        if self.band is not None:
+            x, lo, hi = self.band
+            band_dict = {"x": x, "lo": lo, "hi": hi}
+
+        diag = {
+            "ess": self.diagnostics.get("ess"),
+            "rhat": self.diagnostics.get("rhat"),
+            "n_samples": self.diagnostics.get("n_samples"),
+        }
+
+        df = _param_df(
+            np.asarray(means, float),
+            np.asarray(stds, float),
+            np.asarray(q05, float),
+            np.asarray(q95, float),
+            names,
+        )
+
+        self._legacy_cache = {
+            "method": self.method,
+            "params": params,
+            "band": band_dict,
+            "diagnostics": diag,
+            "param_mean": np.asarray(means, float),
+            "param_std": np.asarray(stds, float),
+            "param_stats": df,
+            "method_label": self.method_label,
+            "label": self.method_label,
+        }
+        return self._legacy_cache
+
+    def __getitem__(self, key: str) -> Any:  # dict-like access
+        return self.get(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in ("label", "method_label"):
+            return self.method_label
+        if key == "method":
+            return self.method
+        if key == "params":
+            return self.params
+        if key == "band":
+            return self._legacy()["band"]
+        if key == "diagnostics":
+            return self.diagnostics
+        legacy = self._legacy()
+        return legacy.get(key, default)
+
+    def __contains__(self, key: str) -> bool:
+        if key in ("label", "method_label", "method", "params", "band", "diagnostics"):
+            return True
+        return key in self._legacy()
+
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +177,7 @@ def asymptotic_ci(
     ymodel_fn: Callable[[np.ndarray], np.ndarray],
     alpha: float = 0.05,
     **_ignored: Any,
-) -> dict:
+) -> UncertaintyResult:
     """Return asymptotic parameter statistics and a prediction band.
 
     ``residual`` and ``jacobian`` may be arrays already evaluated at
@@ -122,33 +223,30 @@ def asymptotic_ci(
     names = [f"p{i}" for i in range(theta.size)]
     params = {
         n: {
-            "mean": float(theta[i]),
-            "std": float(std[i]),
-            "q05": float(ci_lo[i]),
-            "q50": float(theta[i]),
-            "q95": float(ci_hi[i]),
+            "est": float(theta[i]),
+            "sd": float(std[i]),
+            "p2_5": float(ci_lo[i]),
+            "p97_5": float(ci_hi[i]),
         }
         for i, n in enumerate(names)
     }
 
-    result = {
-        "method": "asymptotic",
-        "params": params,
-        "band": {"x": x, "lo": lo, "hi": hi},
-        "diagnostics": {"ess": None, "rhat": None, "n_samples": None},
-        # backwards compatibility -------------------------------------------------
-        "param_mean": theta,
-        "param_std": std,
-        "param_stats": _param_df(theta, std, ci_lo, ci_hi, names),
-    }
-    return result
+    band = (x, lo, hi)
+    diagnostics: Dict[str, object] = {"alpha": alpha, "param_order": names}
+    return UncertaintyResult(
+        method="asymptotic",
+        method_label="Asymptotic (JᵀJ)",
+        params=params,
+        band=band,
+        diagnostics=diagnostics,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Residual bootstrap
 # ---------------------------------------------------------------------------
 
-def bootstrap_ci(*args: Any, **kwargs: Any) -> dict:
+def bootstrap_ci(*args: Any, **kwargs: Any) -> UncertaintyResult:
     """Residual bootstrap with extensive compatibility shim."""
 
     alias_map = {
@@ -249,38 +347,39 @@ def bootstrap_ci(*args: Any, **kwargs: Any) -> dict:
 
     params = {
         name: {
-            "mean": float(mean[i]),
-            "std": float(std[i]),
-            "q05": float(ci_lo[i]),
-            "q50": float(mean[i]),
-            "q95": float(ci_hi[i]),
+            "est": float(mean[i]),
+            "sd": float(std[i]),
+            "p2_5": float(ci_lo[i]),
+            "p97_5": float(ci_hi[i]),
         }
         for i, name in enumerate(param_names)
     }
 
-    band_dict = None
+    band = None
     if curves is not None:
         curves_arr = np.vstack(curves)
         lo = np.quantile(curves_arr, alpha / 2, axis=0)
         hi = np.quantile(curves_arr, 1 - alpha / 2, axis=0)
         y0 = predict_full(theta)
         x = x_full if x_full is not None else np.arange(y0.size)
-        band_dict = {"x": x, "lo": lo, "hi": hi}
+        band = (x, lo, hi)
 
     if workers:  # pragma: no cover - workers ignored in this simplified impl
         log.debug("bootstrap_ci called with workers=%d (serial)", workers)
 
-    result = {
-        "method": "bootstrap",
-        "params": params,
-        "band": band_dict,
-        "diagnostics": {"ess": None, "rhat": None, "n_samples": int(samples_arr.shape[0])},
-        # backwards compatibility -------------------------------------------------
-        "param_mean": mean,
-        "param_std": std,
-        "param_stats": _param_df(mean, std, ci_lo, ci_hi, param_names),
+    diagnostics: Dict[str, object] = {
+        "n_resamples": int(n_boot),
+        "seed": seed,
+        "n_samples": int(samples_arr.shape[0]),
+        "param_order": param_names,
     }
-    return result
+    return UncertaintyResult(
+        method="bootstrap",
+        method_label="Bootstrap (residual)",
+        params=params,
+        band=band,
+        diagnostics=diagnostics,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -321,24 +420,16 @@ def bayesian_ci(
     base_all: Optional[np.ndarray] = None,
     add_mode: bool = False,
     **kwargs: Any,
-) -> dict:
+) -> UncertaintyResult:
     """Bayesian posterior sampling using :mod:`emcee`.
 
     Parameters mirror the legacy implementation and extra ``kwargs`` are
-    silently ignored after alias normalisation.  When the optional ``emcee``
-    dependency is missing a result with ``method='NotAvailable'`` is returned
-    instead of raising an exception.
-    """
+    silently ignored after alias normalisation."""
 
     try:
         import emcee  # type: ignore
-    except Exception:  # pragma: no cover - missing dependency
-        return {
-            "method": "NotAvailable",
-            "params": {},
-            "band": None,
-            "diagnostics": {"ess": None, "rhat": None, "n_samples": None},
-        }
+    except Exception as exc:  # pragma: no cover - missing dependency
+        raise ImportError("emcee is required for bayesian_ci") from exc
 
     alias_map = {
         "samples": "n_steps",
@@ -418,22 +509,15 @@ def bayesian_ci(
     if ndim == 0:
         y0 = predict_full(theta)
         x = x_all if x_all is not None else np.arange(y0.size)
-        band = {"x": x, "lo": y0, "hi": y0} if return_band else None
-        df = _param_df(theta, np.zeros_like(theta), theta, theta, param_names)
+        band = (x, y0, y0) if return_band else None
         params = {
-            name: {"mean": float(theta[i]), "std": 0.0, "q05": float(theta[i]), "q50": float(theta[i]), "q95": float(theta[i])}
+            name: {"est": float(theta[i]), "sd": 0.0, "p2_5": float(theta[i]), "p97_5": float(theta[i])}
             for i, name in enumerate(param_names)
         }
-        return {
-            "method": "bayesian",
-            "params": params,
-            "band": band,
-            "diagnostics": {"ess": None, "rhat": None, "n_samples": 0},
-            # backward compatibility
-            "param_mean": theta,
-            "param_std": np.zeros_like(theta),
-            "param_stats": df,
-        }
+        diagnostics = {"n_samples": 0, "param_order": param_names}
+        return UncertaintyResult(
+            "bayesian", "Bayesian (MCMC)", params, band, diagnostics
+        )
 
     n_walkers = max(n_walkers, 2 * ndim)
     rng = np.random.default_rng(seed)
@@ -489,35 +573,29 @@ def bayesian_ci(
     if np.any(ess < 200) or np.any(rhat > 1.1):
         warnings.warn("MCMC diagnostics indicate poor convergence", RuntimeWarning)
 
-    df = _param_df(mean, std, ci_lo, ci_hi, param_names)
-
     params = {
         name: {
-            "mean": float(mean[i]),
-            "std": float(std[i]),
-            "q05": float(ci_lo[i]),
-            "q50": float(mean[i]),
-            "q95": float(ci_hi[i]),
+            "est": float(mean[i]),
+            "sd": float(std[i]),
+            "p2_5": float(ci_lo[i]),
+            "p97_5": float(ci_hi[i]),
         }
         for i, name in enumerate(param_names)
     }
-    band_dict = None
-    if band is not None:
-        x, lo, hi = band
-        band_dict = {"x": x, "lo": lo, "hi": hi}
 
-    result = {
-        "method": "bayesian",
-        "params": params,
-        "band": band_dict,
-        "diagnostics": {
-            "ess": float(np.min(ess)) if ess.size else None,
-            "rhat": float(np.max(rhat)) if rhat.size else None,
-            "n_samples": int(samples_full.shape[0]),
-        },
-        # backward compatibility ---------------------------------------------
-        "param_mean": mean,
-        "param_std": std,
-        "param_stats": df,
+    band_tuple = band
+
+    diagnostics: Dict[str, object] = {
+        "ess": {name: float(ess[i]) for i, name in enumerate(param_names)},
+        "rhat": {name: float(rhat[i]) for i, name in enumerate(param_names)},
+        "n_samples": int(samples_full.shape[0]),
+        "n_chains": int(chain.shape[1]),
+        "param_order": param_names,
     }
-    return result
+    return UncertaintyResult(
+        method="bayesian",
+        method_label="Bayesian (MCMC)",
+        params=params,
+        band=band_tuple,
+        diagnostics=diagnostics,
+    )

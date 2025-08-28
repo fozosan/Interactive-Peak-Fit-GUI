@@ -5,7 +5,7 @@ artifacts. Implementations follow the Peakfit 3.x blueprint.
 """
 from __future__ import annotations
 
-from typing import Iterable, Tuple
+from typing import Dict, Iterable, Tuple, Union
 
 import csv
 import io
@@ -14,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from .uncertainty import UncertaintyResult
 
 
 def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -198,52 +200,64 @@ def write_dataframe(df: pd.DataFrame, path: Path) -> None:
         df.to_csv(fh, index=False, lineterminator="\n")
 
 
-def write_uncertainty_csv(path: Path, unc: dict) -> None:
+def _ensure_result(unc: Union[UncertaintyResult, dict]) -> UncertaintyResult:
+    if isinstance(unc, UncertaintyResult):
+        return unc
+    params: Dict[str, Dict[str, float]] = {}
+    for name, stats in unc.get("params", {}).items():
+        params[name] = {
+            "est": stats.get("mean"),
+            "sd": stats.get("std"),
+        }
+        if stats.get("q05") is not None and stats.get("q95") is not None:
+            params[name]["p2_5"] = stats.get("q05")
+            params[name]["p97_5"] = stats.get("q95")
+    band = None
+    if unc.get("band"):
+        b = unc["band"]
+        band = (np.asarray(b["x"]), np.asarray(b["lo"]), np.asarray(b["hi"]))
+    diagnostics = unc.get("diagnostics", {})
+    method = str(unc.get("method", "unknown"))
+    label = (
+        unc.get("method_label")
+        or unc.get("label")
+        or {"asymptotic": "Asymptotic (JᵀJ)", "bootstrap": "Bootstrap (residual)", "bayesian": "Bayesian (MCMC)"}.get(method.lower(), method.title())
+    )
+    return UncertaintyResult(method, label, params, band, diagnostics)
+
+
+def write_uncertainty_csv(path: Path, unc: Union[UncertaintyResult, dict]) -> None:
     """Write uncertainty statistics to ``path``.
 
-    The CSV schema is: ``param, mean, std, q05, q50, q95, method, ess, rhat``.
-    Global diagnostics (``ess``/``rhat``) are repeated on every row for ease of
-    inspection.
+    The CSV schema is a single-row table with per-parameter columns like
+    ``p0_est``, ``p0_sd`` and optional ``p0_p2_5``/``p0_p97_5``.
     """
 
-    rows = []
-    diag = unc.get("diagnostics", {})
-    ess = diag.get("ess")
-    rhat = diag.get("rhat")
-    for name, stats in unc.get("params", {}).items():
-        rows.append(
-            {
-                "param": name,
-                "mean": stats.get("mean"),
-                "std": stats.get("std"),
-                "q05": stats.get("q05"),
-                "q50": stats.get("q50"),
-                "q95": stats.get("q95"),
-                "method": unc.get("method"),
-                "ess": ess,
-                "rhat": rhat,
-            }
-        )
-    df = pd.DataFrame(rows, columns=["param", "mean", "std", "q05", "q50", "q95", "method", "ess", "rhat"])
+    res = _ensure_result(unc)
+    row: Dict[str, float | str] = {"method": res.method_label}
+    for name, stats in res.params.items():
+        row[f"{name}_est"] = stats.get("est")
+        row[f"{name}_sd"] = stats.get("sd")
+        row[f"{name}_p2_5"] = stats.get("p2_5") or stats.get("p2.5")
+        row[f"{name}_p97_5"] = stats.get("p97_5") or stats.get("p97.5")
+    df = pd.DataFrame([row])
     write_dataframe(df, path)
 
 
-def write_uncertainty_txt(path: Path, unc: dict) -> None:
+def write_uncertainty_txt(path: Path, unc: Union[UncertaintyResult, dict]) -> None:
     """Write a human readable uncertainty summary to ``path``."""
 
-    lines = [f"Method: {unc.get('method', 'unknown').capitalize()}"]
-    params = unc.get("params", {})
-    for name, stats in params.items():
-        mean = stats.get("mean")
-        std = stats.get("std")
-        lo = stats.get("q05")
-        hi = stats.get("q95")
-        lines.append(f"{name} = {mean:.6g} ± {std:.6g} (95% CI: [{lo:.6g}, {hi:.6g}])")
-    diag = unc.get("diagnostics", {})
-    if diag.get("ess") is not None:
-        lines.append(f"ESS ≈ {diag['ess']:.1f}")
-    if diag.get("rhat") is not None:
-        lines.append(f"R-hat ≈ {diag['rhat']:.3f}")
+    res = _ensure_result(unc)
+    lines = [f"Method: {res.method_label}"]
+    for name, stats in res.params.items():
+        est = stats.get("est")
+        sd = stats.get("sd")
+        line = f"{name}: {est:.6g} ± {sd:.6g}"
+        lo = stats.get("p2_5") or stats.get("p2.5")
+        hi = stats.get("p97_5") or stats.get("p97.5")
+        if lo is not None and hi is not None:
+            line += f"   [2.5%: {lo:.6g}, 97.5%: {hi:.6g}]"
+        lines.append(line)
     text = "\n".join(lines) + "\n"
     path.write_text(text, encoding="utf-8")
 
