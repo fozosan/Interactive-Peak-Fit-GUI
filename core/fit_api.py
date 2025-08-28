@@ -6,6 +6,17 @@ from typing import List, Optional, Tuple, Callable, Dict, Any
 
 import numpy as np
 
+try:
+    from .data_io import pseudo_voigt  # type: ignore
+except Exception:  # fallback when data_io lacks pseudo_voigt
+    def pseudo_voigt(x, height, x0, fwhm, eta):
+        x = np.asarray(x, float)
+        dx = (x - x0) / float(fwhm)
+        A = 4.0 * np.log(2.0)
+        gaussian = np.exp(-A * dx * dx)
+        lorentz = 1.0 / (1.0 + 4.0 * dx * dx)
+        return height * ((1.0 - eta) * gaussian + eta * lorentz)
+
 from .peaks import Peak
 from . import models
 from .weights import noise_weights
@@ -27,6 +38,49 @@ class StepResult:
     lambda_used: float | None
     backtracks: int
     reason: str
+
+
+def _make_predict_full_generic(
+    x_all: np.ndarray,
+    base_all: np.ndarray,
+    add_mode: bool,
+    model_peaks: Callable[..., np.ndarray],
+) -> Callable[[np.ndarray], np.ndarray]:
+    def predict_full(theta_vec: np.ndarray) -> np.ndarray:
+        y_peaks = model_peaks(x_all, *np.asarray(theta_vec, float))
+        return base_all + y_peaks if add_mode else y_peaks
+
+    return predict_full
+
+
+def _vp_design_columns(
+    x: np.ndarray,
+    c_list: List[float],
+    w_list: List[float],
+    eta_list: List[float],
+) -> np.ndarray:
+    cols = [pseudo_voigt(x, 1.0, c, w, eta) for c, w, eta in zip(c_list, w_list, eta_list)]
+    return np.column_stack(cols) if cols else np.zeros((len(x), 0), float)
+
+
+def _vp_unpack_cw(theta_nl: np.ndarray, struct: List[dict], peaks) -> (List[float], List[float]):
+    theta_nl = list(np.asarray(theta_nl, float).ravel())
+    c_list, w_list = [], []
+    tptr = 0
+    for s, pk in zip(struct, peaks):
+        if s.get("ic") is not None:
+            c = float(theta_nl[tptr])
+            tptr += 1
+        else:
+            c = float(s.get("c_fixed", pk.center))
+        if s.get("iw") is not None:
+            w = float(theta_nl[tptr])
+            tptr += 1
+        else:
+            w = float(s.get("w_fixed", pk.fwhm))
+        c_list.append(c)
+        w_list.append(w)
+    return c_list, w_list
 
 
 def run_fit_consistent(
@@ -179,7 +233,7 @@ def run_fit_consistent(
             total = total + baseline
         return total
 
-    def _model_peaks(x_data: np.ndarray, *theta_vec: np.ndarray) -> np.ndarray:
+    def model_peaks(x_data: np.ndarray, *theta_vec: np.ndarray) -> np.ndarray:
         pk = []
         for i in range(len(peaks_out)):
             c, h, fw, eta = theta_vec[4 * i : 4 * i + 4]
@@ -261,31 +315,63 @@ def run_fit_consistent(
             }
         )
 
-    def _make_predict_full(
-        x_all: np.ndarray,
-        base_all: np.ndarray,
-        add_mode: bool,
-        model_peaks: Callable[..., np.ndarray],
-    ) -> Callable[[np.ndarray], np.ndarray]:
-        def predict_full(theta_vec: np.ndarray) -> np.ndarray:
-            theta_vec = np.asarray(theta_vec, float)
-            y_peaks = model_peaks(x_all, *theta_vec)
-            return (base_all + y_peaks) if add_mode else y_peaks
-
-        return predict_full
-
     base_all = baseline if baseline is not None else np.zeros_like(x)
+    add_mode = bool(mode == "add")
+    solver_used = best_res.solver if best_res is not None else solver_name
+    if solver_used in ("modern_vp", "lmfit_vp"):
+        solver_kind = "vp"
+    elif solver_used == "modern_trf":
+        solver_kind = "trf"
+    elif solver_used == "classic":
+        solver_kind = "classic"
+    elif solver_used.startswith("lmfit"):
+        solver_kind = "lmfit"
+    else:
+        solver_kind = str(solver_used)
+
     fit_ctx: Dict[str, Any] = {
         "x_all": np.asarray(x, float),
-        "predict_full": _make_predict_full(
-            np.asarray(x, float),
-            np.asarray(base_all, float),
-            bool(mode == "add"),
-            _model_peaks,
-        ),
+        "base_all": np.asarray(base_all, float),
+        "add_mode": add_mode,
         "theta_hat": np.asarray(theta, float),
         "param_names": list(names),
+        "predict_full": _make_predict_full_generic(
+            np.asarray(x, float),
+            np.asarray(base_all, float),
+            add_mode,
+            model_peaks,
+        ),
+        "solver_kind": solver_kind,
     }
+    if solver_kind == "vp":
+        struct: List[dict] = []
+        idx = 0
+        for pk in peaks_out:
+            s: dict = {}
+            if pk.lock_center:
+                s["ic"] = None
+                s["c_fixed"] = pk.center
+            else:
+                s["ic"] = idx
+                idx += 1
+            if pk.lock_width:
+                s["iw"] = None
+                s["w_fixed"] = pk.fwhm
+            else:
+                s["iw"] = idx
+                idx += 1
+            struct.append(s)
+        fit_ctx.update(
+            {
+                "vp_struct": struct,
+                "vp_etas": [p.eta for p in peaks_out],
+                "x_fit": np.asarray(x_fit, float),
+                "y_target_fit": np.asarray(y_target, float),
+                "wvec_fit": None if weights is None else np.asarray(weights, float),
+                "mask": np.asarray(mask, bool),
+                "vp_unpack_cw": lambda theta_nl, struct=struct, peaks=peaks_out: _vp_unpack_cw(theta_nl, struct, peaks),
+            }
+        )
     result["fit_ctx"] = fit_ctx
 
     if return_predictors:

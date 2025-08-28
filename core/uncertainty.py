@@ -16,6 +16,13 @@ import warnings
 import numpy as np
 import pandas as pd
 
+try:
+    from scipy.optimize import nnls as _nnls
+except Exception:  # pragma: no cover - optional dependency
+    _nnls = None
+
+from .fit_api import _vp_design_columns
+
 __all__ = ["asymptotic_ci", "bootstrap_ci", "bayesian_ci", "UncertaintyResult"]
 
 log = logging.getLogger(__name__)
@@ -176,50 +183,73 @@ def _prediction_band_from_thetas(
     theta_samples: Sequence[np.ndarray],
     predict_full: Callable[[np.ndarray], np.ndarray],
     x_all: np.ndarray,
-    max_samples: int = 512,
     lo_q: float = 2.5,
     hi_q: float = 97.5,
+    max_samples: int = 512,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute prediction band from parameter samples.
-
-    Parameters
-    ----------
-    theta_samples:
-        Iterable of parameter vectors compatible with ``predict_full``.
-    predict_full:
-        Callable returning model predictions over ``x_all`` for a given
-        parameter vector.
-    x_all:
-        Abscissa over which predictions are evaluated.
-    max_samples:
-        Maximum number of samples used for band construction.  Samples are
-        thinned deterministically to ensure reproducibility.
-    lo_q, hi_q:
-        Percentile bounds defining the band (default 2.5/97.5).
-    """
-
-    theta_samples = list(theta_samples)
     if not theta_samples:
-        raise ValueError("No theta samples provided.")
-
+        raise ValueError("no theta samples")
     if len(theta_samples) > max_samples:
-        idx = np.linspace(0, len(theta_samples) - 1, max_samples).astype(int)
-        theta_samples = [theta_samples[i] for i in idx]
-
-    preds: List[np.ndarray] = []
+        sel = np.linspace(0, len(theta_samples) - 1, max_samples).astype(int)
+        theta_samples = [theta_samples[i] for i in sel]
+    preds = []
     for th in theta_samples:
-        y = np.asarray(predict_full(np.asarray(th, float)), float)
+        y = np.asarray(predict_full(np.asarray(th, float)), float).ravel()
         preds.append(y)
     Y = np.stack(preds, axis=0)
-
     lo = np.percentile(Y, lo_q, axis=0)
     hi = np.percentile(Y, hi_q, axis=0)
-    x_all = np.asarray(x_all, float)
-    if lo.shape != x_all.shape or hi.shape != x_all.shape:
-        raise ValueError(
-            f"Band shape mismatch: lo {lo.shape}, hi {hi.shape}, x {x_all.shape}"
-        )
-    return x_all, lo, hi
+    return (np.asarray(x_all, float), lo, hi)
+
+
+def _predict_full_vp(theta_nl: np.ndarray, fit_ctx: Dict[str, Any]) -> np.ndarray:
+    x_fit = fit_ctx["x_fit"]
+    y_fit = fit_ctx["y_target_fit"]
+    w = fit_ctx.get("wvec_fit", None)
+    x_all = fit_ctx["x_all"]
+    base_all = fit_ctx["base_all"]
+    add_mode = fit_ctx["add_mode"]
+    vp_unpack_cw = fit_ctx["vp_unpack_cw"]
+    etas = fit_ctx["vp_etas"]
+
+    c_list, w_list = vp_unpack_cw(theta_nl)
+    A_fit = _vp_design_columns(x_fit, c_list, w_list, etas)
+    rhs = y_fit if w is None else (y_fit * w)
+    Aeq = A_fit if w is None else (A_fit * w[:, None])
+
+    if Aeq.shape[1] == 0:
+        h = np.zeros(0, float)
+    elif _nnls is not None:
+        h, _ = _nnls(Aeq, rhs)
+    else:
+        h, *_ = np.linalg.lstsq(Aeq, rhs, rcond=None)
+        h = np.clip(h, 0.0, np.inf)
+
+    A_all = _vp_design_columns(x_all, c_list, w_list, etas)
+    y_peaks = A_all @ h if h.size else np.zeros_like(x_all, float)
+    return base_all + y_peaks if add_mode else y_peaks
+
+
+def _prediction_band_vp(
+    theta_nl_samples: Sequence[np.ndarray],
+    fit_ctx: Dict[str, Any],
+    lo_q: float = 2.5,
+    hi_q: float = 97.5,
+    max_samples: int = 256,
+):
+    if not theta_nl_samples:
+        raise ValueError("no theta_nl samples")
+    if len(theta_nl_samples) > max_samples:
+        sel = np.linspace(0, len(theta_nl_samples) - 1, max_samples).astype(int)
+        theta_nl_samples = [theta_nl_samples[i] for i in sel]
+    preds = [
+        np.asarray(_predict_full_vp(th, fit_ctx), float).ravel()
+        for th in theta_nl_samples
+    ]
+    Y = np.stack(preds, axis=0)
+    lo = np.percentile(Y, lo_q, axis=0)
+    hi = np.percentile(Y, hi_q, axis=0)
+    return (fit_ctx["x_all"], lo, hi)
 
 
 def _coerce_draws_to_thetas(
@@ -467,41 +497,50 @@ def bootstrap_ci(*args: Any, fit_ctx: Optional[Dict[str, Any]] = None, **kwargs:
 
     band = None
     reason = None
-    ctx = fit_ctx or {}
-    try:
-        if (
-            return_band
-            and "predict_full" in ctx
-            and "x_all" in ctx
-            and len(theta_samples) >= 8
-        ):
-            band = _prediction_band_from_thetas(
-                theta_samples,
-                ctx["predict_full"],
-                np.asarray(ctx["x_all"], float),
-                max_samples=512,
-            )
-        else:
-            reason = "missing_predict_full_or_insufficient_samples"
-    except Exception as e:  # pragma: no cover
-        reason = f"band_failed:{type(e).__name__}"
-        band = None
-
     if workers:  # pragma: no cover - workers ignored in this simplified impl
         log.debug("bootstrap_ci called with workers=%d (serial)", workers)
 
-    diag: Dict[str, object] = {
+    diagnostics: Dict[str, object] = {
         "B": int(n_boot),
         "n_success": int(len(theta_samples)),
     }
-    if reason:
-        diag["band_reason"] = reason
+
+    try:
+        fc = fit_ctx or {}
+        if fc.get("solver_kind") == "vp":
+            struct = fc.get("vp_struct", [])
+            theta_nl_samples: List[np.ndarray] = []
+            for th in theta_samples:
+                th = np.asarray(th, float)
+                tnl: List[float] = []
+                for i, s in enumerate(struct):
+                    if s.get("ic") is not None:
+                        tnl.append(th[4 * i + 0])
+                    if s.get("iw") is not None:
+                        tnl.append(th[4 * i + 2])
+                theta_nl_samples.append(np.asarray(tnl, float))
+            if len(theta_nl_samples) >= 16:
+                band = _prediction_band_vp(theta_nl_samples, fc)
+            else:
+                reason = "insufficient_vp_samples"
+        else:
+            pred = fc.get("predict_full")
+            x_all = fc.get("x_all")
+            if pred is not None and x_all is not None and len(theta_samples) >= 16:
+                band = _prediction_band_from_thetas(theta_samples, pred, np.asarray(x_all, float))
+            else:
+                reason = "missing_predict_full_or_samples"
+    except Exception as e:  # pragma: no cover
+        reason = f"band_failed:{type(e).__name__}"
+
+    if band is None and reason:
+        diagnostics["band_reason"] = reason
     label = "Bootstrap (residual)"
     return UncertaintyResult(
         method="bootstrap",
         label=label,
         stats=stats,
-        diagnostics=diag,
+        diagnostics=diagnostics,
         band=band,
     )
 
@@ -696,25 +735,41 @@ def bayesian_ci(
     )
     band = None
     reason = None
+    diagnostics: Dict[str, object] = {"n_draws": int(len(theta_samples))}
     try:
-        if (
-            return_band
-            and "predict_full" in ctx
-            and "x_all" in ctx
-            and len(theta_samples) >= 50
-        ):
-            xb, lob, hib = _prediction_band_from_thetas(
-                theta_samples,
-                ctx["predict_full"],
-                np.asarray(ctx["x_all"], float),
-                max_samples=512,
-            )
-            band = (xb, _smooth_envelope(lob), _smooth_envelope(hib))
+        fc = ctx
+        if fc.get("solver_kind") == "vp":
+            if return_band:
+                struct = fc.get("vp_struct", [])
+                theta_nl_samples: List[np.ndarray] = []
+                for th in theta_samples:
+                    th = np.asarray(th, float)
+                    tnl: List[float] = []
+                    for i, s in enumerate(struct):
+                        if s.get("ic") is not None:
+                            tnl.append(th[4 * i + 0])
+                        if s.get("iw") is not None:
+                            tnl.append(th[4 * i + 2])
+                    theta_nl_samples.append(np.asarray(tnl, float))
+                if len(theta_nl_samples) >= 50:
+                    band = _prediction_band_vp(theta_nl_samples, fc)
+                else:
+                    reason = "insufficient_vp_draws"
+            else:
+                reason = "missing_predict_full_or_draws"
         else:
-            reason = "missing_predict_full_or_insufficient_samples"
+            pred = fc.get("predict_full")
+            x_all = fc.get("x_all")
+            if return_band and pred is not None and x_all is not None and len(theta_samples) >= 50:
+                xb, lob, hib = _prediction_band_from_thetas(theta_samples, pred, np.asarray(x_all, float))
+                band = (xb, _smooth_envelope(lob), _smooth_envelope(hib))
+            else:
+                reason = "missing_predict_full_or_draws"
     except Exception as e:  # pragma: no cover
         reason = f"band_failed:{type(e).__name__}"
-        band = None
+
+    if band is None and reason:
+        diagnostics["band_reason"] = reason
 
     # Diagnostics ---------------------------------------------------------
     try:
@@ -751,8 +806,7 @@ def bayesian_ci(
         "n_chains": int(chain.shape[1]),
         "param_order": param_names,
     }
-    if reason:
-        diag["band_reason"] = reason
+    diag.update(diagnostics)
     label = "Bayesian (MCMC)"
     return UncertaintyResult(
         method="bayesian",
