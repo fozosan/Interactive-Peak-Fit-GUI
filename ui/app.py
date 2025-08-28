@@ -186,7 +186,7 @@ import time
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 import numpy as np
 
@@ -213,7 +213,13 @@ import traceback
 from scipy.signal import find_peaks
 
 from core import signals, data_io
-from core.uncertainty import UncertaintyResult
+try:
+    from core.uncertainty import UncertaintyResult, NotAvailable
+except Exception:  # pragma: no cover - NotAvailable may be absent
+    from core.uncertainty import UncertaintyResult  # type: ignore
+
+    class NotAvailable:  # pragma: no cover - fallback placeholder
+        pass
 from core.residuals import build_residual, jacobian_fd
 from core.fit_api import (
     classic_step,
@@ -530,6 +536,158 @@ def load_xy_any(path: str):
     from core import data_io
 
     return data_io.load_xy(path)
+
+
+def _unc_method_label(res: Any) -> str:
+    for k in ("method_label", "label", "method", "type"):
+        v = getattr(res, k, None) if not isinstance(res, dict) else res.get(k)
+        if isinstance(v, str) and v.strip():
+            m = v.strip()
+            break
+    else:
+        return "Unknown"
+    m_low = m.lower()
+    return {
+        "asymptotic": "Asymptotic (JᵀJ)",
+        "bootstrap": "Bootstrap (residual)",
+        "bayesian": "Bayesian (MCMC)",
+    }.get(m_low, m)
+
+
+def _coerce_param_stats(res: Any) -> Dict[str, Dict[str, Any]]:
+    """Return normalized parameter stats mapping."""
+
+    def _norm_map(d: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        nested = True
+        for v in d.values():
+            if not isinstance(v, dict):
+                nested = False
+                break
+        if nested:
+            for p, inner in d.items():
+                if not isinstance(inner, dict):
+                    continue
+                est = inner.get("est") or inner.get("mean") or inner.get("median")
+                sd = inner.get("sd") or inner.get("stderr") or inner.get("sigma")
+                p25 = (
+                    inner.get("p2_5")
+                    or inner.get("p025")
+                    or inner.get("q2_5")
+                    or inner.get("q025")
+                )
+                p975 = (
+                    inner.get("p97_5")
+                    or inner.get("p975")
+                    or inner.get("q97_5")
+                    or inner.get("q975")
+                )
+                out[p] = {"est": est, "sd": sd, "p2_5": p25, "p97_5": p975}
+            return out
+
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for k, v in d.items():
+            if not isinstance(k, str) or "_" not in k:
+                continue
+            base, suffix = k.rsplit("_", 1)
+            suffix = suffix.lower()
+            if suffix not in (
+                "est",
+                "mean",
+                "median",
+                "sd",
+                "stderr",
+                "sigma",
+                "p2",
+                "p2_5",
+                "p025",
+                "p97",
+                "p97_5",
+                "p975",
+                "q2_5",
+                "q025",
+                "q97_5",
+                "q975",
+            ):
+                continue
+            b = buckets.setdefault(base, {})
+            b[suffix] = v
+
+        for base, inner in buckets.items():
+            est = inner.get("est") or inner.get("mean") or inner.get("median")
+            sd = inner.get("sd") or inner.get("stderr") or inner.get("sigma")
+            p25 = inner.get("p2_5") or inner.get("p025") or inner.get("p2") or inner.get("q2_5") or inner.get("q025")
+            p975 = (
+                inner.get("p97_5")
+                or inner.get("p975")
+                or inner.get("p97")
+                or inner.get("q97_5")
+                or inner.get("q975")
+            )
+            out[base] = {"est": est, "sd": sd, "p2_5": p25, "p97_5": p975}
+        return out
+
+    if isinstance(res, dict):
+        for key in ("param_stats", "params", "parameters", "stats"):
+            if key in res and isinstance(res[key], dict):
+                return _norm_map(res[key])
+        return _norm_map(res)
+    else:
+        for key in ("param_stats", "params", "parameters", "stats"):
+            if hasattr(res, key):
+                val = getattr(res, key)
+                if isinstance(val, dict):
+                    return _norm_map(val)
+        if hasattr(res, "to_dict"):
+            maybe = res.to_dict()
+            if isinstance(maybe, dict):
+                return _norm_map(maybe)
+    return {}
+
+
+def _iter_peakwise(stats_map: Dict[str, Dict[str, Any]], n_peaks: int) -> Iterable[Tuple[int, Dict[str, Any]]]:
+    def _get(param: str):
+        return stats_map.get(param) or stats_map.get(param.rstrip("s"))
+
+    rows = []
+    for i in range(n_peaks):
+        row: Dict[str, Any] = {}
+        for pname in ("center", "fwhm", "height"):
+            rec = _get(pname)
+            if not rec:
+                continue
+
+            def pick(x):
+                if isinstance(x, (list, tuple, np.ndarray)):
+                    return x[i] if i < len(x) else None
+                return x
+
+            row[pname] = {
+                "est": pick(rec.get("est")),
+                "sd": pick(rec.get("sd")),
+                "p2_5": pick(rec.get("p2_5")),
+                "p97_5": pick(rec.get("p97_5")),
+            }
+        rows.append((i + 1, row))
+    return rows
+
+
+def _format_unc_row(i: int, row: Dict[str, Any]) -> str:
+    def fmt(name: str) -> str:
+        v = row.get(name) or {}
+        est = v.get("est")
+        sd = v.get("sd")
+        if est is None or sd is None:
+            return f"{name} = n/a"
+        s = f"{name} = {est:.6g} ± {sd:.2g}"
+        p25 = v.get("p2_5")
+        p975 = v.get("p97_5")
+        if p25 is not None and p975 is not None:
+            s += f" (2.5%={p25:.6g}, 97.5%={p975:.6g})"
+        return s
+
+    parts = [fmt("center"), fmt("fwhm"), fmt("height")]
+    return f"Peak {i}: " + " | ".join(parts)
 
 
 # ---------- Main GUI ----------
@@ -2433,39 +2591,86 @@ class PeakFitApp:
                 return
             if method == "asymptotic":
                 cov, theta, info = res
-                self.show_ci_band = True
                 self.show_ci_band_var.set(True)
-                self.refresh_plot()
                 lines, warns = self._format_asymptotic_summary(cov, theta, info, self.ci_band)
                 for ln in lines:
                     self.log(ln)
                 for ln in warns:
                     self.log(ln, level="WARN")
-            else:
-                if isinstance(res, UncertaintyResult):
-                    if res.band is not None:
-                        self.ci_band = res.band
-                        self.show_ci_band = True
-                    extra = ""
-                    if res.method == "bootstrap":
-                        n = res.meta.get("n_resamples")
-                        seed = res.meta.get("seed")
-                        extra = f" (n={n}, seed={seed})" if n is not None else ""
-                    elif res.method == "bayesian":
-                        n_samples = res.meta.get("n_samples")
-                        n_chains = res.meta.get("n_chains")
-                        ess = res.meta.get("ess") or {}
-                        rhat = res.meta.get("rhat") or {}
-                        if ess and rhat:
-                            extra = (
-                                f" (draws={n_samples}, chains={n_chains}; min ESS={min(ess.values()):.0f}, "
-                                f"max R̂={max(rhat.values()):.3f})"
-                            )
-                    msg = f"Computed {res.method_label} uncertainty{extra}"
-                else:
-                    msg = "Bayesian MCMC requires emcee. Skipping." if res is None else f"Computed {getattr(res, 'method', 'unknown')} uncertainty."
-                self.log(msg)
-                messagebox.showinfo("Uncertainty", msg)
+                res = {
+                    "method": "asymptotic",
+                    "method_label": "Asymptotic (JᵀJ)",
+                    "band": self.ci_band[:3] if self.ci_band else None,
+                }
+
+            if isinstance(res, NotAvailable):
+                msg = "Bayesian MCMC requires emcee. Skipping. Details: " + str(getattr(res, "msg", "emcee not installed"))
+                self.log("ℹ INFO — " + msg)
+                return
+
+            if isinstance(res, dict) and "params" in res and "param_stats" not in res:
+                try:
+                    params = res.get("params", {})
+                    th = np.asarray(params.get("theta", []), float)
+                    cov = params.get("cov")
+                    sd = (
+                        np.sqrt(np.diag(np.asarray(cov, float)))
+                        if cov is not None and np.size(cov) > 0
+                        else None
+                    )
+                    samples = params.get("samples")
+                    p_lo = p_hi = None
+                    if samples is not None and np.size(samples) > 0:
+                        samp = np.asarray(samples, float)
+                        p_lo = np.quantile(samp, 0.025, axis=0)
+                        p_hi = np.quantile(samp, 0.975, axis=0)
+
+                    def slice_stats(idx: int) -> Dict[str, Any]:
+                        est = th[idx::4] if th.size else None
+                        sd_i = sd[idx::4] if sd is not None else None
+                        d: Dict[str, Any] = {"est": est, "sd": sd_i}
+                        if p_lo is not None and p_hi is not None:
+                            d["p2_5"] = p_lo[idx::4]
+                            d["p97_5"] = p_hi[idx::4]
+                        return d
+
+                    res["param_stats"] = {
+                        "center": slice_stats(0),
+                        "height": slice_stats(1),
+                        "fwhm": slice_stats(2),
+                    }
+                except Exception as e:  # pragma: no cover - safe guard
+                    self.log(f"Could not derive parameter stats: {e}", level="WARN")
+
+            label = _unc_method_label(res)
+            if isinstance(res, dict):
+                res.setdefault("method_label", label)
+            msg = f"Computed {label} uncertainty."
+            self.log_threadsafe(msg, "INFO")
+            self.status_info(msg)
+
+            try:
+                stats_map = _coerce_param_stats(res)
+                if stats_map:
+                    n_peaks = len(self.peaks) if hasattr(self, "peaks") else 0
+                    for i, row in _iter_peakwise(stats_map, n_peaks):
+                        self.log(_format_unc_row(i, row))
+            except Exception as e:  # pragma: no cover - formatting guard
+                self.log(f"Could not format uncertainty values: {e}", level="WARN")
+
+            band = getattr(res, "band", None)
+            if band is None and isinstance(res, dict):
+                band = res.get("band") or res.get("curve_band")
+
+            if band and isinstance(band, (tuple, list)) and len(band) == 3:
+                try:
+                    self.ci_band = band
+                    self.show_ci_band = True
+                    self.refresh_plot()
+                except Exception as e:
+                    self.log(f"⚠ WARN — Could not render uncertainty band: {e}")
+
+            self.last_uncertainty = res
             self.set_busy(False, "Uncertainty ready (95% band).")
 
         self.set_busy(True, "Computing uncertainty…")
