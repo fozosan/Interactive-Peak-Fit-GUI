@@ -2964,6 +2964,7 @@ class PeakFitApp:
 
             # Band
             band = self._unc_extract_band(result)
+            self.status_info(f"Computed {label} uncertainty.")
             if band is not None:
                 self.ci_band = band            # store as (x, lo, hi)
                 self.show_ci_band = True
@@ -2971,15 +2972,9 @@ class PeakFitApp:
                     self.refresh_plot()
                 except Exception:
                     pass
-                self.status_info(f"Computed {label} uncertainty.")
-            else:
-                self.status_info(f"Computed {label} uncertainty. (no band)")
-                diag = getattr(result, "diagnostics", None)
-                if diag is None and isinstance(result, dict):
-                    diag = result.get("diagnostics")
-                reason = diag.get("band_reason") if isinstance(diag, dict) else None
-                if reason:
-                    self.status_warn(f"{label}: no band — {reason}")
+            reason = getattr(result, "diagnostics", {}).get("band_reason")
+            if band is None and reason:
+                self.status_warn(f"{label}: no band — {reason}")
 
             # Per-peak stats
             try:
@@ -3317,20 +3312,19 @@ class PeakFitApp:
             lo, hi = sorted((self.fit_xmin, self.fit_xmax))
             self.ax.axvspan(lo, hi, color="0.8", alpha=0.25, lw=0)
 
-        if getattr(self, "show_ci_band", False) and getattr(self, "ci_band", None) is not None:
+        if self.show_ci_band and self.ci_band is not None:
             try:
-                # Accept (x, lo, hi) or (x, lo, hi, method)
-                if len(self.ci_band) == 3:
-                    xb, lob, hib = self.ci_band
-                elif len(self.ci_band) >= 3:
-                    xb, lob, hib = self.ci_band[0], self.ci_band[1], self.ci_band[2]
+                if len(self.ci_band) == 4:
+                    x_b, lo_b, hi_b, _ = self.ci_band
                 else:
-                    xb = lob = hib = None
-                if xb is not None and lob is not None and hib is not None:
-                    self.ax.fill_between(np.asarray(xb), np.asarray(lob), np.asarray(hib), alpha=0.18, label="Uncertainty band")
-            except Exception:
-                # be robust: never crash plot
-                pass
+                    x_b, lo_b, hi_b = self.ci_band
+                self.ax.fill_between(
+                    np.asarray(x_b), np.asarray(lo_b), np.asarray(hi_b),
+                    alpha=0.18, label="Uncertainty band"
+                )
+            except Exception as e:
+                if hasattr(self, "status_warn"):
+                    self.status_warn(f"Uncertainty band unavailable: {type(e).__name__}")
 
         # Legend toggle
         leg = self.ax.get_legend()
