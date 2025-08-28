@@ -25,34 +25,33 @@ log = logging.getLogger(__name__)
 class UncertaintyResult:
     """Light weight container for uncertainty estimates.
 
-    Parameters
-    ----------
-    method:
-        Name of the estimation method.  Expected values are "asymptotic",
-        "bootstrap" or "bayesian" though the class does not enforce the
-        restriction which allows graceful handling of missing optional
-        backends.
-    band:
-        Optional prediction band represented as a tuple ``(x, lo, hi)``.
-    param_stats:
-        Mapping of parameter name to a stats dictionary.  Common keys are
-        ``est`` (point estimate) and ``sd`` (standard deviation).  Quantile
-        entries may be present using the ``p2.5``/``p97.5`` convention.
-    meta:
-        Additional method specific metadata.  Diagnostics such as ``ess`` and
-        ``rhat`` are stored here as nested mappings.
+    The class exposes the canonical fields ``method``, ``label``, ``stats``
+    and ``diagnostics`` together with an optional prediction ``band``.  A
+    backwards compatible dictionary-like API is provided so that older code
+    accessing keys such as ``param_mean`` continues to operate.
     """
 
     method: str
-    band: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]
-    param_stats: Dict[str, Dict[str, float]]
-    meta: Dict[str, object] = field(default_factory=dict)
+    label: str
+    stats: Dict[str, Any]
+    diagnostics: Dict[str, Any]
+    band: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
     _legacy_cache: Dict[str, Any] | None = field(default=None, init=False, repr=False)
 
+    # ------------------------------------------------------------------
+    # Compatibility helpers
+    # ------------------------------------------------------------------
     @property
     def method_label(self) -> str:
-        m = self.method.lower()
-        return {"asymptotic": "Asymptotic", "bootstrap": "Bootstrap", "bayesian": "Bayesian"}.get(m, m.title())
+        return self.label
+
+    @property  # pragma: no cover - simple alias
+    def param_stats(self) -> Dict[str, Any]:
+        return self.stats
+
+    @property  # pragma: no cover - simple alias
+    def meta(self) -> Dict[str, Any]:
+        return self.diagnostics
 
     # -- Backwards compatibility -------------------------------------------------
     def _legacy(self) -> Dict[str, Any]:
@@ -65,7 +64,7 @@ class UncertaintyResult:
         stds: list[float] = []
         q05: list[float] = []
         q95: list[float] = []
-        for name, st in self.param_stats.items():
+        for name, st in self.stats.items():
             est = float(st.get("est", np.nan))
             sd = float(st.get("sd", np.nan))
             lo = st.get("p2.5")
@@ -89,9 +88,9 @@ class UncertaintyResult:
             band_dict = {"x": x, "lo": lo, "hi": hi}
 
         diag = {
-            "ess": self.meta.get("ess"),
-            "rhat": self.meta.get("rhat"),
-            "n_samples": self.meta.get("n_samples"),
+            "ess": self.diagnostics.get("ess"),
+            "rhat": self.diagnostics.get("rhat"),
+            "n_samples": self.diagnostics.get("n_samples"),
         }
 
         df = _param_df(
@@ -170,6 +169,40 @@ def _param_df(theta: np.ndarray, std: np.ndarray, lo: np.ndarray, hi: np.ndarray
 
 
 # ---------------------------------------------------------------------------
+# Prediction band helper
+# ---------------------------------------------------------------------------
+
+def _prediction_band_from_thetas(
+    thetas: Sequence[np.ndarray],
+    predict_full: Callable[[np.ndarray], np.ndarray],
+    alpha: float = 0.05,
+    max_samples: int = 512,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return lower/upper prediction envelopes from parameter draws.
+
+    ``thetas`` is an iterable of parameter vectors compatible with
+    ``predict_full``.  The function thins the samples to ``max_samples`` to
+    bound runtime and returns the 2.5/97.5 percentile envelopes.
+    """
+
+    thetas = list(thetas)
+    if len(thetas) == 0:
+        raise ValueError("No theta samples provided for prediction band.")
+
+    if len(thetas) > max_samples:
+        idx = np.linspace(0, len(thetas) - 1, max_samples).astype(int)
+        thetas = [thetas[i] for i in idx]
+
+    ys = []
+    for th in thetas:
+        ys.append(np.asarray(predict_full(np.asarray(th, float)), float))
+    Y = np.stack(ys, axis=0)
+    lo = np.percentile(Y, 100 * (alpha / 2), axis=0)
+    hi = np.percentile(Y, 100 * (1 - alpha / 2), axis=0)
+    return lo, hi
+
+
+# ---------------------------------------------------------------------------
 # Asymptotic confidence intervals
 # ---------------------------------------------------------------------------
 
@@ -224,7 +257,7 @@ def asymptotic_ci(
     x = np.arange(y0.size)
 
     names = [f"p{i}" for i in range(theta.size)]
-    param_stats = {
+    stats = {
         n: {
             "est": float(theta[i]),
             "sd": float(std[i]),
@@ -235,16 +268,28 @@ def asymptotic_ci(
     }
 
     band = (x, lo, hi)
-    meta: Dict[str, object] = {"alpha": alpha, "param_order": names}
-    return UncertaintyResult(method="asymptotic", band=band, param_stats=param_stats, meta=meta)
+    diag: Dict[str, object] = {"alpha": alpha, "param_order": names}
+    label = "Asymptotic (JᵀJ)"
+    return UncertaintyResult(
+        method="asymptotic",
+        label=label,
+        stats=stats,
+        diagnostics=diag,
+        band=band,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Residual bootstrap
 # ---------------------------------------------------------------------------
 
-def bootstrap_ci(*args: Any, **kwargs: Any) -> UncertaintyResult:
-    """Residual bootstrap with extensive compatibility shim."""
+def bootstrap_ci(*args: Any, fit_ctx: Optional[Dict[str, Any]] = None, **kwargs: Any) -> UncertaintyResult:
+    """Residual bootstrap with extensive compatibility shim.
+
+    ``fit_ctx`` may supply ``predict_full`` and ``x_all`` used for
+    prediction band construction.  When omitted the information is extracted
+    from the provided fit object if possible.
+    """
 
     alias_map = {
         "n": "n_boot",
@@ -308,7 +353,7 @@ def bootstrap_ci(*args: Any, **kwargs: Any) -> UncertaintyResult:
     theta = np.asarray(fit["theta"], float)
     r = -np.asarray(fit["residual"], float)
     J = np.asarray(fit["jacobian"], float)
-    predict_full = fit["predict_full"]
+    predict_full = fit.get("predict_full")
     bounds = fit.get("bounds")
     param_names = fit.get("param_names") or [f"p{i}" for i in range(theta.size)]
     locked = np.asarray(fit.get("locked_mask"), bool)
@@ -316,10 +361,16 @@ def bootstrap_ci(*args: Any, **kwargs: Any) -> UncertaintyResult:
         locked = np.zeros(theta.size, bool)
     x_full = fit.get("x")
 
+    if fit_ctx is None:
+        fit_ctx = {}
+    if "predict_full" not in fit_ctx and predict_full is not None:
+        fit_ctx["predict_full"] = predict_full
+    if "x_all" not in fit_ctx and x_full is not None:
+        fit_ctx["x_all"] = x_full
+
     J_pinv = np.linalg.pinv(J)
     rng = np.random.default_rng(seed)
-    samples = []
-    curves = [] if return_band else None
+    theta_samples: list[np.ndarray] = []
     for _ in range(int(n_boot)):
         idx = rng.integers(0, r.size, r.size)
         delta = J_pinv @ r[idx]
@@ -328,11 +379,9 @@ def bootstrap_ci(*args: Any, **kwargs: Any) -> UncertaintyResult:
         if bounds is not None:
             lo_b, hi_b = bounds
             th = np.clip(th, lo_b, hi_b)
-        samples.append(th)
-        if curves is not None:
-            curves.append(predict_full(th))
+        theta_samples.append(th)
 
-    samples_arr = np.vstack(samples) if samples else theta[None, :]
+    samples_arr = np.vstack(theta_samples) if theta_samples else theta[None, :]
     mean = samples_arr.mean(axis=0)
     std = samples_arr.std(axis=0, ddof=1)
     ci_lo = np.quantile(samples_arr, alpha / 2, axis=0)
@@ -341,8 +390,7 @@ def bootstrap_ci(*args: Any, **kwargs: Any) -> UncertaintyResult:
     std[locked] = 0.0
     ci_lo[locked] = theta[locked]
     ci_hi[locked] = theta[locked]
-
-    param_stats = {
+    stats = {
         name: {
             "est": float(mean[i]),
             "sd": float(std[i]),
@@ -353,24 +401,40 @@ def bootstrap_ci(*args: Any, **kwargs: Any) -> UncertaintyResult:
     }
 
     band = None
-    if curves is not None:
-        curves_arr = np.vstack(curves)
-        lo = np.quantile(curves_arr, alpha / 2, axis=0)
-        hi = np.quantile(curves_arr, 1 - alpha / 2, axis=0)
-        y0 = predict_full(theta)
-        x = x_full if x_full is not None else np.arange(y0.size)
-        band = (x, lo, hi)
+    ctx = fit_ctx or {}
+    if (
+        return_band
+        and "predict_full" in ctx
+        and "x_all" in ctx
+        and len(theta_samples) >= 3
+    ):
+        try:
+            lo_b, hi_b = _prediction_band_from_thetas(
+                theta_samples, ctx["predict_full"], alpha=alpha, max_samples=512
+            )
+            x_all = np.asarray(ctx["x_all"], float)
+            if lo_b.shape == x_all.shape == hi_b.shape:
+                band = (x_all, lo_b, hi_b)
+        except Exception:  # pragma: no cover - band errors are non-fatal
+            band = None
 
     if workers:  # pragma: no cover - workers ignored in this simplified impl
         log.debug("bootstrap_ci called with workers=%d (serial)", workers)
 
-    meta: Dict[str, object] = {
+    diag: Dict[str, object] = {
         "n_resamples": int(n_boot),
         "seed": seed,
         "n_samples": int(samples_arr.shape[0]),
         "param_order": param_names,
     }
-    return UncertaintyResult(method="bootstrap", band=band, param_stats=param_stats, meta=meta)
+    label = "Bootstrap (residual)"
+    return UncertaintyResult(
+        method="bootstrap",
+        label=label,
+        stats=stats,
+        diagnostics=diag,
+        band=band,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +471,7 @@ def bayesian_ci(
     n_steps: int = 2000,
     thin: int = 10,
     return_band: bool = False,
+    fit_ctx: Optional[Dict[str, Any]] = None,
     x_all: Optional[np.ndarray] = None,
     base_all: Optional[np.ndarray] = None,
     add_mode: bool = False,
@@ -479,6 +544,13 @@ def bayesian_ci(
     base_all = fit.get("baseline", base_all)
     add_mode = bool(fit.get("mode", "add") == "add")
 
+    if fit_ctx is None:
+        fit_ctx = {}
+    if "predict_full" not in fit_ctx and predict_full is not None:
+        fit_ctx["predict_full"] = predict_full
+    if "x_all" not in fit_ctx and x_all is not None:
+        fit_ctx["x_all"] = x_all
+
     if residual_fn is None or predict_full is None:
         raise ValueError("residual_fn and predict_full required")
 
@@ -501,24 +573,31 @@ def bayesian_ci(
         y0 = predict_full(theta)
         x = x_all if x_all is not None else np.arange(y0.size)
         band = (x, y0, y0) if return_band else None
-        param_stats = {
+        stats = {
             name: {"est": float(theta[i]), "sd": 0.0, "p2.5": float(theta[i]), "p97.5": float(theta[i])}
             for i, name in enumerate(param_names)
         }
-        meta = {"n_samples": 0, "param_order": param_names}
-        return UncertaintyResult("bayesian", band, param_stats, meta)
+        diag = {"n_samples": 0, "param_order": param_names}
+        label = "Bayesian (MCMC)"
+        return UncertaintyResult(
+            method="bayesian",
+            label=label,
+            stats=stats,
+            diagnostics=diag,
+            band=band,
+        )
 
     n_walkers = max(n_walkers, 2 * ndim)
-    rng = np.random.default_rng(seed)
+    np.random.seed(seed)
 
     def log_prob_free(th_free: np.ndarray) -> float:
         th = theta.copy()
         th[free_idx] = th_free
         return loglike(th)
 
-    p0 = theta[free_idx] + 1e-4 * rng.standard_normal((n_walkers, ndim))
+    p0 = theta[free_idx] + 1e-4 * np.random.standard_normal((n_walkers, ndim))
     sampler = emcee.EnsembleSampler(n_walkers, ndim, log_prob_free)
-    sampler.run_mcmc(p0, n_burn + n_steps, thin=thin, progress=False, random_state=rng)
+    sampler.run_mcmc(p0, n_burn + n_steps, progress=False)
     chain = sampler.get_chain(discard=n_burn, thin=thin, flat=False)
     flat = chain.reshape(-1, ndim)
 
@@ -536,13 +615,31 @@ def bayesian_ci(
     ci_hi[locked] = theta[locked]
 
     band = None
-    if return_band and x_all is not None:
-        curves = np.vstack([predict_full(th) for th in samples_full])
-        lo = np.quantile(curves, 0.025, axis=0)
-        hi = np.quantile(curves, 0.975, axis=0)
-        lo = _smooth_envelope(lo)
-        hi = _smooth_envelope(hi)
-        band = (x_all, lo, hi)
+    ctx = fit_ctx or {}
+    draws = samples_full
+    if (
+        return_band
+        and "predict_full" in ctx
+        and "x_all" in ctx
+        and draws is not None
+        and draws.shape[0] >= 50
+    ):
+        try:
+            max_samples = 512
+            if draws.shape[0] > max_samples:
+                idx = np.linspace(0, draws.shape[0] - 1, max_samples).astype(int)
+                theta_samples = [draws[i, :] for i in idx]
+            else:
+                theta_samples = [row for row in draws]
+
+            lo_b, hi_b = _prediction_band_from_thetas(
+                theta_samples, ctx["predict_full"], alpha=0.05, max_samples=512
+            )
+            x_all_arr = np.asarray(ctx["x_all"], float)
+            if lo_b.shape == x_all_arr.shape == hi_b.shape:
+                band = (x_all_arr, _smooth_envelope(lo_b), _smooth_envelope(hi_b))
+        except Exception:  # pragma: no cover - band errors are non-fatal
+            band = None
 
     # Diagnostics ---------------------------------------------------------
     try:
@@ -562,7 +659,7 @@ def bayesian_ci(
     if np.any(ess < 200) or np.any(rhat > 1.1):
         warnings.warn("MCMC diagnostics indicate poor convergence", RuntimeWarning)
 
-    param_stats = {
+    stats = {
         name: {
             "est": float(mean[i]),
             "sd": float(std[i]),
@@ -572,13 +669,18 @@ def bayesian_ci(
         for i, name in enumerate(param_names)
     }
 
-    band_tuple = band
-
-    meta: Dict[str, object] = {
+    diag: Dict[str, object] = {
         "ess": {name: float(ess[i]) for i, name in enumerate(param_names)},
         "rhat": {name: float(rhat[i]) for i, name in enumerate(param_names)},
         "n_samples": int(samples_full.shape[0]),
         "n_chains": int(chain.shape[1]),
         "param_order": param_names,
     }
-    return UncertaintyResult(method="bayesian", band=band_tuple, param_stats=param_stats, meta=meta)
+    label = "Bayesian (MCMC)"
+    return UncertaintyResult(
+        method="bayesian",
+        label=label,
+        stats=stats,
+        diagnostics=diag,
+        band=band,
+    )

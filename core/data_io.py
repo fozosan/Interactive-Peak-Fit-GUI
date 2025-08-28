@@ -256,11 +256,17 @@ def _ensure_result(unc: Union[UncertaintyResult, dict]) -> UncertaintyResult:
         elif isinstance(b, (tuple, list)) and len(b) == 3:
             band = tuple(np.asarray(part) for part in b)
 
-    meta = {
+    diagnostics = {
         "ess": unc.get("diagnostics", {}).get("ess"),
         "rhat": unc.get("diagnostics", {}).get("rhat"),
     }
-    return _DictResult(method, band, params, meta, method_label)
+    return UncertaintyResult(
+        method=method,
+        label=method_label,
+        stats=params,
+        diagnostics=diagnostics,
+        band=band,
+    )
 
 
 def write_uncertainty_csv(path: Path, unc: Union[UncertaintyResult, dict]) -> None:

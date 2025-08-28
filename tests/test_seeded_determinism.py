@@ -19,7 +19,13 @@ def _export(path_base, theta, std):
         }
         for i in range(len(theta))
     }
-    unc = UncertaintyResult("asymptotic", None, param_stats, {})
+    unc = UncertaintyResult(
+        method="asymptotic",
+        label="Asymptotic (JᵀJ)",
+        stats=param_stats,
+        diagnostics={},
+        band=None,
+    )
     data_io.write_uncertainty_csv(paths["unc_csv"], unc)
     return (
         hashlib.md5(paths["fit"].read_bytes()).hexdigest(),

@@ -8,7 +8,7 @@ def test_unc_bootstrap_outputs(two_peak_data, tmp_path):
         **two_peak_data, return_jacobian=True, return_predictors=True
     )
     res1 = uncertainty.bootstrap_ci(fit, n_boot=20, seed=42, workers=0)
-    assert res1.method_label == "Bootstrap"
+    assert res1.method_label == "Bootstrap (residual)"
 
     paths = data_io.derive_export_paths(str(tmp_path / "out.csv"))
     data_io.write_uncertainty_csv(paths["unc_csv"], res1)
