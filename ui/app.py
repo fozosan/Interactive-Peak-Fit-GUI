@@ -2974,6 +2974,12 @@ class PeakFitApp:
                 self.status_info(f"Computed {label} uncertainty.")
             else:
                 self.status_info(f"Computed {label} uncertainty. (no band)")
+                diag = getattr(result, "diagnostics", None)
+                if diag is None and isinstance(result, dict):
+                    diag = result.get("diagnostics")
+                reason = diag.get("band_reason") if isinstance(diag, dict) else None
+                if reason:
+                    self.status_warn(f"{label}: no band — {reason}")
 
             # Per-peak stats
             try:
@@ -3321,7 +3327,7 @@ class PeakFitApp:
                 else:
                     xb = lob = hib = None
                 if xb is not None and lob is not None and hib is not None:
-                    self.ax.fill_between(xb, lob, hib, alpha=0.18, label="Uncertainty band")
+                    self.ax.fill_between(np.asarray(xb), np.asarray(lob), np.asarray(hib), alpha=0.18, label="Uncertainty band")
             except Exception:
                 # be robust: never crash plot
                 pass
