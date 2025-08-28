@@ -213,7 +213,13 @@ import traceback
 from scipy.signal import find_peaks
 
 from core import signals, data_io
-from core.uncertainty import UncertaintyResult
+try:
+    from core.uncertainty import UncertaintyResult, NotAvailable
+except Exception:  # pragma: no cover - NotAvailable may be absent
+    from core.uncertainty import UncertaintyResult  # type: ignore
+
+    class NotAvailable:  # pragma: no cover - fallback placeholder
+        pass
 from core.residuals import build_residual, jacobian_fd
 from core.fit_api import (
     classic_step,
@@ -2433,39 +2439,67 @@ class PeakFitApp:
                 return
             if method == "asymptotic":
                 cov, theta, info = res
-                self.show_ci_band = True
                 self.show_ci_band_var.set(True)
-                self.refresh_plot()
                 lines, warns = self._format_asymptotic_summary(cov, theta, info, self.ci_band)
                 for ln in lines:
                     self.log(ln)
                 for ln in warns:
                     self.log(ln, level="WARN")
-            else:
-                if isinstance(res, UncertaintyResult):
-                    if res.band is not None:
-                        self.ci_band = res.band
-                        self.show_ci_band = True
-                    extra = ""
-                    if res.method == "bootstrap":
-                        n = res.meta.get("n_resamples")
-                        seed = res.meta.get("seed")
-                        extra = f" (n={n}, seed={seed})" if n is not None else ""
-                    elif res.method == "bayesian":
-                        n_samples = res.meta.get("n_samples")
-                        n_chains = res.meta.get("n_chains")
-                        ess = res.meta.get("ess") or {}
-                        rhat = res.meta.get("rhat") or {}
-                        if ess and rhat:
-                            extra = (
-                                f" (draws={n_samples}, chains={n_chains}; min ESS={min(ess.values()):.0f}, "
-                                f"max R̂={max(rhat.values()):.3f})"
-                            )
-                    msg = f"Computed {res.method_label} uncertainty{extra}"
-                else:
-                    msg = "Bayesian MCMC requires emcee. Skipping." if res is None else f"Computed {getattr(res, 'method', 'unknown')} uncertainty."
-                self.log(msg)
-                messagebox.showinfo("Uncertainty", msg)
+                res = {
+                    "method": "asymptotic",
+                    "method_label": "Asymptotic",
+                    "band": self.ci_band[:3] if self.ci_band else None,
+                }
+
+            if isinstance(res, NotAvailable):
+                msg = "Bayesian MCMC requires emcee. Skipping. Details: " + str(getattr(res, "msg", "emcee not installed"))
+                self.log("ℹ INFO — " + msg)
+                return
+
+            def _label_from_unc(res_obj):
+                if hasattr(res_obj, "method_label") and res_obj.method_label:
+                    m = str(res_obj.method_label).lower()
+                    return {
+                        "asymptotic": "Asymptotic (JᵀJ)",
+                        "bootstrap": "Bootstrap (residual)",
+                        "bayesian": "Bayesian (MCMC)",
+                    }.get(m, res_obj.method_label)
+                if hasattr(res_obj, "method") and res_obj.method:
+                    m = str(res_obj.method).lower()
+                    return {
+                        "asymptotic": "Asymptotic (JᵀJ)",
+                        "bootstrap": "Bootstrap (residual)",
+                        "bayesian": "Bayesian (MCMC)",
+                    }.get(m, m)
+                if isinstance(res_obj, dict):
+                    m = str(res_obj.get("type") or res_obj.get("method") or "").lower()
+                    return {
+                        "asymptotic": "Asymptotic (JᵀJ)",
+                        "bootstrap": "Bootstrap (residual)",
+                        "bayesian": "Bayesian (MCMC)",
+                    }.get(m, "unknown")
+                return "unknown"
+
+            label = _label_from_unc(res)
+            msg = f"Computed {label} uncertainty."
+            self.log_threadsafe(msg, "INFO")
+            self.status_info(msg)
+
+            band = None
+            if hasattr(res, "band"):
+                band = res.band
+            elif isinstance(res, dict):
+                band = res.get("band") or res.get("curve_band")
+
+            if band and isinstance(band, (tuple, list)) and len(band) == 3:
+                try:
+                    self.ci_band = band
+                    self.show_ci_band = True
+                    self.refresh_plot()
+                except Exception as e:
+                    self.log(f"⚠ WARN — Could not render uncertainty band: {e}")
+
+            self.last_uncertainty = res
             self.set_busy(False, "Uncertainty ready (95% band).")
 
         self.set_busy(True, "Computing uncertainty…")
