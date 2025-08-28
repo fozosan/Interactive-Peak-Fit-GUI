@@ -1368,6 +1368,9 @@ class PeakFitApp:
     def log_threadsafe(self, msg: str, level: str = "INFO"):
         self.log(msg, level)
 
+    def log_info(self, msg: str) -> None:
+        self.log(msg, level="INFO")
+
     def run_in_thread(self, fn, on_done):
         def worker():
             try:
@@ -2376,6 +2379,13 @@ class PeakFitApp:
         )
         return lines, warns
 
+    def _unc_label(self, res) -> str:
+        if isinstance(res, UncertaintyResult):
+            return res.method_label
+        if isinstance(res, dict):
+            return res.get("method_label") or res.get("label") or res.get("method", "unknown")
+        return "unknown"
+
     def run_uncertainty(self):
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Uncertainty", "Load data and perform a fit first.")
@@ -2399,8 +2409,7 @@ class PeakFitApp:
 
         resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
 
-        method_label = self.unc_method.get()
-        method = "bootstrap" if method_label.startswith("Bootstrap") else method_label.lower()
+        method = self.unc_method.get().strip().lower()
 
         def work():
             if method == "asymptotic":
@@ -2425,11 +2434,16 @@ class PeakFitApp:
             raise RuntimeError("Unknown method")
 
         def done(res, err):
-            if err or res is None:
+            if err:
                 self.set_busy(False, "Uncertainty failed.")
-                if err:
-                    self.log(f"Uncertainty failed: {err}", level="ERROR")
-                    messagebox.showerror("Uncertainty", f"Failed: {err}")
+                self.log(f"Uncertainty failed: {err}", level="ERROR")
+                messagebox.showerror("Uncertainty", f"Failed: {err}")
+                return
+            if res is None:
+                msg = "Bayesian MCMC requires emcee. Skipping." if method == "bayesian" else "Uncertainty unavailable."
+                self.log_info(msg)
+                messagebox.showinfo("Uncertainty", msg)
+                self.set_busy(False, "Uncertainty skipped.")
                 return
             if method == "asymptotic":
                 cov, theta, info = res
@@ -2442,29 +2456,13 @@ class PeakFitApp:
                 for ln in warns:
                     self.log(ln, level="WARN")
             else:
-                if isinstance(res, UncertaintyResult):
-                    if res.band is not None:
-                        self.ci_band = res.band
-                        self.show_ci_band = True
-                    extra = ""
-                    if res.method == "bootstrap":
-                        n = res.meta.get("n_resamples")
-                        seed = res.meta.get("seed")
-                        extra = f" (n={n}, seed={seed})" if n is not None else ""
-                    elif res.method == "bayesian":
-                        n_samples = res.meta.get("n_samples")
-                        n_chains = res.meta.get("n_chains")
-                        ess = res.meta.get("ess") or {}
-                        rhat = res.meta.get("rhat") or {}
-                        if ess and rhat:
-                            extra = (
-                                f" (draws={n_samples}, chains={n_chains}; min ESS={min(ess.values()):.0f}, "
-                                f"max R̂={max(rhat.values()):.3f})"
-                            )
-                    msg = f"Computed {res.method_label} uncertainty{extra}"
-                else:
-                    msg = "Bayesian MCMC requires emcee. Skipping." if res is None else f"Computed {getattr(res, 'method', 'unknown')} uncertainty."
-                self.log(msg)
+                label = self._unc_label(res)
+                if isinstance(res, UncertaintyResult) and res.band is not None:
+                    self.ci_band = res.band
+                    self.show_ci_band = True
+                    self.refresh_plot()
+                msg = f"Computed {label} uncertainty."
+                self.log_info(msg)
                 messagebox.showinfo("Uncertainty", msg)
             self.set_busy(False, "Uncertainty ready (95% band).")
 

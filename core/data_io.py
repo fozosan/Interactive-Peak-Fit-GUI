@@ -203,7 +203,6 @@ def write_dataframe(df: pd.DataFrame, path: Path) -> None:
 def _ensure_result(unc: Union[UncertaintyResult, dict]) -> UncertaintyResult:
     if isinstance(unc, UncertaintyResult):
         return unc
-    # minimal adapter from legacy dicts
     params: Dict[str, Dict[str, float]] = {}
     for name, stats in unc.get("params", {}).items():
         params[name] = {
@@ -211,17 +210,20 @@ def _ensure_result(unc: Union[UncertaintyResult, dict]) -> UncertaintyResult:
             "sd": stats.get("std"),
         }
         if stats.get("q05") is not None and stats.get("q95") is not None:
-            params[name]["p2.5"] = stats.get("q05")
-            params[name]["p97.5"] = stats.get("q95")
+            params[name]["p2_5"] = stats.get("q05")
+            params[name]["p97_5"] = stats.get("q95")
     band = None
     if unc.get("band"):
         b = unc["band"]
         band = (np.asarray(b["x"]), np.asarray(b["lo"]), np.asarray(b["hi"]))
-    meta = {
-        "ess": unc.get("diagnostics", {}).get("ess"),
-        "rhat": unc.get("diagnostics", {}).get("rhat"),
-    }
-    return UncertaintyResult(str(unc.get("method", "unknown")), band, params, meta)
+    diagnostics = unc.get("diagnostics", {})
+    method = str(unc.get("method", "unknown"))
+    label = (
+        unc.get("method_label")
+        or unc.get("label")
+        or {"asymptotic": "Asymptotic (JᵀJ)", "bootstrap": "Bootstrap (residual)", "bayesian": "Bayesian (MCMC)"}.get(method.lower(), method.title())
+    )
+    return UncertaintyResult(method, label, params, band, diagnostics)
 
 
 def write_uncertainty_csv(path: Path, unc: Union[UncertaintyResult, dict]) -> None:
@@ -233,12 +235,11 @@ def write_uncertainty_csv(path: Path, unc: Union[UncertaintyResult, dict]) -> No
 
     res = _ensure_result(unc)
     row: Dict[str, float | str] = {"method": res.method_label}
-    for name, stats in res.param_stats.items():
+    for name, stats in res.params.items():
         row[f"{name}_est"] = stats.get("est")
         row[f"{name}_sd"] = stats.get("sd")
-        if "p2.5" in stats and "p97.5" in stats:
-            row[f"{name}_p2_5"] = stats.get("p2.5")
-            row[f"{name}_p97_5"] = stats.get("p97.5")
+        row[f"{name}_p2_5"] = stats.get("p2_5") or stats.get("p2.5")
+        row[f"{name}_p97_5"] = stats.get("p97_5") or stats.get("p97.5")
     df = pd.DataFrame([row])
     write_dataframe(df, path)
 
@@ -248,12 +249,14 @@ def write_uncertainty_txt(path: Path, unc: Union[UncertaintyResult, dict]) -> No
 
     res = _ensure_result(unc)
     lines = [f"Method: {res.method_label}"]
-    for name, stats in res.param_stats.items():
+    for name, stats in res.params.items():
         est = stats.get("est")
         sd = stats.get("sd")
         line = f"{name}: {est:.6g} ± {sd:.6g}"
-        if "p2.5" in stats and "p97.5" in stats:
-            line += f"   [2.5%: {stats['p2.5']:.6g}, 97.5%: {stats['p97.5']:.6g}]"
+        lo = stats.get("p2_5") or stats.get("p2.5")
+        hi = stats.get("p97_5") or stats.get("p97.5")
+        if lo is not None and hi is not None:
+            line += f"   [2.5%: {lo:.6g}, 97.5%: {hi:.6g}]"
         lines.append(line)
     text = "\n".join(lines) + "\n"
     path.write_text(text, encoding="utf-8")

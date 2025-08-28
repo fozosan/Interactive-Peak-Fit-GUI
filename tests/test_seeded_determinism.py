@@ -10,16 +10,16 @@ def _export(path_base, theta, std):
     paths = data_io.derive_export_paths(str(path_base))
     df_fit = pd.DataFrame({"theta": theta})
     data_io.write_dataframe(df_fit, paths["fit"])
-    param_stats = {
+    params = {
         f"p{i}": {
             "est": float(theta[i]),
             "sd": float(std[i]),
-            "p2.5": float(theta[i] - 1.96 * std[i]),
-            "p97.5": float(theta[i] + 1.96 * std[i]),
+            "p2_5": float(theta[i] - 1.96 * std[i]),
+            "p97_5": float(theta[i] + 1.96 * std[i]),
         }
         for i in range(len(theta))
     }
-    unc = UncertaintyResult("asymptotic", None, param_stats, {})
+    unc = UncertaintyResult("asymptotic", "Asymptotic (JᵀJ)", params)
     data_io.write_uncertainty_csv(paths["unc_csv"], unc)
     return (
         hashlib.md5(paths["fit"].read_bytes()).hexdigest(),

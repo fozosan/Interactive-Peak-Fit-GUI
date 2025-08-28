@@ -23,36 +23,14 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class UncertaintyResult:
-    """Light weight container for uncertainty estimates.
-
-    Parameters
-    ----------
-    method:
-        Name of the estimation method.  Expected values are "asymptotic",
-        "bootstrap" or "bayesian" though the class does not enforce the
-        restriction which allows graceful handling of missing optional
-        backends.
-    band:
-        Optional prediction band represented as a tuple ``(x, lo, hi)``.
-    param_stats:
-        Mapping of parameter name to a stats dictionary.  Common keys are
-        ``est`` (point estimate) and ``sd`` (standard deviation).  Quantile
-        entries may be present using the ``p2.5``/``p97.5`` convention.
-    meta:
-        Additional method specific metadata.  Diagnostics such as ``ess`` and
-        ``rhat`` are stored here as nested mappings.
-    """
+    """Light weight container for uncertainty estimates with legacy dict access."""
 
     method: str
-    band: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]
-    param_stats: Dict[str, Dict[str, float]]
-    meta: Dict[str, object] = field(default_factory=dict)
+    method_label: str
+    params: Dict[str, Dict[str, float]]
+    band: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+    diagnostics: Dict[str, object] = field(default_factory=dict)
     _legacy_cache: Dict[str, Any] | None = field(default=None, init=False, repr=False)
-
-    @property
-    def method_label(self) -> str:
-        m = self.method.lower()
-        return {"asymptotic": "Asymptotic", "bootstrap": "Bootstrap", "bayesian": "Bayesian"}.get(m, m.title())
 
     # -- Backwards compatibility -------------------------------------------------
     def _legacy(self) -> Dict[str, Any]:
@@ -65,11 +43,15 @@ class UncertaintyResult:
         stds: list[float] = []
         q05: list[float] = []
         q95: list[float] = []
-        for name, st in self.param_stats.items():
+        for name, st in self.params.items():
             est = float(st.get("est", np.nan))
             sd = float(st.get("sd", np.nan))
-            lo = st.get("p2.5")
-            hi = st.get("p97.5")
+            lo = st.get("p2_5")
+            if lo is None:
+                lo = st.get("p2.5")
+            hi = st.get("p97_5")
+            if hi is None:
+                hi = st.get("p97.5")
             params[name] = {
                 "mean": est,
                 "std": sd,
@@ -89,9 +71,9 @@ class UncertaintyResult:
             band_dict = {"x": x, "lo": lo, "hi": hi}
 
         diag = {
-            "ess": self.meta.get("ess"),
-            "rhat": self.meta.get("rhat"),
-            "n_samples": self.meta.get("n_samples"),
+            "ess": self.diagnostics.get("ess"),
+            "rhat": self.diagnostics.get("rhat"),
+            "n_samples": self.diagnostics.get("n_samples"),
         }
 
         df = _param_df(
@@ -110,16 +92,31 @@ class UncertaintyResult:
             "param_mean": np.asarray(means, float),
             "param_std": np.asarray(stds, float),
             "param_stats": df,
+            "method_label": self.method_label,
+            "label": self.method_label,
         }
         return self._legacy_cache
 
     def __getitem__(self, key: str) -> Any:  # dict-like access
-        return self._legacy()[key]
+        return self.get(key)
 
     def get(self, key: str, default: Any = None) -> Any:
-        return self._legacy().get(key, default)
+        if key in ("label", "method_label"):
+            return self.method_label
+        if key == "method":
+            return self.method
+        if key == "params":
+            return self.params
+        if key == "band":
+            return self._legacy()["band"]
+        if key == "diagnostics":
+            return self.diagnostics
+        legacy = self._legacy()
+        return legacy.get(key, default)
 
     def __contains__(self, key: str) -> bool:
+        if key in ("label", "method_label", "method", "params", "band", "diagnostics"):
+            return True
         return key in self._legacy()
 
 
@@ -228,15 +225,21 @@ def asymptotic_ci(
         n: {
             "est": float(theta[i]),
             "sd": float(std[i]),
-            "p2.5": float(ci_lo[i]),
-            "p97.5": float(ci_hi[i]),
+            "p2_5": float(ci_lo[i]),
+            "p97_5": float(ci_hi[i]),
         }
         for i, n in enumerate(names)
     }
 
     band = (x, lo, hi)
-    meta: Dict[str, object] = {"alpha": alpha, "param_order": names}
-    return UncertaintyResult(method="asymptotic", band=band, param_stats=param_stats, meta=meta)
+    diagnostics: Dict[str, object] = {"alpha": alpha, "param_order": names}
+    return UncertaintyResult(
+        method="asymptotic",
+        method_label="Asymptotic (JᵀJ)",
+        params=params,
+        band=band,
+        diagnostics=diagnostics,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -346,8 +349,8 @@ def bootstrap_ci(*args: Any, **kwargs: Any) -> UncertaintyResult:
         name: {
             "est": float(mean[i]),
             "sd": float(std[i]),
-            "p2.5": float(ci_lo[i]),
-            "p97.5": float(ci_hi[i]),
+            "p2_5": float(ci_lo[i]),
+            "p97_5": float(ci_hi[i]),
         }
         for i, name in enumerate(param_names)
     }
@@ -364,13 +367,19 @@ def bootstrap_ci(*args: Any, **kwargs: Any) -> UncertaintyResult:
     if workers:  # pragma: no cover - workers ignored in this simplified impl
         log.debug("bootstrap_ci called with workers=%d (serial)", workers)
 
-    meta: Dict[str, object] = {
+    diagnostics: Dict[str, object] = {
         "n_resamples": int(n_boot),
         "seed": seed,
         "n_samples": int(samples_arr.shape[0]),
         "param_order": param_names,
     }
-    return UncertaintyResult(method="bootstrap", band=band, param_stats=param_stats, meta=meta)
+    return UncertaintyResult(
+        method="bootstrap",
+        method_label="Bootstrap (residual)",
+        params=params,
+        band=band,
+        diagnostics=diagnostics,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -501,12 +510,14 @@ def bayesian_ci(
         y0 = predict_full(theta)
         x = x_all if x_all is not None else np.arange(y0.size)
         band = (x, y0, y0) if return_band else None
-        param_stats = {
-            name: {"est": float(theta[i]), "sd": 0.0, "p2.5": float(theta[i]), "p97.5": float(theta[i])}
+        params = {
+            name: {"est": float(theta[i]), "sd": 0.0, "p2_5": float(theta[i]), "p97_5": float(theta[i])}
             for i, name in enumerate(param_names)
         }
-        meta = {"n_samples": 0, "param_order": param_names}
-        return UncertaintyResult("bayesian", band, param_stats, meta)
+        diagnostics = {"n_samples": 0, "param_order": param_names}
+        return UncertaintyResult(
+            "bayesian", "Bayesian (MCMC)", params, band, diagnostics
+        )
 
     n_walkers = max(n_walkers, 2 * ndim)
     rng = np.random.default_rng(seed)
@@ -562,23 +573,29 @@ def bayesian_ci(
     if np.any(ess < 200) or np.any(rhat > 1.1):
         warnings.warn("MCMC diagnostics indicate poor convergence", RuntimeWarning)
 
-    param_stats = {
+    params = {
         name: {
             "est": float(mean[i]),
             "sd": float(std[i]),
-            "p2.5": float(ci_lo[i]),
-            "p97.5": float(ci_hi[i]),
+            "p2_5": float(ci_lo[i]),
+            "p97_5": float(ci_hi[i]),
         }
         for i, name in enumerate(param_names)
     }
 
     band_tuple = band
 
-    meta: Dict[str, object] = {
+    diagnostics: Dict[str, object] = {
         "ess": {name: float(ess[i]) for i, name in enumerate(param_names)},
         "rhat": {name: float(rhat[i]) for i, name in enumerate(param_names)},
         "n_samples": int(samples_full.shape[0]),
         "n_chains": int(chain.shape[1]),
         "param_order": param_names,
     }
-    return UncertaintyResult(method="bayesian", band=band_tuple, param_stats=param_stats, meta=meta)
+    return UncertaintyResult(
+        method="bayesian",
+        method_label="Bayesian (MCMC)",
+        params=params,
+        band=band_tuple,
+        diagnostics=diagnostics,
+    )
