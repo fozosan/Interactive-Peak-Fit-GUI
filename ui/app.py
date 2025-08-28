@@ -216,9 +216,9 @@ from core import signals, data_io
 try:
     from core.uncertainty import UncertaintyResult, NotAvailable
 except Exception:  # pragma: no cover - NotAvailable may be absent
-    from core.uncertainty import UncertaintyResult  # type: ignore
+    from core.uncertainty import UncertaintyResult
 
-    class NotAvailable:  # pragma: no cover - fallback placeholder
+    class NotAvailable(Exception):
         pass
 from core.residuals import build_residual, jacobian_fd
 from core.fit_api import (
@@ -2942,68 +2942,40 @@ class PeakFitApp:
                 return res
             raise RuntimeError("Unknown method")
 
-        def done(result, error):
-            # Drop stale callbacks (auto asymptotic finishing after a newer user-triggered run)
-            if job_id != getattr(self, "_unc_job_id", 0):
-                self._progress_end("uncertainty")
-                return
-
+        def done(res, error):
             self._unc_running = False
             self._progress_end("uncertainty")
-
             if error is not None:
-                self.status_error(f"Uncertainty failed: {error}")
+                self.log(f"⚠ WARN — Uncertainty failed: {error}")
                 return
 
-            label = self._unc_pretty_label(result)
+            def _unc_label(obj):
+                if hasattr(obj, "method_label") and getattr(obj, "method_label"):
+                    return getattr(obj, "method_label")
+                if hasattr(obj, "method") and getattr(obj, "method"):
+                    return getattr(obj, "method")
+                if isinstance(obj, dict):
+                    return obj.get("method_label") or obj.get("method")
+                return None
 
-            # De-dupe “Computed …” for this job+label
-            if getattr(self, "_last_unc_log", None) == (job_id, label):
+            if isinstance(res, NotAvailable):
+                msg = "Bayesian MCMC requires emcee. Skipping. Details: " + str(getattr(res, "msg", "emcee not installed"))
+                self.log("ℹ INFO — " + msg)
                 return
-            self._last_unc_log = (job_id, label)
 
-            # Band
-            band = self._unc_extract_band(result)
-            if band is not None:
-                self.ci_band = band            # store as (x, lo, hi)
-                self.show_ci_band = True
+            label = _unc_label(res) or "unknown"
+
+            band = getattr(res, "band", None)
+            if band and self.show_ci_band:
                 try:
+                    x_b, lo_b, hi_b = band
+                    self.ci_band = (x_b, lo_b, hi_b)
                     self.refresh_plot()
-                except Exception:
-                    pass
-                self.status_info(f"Computed {label} uncertainty.")
-            else:
-                self.status_info(f"Computed {label} uncertainty. (no band)")
-                diag = getattr(result, "diagnostics", None)
-                if diag is None and isinstance(result, dict):
-                    diag = result.get("diagnostics")
-                reason = diag.get("band_reason") if isinstance(diag, dict) else None
-                if reason:
-                    self.status_warn(f"{label}: no band — {reason}")
+                except Exception as e:
+                    self.log(f"⚠ WARN — Could not render uncertainty band: {e}")
 
-            # Per-peak stats
-            try:
-                rows = self._unc_extract_stats(result)
-                if rows:
-                    for i, row in enumerate(rows, 1):
-                        def _fmt(v_est, v_sd):
-                            try:
-                                s_est = f"{float(v_est):.6g}" if v_est is not None else "n/a"
-                            except Exception:
-                                s_est = "n/a"
-                            try:
-                                s_sd = f"{float(v_sd):.3g}" if v_sd is not None else "n/a"
-                            except Exception:
-                                s_sd = "n/a"
-                            return s_est, s_sd
-                        c_est, c_sd = _fmt(row.get("center_est"), row.get("center_sd"))
-                        h_est, h_sd = _fmt(row.get("height_est"), row.get("height_sd"))
-                        w_est, w_sd = _fmt(row.get("fwhm_est"),  row.get("fwhm_sd"))
-                        self.status_info(
-                            f"Peak {i}: center={c_est} ± {c_sd} | height={h_est} ± {h_sd} | FWHM={w_est} ± {w_sd}"
-                        )
-            except Exception as _e:
-                self.status_warn(f"Uncertainty stats formatting skipped ({_e.__class__.__name__}).")
+            self.last_uncertainty = res
+            self.log(f"ℹ INFO — Computed {label} uncertainty.")
 
         self._unc_running = True
         self._unc_job_id += 1
