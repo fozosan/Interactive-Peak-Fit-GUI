@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable, Dict, Any
 
 import numpy as np
 
@@ -179,6 +179,13 @@ def run_fit_consistent(
             total = total + baseline
         return total
 
+    def _model_peaks(x_data: np.ndarray, *theta_vec: np.ndarray) -> np.ndarray:
+        pk = []
+        for i in range(len(peaks_out)):
+            c, h, fw, eta = theta_vec[4 * i : 4 * i + 4]
+            pk.append((h, c, fw, eta))
+        return performance.eval_total(x_data, pk)
+
     baseline_cfg = cfg.get("baseline", {})
     baseline_params = {
         "lam": baseline_cfg.get("lam"),
@@ -222,17 +229,16 @@ def run_fit_consistent(
         "fit_ok": bool(best_res.success if best_res is not None else False),
     }
 
+    names: list[str] = []
+    locked: list[bool] = []
+    for i, pk in enumerate(peaks_out):
+        names.extend([f"center{i+1}", f"height{i+1}", f"fwhm{i+1}", f"eta{i+1}"])
+        locked.extend([pk.lock_center, False, pk.lock_width, False])
+
     if return_jacobian:
         r0 = resid_fn(theta)
         J = jacobian_fd(resid_fn, theta)
         dof = max(r0.size - theta.size, 1)
-
-        # parameter meta information
-        names: list[str] = []
-        locked: list[bool] = []
-        for i, pk in enumerate(peaks_out):
-            names.extend([f"center{i+1}", f"height{i+1}", f"fwhm{i+1}", f"eta{i+1}"])
-            locked.extend([pk.lock_center, False, pk.lock_width, False])
 
         result.update(
             {
@@ -255,26 +261,52 @@ def run_fit_consistent(
             }
         )
 
-        if return_predictors:
-            x_all = x
-            baseline_all = baseline
-            x_fit = x[mask]
-            baseline_fit = baseline[mask] if (baseline is not None and mode == "add") else None
+    def _make_predict_full(
+        x_all: np.ndarray,
+        base_all: np.ndarray,
+        add_mode: bool,
+        model_peaks: Callable[..., np.ndarray],
+    ) -> Callable[[np.ndarray], np.ndarray]:
+        def predict_full(theta_vec: np.ndarray) -> np.ndarray:
+            theta_vec = np.asarray(theta_vec, float)
+            y_peaks = model_peaks(x_all, *theta_vec)
+            return (base_all + y_peaks) if add_mode else y_peaks
 
-            def predict_full(th: np.ndarray) -> np.ndarray:
-                return ymodel_fn(th)
+        return predict_full
 
-            def predict_fit(th: np.ndarray) -> np.ndarray:
-                pk = []
-                for i in range(len(peaks_out)):
-                    c, h, w, e = th[4 * i : 4 * i + 4]
-                    pk.append((h, c, w, e))
-                total = performance.eval_total(x_fit, pk)
-                if baseline_fit is not None:
-                    total = total + baseline_fit
-                return total
+    base_all = baseline if baseline is not None else np.zeros_like(x)
+    fit_ctx: Dict[str, Any] = {
+        "x_all": np.asarray(x, float),
+        "predict_full": _make_predict_full(
+            np.asarray(x, float),
+            np.asarray(base_all, float),
+            bool(mode == "add"),
+            _model_peaks,
+        ),
+        "theta_hat": np.asarray(theta, float),
+        "param_names": list(names),
+    }
+    result["fit_ctx"] = fit_ctx
 
-            result.update({"predict_fit": predict_fit, "predict_full": predict_full})
+    if return_predictors:
+        x_all = x
+        baseline_all = baseline
+        x_fit = x[mask]
+        baseline_fit = baseline[mask] if (baseline is not None and mode == "add") else None
+
+        predict_full = fit_ctx["predict_full"]
+
+        def predict_fit(th: np.ndarray) -> np.ndarray:
+            pk = []
+            for i in range(len(peaks_out)):
+                c, h, w, e = th[4 * i : 4 * (i + 1)]
+                pk.append((h, c, w, e))
+            total = performance.eval_total(x_fit, pk)
+            if baseline_fit is not None:
+                total = total + baseline_fit
+            return total
+
+        result.update({"predict_fit": predict_fit, "predict_full": predict_full})
 
     return result
 
