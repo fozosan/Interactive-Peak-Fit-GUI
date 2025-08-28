@@ -1633,7 +1633,7 @@ class PeakFitApp:
         text = (str(lbl) if lbl else "").lower()
 
         # Map common aliases
-        if "asym" in text or "j^t" in text or "jtj" in text:
+        if "asym" in text or "j" in text and "t" in text and "j" in text:  # covers "jtj", "j^t j"
             return "Asymptotic (JᵀJ)"
         if "boot" in text or "resid" in text:
             return "Bootstrap (residual)"
@@ -1676,6 +1676,123 @@ class PeakFitApp:
                         return (x, lo, hi)
                 except Exception:
                     pass
+        return None
+
+    def _unc_extract_stats(self, result):
+        """
+        Return list of per-peak dicts with keys:
+          center_est, center_sd, height_est, height_sd, fwhm_est, fwhm_sd
+        Supports:
+          - result.stats / parameters / param_stats
+          - list-of-dicts rows
+          - dict {'center': {'est':[...],'sd':[...]} , ...}
+          - flat dict-of-lists {'center_est':[...], 'height_sd':[...], ...}
+        """
+        import math
+
+        def _pick_idx(container, i, *keys):
+            # pick container[key][i] for first existing key; tolerate short arrays
+            for k in keys:
+                v = container.get(k)
+                if v is None:
+                    continue
+                try:
+                    return v[i]
+                except Exception:
+                    # could be scalar
+                    try:
+                        return v
+                    except Exception:
+                        pass
+            return None
+
+        def _coerce_row(row):
+            # row may be nested: {'center': {'est':..,'sd':..}, 'height': {...}, 'fwhm': {...}}
+            out = {}
+            # nested blocks
+            for pname in ("center", "height", "fwhm"):
+                blk = row.get(pname)
+                if isinstance(blk, dict):
+                    est = blk.get("est") or blk.get("mean") or blk.get("median") or blk.get("value")
+                    sd  = blk.get("sd")  or blk.get("std")  or blk.get("se")
+                    if est is not None: out[f"{pname}_est"] = est
+                    if sd  is not None: out[f"{pname}_sd"]  = sd
+            # flat fallbacks
+            for pname in ("center", "height", "fwhm"):
+                for k in (f"{pname}_est", pname):
+                    if k in row and row[k] is not None:
+                        out.setdefault(f"{pname}_est", row[k])
+                        break
+                for k in (f"{pname}_sd", f"{pname}_std", f"{pname}_se"):
+                    if k in row and row[k] is not None:
+                        out.setdefault(f"{pname}_sd", row[k])
+                        break
+            return out
+
+        # locate stats object
+        stats = None
+        for attr in ("stats", "parameters", "param_stats"):
+            if hasattr(result, attr):
+                stats = getattr(result, attr)
+                break
+        if stats is None and isinstance(result, dict):
+            for k in ("stats", "parameters", "param_stats"):
+                if k in result:
+                    stats = result[k]
+                    break
+        if stats is None:
+            return None
+
+        # case A: list-of-dicts
+        if isinstance(stats, (list, tuple)):
+            rows = []
+            for row in stats:
+                if isinstance(row, dict):
+                    rows.append(_coerce_row(row))
+            return rows if rows else None
+
+        # case B: dict form
+        if isinstance(stats, dict):
+            # B1) block-of-arrays: {'center': {'est':[...],'sd':[...]} , ...}
+            if all(k in stats for k in ("center", "height", "fwhm")) and \
+               all(isinstance(stats[k], dict) for k in ("center", "height", "fwhm")):
+                n = 0
+                for pname in ("center", "height", "fwhm"):
+                    for key in ("est", "mean", "median", "value"):
+                        v = stats[pname].get(key)
+                        if hasattr(v, "__len__"):
+                            n = max(n, len(v))
+                rows = []
+                for i in range(n):
+                    row = {
+                        "center": {"est": _pick_idx(stats["center"], i, "est", "mean", "median", "value"),
+                                   "sd":  _pick_idx(stats["center"], i, "sd", "std", "se")},
+                        "height": {"est": _pick_idx(stats["height"], i, "est", "mean", "median", "value"),
+                                   "sd":  _pick_idx(stats["height"], i, "sd", "std", "se")},
+                        "fwhm":   {"est": _pick_idx(stats["fwhm"],   i, "est", "mean", "median", "value"),
+                                   "sd":  _pick_idx(stats["fwhm"],   i, "sd", "std", "se")},
+                    }
+                    rows.append(_coerce_row(row))
+                return rows
+            # B2) flat dict-of-lists: {'center_est':[...], 'height_sd':[...], ...}
+            # compute max length
+            n = 0
+            for v in stats.values():
+                if hasattr(v, "__len__") and not isinstance(v, (str, bytes)):
+                    n = max(n, len(v))
+            if n == 0:
+                return None
+            rows = []
+            for i in range(n):
+                row = {}
+                for k, v in stats.items():
+                    try:
+                        row[k] = v[i] if hasattr(v, "__getitem__") else v
+                    except Exception:
+                        row[k] = v
+                rows.append(_coerce_row(row))
+            return rows
+
         return None
 
     def run_in_thread(self, fn, on_done):
@@ -2826,36 +2943,30 @@ class PeakFitApp:
             raise RuntimeError("Unknown method")
 
         def done(result, error):
-            # Always stop the spinner and mark idle
-            try:
-                self._unc_running = False
-            except Exception:
-                pass
+            # Drop stale callbacks (auto asymptotic finishing after a newer user-triggered run)
+            if job_id != getattr(self, "_unc_job_id", 0):
+                self._progress_end("uncertainty")
+                return
+
+            self._unc_running = False
             self._progress_end("uncertainty")
 
             if error is not None:
                 self.status_error(f"Uncertainty failed: {error}")
                 return
 
-            # Pretty label
             label = self._unc_pretty_label(result)
 
-            # De-duplicate identical completion logs for this job
-            jid = getattr(self, "_unc_job_id", 0)
-            if getattr(self, "_last_unc_log", None) == (jid, label):
-                # Same job + label already reported; ignore duplicate callback
+            # De-dupe “Computed …” for this job+label
+            if getattr(self, "_last_unc_log", None) == (job_id, label):
                 return
-            self._last_unc_log = (jid, label)
+            self._last_unc_log = (job_id, label)
 
-            # Try to extract and show band
+            # Band
             band = self._unc_extract_band(result)
             if band is not None:
-                self.ci_band = band
-                try:
-                    self.show_ci_band = True
-                except Exception:
-                    pass
-                # Redraw
+                self.ci_band = band            # store as (x, lo, hi)
+                self.show_ci_band = True
                 try:
                     self.refresh_plot()
                 except Exception:
@@ -2864,90 +2975,33 @@ class PeakFitApp:
             else:
                 self.status_info(f"Computed {label} uncertainty. (no band)")
 
-            # Optional: log per-peak stats if present (robust to shapes)
+            # Per-peak stats
             try:
-                stats = None
-                # attribute forms
-                for attr in ("stats", "parameters", "param_stats"):
-                    if hasattr(result, attr):
-                        stats = getattr(result, attr)
-                        break
-                # dict forms
-                if stats is None and isinstance(result, dict):
-                    for k in ("stats", "parameters", "param_stats"):
-                        if k in result:
-                            stats = result[k]
-                            break
-                # stats expected as list[dict] per-peak or dict of lists
-                if stats:
-                    # normalize to list-of-dicts per peak
-                    if isinstance(stats, dict):
-                        # Convert columnar dict -> per-peak dicts (best-effort)
-                        n = 0
-                        for v in stats.values():
+                rows = self._unc_extract_stats(result)
+                if rows:
+                    for i, row in enumerate(rows, 1):
+                        def _fmt(v_est, v_sd):
                             try:
-                                n = max(n, len(v))
+                                s_est = f"{float(v_est):.6g}" if v_est is not None else "n/a"
                             except Exception:
-                                pass
-                        rows = []
-                        for i in range(n):
-                            row = {}
-                            for k, v in stats.items():
-                                try:
-                                    row[k] = v[i]
-                                except Exception:
-                                    pass
-                            rows.append(row)
-                        stats_rows = rows
-                    else:
-                        stats_rows = list(stats)
-
-                    def _get(row, *keys, default="n/a"):
-                        for k in keys:
-                            if k in row and row[k] is not None:
-                                return row[k]
-                        return default
-
-                    for i, row in enumerate(stats_rows, 1):
-                        c_est = _get(row, "center_est", "center", default="n/a")
-                        c_sd  = _get(row, "center_sd", "center_std", "center_se", default="n/a")
-                        h_est = _get(row, "height_est", "height", default="n/a")
-                        h_sd  = _get(row, "height_sd", "height_std", "height_se", default="n/a")
-                        w_est = _get(row, "fwhm_est", "fwhm", default="n/a")
-                        w_sd  = _get(row, "fwhm_sd", "fwhm_std", "fwhm_se", default="n/a")
-                        try:
-                            c_est = f"{float(c_est):.6g}" if c_est != "n/a" else c_est
-                        except Exception:
-                            pass
-                        try:
-                            c_sd  = f"{float(c_sd):.3g}" if c_sd  != "n/a" else c_sd
-                        except Exception:
-                            pass
-                        try:
-                            h_est = f"{float(h_est):.6g}" if h_est != "n/a" else h_est
-                        except Exception:
-                            pass
-                        try:
-                            h_sd  = f"{float(h_sd):.3g}" if h_sd  != "n/a" else h_sd
-                        except Exception:
-                            pass
-                        try:
-                            w_est = f"{float(w_est):.6g}" if w_est != "n/a" else w_est
-                        except Exception:
-                            pass
-                        try:
-                            w_sd  = f"{float(w_sd):.3g}" if w_sd  != "n/a" else w_sd
-                        except Exception:
-                            pass
+                                s_est = "n/a"
+                            try:
+                                s_sd = f"{float(v_sd):.3g}" if v_sd is not None else "n/a"
+                            except Exception:
+                                s_sd = "n/a"
+                            return s_est, s_sd
+                        c_est, c_sd = _fmt(row.get("center_est"), row.get("center_sd"))
+                        h_est, h_sd = _fmt(row.get("height_est"), row.get("height_sd"))
+                        w_est, w_sd = _fmt(row.get("fwhm_est"),  row.get("fwhm_sd"))
                         self.status_info(
                             f"Peak {i}: center={c_est} ± {c_sd} | height={h_est} ± {h_sd} | FWHM={w_est} ± {w_sd}"
                         )
             except Exception as _e:
-                # Don't crash UI if stats shape is unexpected
                 self.status_warn(f"Uncertainty stats formatting skipped ({_e.__class__.__name__}).")
 
         self._unc_running = True
         self._unc_job_id += 1
+        job_id = self._unc_job_id
         self._progress_begin("uncertainty")
         self.status_info("Computing uncertainty…")
         self.run_in_thread(work, done)
@@ -3257,9 +3311,20 @@ class PeakFitApp:
             lo, hi = sorted((self.fit_xmin, self.fit_xmax))
             self.ax.axvspan(lo, hi, color="0.8", alpha=0.25, lw=0)
 
-        if self.show_ci_band and self.ci_band is not None:
-            xb, lob, hib, _ = self.ci_band
-            self.ax.fill_between(xb, lob, hib, alpha=0.18, label="Uncertainty band")
+        if getattr(self, "show_ci_band", False) and getattr(self, "ci_band", None) is not None:
+            try:
+                # Accept (x, lo, hi) or (x, lo, hi, method)
+                if len(self.ci_band) == 3:
+                    xb, lob, hib = self.ci_band
+                elif len(self.ci_band) >= 3:
+                    xb, lob, hib = self.ci_band[0], self.ci_band[1], self.ci_band[2]
+                else:
+                    xb = lob = hib = None
+                if xb is not None and lob is not None and hib is not None:
+                    self.ax.fill_between(xb, lob, hib, alpha=0.18, label="Uncertainty band")
+            except Exception:
+                # be robust: never crash plot
+                pass
 
         # Legend toggle
         leg = self.ax.get_legend()
