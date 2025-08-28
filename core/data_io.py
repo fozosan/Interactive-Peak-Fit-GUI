@@ -200,6 +200,25 @@ def write_dataframe(df: pd.DataFrame, path: Path) -> None:
         df.to_csv(fh, index=False, lineterminator="\n")
 
 
+class _DictResult(UncertaintyResult):
+    """Shim exposing custom method labels for legacy dict results."""
+
+    def __init__(
+        self,
+        method: str,
+        band,
+        param_stats: Dict[str, Dict[str, float]],
+        meta: Dict[str, object],
+        label: str,
+    ) -> None:
+        super().__init__(method, band, param_stats, meta)
+        self._label = label
+
+    @property
+    def method_label(self) -> str:  # type: ignore[override]
+        return self._label
+
+
 def _ensure_result(unc: Union[UncertaintyResult, dict]) -> UncertaintyResult:
     if isinstance(unc, UncertaintyResult):
         return unc
