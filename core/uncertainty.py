@@ -221,7 +221,7 @@ def asymptotic_ci(
     x = np.arange(y0.size)
 
     names = [f"p{i}" for i in range(theta.size)]
-    params = {
+    param_stats = {
         n: {
             "est": float(theta[i]),
             "sd": float(std[i]),
@@ -345,7 +345,7 @@ def bootstrap_ci(*args: Any, **kwargs: Any) -> UncertaintyResult:
     ci_lo[locked] = theta[locked]
     ci_hi[locked] = theta[locked]
 
-    params = {
+    param_stats = {
         name: {
             "est": float(mean[i]),
             "sd": float(std[i]),
