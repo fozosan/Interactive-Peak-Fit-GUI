@@ -12,7 +12,6 @@ import glob
 from pathlib import Path
 from typing import Iterable, Sequence, List
 
-import math
 import csv
 import os
 import copy
@@ -23,104 +22,8 @@ if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safegu
     os.environ.setdefault("MPLBACKEND", "Agg")
 
 from core import data_io, models, peaks, signals, fit_api
-from core.residuals import build_residual, jacobian_fd
-from uncertainty import bootstrap
-
-
-def _asymptotic_uncertainty(x, y_target, baseline, fitted, mode):
-    try:
-        theta = []
-        for p in fitted:
-            theta.extend([p.center, p.height, p.fwhm, p.eta])
-        theta = np.asarray(theta, float)
-        resid_fn = build_residual(x, y_target, fitted, mode, baseline, "linear", None)
-        J = jacobian_fd(resid_fn, theta)
-        r0 = resid_fn(theta)
-        rss = float(np.dot(r0, r0))
-        m = r0.size
-        jtj = J.T @ J
-        try:
-            cov = np.linalg.inv(jtj)
-        except np.linalg.LinAlgError:
-            cov = np.linalg.pinv(jtj)
-        dof = max(m - theta.size, 1)
-        sigma2 = rss / dof
-        cov *= sigma2
-        sigma = np.sqrt(np.diag(cov))
-
-        def ymodel(th):
-            tmp = []
-            for i in range(len(fitted)):
-                c, h, w, e = th[4 * i : 4 * i + 4]
-                tmp.append(peaks.Peak(c, h, w, e))
-            total = models.pv_sum(x, tmp)
-            if baseline is not None:
-                total = total + baseline
-            return total
-
-        y0 = ymodel(theta)
-        G = np.empty((x.size, theta.size), float)
-        for j in range(theta.size):
-            step = 1e-6 * max(1.0, abs(theta[j]))
-            tp = theta.copy()
-            tp[j] += step
-            G[:, j] = (ymodel(tp) - y0) / step
-        var = np.einsum('ij,jk,ik->i', G, cov, G)
-        band_std = np.sqrt(np.maximum(var, 0.0))
-        z = 1.96
-        lo = y0 - z * band_std
-        hi = y0 + z * band_std
-        return sigma, (x, lo, hi, y0), {"dof": dof, "s2": sigma2, "rmse": math.sqrt(rss / m)}
-    except Exception:
-        return np.full(4 * len(fitted), np.nan), None, {"dof": np.nan, "s2": np.nan, "rmse": np.nan}
-
-
-def _asymptotic_uncertainty(x, y_target, baseline, fitted, mode):
-    try:
-        theta = []
-        for p in fitted:
-            theta.extend([p.center, p.height, p.fwhm, p.eta])
-        theta = np.asarray(theta, float)
-        resid_fn = build_residual(x, y_target, fitted, mode, baseline, "linear", None)
-        J = jacobian_fd(resid_fn, theta)
-        r0 = resid_fn(theta)
-        rss = float(np.dot(r0, r0))
-        m = r0.size
-        jtj = J.T @ J
-        try:
-            cov = np.linalg.inv(jtj)
-        except np.linalg.LinAlgError:
-            cov = np.linalg.pinv(jtj)
-        dof = max(m - theta.size, 1)
-        sigma2 = rss / dof
-        cov *= sigma2
-        sigma = np.sqrt(np.diag(cov))
-
-        def ymodel(th):
-            tmp = []
-            for i in range(len(fitted)):
-                c, h, w, e = th[4 * i : 4 * i + 4]
-                tmp.append(peaks.Peak(c, h, w, e))
-            total = models.pv_sum(x, tmp)
-            if baseline is not None:
-                total = total + baseline
-            return total
-
-        y0 = ymodel(theta)
-        G = np.empty((x.size, theta.size), float)
-        for j in range(theta.size):
-            step = 1e-6 * max(1.0, abs(theta[j]))
-            tp = theta.copy()
-            tp[j] += step
-            G[:, j] = (ymodel(tp) - y0) / step
-        var = np.einsum('ij,jk,ik->i', G, cov, G)
-        band_std = np.sqrt(np.maximum(var, 0.0))
-        z = 1.96
-        lo = y0 - z * band_std
-        hi = y0 + z * band_std
-        return sigma, (x, lo, hi, y0), {"dof": dof, "s2": sigma2, "rmse": math.sqrt(rss / m)}
-    except Exception:
-        return np.full(4 * len(fitted), np.nan), None, {"dof": np.nan, "s2": np.nan, "rmse": np.nan}
+from core.residuals import build_residual
+from core import uncertainty as unc
 
 
 def _auto_seed(x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: int = 5) -> List[peaks.Peak]:
@@ -148,7 +51,15 @@ def _auto_seed(x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: in
     return found
 
 
-def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
+def run_batch(
+    patterns: Iterable[str],
+    config: dict,
+    *,
+    compute_uncertainty: bool = False,
+    unc_method: str = "asymptotic",
+    progress=None,
+    log=None,
+) -> tuple[int, int]:
     """Run the peak fitting pipeline over matching files.
 
     Parameters
@@ -187,7 +98,6 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
     source = config.get("source", "template")
     reheight = bool(config.get("reheight", False))
     auto_max = int(config.get("auto_max", 5))
-    unc_method = config.get("unc_method", "asymptotic")
     unc_workers = int(config.get("unc_workers", 0))
     if unc_workers <= 0:
         unc_workers = int(config.get("perf_max_workers", 0)) or os.cpu_count() or 1
@@ -272,6 +182,8 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
             reheight=reheight,
             rng_seed=seed,
             verbose=bool(log),
+            return_jacobian=compute_uncertainty,
+            return_predictors=compute_uncertainty,
         )
 
         fitted = res["peaks_out"]
@@ -351,96 +263,61 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
             records.append(rec)
             local_records.append(rec)
 
-        if res["fit_ok"]:
-            x_fit = x[mask]
-            y_target = (y if mode == "add" else y - baseline)[mask]
-            base_resid = baseline[mask] if mode == "add" else None
-            if unc_method == "bootstrap":
-                try:
-                    theta = []
-                    for pk in fitted:
-                        theta.extend([pk.center, pk.height, pk.fwhm, pk.eta])
-                    theta = np.asarray(theta, float)
-                    resid_fn = build_residual(x_fit, y_target, fitted, mode, base_resid, "linear", None)
-                    cfg_boot = {
-                        "x": x_fit,
-                        "y": y_target,
-                        "peaks": fitted,
-                        "mode": mode,
-                        "baseline": base_resid,
-                        "theta": theta,
-                        "options": config.get(solver_name, {}),
-                        "n": 100,
-                        "workers": unc_workers,
-                    }
-                    boot_res = bootstrap.bootstrap(solver_name, cfg_boot, resid_fn)
-                    cov = boot_res["params"].get("cov", np.zeros((theta.size, theta.size)))
-                    sigma = np.sqrt(np.diag(cov)) if cov.size else np.full(theta.size, np.nan)
-                    info = {"dof": np.nan, "rmse": boot_res.get("meta", {}).get("rmse", rmse)}
-                    _band = None
-                except Exception:
-                    sigma = np.full(4 * len(fitted), np.nan)
-                    info = {"dof": np.nan, "rmse": rmse}
-                    _band = None
-            else:
-                sigma, _band, info = _asymptotic_uncertainty(x_fit, y_target, base_resid, fitted, mode)
-        else:
-            sigma = np.full(4 * len(fitted), np.nan)
-            info = {"dof": np.nan, "rmse": rmse}
-            _band = None
-        z = 1.96
-        unc_rows_file = []
-        for idx, p in enumerate(fitted, start=1):
-            sc = sigma[4 * (idx - 1)] if sigma.size >= 4 * idx else np.nan
-            sh = sigma[4 * (idx - 1) + 1] if sigma.size >= 4 * idx + 1 else np.nan
-            sf = sigma[4 * (idx - 1) + 2] if sigma.size >= 4 * idx + 2 else np.nan
-            se = sigma[4 * (idx - 1) + 3] if sigma.size >= 4 * idx + 3 else np.nan
-            if p.lock_center:
-                sc = np.nan
-            if p.lock_width:
-                sf = np.nan
-            params = [
-                ("center", p.center, sc, not p.lock_center),
-                ("height", p.height, sh, True),
-                ("fwhm", p.fwhm, sf, not p.lock_width),
-                ("eta", p.eta, se, True),
-            ]
-            for pname, val, std, free in params:
-                if free and np.isfinite(std):
-                    ci_lo, ci_hi = val - z * std, val + z * std
-                else:
-                    ci_lo = ci_hi = np.nan
-                row_unc = {
-                    "file": Path(path).name,
-                    "peak": idx,
-                    "param": pname,
-                    "value": val,
-                    "stderr": std if np.isfinite(std) else np.nan,
-                    "ci_lo": ci_lo,
-                    "ci_hi": ci_hi,
-                    "method": "asymptotic",
-                    "rmse": rmse,
-                    "dof": info.get("dof", np.nan),
-                }
-                unc_rows.append(row_unc)
-                unc_rows_file.append(row_unc)
-
         fit_csv = data_io.build_peak_table(local_records)
         with (out_dir / f"{Path(path).stem}_fit.csv").open("w", encoding="utf-8", newline="") as fh:
             fh.write(fit_csv)
-        data_io.write_dataframe(pd.DataFrame(unc_rows_file), out_dir / f"{Path(path).stem}_uncertainty.csv")
-        lines = [f"File: {Path(path).name}", "Uncertainty method: Asymptotic"]
-        seen_peaks: set[int] = set()
-        for row in unc_rows_file:
-            if row["peak"] not in seen_peaks:
-                lines.append(f"Peak {row['peak']}")
-                seen_peaks.add(row["peak"])
-            if np.isfinite(row["stderr"]):
-                lines.append(f"  {row['param']} \u00b1 {row['stderr']:.3g}")
-            else:
-                lines.append(f"  {row['param']} (fixed)")
-        with (out_dir / f"{Path(path).stem}_uncertainty.txt").open("w", encoding="utf-8", newline="") as fh:
-            fh.write("\n".join(lines) + "\n")
+
+        unc_res = None
+        if compute_uncertainty and res["fit_ok"]:
+            try:
+                if "boot" in unc_method.lower():
+                    unc_res = unc.bootstrap_ci(fit_ctx=res, n_boot=100, workers=unc_workers)
+                elif "bayes" in unc_method.lower() or "mcmc" in unc_method.lower():
+                    unc_res = unc.bayesian_ci(fit_ctx=res)
+                else:
+                    unc_res = unc.asymptotic_ci(
+                        res["theta"], res["residual_fn"], res["jacobian"], res["ymodel_fn"]
+                    )
+            except Exception:
+                unc_res = None
+
+        if compute_uncertainty and unc_res is not None:
+            stem = Path(path).stem
+            data_io.write_uncertainty_txt(
+                out_dir / f"{stem}_uncertainty.txt",
+                unc_res,
+                peaks=fitted,
+                method_label=unc_method,
+            )
+            data_io.write_uncertainty_csv(
+                out_dir / f"{stem}_uncertainty.csv",
+                unc_res,
+                peaks=fitted,
+                method_label=unc_method,
+            )
+            band = getattr(unc_res, "band", None)
+            if band is not None:
+                xb, lob, hib = band
+                with (out_dir / f"{stem}_uncertainty_band.csv").open("w", newline="", encoding="utf-8") as fh:
+                    bw = csv.writer(fh, lineterminator="\n")
+                    bw.writerow(["x", "y_lo95", "y_hi95"])
+                    for xi, lo, hi in zip(xb, lob, hib):
+                        bw.writerow([xi, lo, hi])
+            for row in data_io._iter_param_rows(unc_res, fitted, unc_method):
+                unc_rows.append(
+                    {
+                        "file": Path(path).name,
+                        "peak": row.get("peak"),
+                        "param": row.get("param"),
+                        "value": row.get("est"),
+                        "stderr": row.get("sd"),
+                        "ci_lo": row.get("p2_5"),
+                        "ci_hi": row.get("p97_5"),
+                        "method": unc_method,
+                        "rmse": rmse,
+                        "dof": np.nan,
+                    }
+                )
 
         trace_path = None
         if save_traces:
@@ -448,14 +325,6 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
             trace_path = out_dir / f"{Path(path).stem}_trace.csv"
             with trace_path.open("w", encoding="utf-8", newline="") as fh:
                 fh.write(trace_csv)
-        if _band is not None:
-            xb, lob, hib, yfit = _band
-            band_path = out_dir / f"{Path(path).stem}_uncertainty_band.csv"
-            with band_path.open("w", newline="", encoding="utf-8") as fh:
-                bw = csv.writer(fh, lineterminator="\n")
-                bw.writerow(["x", "y_fit", "y_lo95", "y_hi95"])
-                for xi, yi, lo, hi in zip(xb, yfit, lob, hib):
-                    bw.writerow([xi, yi, lo, hi])
         if log:
             msg = f"{Path(path).name}: {'ok' if res['fit_ok'] else 'fail'} rmse={rmse:.3g}"
             if trace_path:
@@ -467,12 +336,13 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None) -> None:
     peak_csv = data_io.build_peak_table(records)
     with peak_output.open("w", encoding="utf-8", newline="") as fh:
         fh.write(peak_csv)
-    data_io.write_dataframe(pd.DataFrame(unc_rows), unc_output)
+    if compute_uncertainty and unc_rows:
+        data_io.write_dataframe(pd.DataFrame(unc_rows), unc_output)
 
     return ok, total
 
 
-def run_batch(
+def run_from_dir(
     *,
     input_dir: str,
     pattern: str = "*.csv",
@@ -519,5 +389,17 @@ def run_batch(
         cfg["perf_numba"] = False
         cfg["perf_max_workers"] = 0
 
-    run(patterns, cfg)
+    run_batch(patterns, cfg)
+
+
+def run(patterns: Iterable[str], config: dict, progress=None, log=None):
+    """Compatibility wrapper using legacy signature."""
+    return run_batch(
+        patterns,
+        config,
+        compute_uncertainty=True,
+        unc_method=config.get("unc_method", "asymptotic"),
+        progress=progress,
+        log=log,
+    )
 
