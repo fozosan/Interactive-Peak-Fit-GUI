@@ -59,6 +59,7 @@ def run_batch(
     unc_method: str = "asymptotic",
     progress=None,
     log=None,
+    abort_evt=None,
 ) -> tuple[int, int]:
     """Run the peak fitting pipeline over matching files.
 
@@ -123,8 +124,11 @@ def run_batch(
     records = []
     unc_rows = []
     ok = 0
+    processed = 0
 
     for i, path in enumerate(files, 1):
+        if abort_evt is not None and abort_evt.is_set():
+            break
         if progress:
             progress(i, total, path)
         x, y = data_io.load_xy(path)
@@ -332,6 +336,7 @@ def run_batch(
             log(msg)
         if res["fit_ok"]:
             ok += 1
+        processed = i
 
     peak_csv = data_io.build_peak_table(records)
     with peak_output.open("w", encoding="utf-8", newline="") as fh:
@@ -339,7 +344,7 @@ def run_batch(
     if compute_uncertainty and unc_rows:
         data_io.write_dataframe(pd.DataFrame(unc_rows), unc_output)
 
-    return ok, total
+    return ok, processed
 
 
 def run_from_dir(
