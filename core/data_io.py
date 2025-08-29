@@ -5,7 +5,8 @@ artifacts. Implementations follow the Peakfit 3.x blueprint.
 """
 from __future__ import annotations
 
-from typing import Dict, Iterable, Tuple, Union, Any, Optional, List
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import csv
 import io
@@ -200,8 +201,168 @@ def write_dataframe(df: pd.DataFrame, path: Path) -> None:
     with path.open("w", newline="", encoding="utf-8") as fh:
         df.to_csv(fh, index=False, lineterminator="\n")
 
+_Z = 1.96  # 95% normal approx
 
-_Z = 1.96  # 95% normal
+
+def _to_float_or_nan(x):
+    try:
+        if x is None:
+            return float("nan")
+        if hasattr(x, "item"):
+            return float(x.item())
+        return float(x)
+    except Exception:
+        return float("nan")
+
+
+def _ci_from_sd(est, sd, z=_Z):
+    est = _to_float_or_nan(est)
+    sd = _to_float_or_nan(sd)
+    if not math.isfinite(est) or not math.isfinite(sd):
+        return (float("nan"), float("nan"))
+    return (est - z * sd, est + z * sd)
+
+
+def _pick(d: Dict, *keys, default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+
+def _stats_for_param(rec: Dict, p: str):
+    """Return (est, sd, q_lo, q_hi) from a per-peak record that may be nested or flat."""
+    node = rec.get("stats", rec)  # tolerate either
+    if isinstance(node.get(p), dict):
+        pdct = node[p]
+        return (
+            _pick(pdct, "est", "mean", default=float("nan")),
+            _pick(pdct, "sd", "stderr", "std", default=float("nan")),
+            _pick(pdct, "p2_5", "q2_5", "q025", default=float("nan")),
+            _pick(pdct, "p97_5", "q97_5", "q975", default=float("nan")),
+        )
+    return (
+        _pick(node, f"{p}_est", default=float("nan")),
+        _pick(node, f"{p}_sd", f"{p}_stderr", default=float("nan")),
+        _pick(node, f"{p}_p2_5", f"{p}_q2_5", f"{p}_q025", default=float("nan")),
+        _pick(node, f"{p}_p97_5", f"{p}_q97_5", f"{p}_q975", default=float("nan")),
+    )
+
+
+def build_uncertainty_rows(
+    file_path: str,
+    method_label: str,
+    rmse: Optional[float],
+    dof: Optional[int],
+    per_peak_stats: List[Dict],
+    method_meta: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build unified long-form rows:
+      file, peak, param, value, stderr, ci_lo, ci_hi, method, rmse, dof,
+      p2_5, p97_5, backend, n_draws, n_boot, ess, rhat
+    method_meta may include backend/n_draws/n_boot/ess/rhat; missing -> empty.
+    """
+    meta = method_meta or {}
+    rows: List[Dict[str, Any]] = []
+    mlabel = (method_label or "").strip()
+
+    for k, rec in enumerate(per_peak_stats, 1):
+        for param in ("center", "height", "fwhm", "eta"):
+            est, sd, qlo, qhi = _stats_for_param(rec, param)
+
+            if math.isfinite(_to_float_or_nan(qlo)) and math.isfinite(_to_float_or_nan(qhi)):
+                ci_lo, ci_hi = _to_float_or_nan(qlo), _to_float_or_nan(qhi)
+            else:
+                ci_lo, ci_hi = _ci_from_sd(est, sd)
+
+            rows.append(
+                {
+                    "file": str(file_path),
+                    "peak": k,
+                    "param": param,
+                    "value": _to_float_or_nan(est),
+                    "stderr": _to_float_or_nan(sd),
+                    "ci_lo": _to_float_or_nan(ci_lo),
+                    "ci_hi": _to_float_or_nan(ci_hi),
+                    "method": mlabel.lower().replace(" (jᵀj)", "").replace(" (j^tj)", ""),
+                    "rmse": _to_float_or_nan(rmse),
+                    "dof": _to_float_or_nan(dof),
+                    "p2_5": _to_float_or_nan(qlo),
+                    "p97_5": _to_float_or_nan(qhi),
+                    "backend": meta.get("backend", ""),
+                    "n_draws": meta.get("n_draws", ""),
+                    "n_boot": meta.get("n_boot", ""),
+                    "ess": meta.get("ess", ""),
+                    "rhat": meta.get("rhat", ""),
+                }
+            )
+    return rows
+
+
+def _write_uncertainty_csv(path: str, rows: List[Dict[str, Any]]):
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "file",
+            "peak",
+            "param",
+            "value",
+            "stderr",
+            "ci_lo",
+            "ci_hi",
+            "method",
+            "rmse",
+            "dof",
+            "p2_5",
+            "p97_5",
+            "backend",
+            "n_draws",
+            "n_boot",
+            "ess",
+            "rhat",
+        ],
+    )
+    df.to_csv(path, index=False, lineterminator="\n")
+
+
+def _write_uncertainty_txt(
+    path: str,
+    file_path: str,
+    method_label: str,
+    solver_meta: str,
+    baseline_meta: str,
+    perf_meta: str,
+    per_peak_stats: List[Dict],
+    z: float = _Z,
+):
+    def fmt(v, nd=6):
+        f = _to_float_or_nan(v)
+        return "n/a" if not math.isfinite(f) else f"{f:.{nd}g}"
+
+    lines = []
+    lines.append(f"File: {file_path}")
+    lines.append(f"Uncertainty method: {method_label.lower()}")
+    lines.append(solver_meta)
+    lines.append(baseline_meta)
+    lines.append(perf_meta)
+    lines.append("Peaks:")
+    for k, rec in enumerate(per_peak_stats, 1):
+        lines.append(f"Peak {k}")
+        for param, label in (("center", "center"), ("height", "height"), ("fwhm", "fwhm"), ("eta", "eta")):
+            est, sd, qlo, qhi = _stats_for_param(rec, param)
+            if math.isfinite(_to_float_or_nan(qlo)) and math.isfinite(_to_float_or_nan(qhi)):
+                lo, hi = qlo, qhi
+            else:
+                lo, hi = _ci_from_sd(est, sd, z)
+            if param == "fwhm" and rec.get("lock_width") is True:
+                lines.append(f"  {label:<6}= {fmt(est)} (fixed)")
+            elif param == "center" and rec.get("lock_center") is True:
+                lines.append(f"  {label:<6}= {fmt(est)} (fixed)")
+            else:
+                lines.append(f"  {label:<6}= {fmt(est)} \u00b1 {fmt(sd)}   (95% CI: [{fmt(lo)}, {fmt(hi)}])")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def _normalize_band(result: Any) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -392,152 +553,43 @@ def _ensure_result(unc: Union[UncertaintyResult, dict]) -> UncertaintyResult:
         diagnostics=diagnostics,
         band=band,
     )
+def _rows_to_per_peak_stats(result, peaks):
+    by_peak: Dict[int, Dict[str, Any]] = {}
+    for r in _iter_peak_param_stats(result, peaks or []):
+        pk = by_peak.setdefault(r["peak"], {})
+        pk.setdefault("stats", {})
+        pk["stats"].setdefault(r["param"], {})
+        if r.get("value") is not None:
+            pk["stats"][r["param"]]["est"] = r.get("value")
+            pk[r["param"]] = r.get("value")
+        if r.get("stderr") is not None:
+            pk["stats"][r["param"]]["sd"] = r.get("stderr")
+        if r.get("p2_5") is not None:
+            pk["stats"][r["param"]]["p2_5"] = r.get("p2_5")
+        if r.get("p97_5") is not None:
+            pk["stats"][r["param"]]["p97_5"] = r.get("p97_5")
+        if r["param"] == "center":
+            pk["lock_center"] = r.get("locked", False)
+        if r["param"] == "fwhm":
+            pk["lock_width"] = r.get("locked", False)
+    return [by_peak[k] for k in sorted(by_peak.keys())]
+
 
 def _iter_param_rows(unc_res, peaks, method_label: str):
-    """Yield normalized per-parameter rows for uncertainty exports."""
-
-    stats = getattr(unc_res, "stats", None)
-    if stats is None and isinstance(unc_res, dict):
-        stats = unc_res.get("stats")
-        if stats is None:
-            stats = unc_res.get("parameters")
-        if stats is None:
-            stats = unc_res.get("param_stats")
-    if not stats:
-        return
-
-    # support both per-peak and per-parameter layouts
-    if any(isinstance(v, dict) and isinstance(v.get("est"), (list, tuple, np.ndarray)) for v in stats.values()):
-        centers = stats.get("center", {})
-        heights = stats.get("height", {})
-        fwhms = stats.get("fwhm", {})
-        etas = stats.get("eta", {})
-
-        est_c = centers.get("est")
-        if est_c is None:
-            est_c = []
-        est_h = heights.get("est")
-        if est_h is None:
-            est_h = []
-        est_w = fwhms.get("est")
-        if est_w is None:
-            est_w = []
-
-        sd_c = centers.get("sd")
-        if sd_c is None:
-            sd_c = []
-        sd_h = heights.get("sd")
-        if sd_h is None:
-            sd_h = []
-        sd_w = fwhms.get("sd")
-        if sd_w is None:
-            sd_w = []
-        est_e = etas.get("est")
-        if est_e is None:
-            est_e = []
-        sd_e = etas.get("sd")
-        if sd_e is None:
-            sd_e = []
-
-        p2_c = centers.get("p2_5")
-        if p2_c is None:
-            p2_c = centers.get("p2.5")
-        if p2_c is None:
-            p2_c = []
-        p2_h = heights.get("p2_5")
-        if p2_h is None:
-            p2_h = heights.get("p2.5")
-        if p2_h is None:
-            p2_h = []
-        p2_w = fwhms.get("p2_5")
-        if p2_w is None:
-            p2_w = fwhms.get("p2.5")
-        if p2_w is None:
-            p2_w = []
-        p2_e = etas.get("p2_5")
-        if p2_e is None:
-            p2_e = etas.get("p2.5")
-        if p2_e is None:
-            p2_e = []
-
-        p97_c = centers.get("p97_5")
-        if p97_c is None:
-            p97_c = centers.get("p97.5")
-        if p97_c is None:
-            p97_c = []
-        p97_h = heights.get("p97_5")
-        if p97_h is None:
-            p97_h = heights.get("p97.5")
-        if p97_h is None:
-            p97_h = []
-        p97_w = fwhms.get("p97_5")
-        if p97_w is None:
-            p97_w = fwhms.get("p97.5")
-        if p97_w is None:
-            p97_w = []
-        p97_e = etas.get("p97_5")
-        if p97_e is None:
-            p97_e = etas.get("p97.5")
-        if p97_e is None:
-            p97_e = []
-        for i, _ in enumerate(peaks, 1):
+    """Yield normalized per-parameter rows for legacy interfaces."""
+    per_peak = _rows_to_per_peak_stats(unc_res, peaks)
+    for idx, rec in enumerate(per_peak, 1):
+        for param in ("center", "height", "fwhm", "eta"):
+            est, sd, qlo, qhi = _stats_for_param(rec, param)
             yield {
-                "peak": i,
-                "param": "center",
-                "est": _safe_idx(est_c, i - 1),
-                "sd": _safe_idx(sd_c, i - 1),
-                "p2_5": _safe_idx(p2_c, i - 1),
-                "p97_5": _safe_idx(p97_c, i - 1),
+                "peak": idx,
+                "param": param,
+                "est": est,
+                "sd": sd,
+                "p2_5": qlo,
+                "p97_5": qhi,
                 "method": method_label,
             }
-            yield {
-                "peak": i,
-                "param": "height",
-                "est": _safe_idx(est_h, i - 1),
-                "sd": _safe_idx(sd_h, i - 1),
-                "p2_5": _safe_idx(p2_h, i - 1),
-                "p97_5": _safe_idx(p97_h, i - 1),
-                "method": method_label,
-            }
-            yield {
-                "peak": i,
-                "param": "fwhm",
-                "est": _safe_idx(est_w, i - 1),
-                "sd": _safe_idx(sd_w, i - 1),
-                "p2_5": _safe_idx(p2_w, i - 1),
-                "p97_5": _safe_idx(p97_w, i - 1),
-                "method": method_label,
-            }
-            yield {
-                "peak": i,
-                "param": "eta",
-                "est": _safe_idx(est_e, i - 1),
-                "sd": _safe_idx(sd_e, i - 1),
-                "p2_5": _safe_idx(p2_e, i - 1),
-                "p97_5": _safe_idx(p97_e, i - 1),
-                "method": method_label,
-            }
-    else:
-        for i, _ in enumerate(peaks, 1):
-            s = stats.get(i) or stats.get(str(i)) or {}
-            for pname in ("center", "height", "fwhm", "eta"):
-                pdict = s.get(pname) or {}
-                yield {
-                    "peak": i,
-                    "param": pname,
-                    "est": pdict.get("est"),
-                    "sd": pdict.get("sd"),
-                    "p2_5": pdict.get("p2_5") or pdict.get("p2.5"),
-                    "p97_5": pdict.get("p97_5") or pdict.get("p97.5"),
-                    "method": method_label,
-                }
-
-
-def _safe_idx(arr, idx):
-    try:
-        return arr[idx]
-    except Exception:
-        return None
 
 
 def export_uncertainty_csv(
@@ -549,60 +601,32 @@ def export_uncertainty_csv(
     peaks: Iterable[Dict[str, Any]] | None = None,
     result: Any = None,
 ) -> str | Path:
-    """
-    Writes a long-form CSV with legacy columns:
-      file, peak, param, value, stderr, ci_lo, ci_hi, method, rmse, dof
-    and (if present) optional columns: p2_5, p97_5, backend, n_draws, n_boot, ess, rhat.
-    """
-    import csv
-
-    # Backward compatibility: old signature (path, result, peaks=None, method_label="")
+    """Compatibility wrapper producing a unified uncertainty CSV."""
+    # Backward compatibility: legacy signature (path, result, peaks=None, method_label="")
     if result is None and peaks is None and not isinstance(file_path, (str, Path)):
         result = file_path
         file_path = None
 
-    rows = []
-    norm_rows = _iter_peak_param_stats(result, peaks or [])  # uses current values if stats missing
-    # Optional diagnostics:
-    diag = getattr(result, "diagnostics", None) if result is not None and not isinstance(result, dict) else (result.get("diagnostics") if isinstance(result, dict) else None)
-    backend = None; n_draws = None; n_boot = None; ess = None; rhat = None
-    if isinstance(diag, dict):
-        backend = diag.get("backend")
-        n_draws = diag.get("n_draws")
-        n_boot = diag.get("n_boot")
-        ess = diag.get("ess")
-        rhat = diag.get("rhat")
+    label = method_label or _method_label(result, default="")
+    if rmse is None and result is not None:
+        rmse = getattr(result, "rmse", None)
+    if dof is None and result is not None:
+        dof = getattr(result, "dof", None)
 
-    for r in norm_rows:
-        rows.append({
-            "file": str(file_path) if file_path else "",
-            "peak": r["peak"],
-            "param": r["param"],
-            "value": r["value"],
-            "stderr": r["stderr"],
-            "ci_lo": r["ci_lo"],
-            "ci_hi": r["ci_hi"],
-            "method": method_label,
-            "rmse": rmse,
-            "dof": dof,
-            # optional extras
-            "p2_5": r.get("p2_5"),
-            "p97_5": r.get("p97_5"),
-            "backend": backend,
-            "n_draws": n_draws,
-            "n_boot": n_boot,
-            "ess": ess,
-            "rhat": rhat,
-        })
-
-    # ensure consistent column order
-    fieldnames = ["file","peak","param","value","stderr","ci_lo","ci_hi","method","rmse","dof",
-                  "p2_5","p97_5","backend","n_draws","n_boot","ess","rhat"]
-    with open(out_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        w.writeheader()
-        for row in rows:
-            w.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in fieldnames})
+    per_peak = _rows_to_per_peak_stats(result, peaks or [])
+    mlow = (label or "").lower()
+    meta: Dict[str, Any] = {}
+    if "bootstrap" in mlow:
+        meta = {"backend": getattr(result, "backend", ""), "n_boot": getattr(result, "n_boot", "")}
+    elif "bayesian" in mlow:
+        meta = {
+            "backend": "emcee",
+            "n_draws": getattr(result, "n_draws", ""),
+            "ess": getattr(result, "ess", ""),
+            "rhat": getattr(result, "rhat", ""),
+        }
+    rows = build_uncertainty_rows(str(file_path) if file_path else "", label, rmse, dof, per_peak, meta)
+    _write_uncertainty_csv(out_path, rows)
     return out_path
 
 
@@ -617,97 +641,59 @@ def export_uncertainty_txt(
     result: Any = None,
     z: float = 1.96,
 ) -> str | Path:
-    """
-    Writes a human-readable report mirroring the legacy format.
-    Expects:
-      solver_meta: dict with solver, loss, weight, f_scale, maxfev, restarts, jitter_pct
-      baseline_meta: dict with uses_fit_range, lam, p, niter, thresh
-      perf_meta: dict with numba, gpu, cache_baseline, seed_all, max_workers
-    """
-    lines = []
-    lines.append(f"File: {file_path}")
-    # Method line
-    if "Asymptotic" in method_label:
-        lines.append(f"Uncertainty method: {method_label} (95% CI, z={z})")
+    """Compatibility wrapper producing a unified uncertainty TXT report."""
+    if result is None and peaks is None and not isinstance(file_path, (str, Path)):
+        result = file_path
+        file_path = None
+
+    label = method_label or _method_label(result, default="")
+    per_peak = _rows_to_per_peak_stats(result, peaks or [])
+
+    if isinstance(solver_meta, str):
+        solver_line = solver_meta
     else:
-        lines.append(f"Uncertainty method: {method_label}")
-    # Solver/baseline/perf
-    s = solver_meta or {}
-    lines.append("Solver: {solver}{loss}{weight}{f}{mfev}{rs}{jit}".format(
-        solver=s.get("solver","unknown"),
-        loss=f", loss={s.get('loss')}" if s.get('loss') is not None else "",
-        weight=f", weight={s.get('weight')}" if s.get('weight') is not None else "",
-        f=f", f_scale={s.get('f_scale')}" if s.get('f_scale') is not None else "",
-        mfev=f", maxfev={s.get('maxfev')}" if s.get('maxfev') is not None else "",
-        rs=f", restarts={s.get('restarts')}" if s.get('restarts') is not None else "",
-        jit=f", jitter_pct={s.get('jitter_pct')}" if s.get('jitter_pct') is not None else "",
-    ))
-    b = baseline_meta or {}
-    lines.append("Baseline: uses_fit_range={uses} , lam={lam} , p={p} , niter={niter} , thresh={th}".format(
-        uses=b.get("uses_fit_range", False),
-        lam=b.get("lam"),
-        p=b.get("p"),
-        niter=b.get("niter"),
-        th=b.get("thresh"),
-    ))
-    pmeta = perf_meta or {}
-    lines.append("Performance: numba={numba}, gpu={gpu}, cache_baseline={cache}, seed_all={seed}, max_workers={mw}".format(
-        numba=pmeta.get("numba"), gpu=pmeta.get("gpu"),
-        cache=pmeta.get("cache_baseline"), seed=pmeta.get("seed_all"),
-        mw=pmeta.get("max_workers"),
-    ))
-    lines.append("Peaks:")
-
-    # Build normalized stats for printing
-    norm_rows = _iter_peak_param_stats(result, peaks or [])
-    # group by peak
-    by_peak: Dict[int, Dict[str, Dict[str, Any]]] = {}
-    for r in norm_rows:
-        by_peak.setdefault(r["peak"], {})[r["param"]] = r
-
-    def _fmt_val_sd_ci(v, sd, lo, hi):
-        def _fmt(x, n=6):
-            try:
-                return f"{float(x):.6g}"
-            except Exception:
-                return "n/a"
-        # if sd None and lo/hi provided, keep ± as missing
-        if v is None and sd is None and lo is None and hi is None:
-            return "n/a"
-        v_s = _fmt(v)
-        sd_s = _fmt(sd) if sd is not None else "n/a"
-        lo_s = _fmt(lo) if lo is not None else "n/a"
-        hi_s = _fmt(hi) if hi is not None else "n/a"
-        return f"{v_s} ± {sd_s}   (95% CI: [{lo_s}, {hi_s}])"
-
-    for k in sorted(by_peak.keys()):
-        lines.append(f"Peak {k}")
-        row_c = by_peak[k].get("center",  {})
-        row_h = by_peak[k].get("height", {})
-        row_w = by_peak[k].get("fwhm",   {})
-        row_e = by_peak[k].get("eta",    {})
-        # Handle fixed width/center display
-        locked_w = row_w.get("locked", False)
-        locked_c = row_c.get("locked", False)
-        if locked_c:
-            center_line = f"  center = {row_c.get('value','n/a')} (fixed)"
-        else:
-            center_line = "  center = " + _fmt_val_sd_ci(row_c.get("value"), row_c.get("stderr"),
-                                                         row_c.get("ci_lo"), row_c.get("ci_hi"))
-        if locked_w:
-            width_line  = f"  fwhm   = {row_w.get('value','n/a')} (fixed)"
-        else:
-            width_line  = "  fwhm   = " + _fmt_val_sd_ci(row_w.get("value"), row_w.get("stderr"),
-                                                         row_w.get("ci_lo"), row_w.get("ci_hi"))
-        height_line = "  height = " + _fmt_val_sd_ci(row_h.get("value"), row_h.get("stderr"),
-                                                     row_h.get("ci_lo"), row_h.get("ci_hi"))
-        eta_line    = "  eta    = " + _fmt_val_sd_ci(row_e.get("value"), row_e.get("stderr"),
-                                                     row_e.get("ci_lo"), row_e.get("ci_hi"))
-        lines.extend([center_line, height_line, width_line, eta_line])
-
-    txt = "\n".join(lines) + "\n"
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(txt)
+        s = solver_meta or {}
+        solver_line = "Solver: {solver}{loss}{weight}{f}{mfev}{rs}{jit}".format(
+            solver=s.get("solver", "unknown"),
+            loss=f", loss={s.get('loss')}" if s.get("loss") is not None else "",
+            weight=f", weight={s.get('weight')}" if s.get("weight") is not None else "",
+            f=f", f_scale={s.get('f_scale')}" if s.get("f_scale") is not None else "",
+            mfev=f", maxfev={s.get('maxfev')}" if s.get("maxfev") is not None else "",
+            rs=f", restarts={s.get('restarts')}" if s.get("restarts") is not None else "",
+            jit=f", jitter_pct={s.get('jitter_pct')}" if s.get("jitter_pct") is not None else "",
+        )
+    if isinstance(baseline_meta, str):
+        baseline_line = baseline_meta
+    else:
+        b = baseline_meta or {}
+        baseline_line = "Baseline: uses_fit_range={uses} , lam={lam} , p={p} , niter={niter} , thresh={th}".format(
+            uses=b.get("uses_fit_range", False),
+            lam=b.get("lam"),
+            p=b.get("p"),
+            niter=b.get("niter"),
+            th=b.get("thresh"),
+        )
+    if isinstance(perf_meta, str):
+        perf_line = perf_meta
+    else:
+        pm = perf_meta or {}
+        perf_line = "Performance: numba={numba}, gpu={gpu}, cache_baseline={cache}, seed_all={seed}, max_workers={mw}".format(
+            numba=pm.get("numba"),
+            gpu=pm.get("gpu"),
+            cache=pm.get("cache_baseline"),
+            seed=pm.get("seed_all"),
+            mw=pm.get("max_workers"),
+        )
+    _write_uncertainty_txt(
+        out_path,
+        str(file_path),
+        label,
+        solver_line,
+        baseline_line,
+        perf_line,
+        per_peak,
+        z,
+    )
     return out_path
 
 
@@ -741,6 +727,15 @@ def write_uncertainty_txt(path, unc_res, peaks=None, method_label: str = "", fil
             lines.append(line)
         Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
-    return export_uncertainty_txt(path, file_path, method_label, solver_meta or {}, baseline_meta or {}, perf_meta or {}, peaks, unc_res)
+    return export_uncertainty_txt(
+        path,
+        file_path=file_path,
+        method_label=method_label,
+        solver_meta=solver_meta,
+        baseline_meta=baseline_meta,
+        perf_meta=perf_meta,
+        peaks=peaks,
+        result=unc_res,
+    )
 
 

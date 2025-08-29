@@ -703,7 +703,7 @@ class PeakFitApp:
         self.cfg.setdefault("perf_seed_all", False)
         self.cfg.setdefault("perf_max_workers", 0)
         self.cfg.setdefault("unc_workers", 0)
-        self.cfg.setdefault("last_template", self.cfg.get("auto_apply_template_name", ""))
+        self.cfg.setdefault("last_template_name", self.cfg.get("auto_apply_template_name", ""))
         save_config(self.cfg)
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
 
@@ -716,7 +716,7 @@ class PeakFitApp:
         performance.set_logger(self.log_threadsafe)
 
         self.default_font = tkfont.nametofont("TkDefaultFont")
-        last_template = self.cfg.get("last_template", "")
+        last_template = self.cfg.get("last_template_name", "")
 
         # Data
         self.x = None
@@ -892,7 +892,16 @@ class PeakFitApp:
         except Exception:
             self.step_btn = ttk.Button(fit_seg, text="Step", command=self.step_once)
         self.step_btn.pack(side=tk.LEFT, padx=2)
-        self.fit_btn = ttk.Button(fit_seg, text="Fit", command=self.fit, style="Success.TButton")
+        self.fit_btn = tk.Button(
+            fit_seg,
+            text="Fit",
+            command=self.fit,
+            bg="#15803d",
+            fg="white",
+            activebackground="#166534",
+            relief="raised",
+            bd=1,
+        )
         self.fit_btn.pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(self.action_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=3)
@@ -1225,6 +1234,7 @@ class PeakFitApp:
             variable=self.show_ci_band_var,
         )
         self.btn_ci_toggle.pack(anchor="w", padx=4)
+        self._set_band_toggle_state('disabled')
         self._update_unc_widgets()
 
         # Axes / label controls
@@ -1285,9 +1295,18 @@ class PeakFitApp:
         self.status.pack(side=tk.LEFT, padx=6)
         self.log_btn = ttk.Button(bar, text="Show log \u25B8", command=self.toggle_log)
         self.log_btn.pack(side=tk.RIGHT)
-        self.abort_btn = ttk.Button(bar, text="Abort", command=self._on_abort, style="Danger.TButton")
-        self.abort_btn.state(['disabled'])
-        self.abort_btn.pack(side=tk.RIGHT)
+        self.abort_btn = tk.Button(
+            bar,
+            text="Abort",
+            command=self.on_abort_clicked,
+            bg="#b91c1c",
+            fg="white",
+            activebackground="#991b1b",
+            relief="raised",
+            bd=1,
+        )
+        self.abort_btn.config(state=tk.DISABLED)
+        self.abort_btn.pack(side=tk.RIGHT, padx=(6, 6))
         self.pbar = ttk.Progressbar(bar, mode="indeterminate", length=160)
         self.pbar.pack(side=tk.RIGHT, padx=6)
         self.progress = self.pbar
@@ -1385,6 +1404,13 @@ class PeakFitApp:
             self.cfg["unc_method"] = "asymptotic"
         save_config(self.cfg)
         self._update_unc_widgets()
+        if self._ci_available_for(self.last_unc_result):
+            self._set_band_toggle_state('normal')
+        else:
+            self.ci_band = None
+            self.show_ci_band = False
+            self._set_band_toggle_state('disabled')
+            self.refresh_plot()
 
     def _on_unc_workers_change(self, *_):
         self.cfg["unc_workers"] = int(self.unc_workers_var.get())
@@ -1430,9 +1456,20 @@ class PeakFitApp:
         save_config(self.cfg)
         self.refresh_plot()
 
-    def _on_abort(self):
+    def _ci_available_for(self, res) -> bool:
+        label = (getattr(res, "label", None) or getattr(res, "method_label", None) or "").lower()
+        return "asymptotic" in label
+
+    def _set_band_toggle_state(self, state: str):
+        try:
+            self.btn_ci_toggle.configure(state=state)
+        except Exception:
+            pass
+
+    def on_abort_clicked(self):
         try:
             self._abort_evt.set()
+            self._progress_end()
             self.status_warn("Aborting…")
         except Exception:
             pass
@@ -2203,7 +2240,7 @@ class PeakFitApp:
 
     def _persist_last_template(self, name: str) -> None:
         if name:
-            self.cfg["last_template"] = name
+            self.cfg["last_template_name"] = name
             self.auto_apply_template_name.set(name)
             save_config(self.cfg)
 
@@ -2622,6 +2659,7 @@ class PeakFitApp:
             self.last_unc_method = None
             self.ci_band = None
             self.show_ci_band = False
+            self._set_band_toggle_state('disabled')
             self.refresh_plot()
             self.set_busy(False, f"Fit done. RMSE {res.rmse:.4g}")
             npts = int(np.count_nonzero(mask))
@@ -2724,7 +2762,7 @@ class PeakFitApp:
             )
 
         def done(res, err):
-            self.abort_btn.state(['disabled'])
+            self.abort_btn.config(state=tk.DISABLED)
             if err or res is None:
                 self.set_busy(False, "Batch failed.")
                 if err:
@@ -2737,7 +2775,7 @@ class PeakFitApp:
             messagebox.showinfo("Batch", f"Summary saved:\n{fit_path}")
 
         self._abort_evt.clear()
-        self.abort_btn.state(['!disabled'])
+        self.abort_btn.config(state=tk.NORMAL)
         self.set_busy(True, "Batch running…")
         self.run_in_thread(work, done)
 
@@ -3004,12 +3042,12 @@ class PeakFitApp:
             # Drop stale callbacks (auto asymptotic finishing after a newer user-triggered run)
             if job_id != getattr(self, "_unc_job_id", 0):
                 self._progress_end("uncertainty")
-                self.abort_btn.state(['disabled'])
+                self.abort_btn.config(state=tk.DISABLED)
                 return
 
             self._unc_running = False
             self._progress_end("uncertainty")
-            self.abort_btn.state(['disabled'])
+            self.abort_btn.config(state=tk.DISABLED)
 
             if error is not None:
                 self.status_error(f"Uncertainty failed: {error}")
@@ -3019,29 +3057,24 @@ class PeakFitApp:
             self.last_unc_result = result
             self.last_unc_method = label
 
-            supports_band = label.startswith("Asymptotic")
-            band = data_io._normalize_band(result) if supports_band else None
-            if band is not None:
-                self.ci_band = band
-                self.show_ci_band = True
-                try:
-                    self.refresh_plot()
-                except Exception:
-                    pass
+            if self._ci_available_for(self.last_unc_result):
+                band = getattr(self.last_unc_result, "band", None) or getattr(
+                    self.last_unc_result, "prediction_band", None
+                )
+                if band is not None and len(band) >= 3:
+                    x, lo, hi = band[:3]
+                    self.ci_band = (np.asarray(x), np.asarray(lo), np.asarray(hi))
+                    self.show_ci_band = True
+                self._set_band_toggle_state('normal')
             else:
                 self.ci_band = None
                 self.show_ci_band = False
-                try:
-                    self.refresh_plot()
-                except Exception:
-                    pass
-            try:
-                state = "normal" if supports_band and band is not None else "disabled"
-                self.btn_ci_toggle.configure(state=state)
-                self.show_ci_band_var.set(self.show_ci_band)
-            except Exception:
-                pass
-            self.status_info(f"Computed {label} uncertainty." + ("" if band is not None else " (no band)"))
+                self._set_band_toggle_state('disabled')
+            self.show_ci_band_var.set(self.show_ci_band)
+            self.refresh_plot()
+            self.status_info(
+                f"Computed {label} uncertainty." + ("" if self.ci_band is not None else " (no band)")
+            )
 
             # Per-peak stats
             try:
@@ -3071,7 +3104,7 @@ class PeakFitApp:
         self._unc_job_id += 1
         job_id = self._unc_job_id
         self._abort_evt.clear()
-        self.abort_btn.state(['!disabled'])
+        self.abort_btn.config(state=tk.NORMAL)
         self._progress_begin("uncertainty")
         self.status_info("Computing uncertainty…")
         self.run_in_thread(work, done)
@@ -3324,64 +3357,89 @@ class PeakFitApp:
         saved = [paths["fit"], paths["trace"]]
         if self.last_unc_result is not None:
             try:
-                label = self.last_unc_method or data_io._method_label(self.last_unc_result, default="Unknown")
-                pk_dicts = [
-                    {"center": p.center, "height": p.height, "fwhm": p.fwhm, "eta": p.eta,
-                     "lock_center": p.lock_center, "lock_width": p.lock_width}
-                    for p in self.peaks
-                ]
-                solver_meta = {
-                    "solver": solver,
-                    "loss": opts.get("loss"),
-                    "weight": opts.get("weights"),
-                    "f_scale": opts.get("f_scale"),
-                    "maxfev": opts.get("maxfev"),
-                    "restarts": opts.get("restarts"),
-                    "jitter_pct": opts.get("jitter_pct"),
-                }
-                baseline_meta = {
-                    "uses_fit_range": bool(self.baseline_use_range.get()),
-                    "lam": float(self.als_lam.get()),
-                    "p": float(self.als_asym.get()),
-                    "niter": int(self.als_niter.get()),
-                    "thresh": float(self.als_thresh.get()),
-                }
-                perf_meta = {
-                    "numba": bool(self.perf_numba.get()),
-                    "gpu": bool(self.perf_gpu.get()),
-                    "cache_baseline": bool(self.perf_cache_baseline.get()),
-                    "seed_all": bool(self.perf_seed_all.get()),
-                    "max_workers": int(self.perf_max_workers.get()),
-                }
+                from itertools import zip_longest
+
+                label = self.last_unc_method or _unc_method_label(self.last_unc_result)
+                stats_rows = self._unc_extract_stats(self.last_unc_result) or []
+                per_peak = []
+                for p, row in zip_longest(self.peaks, stats_rows, fillvalue={}):
+                    r = dict(row or {})
+                    if p is not None:
+                        r.setdefault("center", p.center)
+                        r.setdefault("height", p.height)
+                        r.setdefault("fwhm", p.fwhm)
+                        r.setdefault("eta", p.eta)
+                        r.setdefault("lock_center", p.lock_center)
+                        r.setdefault("lock_width", p.lock_width)
+                    per_peak.append(r)
                 dof = getattr(self, "unc_info", {}).get("dof", None)
-                data_io.export_uncertainty_txt(
-                    paths["unc_txt"],
-                    self.current_file,
-                    label,
-                    solver_meta,
-                    baseline_meta,
-                    perf_meta,
-                    pk_dicts,
-                    self.last_unc_result,
-                )
-                data_io.export_uncertainty_csv(
-                    paths["unc_csv"],
-                    self.current_file,
+                meta = {}
+                ml = label.lower()
+                if "bootstrap" in ml:
+                    meta = {
+                        "backend": getattr(self.last_unc_result, "backend", ""),
+                        "n_boot": getattr(self.last_unc_result, "n_boot", ""),
+                    }
+                elif "bayesian" in ml:
+                    meta = {
+                        "backend": "emcee",
+                        "n_draws": getattr(self.last_unc_result, "n_draws", ""),
+                        "ess": getattr(self.last_unc_result, "ess", ""),
+                        "rhat": getattr(self.last_unc_result, "rhat", ""),
+                    }
+                rows = data_io.build_uncertainty_rows(
+                    str(self.current_file) if self.current_file else "",
                     label,
                     rmse,
                     dof,
-                    pk_dicts,
-                    self.last_unc_result,
+                    per_peak,
+                    meta,
                 )
-                band = data_io._normalize_band(self.last_unc_result)
-                if band is not None:
-                    xb, lob, hib = band
-                    with open(paths["unc_band"], "w", newline="", encoding="utf-8") as fh:
-                        bw = csv.writer(fh, lineterminator="\n")
-                        bw.writerow(["x", "y_lo95", "y_hi95"])
-                        for xi, lo, hi in zip(xb, lob, hib):
-                            bw.writerow([xi, lo, hi])
-                    saved.append(paths["unc_band"])
+                data_io.write_uncertainty_csv(paths["unc_csv"], rows)
+                solver_line = "Solver: {solver}{loss}{weight}{f}{mfev}{rs}{jit}".format(
+                    solver=solver,
+                    loss=f", loss={opts.get('loss')}" if opts.get("loss") is not None else "",
+                    weight=f", weight={opts.get('weights')}" if opts.get("weights") is not None else "",
+                    f=f", f_scale={opts.get('f_scale')}" if opts.get("f_scale") is not None else "",
+                    mfev=f", maxfev={opts.get('maxfev')}" if opts.get("maxfev") is not None else "",
+                    rs=f", restarts={opts.get('restarts')}" if opts.get("restarts") is not None else "",
+                    jit=f", jitter_pct={opts.get('jitter_pct')}" if opts.get("jitter_pct") is not None else "",
+                )
+                baseline_line = "Baseline: uses_fit_range={uses} , lam={lam} , p={p} , niter={niter} , thresh={th}".format(
+                    uses=bool(self.baseline_use_range.get()),
+                    lam=float(self.als_lam.get()),
+                    p=float(self.als_asym.get()),
+                    niter=int(self.als_niter.get()),
+                    th=float(self.als_thresh.get()),
+                )
+                perf_line = "Performance: numba={numba}, gpu={gpu}, cache_baseline={cache}, seed_all={seed}, max_workers={mw}".format(
+                    numba=bool(self.perf_numba.get()),
+                    gpu=bool(self.perf_gpu.get()),
+                    cache=bool(self.perf_cache_baseline.get()),
+                    seed=bool(self.perf_seed_all.get()),
+                    mw=int(self.perf_max_workers.get()),
+                )
+                data_io.write_uncertainty_txt(
+                    paths["unc_txt"],
+                    self.current_file,
+                    label,
+                    solver_line,
+                    baseline_line,
+                    perf_line,
+                    per_peak,
+                )
+                if self._ci_available_for(self.last_unc_result):
+                    band = getattr(self.last_unc_result, "band", None) or getattr(
+                        self.last_unc_result, "prediction_band", None
+                    )
+                    if band is not None and len(band) >= 3:
+                        xb, lob, hib = band[:3]
+                        with open(paths["unc_band"], "w", newline="", encoding="utf-8") as fh:
+                            bw = csv.writer(fh, lineterminator="\n")
+                            bw.writerow(["x", "y_lo95", "y_hi95"])
+                            for xi, lo, hi in zip(xb, lob, hib):
+                                bw.writerow([xi, lo, hi])
+                        saved.append(paths["unc_band"])
                 saved.extend([paths["unc_txt"], paths["unc_csv"]])
                 self.status_info(f"Exported uncertainty ({label}).")
             except Exception as e:  # pragma: no cover - defensive
@@ -3443,12 +3501,9 @@ class PeakFitApp:
 
         if self.show_ci_band and self.ci_band is not None:
             try:
-                if len(self.ci_band) == 4:
-                    x_b, lo_b, hi_b, _ = self.ci_band
-                else:
-                    x_b, lo_b, hi_b = self.ci_band
+                xb, lob, hib = self.ci_band
                 self.ax.fill_between(
-                    np.asarray(x_b), np.asarray(lo_b), np.asarray(hi_b),
+                    np.asarray(xb), np.asarray(lob), np.asarray(hib),
                     alpha=0.18, label="Uncertainty band"
                 )
             except Exception as e:
