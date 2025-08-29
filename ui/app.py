@@ -772,6 +772,7 @@ class PeakFitApp:
         self.batch_reheight = tk.BooleanVar(value=bool(self.cfg.get("batch_reheight", False)))
         self.batch_auto_max = tk.IntVar(value=int(self.cfg.get("batch_auto_max", 5)))
         self.batch_save_traces = tk.BooleanVar(value=bool(self.cfg.get("batch_save_traces", False)))
+        self.batch_unc_enabled = tk.BooleanVar(value=bool(self.cfg.get("batch_compute_uncertainty", False)))
 
         self._baseline_cache = {}
 
@@ -811,6 +812,10 @@ class PeakFitApp:
 
         self.show_ci_band = bool(self.cfg.get("ui_show_uncertainty_band", True))
         self.ci_band = None
+        # Uncertainty state
+        self.last_unc_result = None
+        self.last_unc_method = None
+
         self.current_file: Optional[Path] = None
         self.show_ci_band_var = tk.BooleanVar(value=self.show_ci_band)
         self.show_ci_band_var.trace_add("write", self._toggle_ci_band)
@@ -1257,6 +1262,8 @@ class PeakFitApp:
         ttk.Checkbutton(rowb3, text="Save traces", variable=self.batch_save_traces).pack(side=tk.LEFT, padx=4)
         ttk.Label(rowb3, text="Auto max:").pack(side=tk.LEFT, padx=(8,0))
         ttk.Spinbox(rowb3, from_=1, to=20, textvariable=self.batch_auto_max, width=5).pack(side=tk.LEFT)
+        rowb4 = ttk.Frame(batch_box); rowb4.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(rowb4, text="Compute uncertainty in batch", variable=self.batch_unc_enabled).pack(side=tk.LEFT)
         ttk.Button(batch_box, text="Run Batch…", command=self.run_batch).pack(side=tk.LEFT, pady=4)
 
         # Status bar and log
@@ -1620,7 +1627,7 @@ class PeakFitApp:
         except Exception:
             pass
 
-    def _unc_pretty_label(self, obj) -> str:
+    def _label_from_unc(self, obj) -> str:
         # Accept UncertaintyResult-like, SimpleNamespace, or dict
         try:
             lbl = getattr(obj, "label", None) or getattr(obj, "method_label", None)
@@ -1642,7 +1649,7 @@ class PeakFitApp:
         # Fallback to original label or generic
         return str(lbl) if lbl else "Unknown"
 
-    def _unc_extract_band(self, obj):
+    def _extract_band(self, obj):
         import numpy as np
         # return (x, lo, hi) or None
         # Attribute forms
@@ -2582,11 +2589,10 @@ class PeakFitApp:
                 return
             self.peaks[:] = res.peaks_out
             self.refresh_tree(keep_selection=True)
-            try:
-                self._run_asymptotic_uncertainty()
-            except Exception as e:
-                self.log(f"Uncertainty failed: {e}", level="WARN")
-            self.show_ci_band = bool(self.show_ci_band_var.get())
+            self.last_unc_result = None
+            self.last_unc_method = None
+            self.ci_band = None
+            self.show_ci_band = False
             self.refresh_plot()
             self.set_busy(False, f"Fit done. RMSE {res.rmse:.4g}")
             npts = int(np.count_nonzero(mask))
@@ -2654,7 +2660,6 @@ class PeakFitApp:
             "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
             "perf_seed_all": bool(self.perf_seed_all.get()),
             "perf_max_workers": int(self.perf_max_workers.get()),
-            "unc_method": self.cfg.get("unc_method", "asymptotic"),
             "unc_workers": int(self.cfg.get("unc_workers", 0)),
             "output_dir": str(output_dir),
             "output_base": output_base,
@@ -2669,13 +2674,24 @@ class PeakFitApp:
         self.cfg["batch_reheight"] = bool(self.batch_reheight.get())
         self.cfg["batch_auto_max"] = int(self.batch_auto_max.get())
         self.cfg["batch_save_traces"] = bool(self.batch_save_traces.get())
+        self.cfg["batch_compute_uncertainty"] = bool(self.batch_unc_enabled.get())
         save_config(self.cfg)
+
+        compute_unc = bool(self.batch_unc_enabled.get())
+        unc_method = str(self.unc_method.get()).strip()
 
         def work():
             def prog(i, total, path):
                 self.root.after(0, lambda: self.status_var.set(f"Batch {i}/{total}: {Path(path).name}"))
 
-            return batch_runner.run(patterns, cfg, progress=prog, log=self.log_threadsafe)
+            return batch_runner.run_batch(
+                patterns,
+                cfg,
+                compute_uncertainty=compute_unc,
+                unc_method=unc_method,
+                progress=prog,
+                log=self.log_threadsafe,
+            )
 
         def done(res, err):
             if err or res is None:
@@ -2955,7 +2971,9 @@ class PeakFitApp:
                 self.status_error(f"Uncertainty failed: {error}")
                 return
 
-            label = self._unc_pretty_label(result)
+            label = self._label_from_unc(result)
+            self.last_unc_result = result
+            self.last_unc_method = label
 
             # De-dupe “Computed …” for this job+label
             if getattr(self, "_last_unc_log", None) == (job_id, label):
@@ -2963,10 +2981,14 @@ class PeakFitApp:
             self._last_unc_log = (job_id, label)
 
             # Band
-            band = self._unc_extract_band(result)
+            band = self._extract_band(result)
             self.status_info(f"Computed {label} uncertainty.")
             if band is not None:
-                self.ci_band = band            # store as (x, lo, hi)
+                x, lo, hi = band[:3]
+                try:
+                    self.ci_band = (np.asarray(x), np.asarray(lo), np.asarray(hi))
+                except Exception:
+                    self.ci_band = band
                 self.show_ci_band = True
                 try:
                     self.refresh_plot()
@@ -3251,17 +3273,36 @@ class PeakFitApp:
         with open(paths["trace"], "w", encoding="utf-8", newline="") as fh:
             fh.write(trace_csv)
 
-        try:
-            self._maybe_export_uncertainty(
-                Path(paths["unc_txt"]), Path(paths["unc_csv"]), Path(paths["unc_band"]), rmse
-            )
-        except Exception as e:  # pragma: no cover - defensive
-            self.log(f"Uncertainty export failed: {e}", level="WARN")
+        saved = [paths["fit"], paths["trace"]]
+        if self.last_unc_result is not None:
+            try:
+                data_io.write_uncertainty_txt(
+                    paths["unc_txt"],
+                    self.last_unc_result,
+                    peaks=self.peaks,
+                    method_label=self.last_unc_method or ""
+                )
+                data_io.write_uncertainty_csv(
+                    paths["unc_csv"],
+                    self.last_unc_result,
+                    peaks=self.peaks,
+                    method_label=self.last_unc_method or ""
+                )
+                if self.ci_band is not None:
+                    xb, lob, hib = self.ci_band[:3]
+                    with open(paths["unc_band"], "w", newline="", encoding="utf-8") as fh:
+                        bw = csv.writer(fh, lineterminator="\n")
+                        bw.writerow(["x", "y_lo95", "y_hi95"])
+                        for xi, lo, hi in zip(xb, lob, hib):
+                            bw.writerow([xi, lo, hi])
+                saved.extend([paths["unc_txt"], paths["unc_csv"]])
+                self.status_info(f"Exported uncertainty ({self.last_unc_method}).")
+            except Exception as e:  # pragma: no cover - defensive
+                self.log(f"Uncertainty export failed: {e}", level="WARN")
+        else:
+            self.status_info("No uncertainty computed — skipping uncertainty export.")
 
-        messagebox.showinfo(
-            "Export",
-            f"Saved:\n{paths['fit']}\n{paths['trace']}\n{paths['unc_txt']}\n{paths['unc_csv']}",
-        )
+        messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved))
 
     # ----- Plot -----
     def toggle_components(self):

@@ -268,39 +268,165 @@ def _ensure_result(unc: Union[UncertaintyResult, dict]) -> UncertaintyResult:
         band=band,
     )
 
+def _iter_param_rows(unc_res, peaks, method_label: str):
+    """Yield normalized per-parameter rows for uncertainty exports."""
 
-def write_uncertainty_csv(path: Path, unc: Union[UncertaintyResult, dict]) -> None:
-    """Write uncertainty statistics to ``path``.
+    stats = getattr(unc_res, "stats", None)
+    if stats is None and isinstance(unc_res, dict):
+        stats = (
+            unc_res.get("stats")
+            or unc_res.get("parameters")
+            or unc_res.get("param_stats")
+        )
+    if not stats:
+        return
 
-    The CSV schema is a single-row table with per-parameter columns like
-    ``p0_est``, ``p0_sd`` and optional ``p0_p2_5``/``p0_p97_5``.
-    """
+    # support both per-peak and per-parameter layouts
+    if any(isinstance(v, dict) and isinstance(v.get("est"), (list, tuple, np.ndarray)) for v in stats.values()):
+        centers = stats.get("center", {})
+        heights = stats.get("height", {})
+        fwhms = stats.get("fwhm", {})
+        etas = stats.get("eta", {})
+        est_c = centers.get("est") or []
+        est_h = heights.get("est") or []
+        est_w = fwhms.get("est") or []
+        sd_c = centers.get("sd") or []
+        sd_h = heights.get("sd") or []
+        sd_w = fwhms.get("sd") or []
+        sd_e = etas.get("sd") or []
+        p2_c = centers.get("p2_5") or centers.get("p2.5") or []
+        p2_h = heights.get("p2_5") or heights.get("p2.5") or []
+        p2_w = fwhms.get("p2_5") or fwhms.get("p2.5") or []
+        p2_e = etas.get("p2_5") or etas.get("p2.5") or []
+        p97_c = centers.get("p97_5") or centers.get("p97.5") or []
+        p97_h = heights.get("p97_5") or heights.get("p97.5") or []
+        p97_w = fwhms.get("p97_5") or fwhms.get("p97.5") or []
+        p97_e = etas.get("p97_5") or etas.get("p97.5") or []
+        for i, _ in enumerate(peaks, 1):
+            yield {
+                "peak": i,
+                "param": "center",
+                "est": _safe_idx(est_c, i - 1),
+                "sd": _safe_idx(sd_c, i - 1),
+                "p2_5": _safe_idx(p2_c, i - 1),
+                "p97_5": _safe_idx(p97_c, i - 1),
+                "method": method_label,
+            }
+            yield {
+                "peak": i,
+                "param": "height",
+                "est": _safe_idx(est_h, i - 1),
+                "sd": _safe_idx(sd_h, i - 1),
+                "p2_5": _safe_idx(p2_h, i - 1),
+                "p97_5": _safe_idx(p97_h, i - 1),
+                "method": method_label,
+            }
+            yield {
+                "peak": i,
+                "param": "fwhm",
+                "est": _safe_idx(est_w, i - 1),
+                "sd": _safe_idx(sd_w, i - 1),
+                "p2_5": _safe_idx(p2_w, i - 1),
+                "p97_5": _safe_idx(p97_w, i - 1),
+                "method": method_label,
+            }
+            yield {
+                "peak": i,
+                "param": "eta",
+                "est": _safe_idx(etas.get("est") or [], i - 1),
+                "sd": _safe_idx(sd_e, i - 1),
+                "p2_5": _safe_idx(p2_e, i - 1),
+                "p97_5": _safe_idx(p97_e, i - 1),
+                "method": method_label,
+            }
+    else:
+        for i, _ in enumerate(peaks, 1):
+            s = stats.get(i) or stats.get(str(i)) or {}
+            for pname in ("center", "height", "fwhm", "eta"):
+                pdict = s.get(pname) or {}
+                yield {
+                    "peak": i,
+                    "param": pname,
+                    "est": pdict.get("est"),
+                    "sd": pdict.get("sd"),
+                    "p2_5": pdict.get("p2_5") or pdict.get("p2.5"),
+                    "p97_5": pdict.get("p97_5") or pdict.get("p97.5"),
+                    "method": method_label,
+                }
 
-    res = _ensure_result(unc)
-    row: Dict[str, float | str] = {"method": res.method_label}
-    for name, stats in res.param_stats.items():
-        row[f"{name}_est"] = stats.get("est")
-        row[f"{name}_sd"] = stats.get("sd")
-        if "p2.5" in stats and "p97.5" in stats:
-            row[f"{name}_p2_5"] = stats.get("p2.5")
-            row[f"{name}_p97_5"] = stats.get("p97.5")
-    df = pd.DataFrame([row])
-    write_dataframe(df, path)
+
+def _safe_idx(arr, idx):
+    try:
+        return arr[idx]
+    except Exception:
+        return None
 
 
-def write_uncertainty_txt(path: Path, unc: Union[UncertaintyResult, dict]) -> None:
-    """Write a human readable uncertainty summary to ``path``."""
+def write_uncertainty_csv(path: str | Path, unc_res, peaks=None, method_label: str = "") -> None:
+    if peaks is None:
+        res = _ensure_result(unc_res)
+        row: Dict[str, float | str] = {"method": res.method_label}
+        for name, stats in res.param_stats.items():
+            row[f"{name}_est"] = stats.get("est")
+            row[f"{name}_sd"] = stats.get("sd")
+            if "p2.5" in stats and "p97.5" in stats:
+                row[f"{name}_p2_5"] = stats.get("p2.5")
+                row[f"{name}_p97_5"] = stats.get("p97.5")
+        df = pd.DataFrame([row])
+        write_dataframe(df, Path(path))
+        return
 
-    res = _ensure_result(unc)
-    lines = [f"Method: {res.method_label}"]
-    for name, stats in res.param_stats.items():
-        est = stats.get("est")
-        sd = stats.get("sd")
-        line = f"{name}: {est:.6g} ± {sd:.6g}"
-        if "p2.5" in stats and "p97.5" in stats:
-            line += f"   [2.5%: {stats['p2.5']:.6g}, 97.5%: {stats['p97.5']:.6g}]"
-        lines.append(line)
-    text = "\n".join(lines) + "\n"
-    path.write_text(text, encoding="utf-8")
+    path = Path(path)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["peak", "param", "est", "sd", "p2_5", "p97_5", "method"],
+            lineterminator="\n",
+        )
+        w.writeheader()
+        for row in _iter_param_rows(unc_res, peaks, method_label):
+            w.writerow(row)
+
+
+def write_uncertainty_txt(path: str | Path, unc_res, peaks=None, method_label: str = "") -> None:
+    if peaks is None:
+        res = _ensure_result(unc_res)
+        lines = [f"Method: {res.method_label}"]
+        for name, stats in res.param_stats.items():
+            est = stats.get("est")
+            sd = stats.get("sd")
+            line = f"{name}: {est:.6g} ± {sd:.6g}"
+            if "p2.5" in stats and "p97.5" in stats:
+                line += f"   [2.5%: {stats['p2.5']:.6g}, 97.5%: {stats['p97.5']:.6g}]"
+            lines.append(line)
+        text = "\n".join(lines) + "\n"
+        Path(path).write_text(text, encoding="utf-8")
+        return
+
+    stats = getattr(unc_res, "stats", None)
+    if stats is None and isinstance(unc_res, dict):
+        stats = (
+            unc_res.get("stats")
+            or unc_res.get("parameters")
+            or unc_res.get("param_stats")
+        )
+    lines = [f"Uncertainty: {method_label}"]
+    if not stats:
+        lines.append("No parameter statistics available.")
+    else:
+        def fmt(d):
+            est = d.get("est")
+            sd = d.get("sd")
+            if est is None or sd is None:
+                return "n/a"
+            return f"{est:.6g} ± {sd:.3g}"
+
+        for i, _ in enumerate(peaks, 1):
+            s = stats.get(i) or stats.get(str(i)) or {}
+            c = fmt(s.get("center", {}))
+            h = fmt(s.get("height", {}))
+            w = fmt(s.get("fwhm", {}))
+            lines.append(f"Peak {i}: center={c} | height={h} | FWHM={w}")
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
