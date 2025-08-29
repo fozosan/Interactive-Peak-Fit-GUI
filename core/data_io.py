@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 
 import math
+from math import isnan
 import numpy as np
 import pandas as pd
 from collections.abc import Mapping
@@ -223,6 +224,219 @@ def _ci_from_sd(est, sd, z=_Z):
     if not math.isfinite(est) or not math.isfinite(sd):
         return (float("nan"), float("nan"))
     return (est - z * sd, est + z * sd)
+
+
+def _as_mapping(obj):
+    """Return an object with .get, handling dict / SimpleNamespace / list fallback."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, SimpleNamespace):
+        return obj.__dict__
+    if isinstance(obj, list):
+        return {"stats": obj}
+    return getattr(obj, "__dict__", {}) or {}
+
+
+def _num(x):
+    """Return a clean number or None (for CSV blanks)."""
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if np.isnan(v) or np.isinf(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _label_from_result(m):
+    """Map uncertainty method to a canonical label."""
+    method = (m.get("method") or m.get("type") or m.get("label") or "").lower()
+    if "asym" in method:
+        return "asymptotic"
+    if "boot" in method:
+        return "bootstrap"
+    if "bayes" in method or "mcmc" in method:
+        return "bayesian"
+    pretty = m.get("label") or m.get("method_label")
+    if pretty:
+        p = pretty.lower()
+        if "asym" in p:
+            return "asymptotic"
+        if "boot" in p:
+            return "bootstrap"
+        if "mcmc" in p or "bayes" in p:
+            return "bayesian"
+    return "unknown"
+
+
+def _rows_from_stats(file_path, m):
+    """
+    Convert any uncertainty result into a list of rows for CSV.
+    Expected keys per stat: peak, param, est/value, sd/stderr, ci_lo/ci_hi or p2_5/p97_5.
+    """
+    stats = m.get("stats") or m.get("parameters") or m.get("param_stats") or []
+    rows = []
+    method_label = _label_from_result(m)
+    rmse = _num(m.get("rmse"))
+    dof = m.get("dof")
+
+    backend = m.get("backend")
+    n_draws = m.get("n_draws") or m.get("n_samples")
+    n_boot = m.get("n_boot")
+    ess = m.get("ess")
+    rhat = m.get("rhat")
+
+    def pick(d, *names):
+        for k in names:
+            if k in d and d[k] is not None:
+                return d[k]
+        return None
+
+    for s in stats:
+        sdct = s if isinstance(s, dict) else getattr(s, "__dict__", {})
+        peak = sdct.get("peak") or sdct.get("index") or sdct.get("k")
+        param = sdct.get("param") or sdct.get("name")
+        est = pick(sdct, "est", "value", "mean", "median")
+        sd = pick(sdct, "sd", "stderr", "std", "stdev")
+        p025 = pick(sdct, "p2_5", "q025", "q2_5")
+        p975 = pick(sdct, "p97_5", "q975", "q97_5")
+        ci_lo = sdct.get("ci_lo")
+        ci_hi = sdct.get("ci_hi")
+        if ci_lo is None and p025 is not None:
+            ci_lo = p025
+        if ci_hi is None and p975 is not None:
+            ci_hi = p975
+        rows.append({
+            "file": str(file_path),
+            "peak": peak,
+            "param": param,
+            "value": _num(est),
+            "stderr": _num(sd),
+            "ci_lo": _num(ci_lo),
+            "ci_hi": _num(ci_hi),
+            "method": method_label,
+            "rmse": rmse,
+            "dof": dof,
+            "p2_5": _num(p025),
+            "p97_5": _num(p975),
+            "backend": backend,
+            "n_draws": n_draws,
+            "n_boot": n_boot,
+            "ess": ess,
+            "rhat": rhat,
+        })
+    return rows
+
+
+def normalize_unc_result(res):
+    """
+    Normalize any uncertainty container (dict, namespace, list-of-stat-rows)
+    to a mapping with:
+      method, label, stats(list), rmse, dof, backend, n_draws, n_boot, ess, rhat,
+      band (optional 3-tuple), and/or band_x, band_lo, band_hi.
+    """
+    m = _as_mapping(res).copy()
+    if "label" not in m:
+        m["label"] = m.get("method_label") or m.get("type") or m.get("method")
+    band = m.get("band")
+    if band and isinstance(band, (tuple, list)) and len(band) == 3:
+        bx, blo, bhi = band
+        m["band_x"], m["band_lo"], m["band_hi"] = bx, blo, bhi
+    return m
+
+
+def write_uncertainty_csv(path, res, file_path):
+    """
+    Write unified CSV:
+      file, peak, param, value, stderr, ci_lo, ci_hi, method, rmse, dof, p2_5, p97_5,
+      backend, n_draws, n_boot, ess, rhat
+    """
+    m = normalize_unc_result(res)
+    rows = _rows_from_stats(file_path, m)
+    cols = ["file","peak","param","value","stderr","ci_lo","ci_hi","method","rmse","dof",
+            "p2_5","p97_5","backend","n_draws","n_boot","ess","rhat"]
+    import csv
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") if r.get(k, None) is not None else "" for k in cols})
+    return path
+
+
+def write_uncertainty_txt(path, res, file_path, solver_line, baseline_line, perf_line):
+    """
+    Human-readable TXT, showing ±stderr and 95% CI (quantiles if available, else ~±1.96σ).
+    """
+    m = normalize_unc_result(res)
+    label = _label_from_result(m)
+    rmse = m.get("rmse")
+    dof = m.get("dof")
+    rows = _rows_from_stats(file_path, m)
+
+    lines = []
+    lines.append(f"File: {file_path}")
+    lines.append(f"Uncertainty method: {label}")
+    if solver_line:   lines.append(f"Solver: {solver_line}")
+    if baseline_line: lines.append(f"Baseline: {baseline_line}")
+    if perf_line:     lines.append(f"Performance: {perf_line}")
+    if rmse is not None and dof is not None:
+        lines.append(f"RMSE={rmse:.4g}, dof={dof}")
+    lines.append("Peaks:")
+
+    from collections import defaultdict
+    g = defaultdict(dict)
+    for r in rows:
+        g[int(r["peak"]) if r["peak"] is not None else -1][r["param"]] = r
+
+    def _fmt(x, digits=6):
+        if x is None: return "n/a"
+        try:
+            return f"{float(x):.{digits}g}"
+        except Exception:
+            return "n/a"
+
+    for pk in sorted(g.keys()):
+        lines.append(f"Peak {pk}")
+        for pname in ("center","height","fwhm","eta"):
+            r = g[pk].get(pname)
+            if not r:
+                continue
+            val = _fmt(r.get("value"))
+            sd = r.get("stderr")
+            ql = r.get("ci_lo")
+            qh = r.get("ci_hi")
+            if pname == "fwhm" and (sd is None):
+                lines.append(f"  {pname:<6} = {val} (fixed)")
+            else:
+                if ql is None or qh is None:
+                    if sd is not None and r.get("value") is not None:
+                        try:
+                            v = float(r["value"]); s = float(sd)
+                            ql = v - 1.96*s
+                            qh = v + 1.96*s
+                        except Exception:
+                            ql = qh = None
+                lines.append(f"  {pname:<6} = {val} ± {_fmt(sd,3)}   (95% CI: [{_fmt(ql)}, {_fmt(qh)}])")
+
+    txt = "\n".join(lines) + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(txt)
+    return path
+
+
+def export_uncertainty_pair(out_csv, out_txt, unc_result, file_path, solver_line, baseline_line, perf_line):
+    """
+    Write both CSV and TXT for the most recently computed uncertainty result.
+    'unc_result' may be dict / namespace / list-of-stats; we normalize inside.
+    """
+    write_uncertainty_csv(out_csv, unc_result, file_path)
+    write_uncertainty_txt(out_txt, unc_result, file_path, solver_line, baseline_line, perf_line)
+    return [out_csv, out_txt]
 
 
 def _pick(d: Dict, *keys, default=None):

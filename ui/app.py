@@ -187,6 +187,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple, Optional
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -721,7 +722,6 @@ class PeakFitApp:
             self.default_font = tkfont.Font()
             self._bold_font = tkfont.Font(weight="bold")
 
-        self._style.configure("Fit.TButton", font=self._bold_font)
         last_template = self.cfg.get("last_template_name", "")
 
         # Data
@@ -826,8 +826,9 @@ class PeakFitApp:
 
         self.ci_band = None
         self.show_ci_band = tk.BooleanVar(value=bool(self.cfg.get("ui_show_uncertainty_band", True)))
+        self.show_ci_band_var = self.show_ci_band
         # Uncertainty state
-        self._last_uncertainty = None
+        self.last_uncertainty = None
 
         self.current_file: Optional[Path] = None
         self.show_ci_band.trace_add("write", self._toggle_ci_band)
@@ -842,6 +843,7 @@ class PeakFitApp:
         else:
             unc_label = "Asymptotic"
         self.unc_method = tk.StringVar(value=unc_label)
+        self.unc_method_var = self.unc_method
         self.unc_workers_var = tk.IntVar(value=int(self.cfg.get("unc_workers", 0)))
         self.unc_workers_var.trace_add("write", lambda *_: self._on_unc_workers_change())
         self.perf_numba = tk.BooleanVar(value=bool(self.cfg.get("perf_numba", False)))
@@ -896,8 +898,12 @@ class PeakFitApp:
         except Exception:
             self.step_btn = ttk.Button(fit_seg, text="Step", command=self.step_once)
         self.step_btn.pack(side=tk.LEFT, padx=2)
-        self.fit_btn = ttk.Button(fit_seg, text="Fit", command=self.fit, style="Fit.TButton")
+        self.fit_btn = ttk.Button(fit_seg, text="Fit", command=self.fit)
         self.fit_btn.pack(side=tk.LEFT, padx=2)
+        # Restore classic ttk button with bold text
+        self._style = getattr(self, "_style", ttk.Style())
+        self._style.configure("Fit.TButton", font=("Segoe UI", 10, "bold"))
+        self.fit_btn.configure(style="Fit.TButton")
 
         ttk.Separator(self.action_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=3)
 
@@ -906,7 +912,7 @@ class PeakFitApp:
         ttk.Button(
             graph_seg,
             text="Uncertainty",
-            command=lambda: self.show_ci_band.set(not self.show_ci_band.get()),
+            command=lambda: self.show_ci_band_var.set(not self.show_ci_band_var.get()),
         ).pack(side=tk.LEFT, padx=2)
         ttk.Button(graph_seg, text="Legend", command=self._toggle_legend_action).pack(
             side=tk.LEFT, padx=2
@@ -1226,11 +1232,13 @@ class PeakFitApp:
         self.chk_ci_band = ttk.Checkbutton(
             unc_box,
             text="Show uncertainty band",
-            variable=self.show_ci_band,
+            variable=self.show_ci_band_var,
         )
         self.chk_ci_band.pack(anchor="w", padx=4)
-        self._set_ci_toggle_state(False)
+        self.ci_toggle = self.chk_ci_band
+        self.ci_toggle.configure(state="disabled")
         self._update_unc_widgets()
+        self._on_uncertainty_method_changed()
 
         # Axes / label controls
         axes_box = ttk.Labelframe(right, text="Axes / Labels")
@@ -1399,17 +1407,7 @@ class PeakFitApp:
             self.cfg["unc_method"] = "asymptotic"
         save_config(self.cfg)
         self._update_unc_widgets()
-        if self._last_uncertainty:
-            lbl = (self._last_uncertainty.get("label") or self._last_uncertainty.get("method") or "").lower()
-            band = self._last_uncertainty.get("band")
-            is_asym = ("asymptotic" in lbl) or ("jᵀj" in lbl) or ("j^tj" in lbl)
-            if is_asym and band is not None:
-                self._set_ci_toggle_state(True)
-                return
-        self.ci_band = None
-        self.show_ci_band.set(False)
-        self._set_ci_toggle_state(False)
-        self.refresh_plot()
+        self._on_uncertainty_method_changed()
 
     def _on_unc_workers_change(self, *_):
         self.cfg["unc_workers"] = int(self.unc_workers_var.get())
@@ -1450,7 +1448,7 @@ class PeakFitApp:
             self._suspend_clicks()
 
     def _toggle_ci_band(self, *_):
-        self.cfg["ui_show_uncertainty_band"] = bool(self.show_ci_band.get())
+        self.cfg["ui_show_uncertainty_band"] = bool(self.show_ci_band_var.get())
         save_config(self.cfg)
         self.refresh_plot()
 
@@ -1528,13 +1526,27 @@ class PeakFitApp:
                 return (x, lo, hi)
         return None
 
-    def _set_ci_toggle_state(self, enabled):
-        """Enable/disable the 'Show uncertainty band' widget."""
-        try:
-            state = "normal" if enabled else "disabled"
-            self.chk_ci_band.configure(state=state)
-        except Exception:
-            pass
+    def _unc_is_asymptotic(self, unc):
+        if unc is None:
+            return False
+        label = ""
+        if isinstance(unc, dict):
+            label = str(unc.get("label") or unc.get("method") or unc.get("type") or "").lower()
+        elif isinstance(unc, SimpleNamespace):
+            label = str(getattr(unc, "label", "") or getattr(unc, "method", "") or getattr(unc, "type", "")).lower()
+        else:
+            return False
+        return ("asym" in label) or ("j" in label and "j" in label)
+
+    def _on_uncertainty_method_changed(self, *_):
+        sel = str(self.unc_method_var.get()).lower()
+        is_asym = ("asym" in sel)
+        self.ci_toggle.configure(state=("normal" if is_asym else "disabled"))
+        if not is_asym:
+            self.show_ci_band_var.set(False)
+            self.ci_band = None
+            self.refresh_plot()
+
 
     def on_abort_clicked(self):
         try:
@@ -2725,10 +2737,10 @@ class PeakFitApp:
                 return
             self.peaks[:] = res.peaks_out
             self.refresh_tree(keep_selection=True)
-            self._last_uncertainty = None
+            self.last_uncertainty = None
             self.ci_band = None
-            self.show_ci_band.set(False)
-            self._set_ci_toggle_state(False)
+            self.show_ci_band_var.set(False)
+            self.ci_toggle.configure(state="disabled")
             self.refresh_plot()
             self.set_busy(False, f"Fit done. RMSE {res.rmse:.4g}")
             npts = int(np.count_nonzero(mask))
@@ -3121,23 +3133,34 @@ class PeakFitApp:
                 self.status_error(f"Uncertainty failed: {error}")
                 return
 
-            unc_norm = _dio._unc_normalize(result)
-            self._last_uncertainty = unc_norm
+            # Store a normalized-ish object (dict or namespace OK; list becomes {"stats": list})
+            if isinstance(result, list):
+                self.last_uncertainty = {"stats": result}
+            elif isinstance(result, SimpleNamespace):
+                self.last_uncertainty = result.__dict__.copy()
+            elif isinstance(result, dict):
+                self.last_uncertainty = result.copy()
+            else:
+                self.last_uncertainty = {"stats": []}  # safe fallback
 
-            label = (unc_norm.get("label") or unc_norm.get("method") or "unknown")
-            l_low = label.lower()
-            band  = unc_norm.get("band")
+            # Gate the CI toggle: only for asymptotic
+            is_asym = self._unc_is_asymptotic(self.last_uncertainty)
+            self.show_ci_band_var.set(bool(is_asym))
+            self.ci_toggle.configure(state=("normal" if is_asym else "disabled"))
 
-            is_asym = ("asymptotic" in l_low) or ("jᵀj" in l_low) or ("j^tj" in l_low)
-            if is_asym and isinstance(band, (tuple, list)) and len(band) == 3:
-                self.ci_band = (np.asarray(band[0]), np.asarray(band[1]), np.asarray(band[2]))
-                self.show_ci_band.set(True)
-                self._set_ci_toggle_state(True)
+            # If asymptotic band present, render; otherwise clear
+            bx = self.last_uncertainty.get("band_x")
+            blo = self.last_uncertainty.get("band_lo")
+            bhi = self.last_uncertainty.get("band_hi")
+            if is_asym and bx is not None and blo is not None and bhi is not None:
+                try:
+                    self.ci_band = (np.asarray(bx), np.asarray(blo), np.asarray(bhi))
+                except Exception:
+                    self.ci_band = None
             else:
                 self.ci_band = None
-                self.show_ci_band.set(False)
-                self._set_ci_toggle_state(False)
 
+            label = (self.last_uncertainty.get("label") or self.last_uncertainty.get("method") or "unknown")
             self.status_info(
                 f"Computed {label} uncertainty." + ("" if self.ci_band is not None else " (no band)")
             )
@@ -3146,7 +3169,7 @@ class PeakFitApp:
 
             # Per-peak stats
             try:
-                rows = self._unc_extract_stats(result)
+                rows = self._unc_extract_stats(self.last_uncertainty)
                 if rows:
                     for i, row in enumerate(rows, 1):
                         def _fmt(v_est, v_sd):
@@ -3423,10 +3446,9 @@ class PeakFitApp:
 
 
         saved = [paths["fit"], paths["trace"]]
-        unc = getattr(self, "_last_uncertainty", None)
-        if unc:
+        saved_unc: List[str] = []
+        if getattr(self, "last_uncertainty", None):
             try:
-                dof = getattr(self, "unc_info", {}).get("dof", None)
                 solver_line = "Solver: {solver}{loss}{weight}{f}{mfev}{rs}{jit}".format(
                     solver=solver,
                     loss=f", loss={opts.get('loss')}" if opts.get("loss") is not None else "",
@@ -3450,31 +3472,18 @@ class PeakFitApp:
                     seed=bool(self.perf_seed_all.get()),
                     mw=int(self.perf_max_workers.get()),
                 )
-                meta = {
-                    'file': str(self.current_file) if self.current_file else "",
-                    'solver': solver_line,
-                    'baseline': baseline_line,
-                    'performance': perf_line,
-                    'rmse': rmse,
-                    'dof': dof,
-                }
-                _dio.export_uncertainty_csv(paths["unc_csv"], unc, meta['file'], rmse=rmse, dof=dof)
-                _dio.export_uncertainty_txt(paths["unc_txt"], unc, meta=meta)
-                band = unc.get("band")
-                if band is not None:
-                    xb, lob, hib = band
-                    with open(paths["unc_band"], "w", newline="", encoding="utf-8") as fh:
-                        bw = csv.writer(fh, lineterminator="\n")
-                        bw.writerow(["x", "y_lo95", "y_hi95"])
-                        for xi, lo, hi in zip(xb, lob, hib):
-                            bw.writerow([xi, lo, hi])
-                    saved.append(paths["unc_band"])
-                saved.extend([paths["unc_txt"], paths["unc_csv"]])
-                label = unc.get("label", "unknown")
+                from core.data_io import export_uncertainty_pair
+                src_path = str(self.current_file) if self.current_file else ""
+                out_csv = paths["unc_csv"]
+                out_txt = paths["unc_txt"]
+                export_uncertainty_pair(out_csv, out_txt, self.last_uncertainty, src_path, solver_line, baseline_line, perf_line)
+                saved_unc.extend([str(out_csv), str(out_txt)])
+                label = self.last_uncertainty.get("label") or self.last_uncertainty.get("method") or "unknown"
                 self.status_info(f"Exported uncertainty ({label}).")
             except Exception as e:  # pragma: no cover - defensive
-                self.log(f"Uncertainty export failed: {e}", level="WARN")
+                self.status_warn(f"Uncertainty export failed: {e}")
 
+        saved.extend(saved_unc)
         saved_lines = [str(p) for p in saved if p]
         messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved_lines))
 
@@ -3527,7 +3536,7 @@ class PeakFitApp:
             lo, hi = sorted((self.fit_xmin, self.fit_xmax))
             self.ax.axvspan(lo, hi, color="0.8", alpha=0.25, lw=0)
 
-        if self.show_ci_band.get() and self.ci_band is not None:
+        if self.show_ci_band_var.get() and self.ci_band is not None:
             try:
                 xb, lob, hib = self.ci_band
                 self.ax.fill_between(
