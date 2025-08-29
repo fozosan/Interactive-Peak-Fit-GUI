@@ -421,9 +421,7 @@ def _normalize_band(result: Any) -> Optional[Tuple[np.ndarray, np.ndarray, np.nd
         if len(band) < 3:
             return None
         x, lo, hi = band[0], band[1], band[2]
-        x = np.asarray(x)
-        lo = np.asarray(lo)
-        hi = np.asarray(hi)
+        x = np.asarray(x); lo = np.asarray(lo); hi = np.asarray(hi)
         if x.shape != lo.shape or x.shape != hi.shape or x.size == 0:
             return None
         return x, lo, hi
