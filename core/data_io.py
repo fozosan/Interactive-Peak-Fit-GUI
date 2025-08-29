@@ -16,6 +16,8 @@ from pathlib import Path
 import math
 import numpy as np
 import pandas as pd
+from collections.abc import Mapping
+from types import SimpleNamespace
 
 from .uncertainty import UncertaintyResult
 
@@ -630,119 +632,179 @@ def _iter_param_rows(unc_res, peaks, method_label: str):
                 "method": method_label,
             }
 
+def _unc_normalize(obj):
+    """
+    Return a dict-like uncertainty payload with at least:
+      - 'label' (str)         : human-readable method label
+      - 'method' (str)        : short method key, e.g. 'asymptotic','bootstrap','bayesian'
+      - 'stats' (list[dict])  : each dict has: peak,param, value|est, stderr|sd, ci_lo, ci_hi, p2_5, p97_5
+      - 'diagnostics' (dict)  : optional metadata (backend, n_draws, n_boot, ess, rhat, rmse, dof, etc)
+      - 'band' (tuple|None)   : (x, lo, hi) or None
+    Accepts Mapping, SimpleNamespace, or list-of-rows. Never returns a list.
+    """
+    # Already a mapping
+    if isinstance(obj, Mapping):
+        return dict(obj)
 
-def export_uncertainty_csv(
-    out_path: str | Path,
-    file_path: str | Path | None = None,
-    method_label: str = "",
-    rmse: float | None = None,
-    dof: float | None = None,
-    peaks: Iterable[Dict[str, Any]] | None = None,
-    result: Any = None,
-) -> str | Path:
-    """Compatibility wrapper producing a unified uncertainty CSV."""
-    # Backward compatibility: legacy signature (path, result, peaks=None, method_label="")
-    if result is None and peaks is None and not isinstance(file_path, (str, Path)):
-        result = file_path
-        file_path = None
+    # Namespace -> dict
+    if isinstance(obj, SimpleNamespace):
+        return vars(obj)
 
-    m = _unc_as_mapping(result)
-    label = method_label or _method_label(m, default="")
-    if rmse is None:
-        rmse = m.get("rmse")
-    if dof is None:
-        dof = m.get("dof")
+    # List/tuple of row dicts -> wrap
+    if isinstance(obj, (list, tuple)):
+        # assume it's a stats row list
+        return {'label': 'unknown', 'method': 'unknown', 'stats': list(obj), 'diagnostics': {}, 'band': None}
 
-    per_peak = _rows_to_per_peak_stats(m, peaks or [])
-    mlow = (label or "").lower()
-    meta: Dict[str, Any] = {}
-    if "bootstrap" in mlow:
-        meta = {"backend": m.get("backend", ""), "n_boot": m.get("n_boot", "")}
-    elif "bayesian" in mlow:
-        meta = {
-            "backend": "emcee",
-            "n_draws": m.get("n_draws", ""),
-            "ess": m.get("ess", ""),
-            "rhat": m.get("rhat", ""),
-        }
-    rows = build_uncertainty_rows(
-        str(file_path) if file_path else "",
-        label,
-        rmse,
-        dof,
-        per_peak,
-        meta,
-    )
-    _write_uncertainty_csv(out_path, rows)
-    return out_path
+    # Fallback to empty structure
+    return {'label': 'unknown', 'method': 'unknown', 'stats': [], 'diagnostics': {}, 'band': None}
 
 
-def export_uncertainty_txt(
-    out_path: str | Path,
-    file_path: str | Path | None = None,
-    method_label: str = "",
-    solver_meta: Dict[str, Any] | None = None,
-    baseline_meta: Dict[str, Any] | None = None,
-    perf_meta: Dict[str, Any] | None = None,
-    peaks: Iterable[Dict[str, Any]] | None = None,
-    result: Any = None,
-    z: float = 1.96,
-) -> str | Path:
-    """Compatibility wrapper producing a unified uncertainty TXT report."""
-    if result is None and peaks is None and not isinstance(file_path, (str, Path)):
-        result = file_path
-        file_path = None
+def _row_value(d, *keys, default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
 
-    m = _unc_as_mapping(result)
-    label = method_label or _method_label(m, default="")
-    per_peak = _rows_to_per_peak_stats(m, peaks or [])
 
-    if isinstance(solver_meta, str):
-        solver_line = solver_meta
-    else:
-        s = solver_meta or {}
-        solver_line = "Solver: {solver}{loss}{weight}{f}{mfev}{rs}{jit}".format(
-            solver=s.get("solver", "unknown"),
-            loss=f", loss={s.get('loss')}" if s.get("loss") is not None else "",
-            weight=f", weight={s.get('weight')}" if s.get("weight") is not None else "",
-            f=f", f_scale={s.get('f_scale')}" if s.get("f_scale") is not None else "",
-            mfev=f", maxfev={s.get('maxfev')}" if s.get("maxfev") is not None else "",
-            rs=f", restarts={s.get('restarts')}" if s.get("restarts") is not None else "",
-            jit=f", jitter_pct={s.get('jitter_pct')}" if s.get("jitter_pct") is not None else "",
-        )
-    if isinstance(baseline_meta, str):
-        baseline_line = baseline_meta
-    else:
-        b = baseline_meta or {}
-        baseline_line = "Baseline: uses_fit_range={uses} , lam={lam} , p={p} , niter={niter} , thresh={th}".format(
-            uses=b.get("uses_fit_range", False),
-            lam=b.get("lam"),
-            p=b.get("p"),
-            niter=b.get("niter"),
-            th=b.get("thresh"),
-        )
-    if isinstance(perf_meta, str):
-        perf_line = perf_meta
-    else:
-        pm = perf_meta or {}
-        perf_line = "Performance: numba={numba}, gpu={gpu}, cache_baseline={cache}, seed_all={seed}, max_workers={mw}".format(
-            numba=pm.get("numba"),
-            gpu=pm.get("gpu"),
-            cache=pm.get("cache_baseline"),
-            seed=pm.get("seed_all"),
-            mw=pm.get("max_workers"),
-        )
-    _write_uncertainty_txt(
-        out_path,
-        str(file_path),
-        label,
-        solver_line,
-        baseline_line,
-        perf_line,
-        per_peak,
-        z,
-    )
-    return out_path
+def _build_unc_rows(unc_mapping, file_path, rmse=None, dof=None):
+    """
+    Build normalized CSV rows from an uncertainty mapping.
+    Returns list of dict rows with fixed schema:
+      file, peak, param, value, stderr, ci_lo, ci_hi, method, rmse, dof,
+      p2_5, p97_5, backend, n_draws, n_boot, ess, rhat
+    """
+    u = _unc_normalize(unc_mapping)
+    label   = u.get('label') or u.get('method') or 'unknown'
+    method  = (u.get('method') or label or 'unknown').lower()
+    stats   = u.get('stats') or []
+    diag    = u.get('diagnostics') or {}
+    file_path = "" if file_path is None else file_path
+
+    rows = []
+    for r in stats:
+        # Support both flat and nested per-param dicts
+        if isinstance(r, Mapping) and 'param' in r:
+            peak   = int(_row_value(r, 'peak', default=0) or 0)
+            param  = str(_row_value(r, 'param', default=''))
+            value  = _row_value(r, 'value', 'est')
+            stderr = _row_value(r, 'stderr', 'sd')
+            ci_lo  = _row_value(r, 'ci_lo', 'p2_5')
+            ci_hi  = _row_value(r, 'ci_hi', 'p97_5')
+            p2_5   = _row_value(r, 'p2_5')
+            p97_5  = _row_value(r, 'p97_5')
+        else:
+            # unknown row type -> skip
+            continue
+
+        rows.append({
+            'file': file_path,
+            'peak': peak,
+            'param': param,
+            'value': value,
+            'stderr': stderr,
+            'ci_lo': ci_lo,
+            'ci_hi': ci_hi,
+            'method': method,
+            'rmse': rmse,
+            'dof': dof,
+            'p2_5': p2_5,
+            'p97_5': p97_5,
+            'backend': diag.get('backend'),
+            'n_draws': diag.get('n_draws') or diag.get('n_samples'),
+            'n_boot': diag.get('n_boot') or diag.get('n_resamples'),
+            'ess': diag.get('ess'),
+            'rhat': diag.get('rhat'),
+        })
+    return rows
+
+
+def export_uncertainty_csv(path, unc_result, file_path, rmse=None, dof=None):
+    """
+    Write uncertainty rows to CSV. Accepts Mapping/Namespace/list; never assumes .get().
+    """
+    rows = _build_unc_rows(unc_result, file_path, rmse=rmse, dof=dof)
+    import csv
+    fieldnames = ['file','peak','param','value','stderr','ci_lo','ci_hi','method','rmse','dof',
+                  'p2_5','p97_5','backend','n_draws','n_boot','ess','rhat']
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in rows:
+            w.writerow({k: ("" if v is None else v) for k, v in row.items()})
+    return path
+
+
+def export_uncertainty_txt(path, unc_result, meta=None):
+    """
+    Human-readable TXT export. Accepts any result shape.
+    meta may contain: solver, baseline, performance, rmse, dof, file.
+    """
+    u = _unc_normalize(unc_result)
+    label  = u.get('label') or u.get('method') or 'unknown'
+    stats  = u.get('stats') or []
+    diag   = u.get('diagnostics') or {}
+    rmse   = (meta or {}).get('rmse')
+    dof    = (meta or {}).get('dof')
+    file_  = (meta or {}).get('file')
+
+    def fmt(x, nan='n/a'):
+        try:
+            if x is None:
+                return nan
+            return f"{float(x):.6g}"
+        except Exception:
+            return str(x) if x is not None else nan
+
+    lines = []
+    if file_: lines.append(f"File: {file_}")
+    lines.append(f"Uncertainty method: {label}")
+    if meta and meta.get('solver'):
+        lines.append(meta['solver'])
+    if meta and meta.get('baseline'):
+        lines.append(meta['baseline'])
+    if meta and meta.get('performance'):
+        lines.append(meta['performance'])
+    if rmse is not None or dof is not None:
+        lines.append(f"RMSE={fmt(rmse)}, dof={fmt(dof)}")
+    if diag:
+        # optional method diagnostics if present
+        parts = []
+        for k in ('backend','n_draws','n_boot','ess','rhat'):
+            if k in diag and diag[k] is not None:
+                parts.append(f"{k}={diag[k]}")
+        if parts:
+            lines.append("Diagnostics: " + ", ".join(parts))
+
+    lines.append("Peaks:")
+    # Group by peak
+    from collections import defaultdict
+    by_peak = defaultdict(list)
+    for r in stats:
+        if isinstance(r, Mapping) and 'param' in r:
+            by_peak[int(r.get('peak', 0))].append(r)
+
+    for k in sorted(by_peak.keys()):
+        lines.append(f"Peak {k}")
+        rows = by_peak[k]
+        # write known params in nice order
+        order = ['center','height','fwhm','eta']
+        for p in order:
+            rr = next((r for r in rows if r.get('param') == p), None)
+            if rr is None: 
+                continue
+            val = _row_value(rr, 'value', 'est')
+            sd  = _row_value(rr, 'stderr', 'sd')
+            lo  = _row_value(rr, 'ci_lo', 'p2_5')
+            hi  = _row_value(rr, 'ci_hi', 'p97_5')
+            fixed = rr.get('fixed', False) or rr.get('lock', False)
+            if fixed:
+                lines.append(f"  {p:<6} = {fmt(val)} (fixed)")
+            else:
+                lines.append(f"  {p:<6} = {fmt(val)} ± {fmt(sd)}   (95% CI: [{fmt(lo)}, {fmt(hi)}])")
+
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines) + "\n")
+    return path
 
 
 # Backwards compatible aliases with older API names
@@ -759,7 +821,14 @@ def write_uncertainty_csv(path, unc_res, peaks=None, method_label: str = "", rms
         df = pd.DataFrame([row])
         write_dataframe(df, Path(path))
         return path
-    return export_uncertainty_csv(path, file_path, method_label, rmse, dof, peaks, unc_res)
+    stats = list(_iter_param_rows(unc_res, peaks, method_label or ""))
+    mapping = {
+        'label': method_label or 'unknown',
+        'method': method_label or 'unknown',
+        'stats': stats,
+        'diagnostics': {},
+    }
+    return export_uncertainty_csv(path, mapping, file_path, rmse=rmse, dof=dof)
 
 
 def write_uncertainty_txt(path, unc_res, peaks=None, method_label: str = "", file_path=None, solver_meta=None, baseline_meta=None, perf_meta=None):
@@ -775,15 +844,19 @@ def write_uncertainty_txt(path, unc_res, peaks=None, method_label: str = "", fil
             lines.append(line)
         Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
-    return export_uncertainty_txt(
-        path,
-        file_path=file_path,
-        method_label=method_label,
-        solver_meta=solver_meta,
-        baseline_meta=baseline_meta,
-        perf_meta=perf_meta,
-        peaks=peaks,
-        result=unc_res,
-    )
+    stats = list(_iter_param_rows(unc_res, peaks, method_label or ""))
+    mapping = {
+        'label': method_label or 'unknown',
+        'method': method_label or 'unknown',
+        'stats': stats,
+        'diagnostics': {},
+    }
+    meta = {
+        'file': file_path,
+        'solver': solver_meta,
+        'baseline': baseline_meta,
+        'performance': perf_meta,
+    }
+    return export_uncertainty_txt(path, mapping, meta=meta)
 
 
