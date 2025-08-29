@@ -249,6 +249,45 @@ def _stats_for_param(rec: Dict, p: str):
     )
 
 
+def _unc_as_mapping(obj):
+    """Map-like view over uncertainty result. List => {'stats': list}."""
+    if obj is None:
+        return {"stats": None}
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, list):
+        return {"stats": obj}
+    d = {}
+    for k in (
+        "label",
+        "method",
+        "method_label",
+        "type",
+        "stats",
+        "parameters",
+        "param_stats",
+        "rmse",
+        "dof",
+        "backend",
+        "n_draws",
+        "n_boot",
+        "ess",
+        "rhat",
+        "band",
+        "prediction_band",
+        "band_x",
+        "band_lo",
+        "band_hi",
+    ):
+        if hasattr(obj, k):
+            d[k] = getattr(obj, k)
+    if not d and hasattr(obj, "__dict__"):
+        d = {**obj.__dict__}
+    if "stats" not in d and "parameters" in d:
+        d["stats"] = d["parameters"]
+    return d
+
+
 def build_uncertainty_rows(
     file_path: str,
     method_label: str,
@@ -607,25 +646,33 @@ def export_uncertainty_csv(
         result = file_path
         file_path = None
 
-    label = method_label or _method_label(result, default="")
-    if rmse is None and result is not None:
-        rmse = getattr(result, "rmse", None)
-    if dof is None and result is not None:
-        dof = getattr(result, "dof", None)
+    m = _unc_as_mapping(result)
+    label = method_label or _method_label(m, default="")
+    if rmse is None:
+        rmse = m.get("rmse")
+    if dof is None:
+        dof = m.get("dof")
 
-    per_peak = _rows_to_per_peak_stats(result, peaks or [])
+    per_peak = _rows_to_per_peak_stats(m, peaks or [])
     mlow = (label or "").lower()
     meta: Dict[str, Any] = {}
     if "bootstrap" in mlow:
-        meta = {"backend": getattr(result, "backend", ""), "n_boot": getattr(result, "n_boot", "")}
+        meta = {"backend": m.get("backend", ""), "n_boot": m.get("n_boot", "")}
     elif "bayesian" in mlow:
         meta = {
             "backend": "emcee",
-            "n_draws": getattr(result, "n_draws", ""),
-            "ess": getattr(result, "ess", ""),
-            "rhat": getattr(result, "rhat", ""),
+            "n_draws": m.get("n_draws", ""),
+            "ess": m.get("ess", ""),
+            "rhat": m.get("rhat", ""),
         }
-    rows = build_uncertainty_rows(str(file_path) if file_path else "", label, rmse, dof, per_peak, meta)
+    rows = build_uncertainty_rows(
+        str(file_path) if file_path else "",
+        label,
+        rmse,
+        dof,
+        per_peak,
+        meta,
+    )
     _write_uncertainty_csv(out_path, rows)
     return out_path
 
@@ -646,8 +693,9 @@ def export_uncertainty_txt(
         result = file_path
         file_path = None
 
-    label = method_label or _method_label(result, default="")
-    per_peak = _rows_to_per_peak_stats(result, peaks or [])
+    m = _unc_as_mapping(result)
+    label = method_label or _method_label(m, default="")
+    per_peak = _rows_to_per_peak_stats(m, peaks or [])
 
     if isinstance(solver_meta, str):
         solver_line = solver_meta
