@@ -704,17 +704,24 @@ class PeakFitApp:
         save_config(self.cfg)
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
 
-        style = ttk.Style(self.root)
-        style.configure("Danger.TButton", foreground="white", background="#c62828")
-        style.map("Danger.TButton", background=[("active", "#b71c1c")])
-        style.configure("Success.TButton", foreground="white", background="#2e7d32")
-        style.map("Success.TButton", background=[("active", "#1b5e20")])
+        self._style = getattr(self, "_style", ttk.Style(self.root))
+        self._style.configure("Danger.TButton", foreground="white", background="#c62828")
+        self._style.map("Danger.TButton", background=[("active", "#b71c1c")])
+        self._style.configure("Success.TButton", foreground="white", background="#2e7d32")
+        self._style.map("Success.TButton", background=[("active", "#1b5e20")])
 
         performance.set_logger(self.log_threadsafe)
 
-        self.default_font = tkfont.nametofont("TkDefaultFont")
-        self._bold_font = tkfont.Font(root=self.root, weight="bold")
-        style.configure("Fit.TButton", font=self._bold_font)
+        try:
+            base = tkfont.nametofont("TkDefaultFont")
+            self.default_font = base
+            self._bold_font = base.copy()
+            self._bold_font.configure(weight="bold")
+        except Exception:
+            self.default_font = tkfont.Font()
+            self._bold_font = tkfont.Font(weight="bold")
+
+        self._style.configure("Fit.TButton", font=self._bold_font)
         last_template = self.cfg.get("last_template_name", "")
 
         # Data
@@ -890,7 +897,6 @@ class PeakFitApp:
             self.step_btn = ttk.Button(fit_seg, text="Step", command=self.step_once)
         self.step_btn.pack(side=tk.LEFT, padx=2)
         self.fit_btn = ttk.Button(fit_seg, text="Fit", command=self.fit, style="Fit.TButton")
-        self.fit_btn["font"] = self._bold_font
         self.fit_btn.pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(self.action_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=3)
