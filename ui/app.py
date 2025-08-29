@@ -3288,13 +3288,15 @@ class PeakFitApp:
                     peaks=self.peaks,
                     method_label=self.last_unc_method or ""
                 )
-                if self.ci_band is not None:
-                    xb, lob, hib = self.ci_band[:3]
+                band = data_io._normalize_band(self.last_unc_result)
+                if band is not None:
+                    xb, lob, hib = band
                     with open(paths["unc_band"], "w", newline="", encoding="utf-8") as fh:
                         bw = csv.writer(fh, lineterminator="\n")
                         bw.writerow(["x", "y_lo95", "y_hi95"])
                         for xi, lo, hi in zip(xb, lob, hib):
                             bw.writerow([xi, lo, hi])
+                    saved.append(paths["unc_band"])
                 saved.extend([paths["unc_txt"], paths["unc_csv"]])
                 self.status_info(f"Exported uncertainty ({self.last_unc_method}).")
             except Exception as e:  # pragma: no cover - defensive
@@ -3302,7 +3304,8 @@ class PeakFitApp:
         else:
             self.status_info("No uncertainty computed — skipping uncertainty export.")
 
-        messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved))
+        saved_lines = [str(p) for p in saved if p]
+        messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved_lines))
 
     # ----- Plot -----
     def toggle_components(self):

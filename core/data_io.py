@@ -200,6 +200,45 @@ def write_dataframe(df: pd.DataFrame, path: Path) -> None:
         df.to_csv(fh, index=False, lineterminator="\n")
 
 
+def _normalize_band(result):
+    """Return ``(x, lo, hi)`` arrays or ``None``.
+
+    Accepts ``UncertaintyResult`` instances or dict-like structures containing a
+    band description. The function avoids evaluating numpy arrays in boolean
+    context and validates shapes before returning normalized arrays.
+    """
+
+    if result is None:
+        return None
+
+    band = getattr(result, "band", None)
+    if band is None:
+        band = getattr(result, "prediction_band", None)
+
+    if band is None and isinstance(result, dict):
+        band = result.get("band")
+        if band is None:
+            band = result.get("prediction_band")
+        if band is None:
+            band = result.get("ci_band")
+
+    if band is None:
+        return None
+
+    try:
+        if len(band) < 3:
+            return None
+        x, lo, hi = band[0], band[1], band[2]
+        x = np.asarray(x)
+        lo = np.asarray(lo)
+        hi = np.asarray(hi)
+        if x.shape != lo.shape or x.shape != hi.shape or x.size == 0:
+            return None
+        return x, lo, hi
+    except Exception:
+        return None
+
+
 class _DictResult(UncertaintyResult):
     """Shim exposing custom method labels for legacy dict results."""
 
@@ -235,26 +274,32 @@ def _ensure_result(unc: Union[UncertaintyResult, dict]) -> UncertaintyResult:
 
     params: Dict[str, Dict[str, float]] = {}
     for name, stats in unc.get("params", {}).items():
-        est = stats.get("est") or stats.get("mean") or stats.get("median")
-        sd = stats.get("sd") or stats.get("stderr") or stats.get("sigma")
-        p2 = stats.get("p2.5") or stats.get("p2_5") or stats.get("q05")
-        p97 = stats.get("p97.5") or stats.get("p97_5") or stats.get("q95")
+        est = stats.get("est")
+        if est is None:
+            est = stats.get("mean")
+        if est is None:
+            est = stats.get("median")
+        sd = stats.get("sd")
+        if sd is None:
+            sd = stats.get("stderr")
+        if sd is None:
+            sd = stats.get("sigma")
+        p2 = stats.get("p2.5")
+        if p2 is None:
+            p2 = stats.get("p2_5")
+        if p2 is None:
+            p2 = stats.get("q05")
+        p97 = stats.get("p97.5")
+        if p97 is None:
+            p97 = stats.get("p97_5")
+        if p97 is None:
+            p97 = stats.get("q95")
         params[name] = {"est": est, "sd": sd}
         if p2 is not None and p97 is not None:
             params[name]["p2.5"] = p2
             params[name]["p97.5"] = p97
 
-    band = None
-    b = unc.get("band") or unc.get("curve_band")
-    if b:
-        if isinstance(b, dict):
-            band = (
-                np.asarray(b.get("x")),
-                np.asarray(b.get("lo")),
-                np.asarray(b.get("hi")),
-            )
-        elif isinstance(b, (tuple, list)) and len(b) == 3:
-            band = tuple(np.asarray(part) for part in b)
+    band = _normalize_band(unc)
 
     diagnostics = {
         "ess": unc.get("diagnostics", {}).get("ess"),
@@ -273,11 +318,11 @@ def _iter_param_rows(unc_res, peaks, method_label: str):
 
     stats = getattr(unc_res, "stats", None)
     if stats is None and isinstance(unc_res, dict):
-        stats = (
-            unc_res.get("stats")
-            or unc_res.get("parameters")
-            or unc_res.get("param_stats")
-        )
+        stats = unc_res.get("stats")
+        if stats is None:
+            stats = unc_res.get("parameters")
+        if stats is None:
+            stats = unc_res.get("param_stats")
     if not stats:
         return
 
@@ -287,21 +332,74 @@ def _iter_param_rows(unc_res, peaks, method_label: str):
         heights = stats.get("height", {})
         fwhms = stats.get("fwhm", {})
         etas = stats.get("eta", {})
-        est_c = centers.get("est") or []
-        est_h = heights.get("est") or []
-        est_w = fwhms.get("est") or []
-        sd_c = centers.get("sd") or []
-        sd_h = heights.get("sd") or []
-        sd_w = fwhms.get("sd") or []
-        sd_e = etas.get("sd") or []
-        p2_c = centers.get("p2_5") or centers.get("p2.5") or []
-        p2_h = heights.get("p2_5") or heights.get("p2.5") or []
-        p2_w = fwhms.get("p2_5") or fwhms.get("p2.5") or []
-        p2_e = etas.get("p2_5") or etas.get("p2.5") or []
-        p97_c = centers.get("p97_5") or centers.get("p97.5") or []
-        p97_h = heights.get("p97_5") or heights.get("p97.5") or []
-        p97_w = fwhms.get("p97_5") or fwhms.get("p97.5") or []
-        p97_e = etas.get("p97_5") or etas.get("p97.5") or []
+
+        est_c = centers.get("est")
+        if est_c is None:
+            est_c = []
+        est_h = heights.get("est")
+        if est_h is None:
+            est_h = []
+        est_w = fwhms.get("est")
+        if est_w is None:
+            est_w = []
+
+        sd_c = centers.get("sd")
+        if sd_c is None:
+            sd_c = []
+        sd_h = heights.get("sd")
+        if sd_h is None:
+            sd_h = []
+        sd_w = fwhms.get("sd")
+        if sd_w is None:
+            sd_w = []
+        est_e = etas.get("est")
+        if est_e is None:
+            est_e = []
+        sd_e = etas.get("sd")
+        if sd_e is None:
+            sd_e = []
+
+        p2_c = centers.get("p2_5")
+        if p2_c is None:
+            p2_c = centers.get("p2.5")
+        if p2_c is None:
+            p2_c = []
+        p2_h = heights.get("p2_5")
+        if p2_h is None:
+            p2_h = heights.get("p2.5")
+        if p2_h is None:
+            p2_h = []
+        p2_w = fwhms.get("p2_5")
+        if p2_w is None:
+            p2_w = fwhms.get("p2.5")
+        if p2_w is None:
+            p2_w = []
+        p2_e = etas.get("p2_5")
+        if p2_e is None:
+            p2_e = etas.get("p2.5")
+        if p2_e is None:
+            p2_e = []
+
+        p97_c = centers.get("p97_5")
+        if p97_c is None:
+            p97_c = centers.get("p97.5")
+        if p97_c is None:
+            p97_c = []
+        p97_h = heights.get("p97_5")
+        if p97_h is None:
+            p97_h = heights.get("p97.5")
+        if p97_h is None:
+            p97_h = []
+        p97_w = fwhms.get("p97_5")
+        if p97_w is None:
+            p97_w = fwhms.get("p97.5")
+        if p97_w is None:
+            p97_w = []
+        p97_e = etas.get("p97_5")
+        if p97_e is None:
+            p97_e = etas.get("p97.5")
+        if p97_e is None:
+            p97_e = []
         for i, _ in enumerate(peaks, 1):
             yield {
                 "peak": i,
@@ -333,7 +431,7 @@ def _iter_param_rows(unc_res, peaks, method_label: str):
             yield {
                 "peak": i,
                 "param": "eta",
-                "est": _safe_idx(etas.get("est") or [], i - 1),
+                "est": _safe_idx(est_e, i - 1),
                 "sd": _safe_idx(sd_e, i - 1),
                 "p2_5": _safe_idx(p2_e, i - 1),
                 "p97_5": _safe_idx(p97_e, i - 1),
@@ -405,11 +503,11 @@ def write_uncertainty_txt(path: str | Path, unc_res, peaks=None, method_label: s
 
     stats = getattr(unc_res, "stats", None)
     if stats is None and isinstance(unc_res, dict):
-        stats = (
-            unc_res.get("stats")
-            or unc_res.get("parameters")
-            or unc_res.get("param_stats")
-        )
+        stats = unc_res.get("stats")
+        if stats is None:
+            stats = unc_res.get("parameters")
+        if stats is None:
+            stats = unc_res.get("param_stats")
     lines = [f"Uncertainty: {method_label}"]
     if not stats:
         lines.append("No parameter statistics available.")
