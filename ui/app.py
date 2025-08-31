@@ -3021,7 +3021,14 @@ class PeakFitApp:
                 return
 
             try:
-                self.last_uncertainty = _normalize_unc_result(result)
+                # Ensure method/label hints are present to avoid 'unknown' in logs/exports
+                res = result
+                if isinstance(res, dict):
+                    # Add robust defaults if the backend didn't set these fields
+                    res.setdefault("method", method)
+                    if "label" not in res and "method_label" not in res:
+                        res["method_label"] = _unc_method_label({"method": method})
+                self.last_uncertainty = _normalize_unc_result(res)
             except Exception:
                 self.last_uncertainty = {"label": "unknown", "stats": []}
 
@@ -3034,7 +3041,13 @@ class PeakFitApp:
                 })
             self._last_unc_locks = locks
 
-            label = _canonical_unc_label(self.last_uncertainty.get("label"))
+            # Derive a stable, canonical label; fall back to the selected method
+            raw_lbl = (self.last_uncertainty.get("label") or self.last_uncertainty.get("method") or "")
+            label = _canonical_unc_label(raw_lbl)
+            if label == "unknown":
+                # Fallback to UI-selected method if the payload didn't specify a label/method
+                label = _unc_method_label({"method": method})
+                self.last_uncertainty["method"] = method
             self.last_uncertainty["label"] = label
 
             if label.startswith("Asymptotic"):
