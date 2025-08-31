@@ -814,8 +814,8 @@ class PeakFitApp:
         self.classic_maxfev = tk.IntVar(value=20000)
         self.classic_centers_window = tk.BooleanVar(value=True)
         self.classic_margin = tk.DoubleVar(value=0.0)
-        self.classic_fwhm_min = tk.DoubleVar(value=2.0)
-        self.classic_fwhm_max = tk.DoubleVar(value=0.5)
+        self.classic_fwhm_min = tk.DoubleVar(value=0.5)
+        self.classic_fwhm_max = tk.DoubleVar(value=2.0)
         self.classic_height_factor = tk.DoubleVar(value=1.0)
         self.modern_loss = tk.StringVar(value="linear")
         self.modern_weight = tk.StringVar(value="none")
@@ -3030,7 +3030,7 @@ class PeakFitApp:
                 locks.append({
                     "center": bool(getattr(pk, "lock_center", False)),
                     "fwhm": bool(getattr(pk, "lock_width", False)),
-                    "eta": True,
+                    "eta": False,
                 })
             self._last_unc_locks = locks
 
@@ -3274,6 +3274,17 @@ class PeakFitApp:
                 saved_unc.extend([str(long_csv), str(txt_path)])
                 if wide_csv:
                     saved_unc.append(str(wide_csv))
+                # Write asymptotic band CSV for compatibility
+                band_csv = base.with_name(base.name + "_uncertainty_band.csv")
+                band = unc.get("band")
+                if band is not None and str(method_label).startswith("Asymptotic"):
+                    xb, lob, hib = band
+                    with band_csv.open("w", newline="", encoding="utf-8") as fh:
+                        w = csv.writer(fh, lineterminator="\n")
+                        w.writerow(["x", "y_lo95", "y_hi95"])
+                        for xi, lo, hi in zip(xb, lob, hib):
+                            w.writerow([float(xi), float(lo), float(hi)])
+                    saved_unc.append(str(band_csv))
             except Exception as e:  # pragma: no cover - defensive
                 self.status_warn(f"Uncertainty export failed: {e}")
 

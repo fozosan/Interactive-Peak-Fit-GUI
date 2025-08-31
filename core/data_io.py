@@ -5,9 +5,9 @@ artifacts. Implementations follow the Peakfit 3.x blueprint.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from collections.abc import Mapping
 
 import csv
 import io
@@ -215,7 +215,7 @@ def _canonical_unc_label(label: Optional[str]) -> str:
     if not label:
         return "unknown"
     s = str(label).strip().lower()
-    if "asym" in s or "j" in s and "j" in s:  # tolerate variants like "Asymptotic (J^T J)"
+    if "asym" in s or "jᵀj" in s or "j^tj" in s or "jtj" in s:
         return "Asymptotic (JᵀJ)"
     if "boot" in s:
         return "Bootstrap (residual)"
@@ -478,21 +478,21 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
 
 
 def _iter_param_rows(
-    file_path: Union[str, "Path", Any],
-    unc_norm: Any,
-    *_: Any,
+    file_path: Union[str, Path, Any],
+    unc_res: Any,
+    *_,
 ) -> Iterable[Mapping[str, Any]]:
     """
     Yield CSV rows in the unified schema:
       file, peak, param, value, stderr, ci_lo, ci_hi, method, rmse, dof,
       p2_5, p97_5, backend, n_draws, n_boot, ess, rhat
     """
-    if not isinstance(file_path, (str, Path)) or isinstance(unc_norm, (list, tuple, Mapping)) and not isinstance(file_path, (str, Path)):
-        unc_norm = _normalize_unc_result(file_path)
-        fname = ""
-    else:
-        unc_norm = _normalize_unc_result(unc_norm)
+    if isinstance(file_path, (str, Path)):
         fname = str(file_path)
+        unc_norm = _normalize_unc_result(unc_res)
+    else:  # backward-compat call: first arg is unc_res
+        fname = ""
+        unc_norm = _normalize_unc_result(file_path)
     label = unc_norm.get("label", "unknown")
     rmse  = _to_float(unc_norm.get("rmse"))
     dof   = int(unc_norm.get("dof", 0))
@@ -700,7 +700,7 @@ def write_uncertainty_csvs(
     unc_norm: Mapping[str, Any],
     *,
     write_wide: bool = False,
-) -> Tuple["Path", "Path"]:
+) -> Tuple[Path, Optional[Path]]:
     """
     Convenience: write long CSV to <base>_uncertainty.csv.
     If write_wide=True, also write <base>_uncertainty_wide.csv.
