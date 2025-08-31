@@ -207,18 +207,43 @@ _Z = 1.96  # 95% normal approx
 # --- BEGIN: Uncertainty helpers (stable public surface for UI/tests) ---
 
 def _canonical_unc_label(label: Optional[str]) -> str:
-    """
-    Map any label/method/type to a human-friendly canonical name.
-    Returns one of: "Asymptotic (JᵀJ)", "Bootstrap (residual)", "Bayesian (MCMC)", "asymptotic", "bootstrap", "bayesian".
-    """
-    if not label:
-        return "unknown"
-    s = str(label).strip().lower()
-    if "asym" in s or "jᵀj" in s or "j^tj" in s or "jtj" in s:
+    """Map many possible uncertainty method aliases to a canonical label."""
+    s = str(label or "").strip().lower()
+    # normalize spacing/symbols for JᵀJ variants
+    s = s.replace("j^t j", "j^tj").replace("j^t  j", "j^tj")
+    s = s.replace("jᵀ j", "jᵀj").replace("j ᵀ j", "jᵀj")
+
+    asym_hits = (
+        "asym" in s
+        or "jtj" in s
+        or "j^tj" in s
+        or "jᵀj" in s
+        or "gauss" in s
+        or "hessian" in s
+        or "linearized" in s
+        or "curvature" in s
+        or s == "cov"
+    )
+    boot_hits = (
+        "boot" in s
+        or "resid" in s
+        or "resample" in s
+    )
+    bayes_hits = (
+        "bayes" in s
+        or "mcmc" in s
+        or "emcee" in s
+        or "pymc" in s
+        or "numpyro" in s
+        or "hmc" in s
+        or "nuts" in s
+    )
+
+    if asym_hits:
         return "Asymptotic (JᵀJ)"
-    if "boot" in s:
+    if boot_hits:
         return "Bootstrap (residual)"
-    if "bayes" in s or "mcmc" in s:
+    if bayes_hits:
         return "Bayesian (MCMC)"
     return "unknown"
 
@@ -567,17 +592,24 @@ def _to_float(x: Any) -> float:
 
 
 def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
-    """
-    Normalize any uncertainty result into a dict with fields:
-      label (canonical string), rmse (float), dof (int), backend (str),
-      n_draws (int), n_boot (int), ess (float), rhat (float),
-      band (optional 3-tuple: (x, lo, hi)),
-      stats: List[ per-peak mapping as described in _extract_stats_table() ].
-    Unknown fields may be absent; missing numeric values are np.nan.
-    """
+    """Normalize arbitrary uncertainty payloads into a common mapping."""
     m = _as_mapping(unc)
-    label = m.get("label") or m.get("method_label") or m.get("method") or m.get("type")
-    canon = _canonical_unc_label(label)
+    # Accept a wide range of potential keys describing the method/label
+    raw_method = (
+        m.get("label")
+        or m.get("method_label")
+        or m.get("method")
+        or m.get("type")
+        or m.get("mode")
+        or m.get("name")
+        or m.get("uncertainty")
+        or m.get("uncertainty_method")
+        or m.get("algorithm")
+        or m.get("algo")
+        or "unknown"
+    )
+    method = str(raw_method)
+    canon = _canonical_unc_label(raw_method)
 
     # Pull band in a tolerant way
     band = None
@@ -589,18 +621,32 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
                 band = (np.asarray(x, float), np.asarray(lo, float), np.asarray(hi, float))
             break
 
+    diag = _as_mapping(m.get("diagnostics"))
+
     out = {
         "label": canon,
+        "method": method,
         "rmse": _to_float(m.get("rmse")),
         "dof": int(m.get("dof", m.get("d.o.f.", m.get("degrees_of_freedom", 0))) or 0),
-        "backend": str(m.get("backend", m.get("engine", ""))) or "",
-        "n_draws": int(m.get("n_draws", m.get("samples", 0)) or 0),
-        "n_boot": int(m.get("n_boot", m.get("bootstraps", 0)) or 0),
+        "backend": str(m.get("backend") or diag.get("backend") or m.get("engine") or ""),
+        "n_draws": int(m.get("n_draws", m.get("samples", diag.get("n_draws", 0))) or 0),
+        "n_boot": int(m.get("n_boot", m.get("bootstraps", diag.get("n_boot", diag.get("bootstraps", 0)))) or 0),
         "ess": _to_float(m.get("ess")),
         "rhat": _to_float(m.get("rhat")),
         "band": band,
         "stats": _extract_stats_table(m),
     }
+
+    if out["label"] == "unknown":
+        backend_s = str(out.get("backend", "")).lower()
+        n_boot_i = int(out.get("n_boot") or 0)
+        if n_boot_i > 0:
+            out["label"] = "Bootstrap (residual)"
+        elif any(k in backend_s for k in ("emcee", "pymc", "numpyro", "mcmc", "hmc", "nuts")):
+            out["label"] = "Bayesian (MCMC)"
+        elif any(k in backend_s for k in ("jtj", "j^tj", "jᵀj", "gauss", "hessian", "linearized", "cov")):
+            out["label"] = "Asymptotic (JᵀJ)"
+
     return out
 
 
