@@ -2896,9 +2896,22 @@ class PeakFitApp:
                 cov, th, _info = res
                 sigma = self._safe_sqrt_vec(np.diag(np.asarray(cov, float)))
                 param_stats = {
-                    "center": {"est": [p.center for p in self.peaks], "sd": sigma[0::4]},
-                    "fwhm": {"est": [p.fwhm for p in self.peaks], "sd": sigma[2::4]},
-                    "height": {"est": [p.height for p in self.peaks], "sd": sigma[1::4]},
+                    "center": {
+                        "est": [p.center for p in self.peaks],
+                        "sd": sigma[0::4].tolist(),
+                    },
+                    "height": {
+                        "est": [p.height for p in self.peaks],
+                        "sd": sigma[1::4].tolist(),
+                    },
+                    "fwhm": {
+                        "est": [p.fwhm for p in self.peaks],
+                        "sd": sigma[2::4].tolist(),
+                    },
+                    "eta": {
+                        "est": [p.eta for p in self.peaks],
+                        "sd": sigma[3::4].tolist(),
+                    },
                 }
                 return {
                     "method": "asymptotic",
@@ -2943,21 +2956,30 @@ class PeakFitApp:
                                 p_hi = np.quantile(samp, 0.975, axis=0)
 
                             def slice_stats(idx: int) -> Dict[str, Any]:
-                                est = th[idx::4] if th.size else None
-                                sd_i = sd[idx::4] if sd is not None else None
+                                est = th[idx::4].tolist() if th.size else None
+                                sd_i = sd[idx::4].tolist() if sd is not None else None
                                 d: Dict[str, Any] = {"est": est, "sd": sd_i}
                                 if p_lo is not None and p_hi is not None:
-                                    d["p2_5"] = p_lo[idx::4]
-                                    d["p97_5"] = p_hi[idx::4]
+                                    d["p2_5"] = p_lo[idx::4].tolist()
+                                    d["p97_5"] = p_hi[idx::4].tolist()
                                 return d
 
                             res["param_stats"] = {
                                 "center": slice_stats(0),
                                 "height": slice_stats(1),
                                 "fwhm": slice_stats(2),
+                                "eta": slice_stats(3),
                             }
                         except Exception:
                             pass
+                    # Ensure param_stats arrays are lists
+                    ps = res.get("param_stats")
+                    if isinstance(ps, dict):
+                        for blk in ps.values():
+                            if isinstance(blk, dict):
+                                for k, v in blk.items():
+                                    if isinstance(v, np.ndarray):
+                                        blk[k] = v.tolist()
                 return res
             if method == "bayesian":
                 init = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
@@ -2987,21 +3009,29 @@ class PeakFitApp:
                                 p_hi = np.quantile(samp, 0.975, axis=0)
 
                             def slice_stats(idx: int) -> Dict[str, Any]:
-                                est = th[idx::4] if th.size else None
-                                sd_i = sd[idx::4] if sd is not None else None
+                                est = th[idx::4].tolist() if th.size else None
+                                sd_i = sd[idx::4].tolist() if sd is not None else None
                                 d: Dict[str, Any] = {"est": est, "sd": sd_i}
                                 if p_lo is not None and p_hi is not None:
-                                    d["p2_5"] = p_lo[idx::4]
-                                    d["p97_5"] = p_hi[idx::4]
+                                    d["p2_5"] = p_lo[idx::4].tolist()
+                                    d["p97_5"] = p_hi[idx::4].tolist()
                                 return d
 
                             res["param_stats"] = {
                                 "center": slice_stats(0),
                                 "height": slice_stats(1),
                                 "fwhm": slice_stats(2),
+                                "eta": slice_stats(3),
                             }
                         except Exception:
                             pass
+                    ps = res.get("param_stats")
+                    if isinstance(ps, dict):
+                        for blk in ps.values():
+                            if isinstance(blk, dict):
+                                for k, v in blk.items():
+                                    if isinstance(v, np.ndarray):
+                                        blk[k] = v.tolist()
                 return res
             return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
 
@@ -3020,9 +3050,9 @@ class PeakFitApp:
                 self.status_error(f"Uncertainty failed: {error}")
                 return
 
+            res = result
             try:
                 # Ensure method/label hints are present to avoid 'unknown' in logs/exports
-                res = result
                 if isinstance(res, dict):
                     # Add robust defaults if the backend didn't set these fields
                     res.setdefault("method", method)
@@ -3049,6 +3079,21 @@ class PeakFitApp:
                 label = _unc_method_label({"method": method})
                 self.last_uncertainty["method"] = method
             self.last_uncertainty["label"] = label
+
+            # Guarantee per-peak stats even if backend omitted blocks
+            if not (self.last_uncertainty.get("stats") or []):
+                pm = None
+                if isinstance(res, dict):
+                    pm = (
+                        res.get("param_stats")
+                        or res.get("parameters")
+                        or res.get("params")
+                    )
+                if pm is not None:
+                    rebuilt = {"param_stats": pm}
+                    self.last_uncertainty["stats"] = (
+                        _normalize_unc_result(rebuilt).get("stats") or []
+                    )
 
             if label.startswith("Asymptotic"):
                 band = self.last_uncertainty.get("band")
@@ -3093,8 +3138,9 @@ class PeakFitApp:
                     c_est, c_sd = _fmt(row.get("center", {}).get("est"), row.get("center", {}).get("sd"))
                     h_est, h_sd = _fmt(row.get("height", {}).get("est"), row.get("height", {}).get("sd"))
                     w_est, w_sd = _fmt(row.get("fwhm", {}).get("est"), row.get("fwhm", {}).get("sd"))
+                    e_est, e_sd = _fmt(row.get("eta", {}).get("est"), row.get("eta", {}).get("sd"))
                     self.status_info(
-                        f"Peak {i}: center={c_est} ± {c_sd} | height={h_est} ± {h_sd} | FWHM={w_est} ± {w_sd}"
+                        f"Peak {i}: center={c_est} ± {c_sd} | height={h_est} ± {h_sd} | FWHM={w_est} ± {w_sd} | eta={e_est} ± {e_sd}"
                     )
             except Exception as _e:
                 self.status_warn(f"Uncertainty stats formatting skipped ({_e.__class__.__name__}).")
@@ -3240,9 +3286,6 @@ class PeakFitApp:
             try:
                 base = Path(out_csv).with_suffix("")
                 write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
-
-                # ensure mapping shape for exporter
-                unc = _normalize_unc_result(unc)
 
                 long_csv, wide_csv = write_uncertainty_csvs(
                     base, self.current_file or "", unc, write_wide=write_wide
