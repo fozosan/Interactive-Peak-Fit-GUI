@@ -222,12 +222,19 @@ def _canonical_unc_label(label: Optional[str]) -> str:
         or "hessian" in s
         or "linearized" in s
         or "curvature" in s
-        or s == "cov"
+        or "cov" == s
+        or "covariance" in s
+        or "covmatrix" in s
     )
     boot_hits = (
         "boot" in s
-        or "resid" in s
+        or "bootstrap" in s
         or "resample" in s
+        or "resampling" in s
+        or "resid" in s           # residual / residuals
+        or "residual" in s
+        or "percentile" in s
+        or "perc" in s
     )
     bayes_hits = (
         "bayes" in s
@@ -237,6 +244,8 @@ def _canonical_unc_label(label: Optional[str]) -> str:
         or "numpyro" in s
         or "hmc" in s
         or "nuts" in s
+        or "posterior" in s
+        or "chain" in s
     )
 
     if asym_hits:
