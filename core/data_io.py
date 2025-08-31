@@ -6,7 +6,8 @@ artifacts. Implementations follow the Peakfit 3.x blueprint.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from collections.abc import Mapping
 
 import csv
 import io
@@ -17,8 +18,6 @@ import math
 from math import isnan
 import numpy as np
 import pandas as pd
-from collections.abc import Mapping
-from types import SimpleNamespace
 
 from .uncertainty import UncertaintyResult
 
@@ -206,871 +205,572 @@ def write_dataframe(df: pd.DataFrame, path: Path) -> None:
 
 _Z = 1.96  # 95% normal approx
 
+# --- BEGIN: Uncertainty helpers (stable public surface for UI/tests) ---
 
-def _to_float_or_nan(x):
+def _canonical_unc_label(label: Optional[str]) -> str:
+    """
+    Map any label/method/type to a human-friendly canonical name.
+    Returns one of: "Asymptotic (JᵀJ)", "Bootstrap (residual)", "Bayesian (MCMC)", "asymptotic", "bootstrap", "bayesian".
+    """
+    if not label:
+        return "unknown"
+    s = str(label).strip().lower()
+    if "asym" in s or "jᵀj" in s or "j^tj" in s or "jtj" in s:
+        return "Asymptotic (JᵀJ)"
+    if "boot" in s:
+        return "Bootstrap (residual)"
+    if "bayes" in s or "mcmc" in s:
+        return "Bayesian (MCMC)"
+    return "unknown"
+
+
+def _as_mapping(obj: Any) -> Mapping[str, Any]:
+    """Return obj as a read-only mapping interface."""
+    if obj is None:
+        return {}
+    if isinstance(obj, Mapping):
+        return obj
+    if hasattr(obj, "__dict__"):
+        return obj.__dict__
+    # list/tuple results (common in older bootstrap paths) -> wrap under a 'stats' key
+    if isinstance(obj, (list, tuple)):
+        return {"stats": obj}
+    return {"value": obj}
+
+
+def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    roots = ["stats", "parameters", "param_stats"]
+    rows = None
+    for k in roots:
+        if k in unc_map and unc_map[k] is not None:
+            rows = unc_map[k]
+            break
+    if rows is None:
+        return []
+
+    # Helper pickers
+    def pick(d, *keys):
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return None
+
+    def norm_param_name(s: Any) -> Optional[str]:
+        if not isinstance(s, str):
+            return None
+        ss = s.strip().lower()
+        if ss in ("center", "centre", "mu", "x0", "pos"):
+            return "center"
+        if ss in ("height", "amp", "amplitude"):
+            return "height"
+        if ss in ("fwhm", "width", "gamma", "sigma"):
+            return "fwhm"
+        if ss in ("eta", "mix", "mixing"):
+            return "eta"
+        return None
+
+    # --- Long-format path: rows like {'peak', 'param', 'est'/ 'value', 'sd'/'stderr', ...}
+    if (
+        isinstance(rows, (list, tuple))
+        and rows
+        and isinstance(rows[0], Mapping)
+        and ("param" in rows[0] or "name" in rows[0])
+    ):
+        from collections import defaultdict
+
+        by_peak: Dict[int, Dict[str, Dict[str, float]]] = defaultdict(dict)
+
+        for r in rows:
+            rm = _as_mapping(r)
+            # Identify peak index
+            idx = pick(rm, "peak", "index", "k", "i")
+            try:
+                pk_idx = int(idx) if idx is not None else None
+            except Exception:
+                pk_idx = None
+            if pk_idx is None:
+                continue
+
+            # Param name -> canonical
+            rawp = pick(rm, "param", "name")
+            pname = norm_param_name(rawp)
+            if not pname:
+                continue
+
+            est = pick(rm, "est", "value", "mean", "median")
+            sd = pick(rm, "sd", "stderr", "std", "stdev")
+            p2_5 = pick(rm, "p2_5", "q025", "q2_5")
+            p97_5 = pick(rm, "p97_5", "q975", "q97_5")
+            ci_lo = pick(rm, "ci_lo")
+            ci_hi = pick(rm, "ci_hi")
+
+            # Synthesize CI from sd if missing
+            if (ci_lo is None or ci_hi is None) and est is not None and sd is not None:
+                try:
+                    e = float(est)
+                    s = float(sd)
+                    ci_lo, ci_hi = e - _Z * s, e + _Z * s
+                except Exception:
+                    pass
+
+            by_peak[pk_idx][pname] = {
+                "est": _to_float(est),
+                "sd": _to_float(sd),
+                "ci_lo": _to_float(ci_lo),
+                "ci_hi": _to_float(ci_hi),
+                "p2_5": _to_float(p2_5),
+                "p97_5": _to_float(p97_5),
+            }
+
+        out = []
+        for pk in sorted(by_peak.keys()):
+            block = by_peak[pk]
+            out.append(
+                {
+                    "index": int(pk),
+                    "center": block.get(
+                        "center",
+                        {
+                            "est": float("nan"),
+                            "sd": float("nan"),
+                            "ci_lo": float("nan"),
+                            "ci_hi": float("nan"),
+                            "p2_5": float("nan"),
+                            "p97_5": float("nan"),
+                        },
+                    ),
+                    "height": block.get(
+                        "height",
+                        {
+                            "est": float("nan"),
+                            "sd": float("nan"),
+                            "ci_lo": float("nan"),
+                            "ci_hi": float("nan"),
+                            "p2_5": float("nan"),
+                            "p97_5": float("nan"),
+                        },
+                    ),
+                    "fwhm": block.get(
+                        "fwhm",
+                        {
+                            "est": float("nan"),
+                            "sd": float("nan"),
+                            "ci_lo": float("nan"),
+                            "ci_hi": float("nan"),
+                            "p2_5": float("nan"),
+                            "p97_5": float("nan"),
+                        },
+                    ),
+                    "eta": block.get(
+                        "eta",
+                        {
+                            "est": float("nan"),
+                            "sd": float("nan"),
+                            "ci_lo": float("nan"),
+                            "ci_hi": float("nan"),
+                            "p2_5": float("nan"),
+                            "p97_5": float("nan"),
+                        },
+                    ),
+                }
+            )
+        return out
+
+    # --- Existing tolerant per-peak/flat path (keep your current logic) ---
+    norm_rows: List[Mapping[str, Any]] = []
+    for i, row in enumerate(rows, start=1):
+        rmap = _as_mapping(row)
+        def param_block(base: str) -> Mapping[str, float]:
+            block = _as_mapping(rmap.get(base))
+            if block:
+                est = block.get("est", block.get("value", np.nan))
+                sd = block.get("sd", block.get("stderr", np.nan))
+                lo = block.get("ci_lo", block.get("lo", np.nan))
+                hi = block.get("ci_hi", block.get("hi", np.nan))
+                p2_5 = block.get("p2_5", np.nan)
+                p97_5 = block.get("p97_5", np.nan)
+            else:
+                est = rmap.get(f"{base}_est", rmap.get(base, np.nan))
+                sd = rmap.get(f"{base}_sd", rmap.get(f"{base}_stderr", np.nan))
+                lo = rmap.get(f"{base}_ci_lo", np.nan)
+                hi = rmap.get(f"{base}_ci_hi", np.nan)
+                p2_5 = rmap.get(f"{base}_p2_5", np.nan)
+                p97_5 = rmap.get(f"{base}_p97_5", np.nan)
+            # synthesize CI if missing but sd present
+            if (
+                (lo is None or np.isnan(_to_float(lo)))
+                and (hi is None or np.isnan(_to_float(hi)))
+                and est is not None
+                and sd is not None
+            ):
+                try:
+                    e = float(est)
+                    s = float(sd)
+                    lo, hi = e - _Z * s, e + _Z * s
+                except Exception:
+                    pass
+            return {
+                "est": _to_float(est),
+                "sd": _to_float(sd),
+                "ci_lo": _to_float(lo),
+                "ci_hi": _to_float(hi),
+                "p2_5": _to_float(p2_5),
+                "p97_5": _to_float(p97_5),
+            }
+
+        norm_rows.append(
+            {
+                "index": int(rmap.get("index", rmap.get("peak", i)) or i),
+                "center": param_block("center"),
+                "height": param_block("height"),
+                "fwhm": param_block("fwhm"),
+                "eta": param_block("eta"),
+            }
+        )
+    return norm_rows
+
+
+def _to_float(x: Any) -> float:
+    if x is None:
+        return float("nan")
     try:
-        if x is None:
-            return float("nan")
-        if hasattr(x, "item"):
-            return float(x.item())
         return float(x)
     except Exception:
         return float("nan")
 
 
-def _ci_from_sd(est, sd, z=_Z):
-    est = _to_float_or_nan(est)
-    sd = _to_float_or_nan(sd)
-    if not math.isfinite(est) or not math.isfinite(sd):
-        return (float("nan"), float("nan"))
-    return (est - z * sd, est + z * sd)
-
-
-def _as_mapping(obj):
-    """Return an object with .get, handling dict / SimpleNamespace / list fallback."""
-    if obj is None:
-        return {}
-    if isinstance(obj, dict):
-        return obj
-    if isinstance(obj, SimpleNamespace):
-        return obj.__dict__
-    if isinstance(obj, list):
-        return {"stats": obj}
-    return getattr(obj, "__dict__", {}) or {}
-
-
-def _num(x):
-    """Return a clean number or None (for CSV blanks)."""
-    try:
-        if x is None:
-            return None
-        v = float(x)
-        if np.isnan(v) or np.isinf(v):
-            return None
-        return v
-    except Exception:
-        return None
-
-
-def _label_from_result(m):
-    """Map uncertainty method to a canonical label."""
-    method = (m.get("method") or m.get("type") or m.get("label") or "").lower()
-    if "asym" in method:
-        return "asymptotic"
-    if "boot" in method:
-        return "bootstrap"
-    if "bayes" in method or "mcmc" in method:
-        return "bayesian"
-    pretty = m.get("label") or m.get("method_label")
-    if pretty:
-        p = pretty.lower()
-        if "asym" in p:
-            return "asymptotic"
-        if "boot" in p:
-            return "bootstrap"
-        if "mcmc" in p or "bayes" in p:
-            return "bayesian"
-    return "unknown"
-
-
-def _rows_from_stats(file_path, m):
+def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
     """
-    Convert any uncertainty result into a list of rows for CSV.
-    Expected keys per stat: peak, param, est/value, sd/stderr, ci_lo/ci_hi or p2_5/p97_5.
+    Normalize any uncertainty result into a dict with fields:
+      label (canonical string), rmse (float), dof (int), backend (str),
+      n_draws (int), n_boot (int), ess (float), rhat (float),
+      band (optional 3-tuple: (x, lo, hi)),
+      stats: List[ per-peak mapping as described in _extract_stats_table() ].
+    Unknown fields may be absent; missing numeric values are np.nan.
     """
-    stats = m.get("stats") or m.get("parameters") or m.get("param_stats") or []
-    rows = []
-    method_label = _label_from_result(m)
-    rmse = _num(m.get("rmse"))
-    dof = m.get("dof")
+    m = _as_mapping(unc)
+    label = m.get("label") or m.get("method_label") or m.get("method") or m.get("type")
+    canon = _canonical_unc_label(label)
 
-    backend = m.get("backend")
-    n_draws = m.get("n_draws") or m.get("n_samples")
-    n_boot = m.get("n_boot")
-    ess = m.get("ess")
-    rhat = m.get("rhat")
+    # Pull band in a tolerant way
+    band = None
+    for key in ("band", "prediction_band", "ci_band"):
+        if key in m and m[key] is not None:
+            b = m[key]
+            if isinstance(b, (list, tuple)) and len(b) >= 3:
+                x, lo, hi = b[0], b[1], b[2]
+                band = (np.asarray(x, float), np.asarray(lo, float), np.asarray(hi, float))
+            break
 
-    def pick(d, *names):
-        for k in names:
-            if k in d and d[k] is not None:
-                return d[k]
-        return None
+    out = {
+        "label": canon,
+        "rmse": _to_float(m.get("rmse")),
+        "dof": int(m.get("dof", m.get("d.o.f.", m.get("degrees_of_freedom", 0))) or 0),
+        "backend": str(m.get("backend", m.get("engine", ""))) or "",
+        "n_draws": int(m.get("n_draws", m.get("samples", 0)) or 0),
+        "n_boot": int(m.get("n_boot", m.get("bootstraps", 0)) or 0),
+        "ess": _to_float(m.get("ess")),
+        "rhat": _to_float(m.get("rhat")),
+        "band": band,
+        "stats": _extract_stats_table(m),
+    }
+    return out
 
-    for s in stats:
-        sdct = s if isinstance(s, dict) else getattr(s, "__dict__", {})
-        peak = sdct.get("peak") or sdct.get("index") or sdct.get("k")
-        param = sdct.get("param") or sdct.get("name")
-        est = pick(sdct, "est", "value", "mean", "median")
-        sd = pick(sdct, "sd", "stderr", "std", "stdev")
-        p025 = pick(sdct, "p2_5", "q025", "q2_5")
-        p975 = pick(sdct, "p97_5", "q975", "q97_5")
-        ci_lo = sdct.get("ci_lo")
-        ci_hi = sdct.get("ci_hi")
-        if ci_lo is None and p025 is not None:
-            ci_lo = p025
-        if ci_hi is None and p975 is not None:
-            ci_hi = p975
-        rows.append({
-            "file": str(file_path),
-            "peak": peak,
-            "param": param,
-            "value": _num(est),
-            "stderr": _num(sd),
-            "ci_lo": _num(ci_lo),
-            "ci_hi": _num(ci_hi),
-            "method": method_label,
+
+def _iter_param_rows(
+    file_path: Union[str, Path, Any],
+    unc_res: Any,
+    *_,
+) -> Iterable[Mapping[str, Any]]:
+    """
+    Yield CSV rows in the unified schema:
+      file, peak, param, value, stderr, ci_lo, ci_hi, method, rmse, dof,
+      p2_5, p97_5, backend, n_draws, n_boot, ess, rhat
+    """
+    if isinstance(file_path, (str, Path)):
+        fname = str(file_path)
+        unc_norm = _normalize_unc_result(unc_res)
+    else:  # backward-compat call: first arg is unc_res
+        fname = ""
+        unc_norm = _normalize_unc_result(file_path)
+    label = unc_norm.get("label", "unknown")
+    rmse  = _to_float(unc_norm.get("rmse"))
+    dof   = int(unc_norm.get("dof", 0))
+    backend = unc_norm.get("backend", "")
+    n_draws = int(unc_norm.get("n_draws", 0))
+    n_boot  = int(unc_norm.get("n_boot", 0))
+    ess     = _to_float(unc_norm.get("ess"))
+    rhat    = _to_float(unc_norm.get("rhat"))
+
+    for row in unc_norm.get("stats", []):
+        peak_idx = int(row.get("index", 0))
+        for pname in ("center","height","fwhm","eta"):
+            p = _as_mapping(row.get(pname))
+            yield {
+                "file": fname,
+                "peak": peak_idx,
+                "param": pname,
+                "value": _to_float(p.get("est")),
+                "stderr": _to_float(p.get("sd")),
+                "ci_lo": _to_float(p.get("ci_lo")),
+                "ci_hi": _to_float(p.get("ci_hi")),
+                "method": label.lower().split()[0],  # asymptotic/bootstrap/bayesian/unknown
+                "rmse": rmse,
+                "dof": dof,
+                "p2_5": _to_float(p.get("p2_5")),
+                "p97_5": _to_float(p.get("p97_5")),
+                "backend": backend,
+                "n_draws": n_draws,
+                "n_boot": n_boot,
+                "ess": ess,
+                "rhat": rhat,
+            }
+
+
+def _format_unc_text(
+    file_path: Union[str, "Path"],
+    unc_norm: Mapping[str, Any],
+    solver_meta: Mapping[str, Any],
+    baseline_meta: Mapping[str, Any],
+    perf_meta: Mapping[str, Any],
+    locks: Sequence[Mapping[str, bool]],
+) -> str:
+    """
+    Return v2.7-style human-readable text with ± and 95% CI, marking (fixed) when locked.
+    """
+    raw_label = str(unc_norm.get("label", "unknown"))
+    if raw_label.startswith("Asymptotic"):
+        nice_label = "Asymptotic (95% CI, z=1.96)"
+    elif raw_label.startswith("Bootstrap"):
+        nice_label = "Bootstrap (95% CI via percentiles)"
+    elif raw_label.startswith("Bayesian"):
+        nice_label = "Bayesian (95% credible interval)"
+    else:
+        nice_label = raw_label
+
+    def fmt(x, nd=6):
+        try:
+            v = float(x)
+            if not np.isfinite(v):
+                return "n/a"
+            return f"{v:.{nd}g}"
+        except Exception:
+            return "n/a"
+
+    fname = str(file_path)
+    lines = []
+    lines.append(f"File: {fname}")
+    lines.append(f"Uncertainty method: {nice_label}")
+    lines.append("Solver: " + ", ".join(f"{k}={v}" for k,v in solver_meta.items()))
+    lines.append("Baseline: " + ", ".join(f"{k}={v}" for k,v in baseline_meta.items()))
+    lines.append("Performance: " + ", ".join(f"{k}={v}" for k,v in perf_meta.items()))
+    lines.append("Peaks:")
+
+    stats = unc_norm.get("stats", [])
+    for i, row in enumerate(stats, start=1):
+        lock = locks[i-1] if i-1 < len(locks) else {"center": False, "fwhm": False, "eta": False}
+        lines.append(f"Peak {i}")
+        def fmt_param(name: str, locked: bool):
+            p = _as_mapping(row.get(name))
+            est = p.get("est")
+            sd = p.get("sd")
+            lo = p.get("ci_lo")
+            hi = p.get("ci_hi")
+            if locked:
+                lines.append(f"  {name:<7}= {fmt(est)} (fixed)")
+            else:
+                if not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
+                    lines.append(
+                        f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}   (95% CI: [{fmt(lo)}, {fmt(hi)}])"
+                    )
+                else:
+                    lines.append(f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}")
+
+        fmt_param("center", lock.get("center", False))
+        fmt_param("height", False)
+        fmt_param("fwhm",   lock.get("fwhm", False))
+        fmt_param("eta",    lock.get("eta", False))
+    return "\n".join(lines)
+
+
+def _write_unc_csv(csv_path: Union[str, "Path"], rows: Iterable[Mapping[str, Any]]) -> None:
+    """Write rows with no blank lines and stable header ordering."""
+    csv_path = Path(csv_path)
+    header = [
+        "file","peak","param","value","stderr","ci_lo","ci_hi",
+        "method","rmse","dof","p2_5","p97_5","backend","n_draws","n_boot","ess","rhat"
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in header})
+
+
+def _write_unc_txt(
+    txt_path: Union[str, "Path"],
+    file_path: Union[str, "Path"],
+    unc_norm: Mapping[str, Any],
+    solver_meta: Mapping[str, Any],
+    baseline_meta: Mapping[str, Any],
+    perf_meta: Mapping[str, Any],
+    locks: Sequence[Mapping[str, bool]],
+) -> None:
+    """Write the human-readable TXT."""
+    txt_path = Path(txt_path)
+    txt = _format_unc_text(file_path, unc_norm, solver_meta, baseline_meta, perf_meta, locks)
+    txt_path.write_text(txt, encoding="utf-8")
+
+# --- BEGIN: add wide exporter next to existing long-format helpers ---
+
+def _iter_peak_rows_wide(
+    file_path: Union[str, "Path"],
+    unc_norm: Mapping[str, Any],
+) -> Iterable[Mapping[str, Any]]:
+    """
+    Yield 'wide' per-peak rows:
+      file, peak, method, rmse, dof, backend, n_draws, n_boot, ess, rhat,
+      center, center_stderr, center_ci_lo, center_ci_hi, center_p2_5, center_p97_5,
+      height, height_stderr, height_ci_lo, height_ci_hi, height_p2_5, height_p97_5,
+      fwhm,   fwhm_stderr,   fwhm_ci_lo,   fwhm_ci_hi,   fwhm_p2_5,   fwhm_p97_5,
+      eta,    eta_stderr,    eta_ci_lo,    eta_ci_hi,    eta_p2_5,    eta_p97_5
+    """
+    fname   = str(file_path)
+    label   = unc_norm.get("label", "unknown")
+    method  = label.lower().split()[0]  # asymptotic/bootstrap/bayesian/unknown
+    rmse    = _to_float(unc_norm.get("rmse"))
+    dof     = int(unc_norm.get("dof", 0))
+    backend = unc_norm.get("backend", "")
+    n_draws = int(unc_norm.get("n_draws", 0))
+    n_boot  = int(unc_norm.get("n_boot", 0))
+    ess     = _to_float(unc_norm.get("ess"))
+    rhat    = _to_float(unc_norm.get("rhat"))
+
+    for row in unc_norm.get("stats", []):
+        peak_idx = int(row.get("index", 0))
+
+        def pick(name: str) -> Mapping[str, float]:
+            pm = _as_mapping(row.get(name))
+            return {
+                name: _to_float(pm.get("est")),
+                f"{name}_stderr": _to_float(pm.get("sd")),
+                f"{name}_ci_lo": _to_float(pm.get("ci_lo")),
+                f"{name}_ci_hi": _to_float(pm.get("ci_hi")),
+                f"{name}_p2_5": _to_float(pm.get("p2_5")),
+                f"{name}_p97_5": _to_float(pm.get("p97_5")),
+            }
+
+        out = {
+            "file": fname,
+            "peak": peak_idx,
+            "method": method,
             "rmse": rmse,
             "dof": dof,
-            "p2_5": _num(p025),
-            "p97_5": _num(p975),
             "backend": backend,
             "n_draws": n_draws,
             "n_boot": n_boot,
             "ess": ess,
             "rhat": rhat,
-        })
-    return rows
+        }
+        for pname in ("center", "height", "fwhm", "eta"):
+            out.update(pick(pname))
+        yield out
 
 
-def normalize_unc_result(res):
-    """
-    Normalize any uncertainty container (dict, namespace, list-of-stat-rows)
-    to a mapping with:
-      method, label, stats(list), rmse, dof, backend, n_draws, n_boot, ess, rhat,
-      band (optional 3-tuple), and/or band_x, band_lo, band_hi.
-    """
-    m = _as_mapping(res).copy()
-    if "label" not in m:
-        m["label"] = m.get("method_label") or m.get("type") or m.get("method")
-    band = m.get("band")
-    if band and isinstance(band, (tuple, list)) and len(band) == 3:
-        bx, blo, bhi = band
-        m["band_x"], m["band_lo"], m["band_hi"] = bx, blo, bhi
-    return m
-
-
-def write_uncertainty_csv(path, res, file_path):
-    """
-    Write unified CSV:
-      file, peak, param, value, stderr, ci_lo, ci_hi, method, rmse, dof, p2_5, p97_5,
-      backend, n_draws, n_boot, ess, rhat
-    """
-    m = normalize_unc_result(res)
-    rows = _rows_from_stats(file_path, m)
-    cols = ["file","peak","param","value","stderr","ci_lo","ci_hi","method","rmse","dof",
-            "p2_5","p97_5","backend","n_draws","n_boot","ess","rhat"]
-    import csv
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+def _write_unc_csv_wide(csv_path: Union[str, "Path"], rows: Iterable[Mapping[str, Any]]) -> None:
+    """Write wide per-peak rows (legacy-friendly)."""
+    csv_path = Path(csv_path)
+    header = [
+        "file","peak","method","rmse","dof","backend","n_draws","n_boot","ess","rhat",
+        "center","center_stderr","center_ci_lo","center_ci_hi","center_p2_5","center_p97_5",
+        "height","height_stderr","height_ci_lo","height_ci_hi","height_p2_5","height_p97_5",
+        "fwhm","fwhm_stderr","fwhm_ci_lo","fwhm_ci_hi","fwhm_p2_5","fwhm_p97_5",
+        "eta","eta_stderr","eta_ci_lo","eta_ci_hi","eta_p2_5","eta_p97_5",
+    ]
+    with Path(csv_path).open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") if r.get(k, None) is not None else "" for k in cols})
-    return path
+            w.writerow({k: r.get(k, "") for k in header})
 
 
-def write_uncertainty_txt(path, res, file_path, solver_line, baseline_line, perf_line):
+def write_uncertainty_csvs(
+    base_path: Union[str, "Path"],
+    file_path: Union[str, "Path"],
+    unc_norm: Mapping[str, Any],
+    *,
+    write_wide: bool = False,
+) -> Tuple[Path, Optional[Path]]:
     """
-    Human-readable TXT, showing ±stderr and 95% CI (quantiles if available, else ~±1.96σ).
+    Convenience: write long CSV to <base>_uncertainty.csv.
+    If write_wide=True, also write <base>_uncertainty_wide.csv.
+    Returns (long_csv_path, wide_csv_path_or_None).
     """
-    m = normalize_unc_result(res)
-    label = _label_from_result(m)
-    rmse = m.get("rmse")
-    dof = m.get("dof")
-    rows = _rows_from_stats(file_path, m)
-
-    lines = []
-    lines.append(f"File: {file_path}")
-    lines.append(f"Uncertainty method: {label}")
-    if solver_line:   lines.append(f"Solver: {solver_line}")
-    if baseline_line: lines.append(f"Baseline: {baseline_line}")
-    if perf_line:     lines.append(f"Performance: {perf_line}")
-    if rmse is not None and dof is not None:
-        lines.append(f"RMSE={rmse:.4g}, dof={dof}")
-    lines.append("Peaks:")
-
-    from collections import defaultdict
-    g = defaultdict(dict)
-    for r in rows:
-        g[int(r["peak"]) if r["peak"] is not None else -1][r["param"]] = r
-
-    def _fmt(x, digits=6):
-        if x is None: return "n/a"
-        try:
-            return f"{float(x):.{digits}g}"
-        except Exception:
-            return "n/a"
-
-    for pk in sorted(g.keys()):
-        lines.append(f"Peak {pk}")
-        for pname in ("center","height","fwhm","eta"):
-            r = g[pk].get(pname)
-            if not r:
-                continue
-            val = _fmt(r.get("value"))
-            sd = r.get("stderr")
-            ql = r.get("ci_lo")
-            qh = r.get("ci_hi")
-            if pname == "fwhm" and (sd is None):
-                lines.append(f"  {pname:<6} = {val} (fixed)")
-            else:
-                if ql is None or qh is None:
-                    if sd is not None and r.get("value") is not None:
-                        try:
-                            v = float(r["value"]); s = float(sd)
-                            ql = v - 1.96*s
-                            qh = v + 1.96*s
-                        except Exception:
-                            ql = qh = None
-                lines.append(f"  {pname:<6} = {val} ± {_fmt(sd,3)}   (95% CI: [{_fmt(ql)}, {_fmt(qh)}])")
-
-    txt = "\n".join(lines) + "\n"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(txt)
-    return path
-
-
-def export_uncertainty_pair(out_csv, out_txt, unc_result, file_path, solver_line, baseline_line, perf_line):
-    """
-    Write both CSV and TXT for the most recently computed uncertainty result.
-    'unc_result' may be dict / namespace / list-of-stats; we normalize inside.
-    """
-    write_uncertainty_csv(out_csv, unc_result, file_path)
-    write_uncertainty_txt(out_txt, unc_result, file_path, solver_line, baseline_line, perf_line)
-    return [out_csv, out_txt]
-
-
-def _pick(d: Dict, *keys, default=None):
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return default
-
-
-def _stats_for_param(rec: Dict, p: str):
-    """Return (est, sd, q_lo, q_hi) from a per-peak record that may be nested or flat."""
-    node = rec.get("stats", rec)  # tolerate either
-    if isinstance(node.get(p), dict):
-        pdct = node[p]
-        return (
-            _pick(pdct, "est", "mean", default=float("nan")),
-            _pick(pdct, "sd", "stderr", "std", default=float("nan")),
-            _pick(pdct, "p2_5", "q2_5", "q025", default=float("nan")),
-            _pick(pdct, "p97_5", "q97_5", "q975", default=float("nan")),
-        )
-    return (
-        _pick(node, f"{p}_est", default=float("nan")),
-        _pick(node, f"{p}_sd", f"{p}_stderr", default=float("nan")),
-        _pick(node, f"{p}_p2_5", f"{p}_q2_5", f"{p}_q025", default=float("nan")),
-        _pick(node, f"{p}_p97_5", f"{p}_q97_5", f"{p}_q975", default=float("nan")),
-    )
-
-
-def _unc_as_mapping(obj):
-    """Map-like view over uncertainty result. List => {'stats': list}."""
-    if obj is None:
-        return {"stats": None}
-    if isinstance(obj, dict):
-        return obj
-    if isinstance(obj, list):
-        return {"stats": obj}
-    d = {}
-    for k in (
-        "label",
-        "method",
-        "method_label",
-        "type",
-        "stats",
-        "parameters",
-        "param_stats",
-        "rmse",
-        "dof",
-        "backend",
-        "n_draws",
-        "n_boot",
-        "ess",
-        "rhat",
-        "band",
-        "prediction_band",
-        "band_x",
-        "band_lo",
-        "band_hi",
-    ):
-        if hasattr(obj, k):
-            d[k] = getattr(obj, k)
-    if not d and hasattr(obj, "__dict__"):
-        d = {**obj.__dict__}
-    if "stats" not in d and "parameters" in d:
-        d["stats"] = d["parameters"]
-    return d
-
-
-def build_uncertainty_rows(
-    file_path: str,
-    method_label: str,
-    rmse: Optional[float],
-    dof: Optional[int],
-    per_peak_stats: List[Dict],
-    method_meta: Dict[str, Any] | None = None,
-) -> List[Dict[str, Any]]:
-    """
-    Build unified long-form rows:
-      file, peak, param, value, stderr, ci_lo, ci_hi, method, rmse, dof,
-      p2_5, p97_5, backend, n_draws, n_boot, ess, rhat
-    method_meta may include backend/n_draws/n_boot/ess/rhat; missing -> empty.
-    """
-    meta = method_meta or {}
-    rows: List[Dict[str, Any]] = []
-    mlabel = (method_label or "").strip()
-
-    for k, rec in enumerate(per_peak_stats, 1):
-        for param in ("center", "height", "fwhm", "eta"):
-            est, sd, qlo, qhi = _stats_for_param(rec, param)
-
-            if math.isfinite(_to_float_or_nan(qlo)) and math.isfinite(_to_float_or_nan(qhi)):
-                ci_lo, ci_hi = _to_float_or_nan(qlo), _to_float_or_nan(qhi)
-            else:
-                ci_lo, ci_hi = _ci_from_sd(est, sd)
-
-            rows.append(
-                {
-                    "file": str(file_path),
-                    "peak": k,
-                    "param": param,
-                    "value": _to_float_or_nan(est),
-                    "stderr": _to_float_or_nan(sd),
-                    "ci_lo": _to_float_or_nan(ci_lo),
-                    "ci_hi": _to_float_or_nan(ci_hi),
-                    "method": mlabel.lower().replace(" (jᵀj)", "").replace(" (j^tj)", ""),
-                    "rmse": _to_float_or_nan(rmse),
-                    "dof": _to_float_or_nan(dof),
-                    "p2_5": _to_float_or_nan(qlo),
-                    "p97_5": _to_float_or_nan(qhi),
-                    "backend": meta.get("backend", ""),
-                    "n_draws": meta.get("n_draws", ""),
-                    "n_boot": meta.get("n_boot", ""),
-                    "ess": meta.get("ess", ""),
-                    "rhat": meta.get("rhat", ""),
-                }
-            )
-    return rows
-
-
-def _write_uncertainty_csv(path: str, rows: List[Dict[str, Any]]):
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "file",
-            "peak",
-            "param",
-            "value",
-            "stderr",
-            "ci_lo",
-            "ci_hi",
-            "method",
-            "rmse",
-            "dof",
-            "p2_5",
-            "p97_5",
-            "backend",
-            "n_draws",
-            "n_boot",
-            "ess",
-            "rhat",
-        ],
-    )
-    df.to_csv(path, index=False, lineterminator="\n")
-
-
-def _write_uncertainty_txt(
-    path: str,
-    file_path: str,
-    method_label: str,
-    solver_meta: str,
-    baseline_meta: str,
-    perf_meta: str,
-    per_peak_stats: List[Dict],
-    z: float = _Z,
-):
-    def fmt(v, nd=6):
-        f = _to_float_or_nan(v)
-        return "n/a" if not math.isfinite(f) else f"{f:.{nd}g}"
-
-    lines = []
-    lines.append(f"File: {file_path}")
-    lines.append(f"Uncertainty method: {method_label.lower()}")
-    lines.append(solver_meta)
-    lines.append(baseline_meta)
-    lines.append(perf_meta)
-    lines.append("Peaks:")
-    for k, rec in enumerate(per_peak_stats, 1):
-        lines.append(f"Peak {k}")
-        for param, label in (("center", "center"), ("height", "height"), ("fwhm", "fwhm"), ("eta", "eta")):
-            est, sd, qlo, qhi = _stats_for_param(rec, param)
-            if math.isfinite(_to_float_or_nan(qlo)) and math.isfinite(_to_float_or_nan(qhi)):
-                lo, hi = qlo, qhi
-            else:
-                lo, hi = _ci_from_sd(est, sd, z)
-            if param == "fwhm" and rec.get("lock_width") is True:
-                lines.append(f"  {label:<6}= {fmt(est)} (fixed)")
-            elif param == "center" and rec.get("lock_center") is True:
-                lines.append(f"  {label:<6}= {fmt(est)} (fixed)")
-            else:
-                lines.append(f"  {label:<6}= {fmt(est)} \u00b1 {fmt(sd)}   (95% CI: [{fmt(lo)}, {fmt(hi)}])")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-
-def _normalize_band(result: Any) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """
-    Return (x, lo, hi) arrays or None.
-    Accepts UncertaintyResult (.band/.prediction_band) or dict {'band'|'prediction_band'|'ci_band': (x, lo, hi)}.
-    """
-    band = None
-    if result is None:
-        return None
-    band = getattr(result, "band", None) or getattr(result, "prediction_band", None)
-    if band is None and isinstance(result, dict):
-        band = result.get("band") or result.get("prediction_band") or result.get("ci_band")
-    if band is None:
-        return None
-    try:
-        if len(band) < 3:
-            return None
-        x, lo, hi = band[0], band[1], band[2]
-        x = np.asarray(x); lo = np.asarray(lo); hi = np.asarray(hi)
-        if x.shape != lo.shape or x.shape != hi.shape or x.size == 0:
-            return None
-        return x, lo, hi
-    except Exception:
-        return None
-
-
-def _method_label(res: Any, default: str = "Unknown") -> str:
-    for key in ("label", "method_label", "method", "type"):
-        v = getattr(res, key, None) if not isinstance(res, dict) else res.get(key)
-        if isinstance(v, str) and v.strip():
-            return v
-    return default
-
-
-def _pack_stats_for_param(param: str, stats_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize per-param stats from result.stats or similar:
-      expect keys like: est/value, sd/stderr, ci_lo, ci_hi, p2_5, p97_5
-    """
-    # prefer common aliases
-    est = stats_dict.get("est", stats_dict.get("value"))
-    sd = stats_dict.get("sd", stats_dict.get("stderr"))
-    p2 = stats_dict.get("p2_5")
-    p97 = stats_dict.get("p97_5")
-    ci_lo = stats_dict.get("ci_lo")
-    ci_hi = stats_dict.get("ci_hi")
-    # if missing CI, try normal approx
-    if ci_lo is None and ci_hi is None and est is not None and sd is not None:
-        try:
-            ci_lo = float(est) - _Z * float(sd)
-            ci_hi = float(est) + _Z * float(sd)
-        except Exception:
-            ci_lo = None; ci_hi = None
-    return dict(param=param, value=est, stderr=sd, ci_lo=ci_lo, ci_hi=ci_hi, p2_5=p2, p97_5=p97)
-
-
-def _iter_peak_param_stats(result: Any, peaks: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Build normalized param rows for each peak, covering center, height, fwhm, eta.
-    Handles locked/fixed parameters by emitting stderr/ci as None and marking value as current.
-    """
-    # Find stats container:
-    stats_container = None
-    if result is not None:
-        stats_container = getattr(result, "stats", None)
-        if stats_container is None and isinstance(result, dict):
-            stats_container = result.get("stats") or result.get("parameters") or result.get("param_stats")
-    rows = []
-    # We expect 'peaks' entries to have current values + lock flags
-    for i, pk in enumerate(peaks, 1):
-        # Look up stats per param if present; else populate with current values and None for sd/ci
-        for param in ("center", "height", "fwhm", "eta"):
-            if isinstance(pk, dict):
-                current = pk.get(param)
-                lock_key = f"lock_{'center' if param=='center' else 'width' if param=='fwhm' else 'none'}"
-                locked = bool(pk.get(lock_key, False)) if lock_key != "lock_none" else False
-            else:
-                current = getattr(pk, param, None)
-                lock_attr = 'lock_center' if param == 'center' else 'lock_width' if param == 'fwhm' else None
-                locked = bool(getattr(pk, lock_attr, False)) if lock_attr else False
-            sd = None; ci_lo = None; ci_hi = None; p2 = None; p97 = None
-            if stats_container:
-                # stats may be structure: stats[i-1][param] -> dict
-                per_peak = None
-                if isinstance(stats_container, list):
-                    per_peak = stats_container[i-1] if i-1 < len(stats_container) else None
-                elif isinstance(stats_container, dict):
-                    per_peak = stats_container.get(i) or stats_container.get(str(i))
-                if per_peak and isinstance(per_peak, dict):
-                    stat_block = per_peak.get(param)
-                    if isinstance(stat_block, dict):
-                        packed = _pack_stats_for_param(param, stat_block)
-                        current = packed["value"] if packed["value"] is not None else current
-                        sd = packed["stderr"]; ci_lo = packed["ci_lo"]; ci_hi = packed["ci_hi"]
-                        p2 = packed["p2_5"]; p97 = packed["p97_5"]
-                    else:
-                        # flat form: center_est/center_sd...
-                        est = per_peak.get(f"{param}_est")
-                        sd = per_peak.get(f"{param}_sd", per_peak.get(f"{param}_stderr"))
-                        p2 = per_peak.get(f"{param}_p2_5")
-                        p97 = per_peak.get(f"{param}_p97_5")
-                        ci_lo = per_peak.get(f"{param}_ci_lo")
-                        ci_hi = per_peak.get(f"{param}_ci_hi")
-                        if est is not None:
-                            current = est
-                        if ci_lo is None and ci_hi is None and est is not None and sd is not None:
-                            try:
-                                ci_lo = float(est) - _Z * float(sd)
-                                ci_hi = float(est) + _Z * float(sd)
-                            except Exception:
-                                pass
-            rows.append(dict(peak=i, param=param, value=current, stderr=sd,
-                             ci_lo=ci_lo, ci_hi=ci_hi, p2_5=p2, p97_5=p97, locked=locked))
-    return rows
-
-
-class _DictResult(UncertaintyResult):
-    """Shim exposing custom method labels for legacy dict results."""
-
-    def __init__(
-        self,
-        method: str,
-        band,
-        param_stats: Dict[str, Dict[str, float]],
-        meta: Dict[str, object],
-        label: str,
-    ) -> None:
-        super().__init__(method, band, param_stats, meta)
-        self._label = label
-
-    @property
-    def method_label(self) -> str:  # type: ignore[override]
-        return self._label
-
-
-def _ensure_result(unc: Union[UncertaintyResult, dict]) -> UncertaintyResult:
-    if isinstance(unc, UncertaintyResult):
-        return unc
-
-    method = str(unc.get("method") or unc.get("type") or "unknown").lower()
-    if method == "asymptotic":
-        method_label = "Asymptotic (JᵀJ)"
-    elif method == "bootstrap":
-        method_label = "Bootstrap (residual)"
-    elif method == "bayesian":
-        method_label = "Bayesian (MCMC)"
-    else:
-        method_label = "unknown"
-
-    params: Dict[str, Dict[str, float]] = {}
-    for name, stats in unc.get("params", {}).items():
-        est = stats.get("est")
-        if est is None:
-            est = stats.get("mean")
-        if est is None:
-            est = stats.get("median")
-        sd = stats.get("sd")
-        if sd is None:
-            sd = stats.get("stderr")
-        if sd is None:
-            sd = stats.get("sigma")
-        p2 = stats.get("p2.5")
-        if p2 is None:
-            p2 = stats.get("p2_5")
-        if p2 is None:
-            p2 = stats.get("q05")
-        p97 = stats.get("p97.5")
-        if p97 is None:
-            p97 = stats.get("p97_5")
-        if p97 is None:
-            p97 = stats.get("q95")
-        params[name] = {"est": est, "sd": sd}
-        if p2 is not None and p97 is not None:
-            params[name]["p2.5"] = p2
-            params[name]["p97.5"] = p97
-
-    band = _normalize_band(unc)
-
-    diagnostics = {
-        "ess": unc.get("diagnostics", {}).get("ess"),
-        "rhat": unc.get("diagnostics", {}).get("rhat"),
-    }
-    return UncertaintyResult(
-        method=method,
-        label=method_label,
-        stats=params,
-        diagnostics=diagnostics,
-        band=band,
-    )
-def _rows_to_per_peak_stats(result, peaks):
-    by_peak: Dict[int, Dict[str, Any]] = {}
-    for r in _iter_peak_param_stats(result, peaks or []):
-        pk = by_peak.setdefault(r["peak"], {})
-        pk.setdefault("stats", {})
-        pk["stats"].setdefault(r["param"], {})
-        if r.get("value") is not None:
-            pk["stats"][r["param"]]["est"] = r.get("value")
-            pk[r["param"]] = r.get("value")
-        if r.get("stderr") is not None:
-            pk["stats"][r["param"]]["sd"] = r.get("stderr")
-        if r.get("p2_5") is not None:
-            pk["stats"][r["param"]]["p2_5"] = r.get("p2_5")
-        if r.get("p97_5") is not None:
-            pk["stats"][r["param"]]["p97_5"] = r.get("p97_5")
-        if r["param"] == "center":
-            pk["lock_center"] = r.get("locked", False)
-        if r["param"] == "fwhm":
-            pk["lock_width"] = r.get("locked", False)
-    return [by_peak[k] for k in sorted(by_peak.keys())]
-
-
-def _iter_param_rows(unc_res, peaks, method_label: str):
-    """Yield normalized per-parameter rows for legacy interfaces."""
-    per_peak = _rows_to_per_peak_stats(unc_res, peaks)
-    for idx, rec in enumerate(per_peak, 1):
-        for param in ("center", "height", "fwhm", "eta"):
-            est, sd, qlo, qhi = _stats_for_param(rec, param)
-            yield {
-                "peak": idx,
-                "param": param,
-                "est": est,
-                "sd": sd,
-                "p2_5": qlo,
-                "p97_5": qhi,
-                "method": method_label,
-            }
-
-def _unc_normalize(obj):
-    """
-    Return a dict-like uncertainty payload with at least:
-      - 'label' (str)         : human-readable method label
-      - 'method' (str)        : short method key, e.g. 'asymptotic','bootstrap','bayesian'
-      - 'stats' (list[dict])  : each dict has: peak,param, value|est, stderr|sd, ci_lo, ci_hi, p2_5, p97_5
-      - 'diagnostics' (dict)  : optional metadata (backend, n_draws, n_boot, ess, rhat, rmse, dof, etc)
-      - 'band' (tuple|None)   : (x, lo, hi) or None
-    Accepts Mapping, SimpleNamespace, or list-of-rows. Never returns a list.
-    """
-    # Already a mapping
-    if isinstance(obj, Mapping):
-        return dict(obj)
-
-    # Namespace -> dict
-    if isinstance(obj, SimpleNamespace):
-        return vars(obj)
-
-    # List/tuple of row dicts -> wrap
-    if isinstance(obj, (list, tuple)):
-        # assume it's a stats row list
-        return {'label': 'unknown', 'method': 'unknown', 'stats': list(obj), 'diagnostics': {}, 'band': None}
-
-    # Fallback to empty structure
-    return {'label': 'unknown', 'method': 'unknown', 'stats': [], 'diagnostics': {}, 'band': None}
-
-
-def _row_value(d, *keys, default=None):
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return default
-
-
-def _build_unc_rows(unc_mapping, file_path, rmse=None, dof=None):
-    """
-    Build normalized CSV rows from an uncertainty mapping.
-    Returns list of dict rows with fixed schema:
-      file, peak, param, value, stderr, ci_lo, ci_hi, method, rmse, dof,
-      p2_5, p97_5, backend, n_draws, n_boot, ess, rhat
-    """
-    u = _unc_normalize(unc_mapping)
-    label   = u.get('label') or u.get('method') or 'unknown'
-    method  = (u.get('method') or label or 'unknown').lower()
-    stats   = u.get('stats') or []
-    diag    = u.get('diagnostics') or {}
-    file_path = "" if file_path is None else file_path
-
-    rows = []
-    for r in stats:
-        # Support both flat and nested per-param dicts
-        if isinstance(r, Mapping) and 'param' in r:
-            peak   = int(_row_value(r, 'peak', default=0) or 0)
-            param  = str(_row_value(r, 'param', default=''))
-            value  = _row_value(r, 'value', 'est')
-            stderr = _row_value(r, 'stderr', 'sd')
-            ci_lo  = _row_value(r, 'ci_lo', 'p2_5')
-            ci_hi  = _row_value(r, 'ci_hi', 'p97_5')
-            p2_5   = _row_value(r, 'p2_5')
-            p97_5  = _row_value(r, 'p97_5')
-        else:
-            # unknown row type -> skip
-            continue
-
-        rows.append({
-            'file': file_path,
-            'peak': peak,
-            'param': param,
-            'value': value,
-            'stderr': stderr,
-            'ci_lo': ci_lo,
-            'ci_hi': ci_hi,
-            'method': method,
-            'rmse': rmse,
-            'dof': dof,
-            'p2_5': p2_5,
-            'p97_5': p97_5,
-            'backend': diag.get('backend'),
-            'n_draws': diag.get('n_draws') or diag.get('n_samples'),
-            'n_boot': diag.get('n_boot') or diag.get('n_resamples'),
-            'ess': diag.get('ess'),
-            'rhat': diag.get('rhat'),
-        })
-    return rows
-
-
-def export_uncertainty_csv(path, unc_result, file_path, rmse=None, dof=None):
-    """
-    Write uncertainty rows to CSV. Accepts Mapping/Namespace/list; never assumes .get().
-    """
-    rows = _build_unc_rows(unc_result, file_path, rmse=rmse, dof=dof)
-    import csv
-    fieldnames = ['file','peak','param','value','stderr','ci_lo','ci_hi','method','rmse','dof',
-                  'p2_5','p97_5','backend','n_draws','n_boot','ess','rhat']
-    with open(path, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for row in rows:
-            w.writerow({k: ("" if v is None else v) for k, v in row.items()})
-    return path
-
-
-def export_uncertainty_txt(path, unc_result, meta=None):
-    """
-    Human-readable TXT export. Accepts any result shape.
-    meta may contain: solver, baseline, performance, rmse, dof, file.
-    """
-    u = _unc_normalize(unc_result)
-    label  = u.get('label') or u.get('method') or 'unknown'
-    stats  = u.get('stats') or []
-    diag   = u.get('diagnostics') or {}
-    rmse   = (meta or {}).get('rmse')
-    dof    = (meta or {}).get('dof')
-    file_  = (meta or {}).get('file')
-
-    def fmt(x, nan='n/a'):
-        try:
-            if x is None:
-                return nan
-            return f"{float(x):.6g}"
-        except Exception:
-            return str(x) if x is not None else nan
-
-    lines = []
-    if file_: lines.append(f"File: {file_}")
-    lines.append(f"Uncertainty method: {label}")
-    if meta and meta.get('solver'):
-        lines.append(meta['solver'])
-    if meta and meta.get('baseline'):
-        lines.append(meta['baseline'])
-    if meta and meta.get('performance'):
-        lines.append(meta['performance'])
-    if rmse is not None or dof is not None:
-        lines.append(f"RMSE={fmt(rmse)}, dof={fmt(dof)}")
-    if diag:
-        # optional method diagnostics if present
-        parts = []
-        for k in ('backend','n_draws','n_boot','ess','rhat'):
-            if k in diag and diag[k] is not None:
-                parts.append(f"{k}={diag[k]}")
-        if parts:
-            lines.append("Diagnostics: " + ", ".join(parts))
-
-    lines.append("Peaks:")
-    # Group by peak
-    from collections import defaultdict
-    by_peak = defaultdict(list)
-    for r in stats:
-        if isinstance(r, Mapping) and 'param' in r:
-            by_peak[int(r.get('peak', 0))].append(r)
-
-    for k in sorted(by_peak.keys()):
-        lines.append(f"Peak {k}")
-        rows = by_peak[k]
-        # write known params in nice order
-        order = ['center','height','fwhm','eta']
-        for p in order:
-            rr = next((r for r in rows if r.get('param') == p), None)
-            if rr is None: 
-                continue
-            val = _row_value(rr, 'value', 'est')
-            sd  = _row_value(rr, 'stderr', 'sd')
-            lo  = _row_value(rr, 'ci_lo', 'p2_5')
-            hi  = _row_value(rr, 'ci_hi', 'p97_5')
-            fixed = rr.get('fixed', False) or rr.get('lock', False)
-            if fixed:
-                lines.append(f"  {p:<6} = {fmt(val)} (fixed)")
-            else:
-                lines.append(f"  {p:<6} = {fmt(val)} ± {fmt(sd)}   (95% CI: [{fmt(lo)}, {fmt(hi)}])")
-
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write("\n".join(lines) + "\n")
-    return path
-
-
-# Backwards compatible aliases with older API names
-def write_uncertainty_csv(path, unc_res, peaks=None, method_label: str = "", rmse=None, dof=None, file_path=None):
-    if peaks is None:
-        res = _ensure_result(unc_res)
-        row: Dict[str, float | str] = {"method": res.method_label}
-        for name, stats in res.param_stats.items():
-            row[f"{name}_est"] = stats.get("est")
-            row[f"{name}_sd"] = stats.get("sd")
-            if "p2.5" in stats and "p97.5" in stats:
-                row[f"{name}_p2_5"] = stats.get("p2.5")
-                row[f"{name}_p97_5"] = stats.get("p97.5")
-        df = pd.DataFrame([row])
-        write_dataframe(df, Path(path))
-        return path
-    stats = list(_iter_param_rows(unc_res, peaks, method_label or ""))
-    mapping = {
-        'label': method_label or 'unknown',
-        'method': method_label or 'unknown',
-        'stats': stats,
-        'diagnostics': {},
-    }
-    return export_uncertainty_csv(path, mapping, file_path, rmse=rmse, dof=dof)
-
-
-def write_uncertainty_txt(path, unc_res, peaks=None, method_label: str = "", file_path=None, solver_meta=None, baseline_meta=None, perf_meta=None):
-    if peaks is None:
-        res = _ensure_result(unc_res)
-        lines = [f"Method: {res.method_label}"]
-        for name, stats in res.param_stats.items():
-            est = stats.get("est")
-            sd = stats.get("sd")
-            line = f"{name}: {est:.6g} ± {sd:.6g}" if est is not None and sd is not None else f"{name}: n/a"
-            if "p2.5" in stats and "p97.5" in stats:
-                line += f"   [2.5%: {stats['p2.5']:.6g}, 97.5%: {stats['p97.5']:.6g}]"
-            lines.append(line)
-        Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return path
-    stats = list(_iter_param_rows(unc_res, peaks, method_label or ""))
-    mapping = {
-        'label': method_label or 'unknown',
-        'method': method_label or 'unknown',
-        'stats': stats,
-        'diagnostics': {},
-    }
-    meta = {
-        'file': file_path,
-        'solver': solver_meta,
-        'baseline': baseline_meta,
-        'performance': perf_meta,
-    }
-    return export_uncertainty_txt(path, mapping, meta=meta)
-
+    base = Path(base_path).with_suffix("")
+    long_csv = base.with_name(base.name + "_uncertainty.csv")
+    rows_long = list(_iter_param_rows(file_path, unc_norm))
+    _write_unc_csv(long_csv, rows_long)
+
+    wide_csv = None
+    if write_wide:
+        wide_csv = base.with_name(base.name + "_uncertainty_wide.csv")
+        rows_wide = list(_iter_peak_rows_wide(file_path, unc_norm))
+        _write_unc_csv_wide(wide_csv, rows_wide)
+
+    return long_csv, wide_csv
+
+# --- END: add wide exporter ---
+
+# --- END: Uncertainty helpers ---
+
+# Backwards-compatible wrappers
+canonical_unc_label = _canonical_unc_label
+normalize_unc_result = _normalize_unc_result
+
+
+def write_uncertainty_csv(
+    path: Union[str, Path],
+    unc_res: Any,
+    peaks: Any | None = None,
+    method_label: str = "",
+    rmse: float | None = None,
+    dof: float | None = None,
+    file_path: Union[str, Path] = "",
+    **_: Any,
+) -> None:
+    unc = _normalize_unc_result(unc_res)
+    rows = list(_iter_peak_rows_wide(file_path, unc))
+    _write_unc_csv_wide(path, rows)
+
+
+def write_uncertainty_txt(
+    path: Union[str, Path],
+    unc_res: Any,
+    peaks: Any | None = None,
+    method_label: str = "",
+    file_path: Union[str, Path] = "",
+    solver_meta: Mapping[str, Any] | None = None,
+    baseline_meta: Mapping[str, Any] | None = None,
+    perf_meta: Mapping[str, Any] | None = None,
+    locks: Sequence[Mapping[str, bool]] | None = None,
+    **_: Any,
+) -> None:
+    unc = _normalize_unc_result(unc_res)
+    _write_unc_txt(path, file_path, unc, solver_meta or {}, baseline_meta or {}, perf_meta or {}, locks or [])
+
+
+def export_uncertainty_pair(
+    out_csv: Union[str, Path],
+    out_txt: Union[str, Path],
+    unc_res: Any,
+    file_path: Union[str, Path] = "",
+    solver_meta: Mapping[str, Any] | None = None,
+    baseline_meta: Mapping[str, Any] | None = None,
+    perf_meta: Mapping[str, Any] | None = None,
+    locks: Sequence[Mapping[str, bool]] | None = None,
+) -> None:
+    unc = _normalize_unc_result(unc_res)
+    rows = list(_iter_param_rows(file_path, unc))
+    _write_unc_csv(out_csv, rows)
+    _write_unc_txt(out_txt, file_path, unc, solver_meta or {}, baseline_meta or {}, perf_meta or {}, locks or [])
 

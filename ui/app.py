@@ -188,6 +188,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple, Optional
 from types import SimpleNamespace
+from core.data_io import (
+    _normalize_unc_result,
+    _canonical_unc_label,
+    write_uncertainty_csvs,
+    _write_unc_txt,
+)
 
 import numpy as np
 
@@ -702,6 +708,7 @@ class PeakFitApp:
         self.cfg.setdefault("perf_max_workers", 0)
         self.cfg.setdefault("unc_workers", 0)
         self.cfg.setdefault("last_template_name", self.cfg.get("auto_apply_template_name", ""))
+        self.cfg.setdefault("export_unc_wide", False)
         save_config(self.cfg)
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
 
@@ -807,8 +814,8 @@ class PeakFitApp:
         self.classic_maxfev = tk.IntVar(value=20000)
         self.classic_centers_window = tk.BooleanVar(value=True)
         self.classic_margin = tk.DoubleVar(value=0.0)
-        self.classic_fwhm_min = tk.DoubleVar(value=2.0)
-        self.classic_fwhm_max = tk.DoubleVar(value=0.5)
+        self.classic_fwhm_min = tk.DoubleVar(value=0.5)
+        self.classic_fwhm_max = tk.DoubleVar(value=2.0)
         self.classic_height_factor = tk.DoubleVar(value=1.0)
         self.modern_loss = tk.StringVar(value="linear")
         self.modern_weight = tk.StringVar(value="none")
@@ -829,6 +836,7 @@ class PeakFitApp:
         self.show_ci_band_var = self.show_ci_band
         # Uncertainty state
         self.last_uncertainty = None
+        self._last_unc_locks: List[Dict[str, bool]] = []
 
         self.current_file: Optional[Path] = None
         self.show_ci_band.trace_add("write", self._toggle_ci_band)
@@ -1236,7 +1244,7 @@ class PeakFitApp:
         )
         self.chk_ci_band.pack(anchor="w", padx=4)
         self.ci_toggle = self.chk_ci_band
-        self.ci_toggle.configure(state="disabled")
+        self._set_ci_toggle_state(False)
         self._update_unc_widgets()
         self._on_uncertainty_method_changed()
 
@@ -1452,6 +1460,13 @@ class PeakFitApp:
         save_config(self.cfg)
         self.refresh_plot()
 
+    def _set_ci_toggle_state(self, enabled: bool):
+        try:
+            state = ("!disabled",) if enabled else ("disabled",)
+            self.ci_toggle.state(state)
+        except Exception:
+            pass
+
     # --- Uncertainty helpers (UI-side) ------------------------------------------
     def _as_mapping(self, obj):
         """Return a mapping-like view for obj. If it's a list (stats), wrap it."""
@@ -1526,22 +1541,10 @@ class PeakFitApp:
                 return (x, lo, hi)
         return None
 
-    def _unc_is_asymptotic(self, unc):
-        if unc is None:
-            return False
-        label = ""
-        if isinstance(unc, dict):
-            label = str(unc.get("label") or unc.get("method") or unc.get("type") or "").lower()
-        elif isinstance(unc, SimpleNamespace):
-            label = str(getattr(unc, "label", "") or getattr(unc, "method", "") or getattr(unc, "type", "")).lower()
-        else:
-            return False
-        return ("asym" in label) or ("j" in label and "j" in label)
-
     def _on_uncertainty_method_changed(self, *_):
         sel = str(self.unc_method_var.get()).lower()
         is_asym = ("asym" in sel)
-        self.ci_toggle.configure(state=("normal" if is_asym else "disabled"))
+        self._set_ci_toggle_state(enabled=is_asym)
         if not is_asym:
             self.show_ci_band_var.set(False)
             self.ci_band = None
@@ -1824,123 +1827,6 @@ class PeakFitApp:
                         return (x, lo, hi)
                 except Exception:
                     pass
-        return None
-
-    def _unc_extract_stats(self, result):
-        """
-        Return list of per-peak dicts with keys:
-          center_est, center_sd, height_est, height_sd, fwhm_est, fwhm_sd
-        Supports:
-          - result.stats / parameters / param_stats
-          - list-of-dicts rows
-          - dict {'center': {'est':[...],'sd':[...]} , ...}
-          - flat dict-of-lists {'center_est':[...], 'height_sd':[...], ...}
-        """
-        import math
-
-        def _pick_idx(container, i, *keys):
-            # pick container[key][i] for first existing key; tolerate short arrays
-            for k in keys:
-                v = container.get(k)
-                if v is None:
-                    continue
-                try:
-                    return v[i]
-                except Exception:
-                    # could be scalar
-                    try:
-                        return v
-                    except Exception:
-                        pass
-            return None
-
-        def _coerce_row(row):
-            # row may be nested: {'center': {'est':..,'sd':..}, 'height': {...}, 'fwhm': {...}}
-            out = {}
-            # nested blocks
-            for pname in ("center", "height", "fwhm"):
-                blk = row.get(pname)
-                if isinstance(blk, dict):
-                    est = blk.get("est") or blk.get("mean") or blk.get("median") or blk.get("value")
-                    sd  = blk.get("sd")  or blk.get("std")  or blk.get("se")
-                    if est is not None: out[f"{pname}_est"] = est
-                    if sd  is not None: out[f"{pname}_sd"]  = sd
-            # flat fallbacks
-            for pname in ("center", "height", "fwhm"):
-                for k in (f"{pname}_est", pname):
-                    if k in row and row[k] is not None:
-                        out.setdefault(f"{pname}_est", row[k])
-                        break
-                for k in (f"{pname}_sd", f"{pname}_std", f"{pname}_se"):
-                    if k in row and row[k] is not None:
-                        out.setdefault(f"{pname}_sd", row[k])
-                        break
-            return out
-
-        # locate stats object
-        stats = None
-        for attr in ("stats", "parameters", "param_stats"):
-            if hasattr(result, attr):
-                stats = getattr(result, attr)
-                break
-        if stats is None and isinstance(result, dict):
-            for k in ("stats", "parameters", "param_stats"):
-                if k in result:
-                    stats = result[k]
-                    break
-        if stats is None:
-            return None
-
-        # case A: list-of-dicts
-        if isinstance(stats, (list, tuple)):
-            rows = []
-            for row in stats:
-                if isinstance(row, dict):
-                    rows.append(_coerce_row(row))
-            return rows if rows else None
-
-        # case B: dict form
-        if isinstance(stats, dict):
-            # B1) block-of-arrays: {'center': {'est':[...],'sd':[...]} , ...}
-            if all(k in stats for k in ("center", "height", "fwhm")) and \
-               all(isinstance(stats[k], dict) for k in ("center", "height", "fwhm")):
-                n = 0
-                for pname in ("center", "height", "fwhm"):
-                    for key in ("est", "mean", "median", "value"):
-                        v = stats[pname].get(key)
-                        if hasattr(v, "__len__"):
-                            n = max(n, len(v))
-                rows = []
-                for i in range(n):
-                    row = {
-                        "center": {"est": _pick_idx(stats["center"], i, "est", "mean", "median", "value"),
-                                   "sd":  _pick_idx(stats["center"], i, "sd", "std", "se")},
-                        "height": {"est": _pick_idx(stats["height"], i, "est", "mean", "median", "value"),
-                                   "sd":  _pick_idx(stats["height"], i, "sd", "std", "se")},
-                        "fwhm":   {"est": _pick_idx(stats["fwhm"],   i, "est", "mean", "median", "value"),
-                                   "sd":  _pick_idx(stats["fwhm"],   i, "sd", "std", "se")},
-                    }
-                    rows.append(_coerce_row(row))
-                return rows
-            # B2) flat dict-of-lists: {'center_est':[...], 'height_sd':[...], ...}
-            # compute max length
-            n = 0
-            for v in stats.values():
-                if hasattr(v, "__len__") and not isinstance(v, (str, bytes)):
-                    n = max(n, len(v))
-            if n == 0:
-                return None
-            rows = []
-            for i in range(n):
-                row = {}
-                for k, v in stats.items():
-                    try:
-                        row[k] = v[i] if hasattr(v, "__getitem__") else v
-                    except Exception:
-                        row[k] = v
-                rows.append(_coerce_row(row))
-            return rows
-
         return None
 
     def run_in_thread(self, fn, on_done):
@@ -2740,7 +2626,8 @@ class PeakFitApp:
             self.last_uncertainty = None
             self.ci_band = None
             self.show_ci_band_var.set(False)
-            self.ci_toggle.configure(state="disabled")
+            self._last_unc_locks = []
+            self._set_ci_toggle_state(False)
             self.refresh_plot()
             self.set_busy(False, f"Fit done. RMSE {res.rmse:.4g}")
             npts = int(np.count_nonzero(mask))
@@ -3133,63 +3020,73 @@ class PeakFitApp:
                 self.status_error(f"Uncertainty failed: {error}")
                 return
 
-            # Store a normalized-ish object (dict or namespace OK; list becomes {"stats": list})
-            if isinstance(result, list):
-                self.last_uncertainty = {"stats": result}
-            elif isinstance(result, SimpleNamespace):
-                self.last_uncertainty = result.__dict__.copy()
-            elif isinstance(result, dict):
-                self.last_uncertainty = result.copy()
-            else:
-                self.last_uncertainty = {"stats": []}  # safe fallback
+            try:
+                self.last_uncertainty = _normalize_unc_result(result)
+            except Exception:
+                self.last_uncertainty = {"label": "unknown", "stats": []}
 
-            # Gate the CI toggle: only for asymptotic
-            is_asym = self._unc_is_asymptotic(self.last_uncertainty)
-            self.show_ci_band_var.set(bool(is_asym))
-            self.ci_toggle.configure(state=("normal" if is_asym else "disabled"))
+            locks = []
+            for pk in self.peaks:
+                locks.append({
+                    "center": bool(getattr(pk, "lock_center", False)),
+                    "fwhm": bool(getattr(pk, "lock_width", False)),
+                    "eta": False,
+                })
+            self._last_unc_locks = locks
 
-            # If asymptotic band present, render; otherwise clear
-            bx = self.last_uncertainty.get("band_x")
-            blo = self.last_uncertainty.get("band_lo")
-            bhi = self.last_uncertainty.get("band_hi")
-            if is_asym and bx is not None and blo is not None and bhi is not None:
-                try:
-                    self.ci_band = (np.asarray(bx), np.asarray(blo), np.asarray(bhi))
-                except Exception:
+            label = _canonical_unc_label(self.last_uncertainty.get("label"))
+            self.last_uncertainty["label"] = label
+
+            if label.startswith("Asymptotic"):
+                band = self.last_uncertainty.get("band")
+                if band is not None:
+                    xb, lob, hib = band
+                    self.ci_band = (xb, lob, hib)
+                    self.show_ci_band_var.set(True)
+                    self._set_ci_toggle_state(True)
+                    self.refresh_plot()
+                else:
                     self.ci_band = None
+                    self._set_ci_toggle_state(True)
             else:
                 self.ci_band = None
+                self.show_ci_band_var.set(False)
+                self._set_ci_toggle_state(False)
 
-            label = (self.last_uncertainty.get("label") or self.last_uncertainty.get("method") or "unknown")
-            self.status_info(
-                f"Computed {label} uncertainty." + ("" if self.ci_band is not None else " (no band)")
-            )
-
-            self.refresh_plot()
-
-            # Per-peak stats
+            # persist band for export when method is asymptotic
             try:
-                rows = self._unc_extract_stats(self.last_uncertainty)
-                if rows:
-                    for i, row in enumerate(rows, 1):
-                        def _fmt(v_est, v_sd):
-                            try:
-                                s_est = f"{float(v_est):.6g}" if v_est is not None else "n/a"
-                            except Exception:
-                                s_est = "n/a"
-                            try:
-                                s_sd = f"{float(v_sd):.3g}" if v_sd is not None else "n/a"
-                            except Exception:
-                                s_sd = "n/a"
-                            return s_est, s_sd
-                        c_est, c_sd = _fmt(row.get("center_est"), row.get("center_sd"))
-                        h_est, h_sd = _fmt(row.get("height_est"), row.get("height_sd"))
-                        w_est, w_sd = _fmt(row.get("fwhm_est"),  row.get("fwhm_sd"))
-                        self.status_info(
-                            f"Peak {i}: center={c_est} ± {c_sd} | height={h_est} ± {h_sd} | FWHM={w_est} ± {w_sd}"
-                        )
+                band_label = self.last_uncertainty.get("label", "unknown")
+                if band_label.startswith("Asymptotic") and getattr(self, "ci_band", None):
+                    xb, lob, hib = self.ci_band
+                    self.last_uncertainty["band"] = (np.asarray(xb), np.asarray(lob), np.asarray(hib))
+            except Exception:
+                pass
+
+            self.status_info(f"Computed {label} uncertainty.")
+
+            try:
+                for i, row in enumerate(self.last_uncertainty.get("stats", []), start=1):
+                    def _fmt(est, sd):
+                        try:
+                            s_est = f"{float(est):.6g}" if est is not None else "n/a"
+                        except Exception:
+                            s_est = "n/a"
+                        try:
+                            s_sd = f"{float(sd):.3g}" if sd is not None else "n/a"
+                        except Exception:
+                            s_sd = "n/a"
+                        return s_est, s_sd
+
+                    c_est, c_sd = _fmt(row.get("center", {}).get("est"), row.get("center", {}).get("sd"))
+                    h_est, h_sd = _fmt(row.get("height", {}).get("est"), row.get("height", {}).get("sd"))
+                    w_est, w_sd = _fmt(row.get("fwhm", {}).get("est"), row.get("fwhm", {}).get("sd"))
+                    self.status_info(
+                        f"Peak {i}: center={c_est} ± {c_sd} | height={h_est} ± {h_sd} | FWHM={w_est} ± {w_sd}"
+                    )
             except Exception as _e:
                 self.status_warn(f"Uncertainty stats formatting skipped ({_e.__class__.__name__}).")
+
+            self.refresh_plot()
 
         self._unc_running = True
         self._unc_job_id += 1
@@ -3220,127 +3117,6 @@ class PeakFitApp:
         save_config(self.cfg)
         self.log(f"Backend: {performance.which_backend()} | workers={performance.get_max_workers()}")
         self.status_var.set("Performance options applied.")
-
-    def _maybe_export_uncertainty(
-        self, txt_path: Path, csv_path: Path, band_path: Path, rmse: float
-    ) -> None:
-        try:
-            if self.ci_band is None or getattr(self, "param_sigma", None) is None:
-                try:
-                    self._run_asymptotic_uncertainty()
-                except Exception as e:
-                    self.log(f"Uncertainty failed: {e}", level="WARN")
-
-            opts = self._solver_options()
-            solver = self.solver_choice.get()
-            fname_disp = self.current_file.name if self.current_file else "(unsaved)"
-            lines = [f"File: {fname_disp}", "Uncertainty method: Asymptotic (95% CI, z=1.96)"]
-            lines.append(
-                "Solver: "
-                f"{solver}, loss={opts.get('loss', '')}, weight={opts.get('weights', '')}, "
-                f"f_scale={opts.get('f_scale', '')}, maxfev={opts.get('maxfev', '')}, "
-                f"restarts={opts.get('restarts', '')}, jitter_pct={opts.get('jitter_pct', '')}"
-            )
-            lines.append(
-                "Baseline: "
-                f"uses_fit_range={bool(self.baseline_use_range.get())}, "
-                f"lam={self.als_lam.get()}, p={self.als_asym.get()}, "
-                f"niter={self.als_niter.get()}, thresh={self.als_thresh.get()}"
-            )
-            lines.append(
-                "Performance: "
-                f"numba={bool(self.perf_numba.get())}, gpu={bool(self.perf_gpu.get())}, "
-                f"cache_baseline={bool(self.perf_cache_baseline.get())}, "
-                f"seed_all={bool(self.perf_seed_all.get())}, max_workers={int(self.perf_max_workers.get())}"
-            )
-            lines.append("Peaks:")
-            z = 1.96
-            sigma = getattr(self, "param_sigma", np.array([]))
-            dof = getattr(self, "unc_info", {}).get("dof", np.nan)
-            rows = []
-            fname = self.current_file.name if self.current_file else ""
-            for i, p in enumerate(self.peaks, 1):
-                lines.append(f"Peak {i}")
-                sc = sigma[4 * (i - 1)] if sigma.size >= 4 * i else np.nan
-                sh = sigma[4 * (i - 1) + 1] if sigma.size >= 4 * i + 1 else np.nan
-                sf = sigma[4 * (i - 1) + 2] if sigma.size >= 4 * i + 2 else np.nan
-                se = sigma[4 * (i - 1) + 3] if sigma.size >= 4 * i + 3 else np.nan
-                params = [
-                    ("center", p.center, sc, not p.lock_center),
-                    ("height", p.height, sh, True),
-                    ("fwhm", p.fwhm, sf, not p.lock_width),
-                    ("eta", p.eta, se, True),
-                ]
-                for pname, val, std, free in params:
-                    if free and np.isfinite(std):
-                        ci_lo = val - z * std
-                        ci_hi = val + z * std
-                        lines.append(
-                            f"  {pname:<7}= {val:.6g} ± {std:.3g}   (95% CI: [{ci_lo:.6g}, {ci_hi:.6g}])"
-                        )
-                        rows.append(
-                            {
-                                "file": fname,
-                                "peak": i,
-                                "param": pname,
-                                "value": val,
-                                "stderr": std,
-                                "ci_lo": ci_lo,
-                                "ci_hi": ci_hi,
-                                "method": "asymptotic",
-                                "rmse": rmse,
-                                "dof": dof,
-                            }
-                        )
-                    else:
-                        lines.append(f"  {pname:<7}= {val:.6g} (fixed)")
-                        rows.append(
-                            {
-                                "file": fname,
-                                "peak": i,
-                                "param": pname,
-                                "value": val,
-                                "stderr": np.nan,
-                                "ci_lo": np.nan,
-                                "ci_hi": np.nan,
-                                "method": "asymptotic",
-                                "rmse": rmse,
-                                "dof": dof,
-                            }
-                        )
-
-            lines.append(f"Fit quality: RMSE={rmse:.5g}, DOF={dof}")
-            with txt_path.open("w", encoding="utf-8", newline="") as fh:
-                fh.write("\n".join(lines) + "\n")
-
-            header = [
-                "file",
-                "peak",
-                "param",
-                "value",
-                "stderr",
-                "ci_lo",
-                "ci_hi",
-                "method",
-                "rmse",
-                "dof",
-            ]
-            with csv_path.open("w", newline="", encoding="utf-8") as fh:
-                writer = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
-                writer.writeheader()
-                for row in rows:
-                    writer.writerow(row)
-
-            if self.ci_band is not None:
-                xb, lob, hib = self.ci_band
-                with band_path.open("w", newline="", encoding="utf-8") as fh:
-                    bw = csv.writer(fh, lineterminator="\n")
-                    bw.writerow(["x", "y_lo95", "y_hi95"])
-                    for xi, lo, hi in zip(xb, lob, hib):
-                        bw.writerow([xi, lo, hi])
-        except Exception as e:  # pragma: no cover - defensive
-            self.log(f"Uncertainty export failed: {e}", level="WARN")
-            self.status_var.set("Uncertainty export failed.")
 
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:
@@ -3444,48 +3220,79 @@ class PeakFitApp:
         with open(paths["trace"], "w", encoding="utf-8", newline="") as fh:
             fh.write(trace_csv)
 
-
         saved = [paths["fit"], paths["trace"]]
         saved_unc: List[str] = []
-        if getattr(self, "last_uncertainty", None):
+        unc = getattr(self, "last_uncertainty", None)
+        if unc:
             try:
-                solver_line = "Solver: {solver}{loss}{weight}{f}{mfev}{rs}{jit}".format(
-                    solver=solver,
-                    loss=f", loss={opts.get('loss')}" if opts.get("loss") is not None else "",
-                    weight=f", weight={opts.get('weights')}" if opts.get("weights") is not None else "",
-                    f=f", f_scale={opts.get('f_scale')}" if opts.get("f_scale") is not None else "",
-                    mfev=f", maxfev={opts.get('maxfev')}" if opts.get("maxfev") is not None else "",
-                    rs=f", restarts={opts.get('restarts')}" if opts.get("restarts") is not None else "",
-                    jit=f", jitter_pct={opts.get('jitter_pct')}" if opts.get("jitter_pct") is not None else "",
+                base = Path(out_csv).with_suffix("")
+                write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
+
+                # ensure mapping shape for exporter
+                unc = _normalize_unc_result(unc)
+
+                long_csv, wide_csv = write_uncertainty_csvs(
+                    base, self.current_file or "", unc, write_wide=write_wide
                 )
-                baseline_line = "Baseline: uses_fit_range={uses} , lam={lam} , p={p} , niter={niter} , thresh={th}".format(
-                    uses=bool(self.baseline_use_range.get()),
-                    lam=float(self.als_lam.get()),
-                    p=float(self.als_asym.get()),
-                    niter=int(self.als_niter.get()),
-                    th=float(self.als_thresh.get()),
+
+                solver_opts = getattr(self, "_solver_options", lambda: SimpleNamespace())()
+                if hasattr(solver_opts, "__dict__"):
+                    solver_opts = solver_opts.__dict__
+                solver_meta = {
+                    "solver": self.solver_choice.get(),
+                    **solver_opts,
+                }
+                baseline_meta = {
+                    "uses_fit_range": bool(self.baseline_use_range.get()),
+                    "lam": float(self.als_lam.get()),
+                    "p": float(self.als_asym.get()),
+                    "niter": int(self.als_niter.get()),
+                    "thresh": float(self.als_thresh.get()),
+                }
+                perf_meta = {
+                    "numba": bool(self.perf_numba.get()),
+                    "gpu": bool(self.perf_gpu.get()),
+                    "cache_baseline": bool(self.perf_cache_baseline.get()),
+                    "seed_all": bool(self.perf_seed_all.get()),
+                    "max_workers": int(self.perf_max_workers.get()),
+                }
+                locks = getattr(self, "_last_unc_locks", [])
+                txt_path = base.with_name(base.name + "_uncertainty.txt")
+                _write_unc_txt(
+                    txt_path,
+                    self.current_file or "",
+                    unc,
+                    solver_meta,
+                    baseline_meta,
+                    perf_meta,
+                    locks,
                 )
-                perf_line = "Performance: numba={numba}, gpu={gpu}, cache_baseline={cache}, seed_all={seed}, max_workers={mw}".format(
-                    numba=bool(self.perf_numba.get()),
-                    gpu=bool(self.perf_gpu.get()),
-                    cache=bool(self.perf_cache_baseline.get()),
-                    seed=bool(self.perf_seed_all.get()),
-                    mw=int(self.perf_max_workers.get()),
-                )
-                from core.data_io import export_uncertainty_pair
-                src_path = str(self.current_file) if self.current_file else ""
-                out_csv = paths["unc_csv"]
-                out_txt = paths["unc_txt"]
-                export_uncertainty_pair(out_csv, out_txt, self.last_uncertainty, src_path, solver_line, baseline_line, perf_line)
-                saved_unc.extend([str(out_csv), str(out_txt)])
-                label = self.last_uncertainty.get("label") or self.last_uncertainty.get("method") or "unknown"
-                self.status_info(f"Exported uncertainty ({label}).")
+
+                method_label = unc.get("label", "unknown")
+                self.log(f"Exported uncertainty ({method_label}).")
+
+                saved_unc.extend([str(long_csv), str(txt_path)])
+                if wide_csv:
+                    saved_unc.append(str(wide_csv))
+                # Write asymptotic band CSV for compatibility
+                band_csv = base.with_name(base.name + "_uncertainty_band.csv")
+                band = unc.get("band")
+                if band is not None and str(method_label).startswith("Asymptotic"):
+                    xb, lob, hib = band
+                    with band_csv.open("w", newline="", encoding="utf-8") as fh:
+                        w = csv.writer(fh, lineterminator="\n")
+                        w.writerow(["x", "y_lo95", "y_hi95"])
+                        for xi, lo, hi in zip(xb, lob, hib):
+                            w.writerow([float(xi), float(lo), float(hi)])
+                    saved_unc.append(str(band_csv))
             except Exception as e:  # pragma: no cover - defensive
                 self.status_warn(f"Uncertainty export failed: {e}")
 
         saved.extend(saved_unc)
         saved_lines = [str(p) for p in saved if p]
         messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved_lines))
+
+
 
     # ----- Plot -----
     def toggle_components(self):
