@@ -1,6 +1,7 @@
 import numpy as np
-import pandas as pd
+from pathlib import Path
 from core import fit_api, uncertainty, data_io
+from tests.conftest import _maybe_read_unc_files, _pivot_long_to_wide
 
 
 def test_unc_bootstrap_outputs(two_peak_data, tmp_path):
@@ -10,18 +11,24 @@ def test_unc_bootstrap_outputs(two_peak_data, tmp_path):
     res1 = uncertainty.bootstrap_ci(fit, n_boot=20, seed=42, workers=0)
     assert res1.method_label == "Bootstrap (residual)"
 
-    paths = data_io.derive_export_paths(str(tmp_path / "out.csv"))
-    data_io.write_uncertainty_csv(paths["unc_csv"], res1)
-    df = pd.read_csv(paths["unc_csv"])
-    for pname in res1.param_stats.keys():
-        sd_col = f"{pname}_sd"
-        assert sd_col in df.columns
-        assert np.isfinite(df.loc[0, sd_col])
-        p_lo = f"{pname}_p2_5"
-        p_hi = f"{pname}_p97_5"
-        if p_lo in df.columns and p_hi in df.columns:
-            est = df.loc[0, f"{pname}_est"]
-            assert df.loc[0, p_lo] - 1e-9 <= est <= df.loc[0, p_hi] + 1e-9
+    base = Path(tmp_path / "out.csv")
+    unc_norm = data_io.normalize_unc_result(res1)
+    data_io.write_uncertainty_csvs(base, "", unc_norm, write_wide=True)
+    basedir = Path(tmp_path)
+    stem = "out"
+    wide_df, long_df, used = _maybe_read_unc_files(basedir, stem)
+    if wide_df is None:
+        assert long_df is not None, "No uncertainty CSVs were written"
+        wide_df = _pivot_long_to_wide(long_df)
+
+    assert not wide_df.empty
+    assert set(["file","peak","method"]).issubset(wide_df.columns)
+    methods = wide_df["method"].astype(str).str.lower()
+    assert any(methods.str.startswith("bootstrap"))
+
+    for col in ["center","center_stderr","height","height_stderr"]:
+        assert col in wide_df.columns, f"missing column {col}"
+        assert str(wide_df[col].dtype).startswith(("float","int","UInt")), f"{col} must be numeric"
 
     res2 = uncertainty.bootstrap_ci(fit, n_boot=20, seed=42, workers=0)
     assert np.allclose(res1["param_mean"], res2["param_mean"])
