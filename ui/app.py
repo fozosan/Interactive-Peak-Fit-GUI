@@ -3227,6 +3227,10 @@ class PeakFitApp:
             try:
                 base = Path(out_csv).with_suffix("")
                 write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
+
+                # ensure mapping shape for exporter
+                unc = _normalize_unc_result(unc)
+
                 long_csv, wide_csv = write_uncertainty_csvs(
                     base, self.current_file or "", unc, write_wide=write_wide
                 )

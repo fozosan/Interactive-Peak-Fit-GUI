@@ -239,13 +239,6 @@ def _as_mapping(obj: Any) -> Mapping[str, Any]:
 
 
 def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
-    """
-    Extract a list of per-peak statistics in a tolerant way.
-    Each row is a mapping with keys like:
-      index, center, height, fwhm, eta  (each param -> dict with est/sd/ci_lo/ci_hi/p2_5/p97_5)
-    Accepts legacy shapes: {'stats': [...]}, {'parameters': [...]}, {'param_stats': [...]}, or flat rows.
-    Missing values become np.nan.
-    """
     roots = ["stats", "parameters", "param_stats"]
     rows = None
     for k in roots:
@@ -255,40 +248,185 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     if rows is None:
         return []
 
+    # Helper pickers
+    def pick(d, *keys):
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return None
+
+    def norm_param_name(s: Any) -> Optional[str]:
+        if not isinstance(s, str):
+            return None
+        ss = s.strip().lower()
+        if ss in ("center", "centre", "mu", "x0", "pos"):
+            return "center"
+        if ss in ("height", "amp", "amplitude"):
+            return "height"
+        if ss in ("fwhm", "width", "gamma", "sigma"):
+            return "fwhm"
+        if ss in ("eta", "mix", "mixing"):
+            return "eta"
+        return None
+
+    # --- Long-format path: rows like {'peak', 'param', 'est'/ 'value', 'sd'/'stderr', ...}
+    if (
+        isinstance(rows, (list, tuple))
+        and rows
+        and isinstance(rows[0], Mapping)
+        and ("param" in rows[0] or "name" in rows[0])
+    ):
+        from collections import defaultdict
+
+        by_peak: Dict[int, Dict[str, Dict[str, float]]] = defaultdict(dict)
+
+        for r in rows:
+            rm = _as_mapping(r)
+            # Identify peak index
+            idx = pick(rm, "peak", "index", "k", "i")
+            try:
+                pk_idx = int(idx) if idx is not None else None
+            except Exception:
+                pk_idx = None
+            if pk_idx is None:
+                continue
+
+            # Param name -> canonical
+            rawp = pick(rm, "param", "name")
+            pname = norm_param_name(rawp)
+            if not pname:
+                continue
+
+            est = pick(rm, "est", "value", "mean", "median")
+            sd = pick(rm, "sd", "stderr", "std", "stdev")
+            p2_5 = pick(rm, "p2_5", "q025", "q2_5")
+            p97_5 = pick(rm, "p97_5", "q975", "q97_5")
+            ci_lo = pick(rm, "ci_lo")
+            ci_hi = pick(rm, "ci_hi")
+
+            # Synthesize CI from sd if missing
+            if (ci_lo is None or ci_hi is None) and est is not None and sd is not None:
+                try:
+                    e = float(est)
+                    s = float(sd)
+                    ci_lo, ci_hi = e - _Z * s, e + _Z * s
+                except Exception:
+                    pass
+
+            by_peak[pk_idx][pname] = {
+                "est": _to_float(est),
+                "sd": _to_float(sd),
+                "ci_lo": _to_float(ci_lo),
+                "ci_hi": _to_float(ci_hi),
+                "p2_5": _to_float(p2_5),
+                "p97_5": _to_float(p97_5),
+            }
+
+        out = []
+        for pk in sorted(by_peak.keys()):
+            block = by_peak[pk]
+            out.append(
+                {
+                    "index": int(pk),
+                    "center": block.get(
+                        "center",
+                        {
+                            "est": float("nan"),
+                            "sd": float("nan"),
+                            "ci_lo": float("nan"),
+                            "ci_hi": float("nan"),
+                            "p2_5": float("nan"),
+                            "p97_5": float("nan"),
+                        },
+                    ),
+                    "height": block.get(
+                        "height",
+                        {
+                            "est": float("nan"),
+                            "sd": float("nan"),
+                            "ci_lo": float("nan"),
+                            "ci_hi": float("nan"),
+                            "p2_5": float("nan"),
+                            "p97_5": float("nan"),
+                        },
+                    ),
+                    "fwhm": block.get(
+                        "fwhm",
+                        {
+                            "est": float("nan"),
+                            "sd": float("nan"),
+                            "ci_lo": float("nan"),
+                            "ci_hi": float("nan"),
+                            "p2_5": float("nan"),
+                            "p97_5": float("nan"),
+                        },
+                    ),
+                    "eta": block.get(
+                        "eta",
+                        {
+                            "est": float("nan"),
+                            "sd": float("nan"),
+                            "ci_lo": float("nan"),
+                            "ci_hi": float("nan"),
+                            "p2_5": float("nan"),
+                            "p97_5": float("nan"),
+                        },
+                    ),
+                }
+            )
+        return out
+
+    # --- Existing tolerant per-peak/flat path (keep your current logic) ---
     norm_rows: List[Mapping[str, Any]] = []
     for i, row in enumerate(rows, start=1):
         rmap = _as_mapping(row)
-        # Resolve param blocks: either nested dicts per param OR flat fields like center_est, center_sd, ...
         def param_block(base: str) -> Mapping[str, float]:
             block = _as_mapping(rmap.get(base))
             if block:
-                est   = block.get("est", block.get("value", np.nan))
-                sd    = block.get("sd",  block.get("stderr", np.nan))
-                lo    = block.get("ci_lo", block.get("lo", np.nan))
-                hi    = block.get("ci_hi", block.get("hi", np.nan))
-                p2_5  = block.get("p2_5",  np.nan)
+                est = block.get("est", block.get("value", np.nan))
+                sd = block.get("sd", block.get("stderr", np.nan))
+                lo = block.get("ci_lo", block.get("lo", np.nan))
+                hi = block.get("ci_hi", block.get("hi", np.nan))
+                p2_5 = block.get("p2_5", np.nan)
                 p97_5 = block.get("p97_5", np.nan)
             else:
-                # flat layout fallbacks
-                est   = rmap.get(f"{base}_est", rmap.get(base, np.nan))
-                sd    = rmap.get(f"{base}_sd",  rmap.get(f"{base}_stderr", np.nan))
-                lo    = rmap.get(f"{base}_ci_lo", np.nan)
-                hi    = rmap.get(f"{base}_ci_hi", np.nan)
-                p2_5  = rmap.get(f"{base}_p2_5", np.nan)
+                est = rmap.get(f"{base}_est", rmap.get(base, np.nan))
+                sd = rmap.get(f"{base}_sd", rmap.get(f"{base}_stderr", np.nan))
+                lo = rmap.get(f"{base}_ci_lo", np.nan)
+                hi = rmap.get(f"{base}_ci_hi", np.nan)
+                p2_5 = rmap.get(f"{base}_p2_5", np.nan)
                 p97_5 = rmap.get(f"{base}_p97_5", np.nan)
+            # synthesize CI if missing but sd present
+            if (
+                (lo is None or np.isnan(_to_float(lo)))
+                and (hi is None or np.isnan(_to_float(hi)))
+                and est is not None
+                and sd is not None
+            ):
+                try:
+                    e = float(est)
+                    s = float(sd)
+                    lo, hi = e - _Z * s, e + _Z * s
+                except Exception:
+                    pass
             return {
-                "est": _to_float(est), "sd": _to_float(sd),
-                "ci_lo": _to_float(lo), "ci_hi": _to_float(hi),
-                "p2_5": _to_float(p2_5), "p97_5": _to_float(p97_5),
+                "est": _to_float(est),
+                "sd": _to_float(sd),
+                "ci_lo": _to_float(lo),
+                "ci_hi": _to_float(hi),
+                "p2_5": _to_float(p2_5),
+                "p97_5": _to_float(p97_5),
             }
 
-        norm_rows.append({
-            "index": int(rmap.get("index", rmap.get("peak", i))),
-            "center": param_block("center"),
-            "height": param_block("height"),
-            "fwhm":   param_block("fwhm"),
-            "eta":    param_block("eta"),
-        })
+        norm_rows.append(
+            {
+                "index": int(rmap.get("index", rmap.get("peak", i)) or i),
+                "center": param_block("center"),
+                "height": param_block("height"),
+                "fwhm": param_block("fwhm"),
+                "eta": param_block("eta"),
+            }
+        )
     return norm_rows
 
 
@@ -400,13 +538,29 @@ def _format_unc_text(
     """
     Return v2.7-style human-readable text with ± and 95% CI, marking (fixed) when locked.
     """
+    raw_label = str(unc_norm.get("label", "unknown"))
+    if raw_label.startswith("Asymptotic"):
+        nice_label = "Asymptotic (95% CI, z=1.96)"
+    elif raw_label.startswith("Bootstrap"):
+        nice_label = "Bootstrap (95% CI via percentiles)"
+    elif raw_label.startswith("Bayesian"):
+        nice_label = "Bayesian (95% credible interval)"
+    else:
+        nice_label = raw_label
+
+    def fmt(x, nd=6):
+        try:
+            v = float(x)
+            if not np.isfinite(v):
+                return "n/a"
+            return f"{v:.{nd}g}"
+        except Exception:
+            return "n/a"
+
     fname = str(file_path)
-    label = unc_norm.get("label", "unknown")
-    rmse  = unc_norm.get("rmse", float("nan"))
-    dof   = unc_norm.get("dof", 0)
     lines = []
     lines.append(f"File: {fname}")
-    lines.append(f"Uncertainty method: {label.split()[0].lower()}")
+    lines.append(f"Uncertainty method: {nice_label}")
     lines.append("Solver: " + ", ".join(f"{k}={v}" for k,v in solver_meta.items()))
     lines.append("Baseline: " + ", ".join(f"{k}={v}" for k,v in baseline_meta.items()))
     lines.append("Performance: " + ", ".join(f"{k}={v}" for k,v in perf_meta.items()))
@@ -419,16 +573,18 @@ def _format_unc_text(
         def fmt_param(name: str, locked: bool):
             p = _as_mapping(row.get(name))
             est = p.get("est")
-            sd  = p.get("sd")
-            lo  = p.get("ci_lo")
-            hi  = p.get("ci_hi")
+            sd = p.get("sd")
+            lo = p.get("ci_lo")
+            hi = p.get("ci_hi")
             if locked:
-                lines.append(f"  {name:<7}= {est:.6g} (fixed)")
+                lines.append(f"  {name:<7}= {fmt(est)} (fixed)")
             else:
                 if not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
-                    lines.append(f"  {name:<7}= {est:.6g} ± {sd:.6g}   (95% CI: [{_to_float(lo):.6g}, {_to_float(hi):.6g}])")
+                    lines.append(
+                        f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}   (95% CI: [{fmt(lo)}, {fmt(hi)}])"
+                    )
                 else:
-                    lines.append(f"  {name:<7}= {est:.6g} ± {sd:.6g}")
+                    lines.append(f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}")
 
         fmt_param("center", lock.get("center", False))
         fmt_param("height", False)
