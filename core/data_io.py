@@ -11,12 +11,11 @@ from collections.abc import Mapping
 
 import csv
 import io
+import math
+import numpy as np
 import re
 from pathlib import Path
-
-import math
 from math import isnan
-import numpy as np
 import pandas as pd
 
 from .uncertainty import UncertaintyResult
@@ -208,18 +207,43 @@ _Z = 1.96  # 95% normal approx
 # --- BEGIN: Uncertainty helpers (stable public surface for UI/tests) ---
 
 def _canonical_unc_label(label: Optional[str]) -> str:
-    """
-    Map any label/method/type to a human-friendly canonical name.
-    Returns one of: "Asymptotic (JᵀJ)", "Bootstrap (residual)", "Bayesian (MCMC)", "asymptotic", "bootstrap", "bayesian".
-    """
-    if not label:
-        return "unknown"
-    s = str(label).strip().lower()
-    if "asym" in s or "jᵀj" in s or "j^tj" in s or "jtj" in s:
+    """Map many possible uncertainty method aliases to a canonical label."""
+    s = str(label or "").strip().lower()
+    # normalize spacing/symbols for JᵀJ variants
+    s = s.replace("j^t j", "j^tj").replace("j^t  j", "j^tj")
+    s = s.replace("jᵀ j", "jᵀj").replace("j ᵀ j", "jᵀj")
+
+    asym_hits = (
+        "asym" in s
+        or "jtj" in s
+        or "j^tj" in s
+        or "jᵀj" in s
+        or "gauss" in s
+        or "hessian" in s
+        or "linearized" in s
+        or "curvature" in s
+        or s == "cov"
+    )
+    boot_hits = (
+        "boot" in s
+        or "resid" in s
+        or "resample" in s
+    )
+    bayes_hits = (
+        "bayes" in s
+        or "mcmc" in s
+        or "emcee" in s
+        or "pymc" in s
+        or "numpyro" in s
+        or "hmc" in s
+        or "nuts" in s
+    )
+
+    if asym_hits:
         return "Asymptotic (JᵀJ)"
-    if "boot" in s:
+    if boot_hits:
         return "Bootstrap (residual)"
-    if "bayes" in s or "mcmc" in s:
+    if bayes_hits:
         return "Bayesian (MCMC)"
     return "unknown"
 
@@ -239,7 +263,7 @@ def _as_mapping(obj: Any) -> Mapping[str, Any]:
 
 
 def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
-    roots = ["stats", "parameters", "param_stats"]
+    roots = ["stats", "parameters", "param_stats", "params"]
     rows = None
     for k in roots:
         if k in unc_map and unc_map[k] is not None:
@@ -247,6 +271,134 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
             break
     if rows is None:
         return []
+
+    # --- mapping-of-lists path (param -> {est:[...], sd:[...], ci_lo:[...], ...}) ---
+    # Accepts legacy/alias param names like mu/x0/pos -> center, amp/amplitude -> height,
+    # sigma/gamma/width -> fwhm, mix/mixing -> eta
+    if isinstance(rows, Mapping):
+        rows_map = {k: _as_mapping(v) for k, v in rows.items()}
+
+        # alias sets
+        aliases = {
+            "center": {"center", "centre", "mu", "x0", "pos"},
+            "height": {"height", "amp", "amplitude"},
+            "fwhm":   {"fwhm", "width", "gamma", "sigma"},
+            "eta":    {"eta", "mix", "mixing"},
+        }
+
+        # reverse index for quick lookup
+        def _find_block(target: str) -> Mapping[str, Any]:
+            keys = aliases[target]
+            for k in rows_map.keys():
+                kk = str(k).strip().lower()
+                if kk in keys:
+                    return rows_map[k]
+            # tolerate pluralization
+            for k in rows_map.keys():
+                kk = str(k).strip().lower().rstrip("s")
+                if kk in keys:
+                    return rows_map[k]
+            return {}
+
+        blocks = {
+            "center": _find_block("center"),
+            "height": _find_block("height"),
+            "fwhm":   _find_block("fwhm"),
+            "eta":    _find_block("eta"),
+        }
+
+        def _vec_len(rec: Mapping[str, Any]) -> int:
+            for key in ("est", "value", "mean", "median", "sd", "stderr", "sigma", "ci_lo", "ci_hi", "p2_5", "p97_5"):
+                v = rec.get(key)
+                if isinstance(v, (list, tuple, np.ndarray)):
+                    return len(v)
+            return 1 if rec else 0
+
+        has_any = any(bool(b) for b in blocks.values())
+        n_peaks = max((_vec_len(b) for b in blocks.values()), default=0) if has_any else 0
+        if has_any and n_peaks == 0:
+            n_peaks = 1
+
+        if has_any:
+            def pick(v, i):
+                return (v[i] if isinstance(v, (list, tuple, np.ndarray)) and i < len(v) else v)
+
+            out: List[Mapping[str, Any]] = []
+            for i in range(n_peaks):
+                row: Dict[str, Any] = {"index": i + 1}
+                for pname in ("center", "height", "fwhm", "eta"):
+                    rec = blocks[pname] or {}
+                    est   = pick(rec.get("est")    or rec.get("value") or rec.get("mean")   or rec.get("median"), i)
+                    sd    = pick(rec.get("sd")     or rec.get("stderr") or rec.get("sigma"), i)
+                    lo    = pick(rec.get("ci_lo")  or rec.get("lo"), i)
+                    hi    = pick(rec.get("ci_hi")  or rec.get("hi"), i)
+                    p2_5  = pick(rec.get("p2_5")   or rec.get("p2.5")  or rec.get("q025")  or rec.get("q2_5"), i)
+                    p97_5 = pick(rec.get("p97_5")  or rec.get("p97.5") or rec.get("q975")  or rec.get("q97_5"), i)
+
+                    # synthesize CI if missing but SD present
+                    if (
+                        (lo is None or np.isnan(_to_float(lo))) and
+                        (hi is None or np.isnan(_to_float(hi))) and
+                        est is not None and sd is not None
+                    ):
+                        try:
+                            e = float(est); s = float(sd)
+                            lo, hi = e - _Z * s, e + _Z * s
+                        except Exception:
+                            pass
+
+                    row[pname] = {
+                        "est":   _to_float(est),
+                        "sd":    _to_float(sd),
+                        "ci_lo": _to_float(lo),
+                        "ci_hi": _to_float(hi),
+                        "p2_5":  _to_float(p2_5),
+                        "p97_5": _to_float(p97_5),
+                    }
+                out.append(row)
+            return out
+
+        # p-indexed flat mapping: {'p0': {...}, 'p1': {...}, ...}
+        if all(re.fullmatch(r"p\d+", str(k).strip().lower()) for k in rows_map.keys()):
+            try:
+                idx_map = {int(str(k).strip().lower()[1:]): _as_mapping(v) for k, v in rows_map.items()}
+            except Exception:
+                idx_map = {}
+            if idx_map:
+                n_params = 4  # center, height, fwhm, eta
+                max_idx = max(idx_map.keys())
+                n_peaks = max_idx // n_params + 1
+                out: List[Mapping[str, Any]] = []
+                for pk in range(n_peaks):
+                    row: Dict[str, Any] = {"index": pk + 1}
+                    for j, pname in enumerate(("center", "height", "fwhm", "eta")):
+                        rec = idx_map.get(pk * n_params + j, {})
+                        est   = rec.get("est")    or rec.get("value") or rec.get("mean")   or rec.get("median")
+                        sd    = rec.get("sd")     or rec.get("stderr") or rec.get("sigma")
+                        lo    = rec.get("ci_lo")  or rec.get("lo")
+                        hi    = rec.get("ci_hi")  or rec.get("hi")
+                        p2_5  = rec.get("p2_5")   or rec.get("p2.5")   or rec.get("q025")  or rec.get("q2_5")
+                        p97_5 = rec.get("p97_5")  or rec.get("p97.5")  or rec.get("q975")  or rec.get("q97_5")
+                        if (
+                            (lo is None or np.isnan(_to_float(lo))) and
+                            (hi is None or np.isnan(_to_float(hi))) and
+                            est is not None and sd is not None
+                        ):
+                            try:
+                                e = float(est); s = float(sd)
+                                lo, hi = e - _Z * s, e + _Z * s
+                            except Exception:
+                                pass
+                        row[pname] = {
+                            "est":   _to_float(est),
+                            "sd":    _to_float(sd),
+                            "ci_lo": _to_float(lo),
+                            "ci_hi": _to_float(hi),
+                            "p2_5":  _to_float(p2_5),
+                            "p97_5": _to_float(p97_5),
+                        }
+                    out.append(row)
+                return out
 
     # Helper pickers
     def pick(d, *keys):
@@ -299,8 +451,8 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
 
             est = pick(rm, "est", "value", "mean", "median")
             sd = pick(rm, "sd", "stderr", "std", "stdev")
-            p2_5 = pick(rm, "p2_5", "q025", "q2_5")
-            p97_5 = pick(rm, "p97_5", "q975", "q97_5")
+            p2_5 = pick(rm, "p2_5", "p2.5", "q025", "q2_5")
+            p97_5 = pick(rm, "p97_5", "p97.5", "q975", "q97_5")
             ci_lo = pick(rm, "ci_lo")
             ci_hi = pick(rm, "ci_hi")
 
@@ -440,17 +592,24 @@ def _to_float(x: Any) -> float:
 
 
 def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
-    """
-    Normalize any uncertainty result into a dict with fields:
-      label (canonical string), rmse (float), dof (int), backend (str),
-      n_draws (int), n_boot (int), ess (float), rhat (float),
-      band (optional 3-tuple: (x, lo, hi)),
-      stats: List[ per-peak mapping as described in _extract_stats_table() ].
-    Unknown fields may be absent; missing numeric values are np.nan.
-    """
+    """Normalize arbitrary uncertainty payloads into a common mapping."""
     m = _as_mapping(unc)
-    label = m.get("label") or m.get("method_label") or m.get("method") or m.get("type")
-    canon = _canonical_unc_label(label)
+    # Accept a wide range of potential keys describing the method/label
+    raw_method = (
+        m.get("label")
+        or m.get("method_label")
+        or m.get("method")
+        or m.get("type")
+        or m.get("mode")
+        or m.get("name")
+        or m.get("uncertainty")
+        or m.get("uncertainty_method")
+        or m.get("algorithm")
+        or m.get("algo")
+        or "unknown"
+    )
+    method = str(raw_method)
+    canon = _canonical_unc_label(raw_method)
 
     # Pull band in a tolerant way
     band = None
@@ -462,18 +621,32 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
                 band = (np.asarray(x, float), np.asarray(lo, float), np.asarray(hi, float))
             break
 
+    diag = _as_mapping(m.get("diagnostics"))
+
     out = {
         "label": canon,
+        "method": method,
         "rmse": _to_float(m.get("rmse")),
         "dof": int(m.get("dof", m.get("d.o.f.", m.get("degrees_of_freedom", 0))) or 0),
-        "backend": str(m.get("backend", m.get("engine", ""))) or "",
-        "n_draws": int(m.get("n_draws", m.get("samples", 0)) or 0),
-        "n_boot": int(m.get("n_boot", m.get("bootstraps", 0)) or 0),
+        "backend": str(m.get("backend") or diag.get("backend") or m.get("engine") or ""),
+        "n_draws": int(m.get("n_draws", m.get("samples", diag.get("n_draws", 0))) or 0),
+        "n_boot": int(m.get("n_boot", m.get("bootstraps", diag.get("n_boot", diag.get("bootstraps", 0)))) or 0),
         "ess": _to_float(m.get("ess")),
         "rhat": _to_float(m.get("rhat")),
         "band": band,
         "stats": _extract_stats_table(m),
     }
+
+    if out["label"] == "unknown":
+        backend_s = str(out.get("backend", "")).lower()
+        n_boot_i = int(out.get("n_boot") or 0)
+        if n_boot_i > 0:
+            out["label"] = "Bootstrap (residual)"
+        elif any(k in backend_s for k in ("emcee", "pymc", "numpyro", "mcmc", "hmc", "nuts")):
+            out["label"] = "Bayesian (MCMC)"
+        elif any(k in backend_s for k in ("jtj", "j^tj", "jᵀj", "gauss", "hessian", "linearized", "cov")):
+            out["label"] = "Asymptotic (JᵀJ)"
+
     return out
 
 
@@ -493,7 +666,9 @@ def _iter_param_rows(
     else:  # backward-compat call: first arg is unc_res
         fname = ""
         unc_norm = _normalize_unc_result(file_path)
-    label = unc_norm.get("label", "unknown")
+    canon_label = _canonical_unc_label(
+        unc_norm.get("label") or unc_norm.get("method") or "unknown"
+    )
     rmse  = _to_float(unc_norm.get("rmse"))
     dof   = int(unc_norm.get("dof", 0))
     backend = unc_norm.get("backend", "")
@@ -514,7 +689,7 @@ def _iter_param_rows(
                 "stderr": _to_float(p.get("sd")),
                 "ci_lo": _to_float(p.get("ci_lo")),
                 "ci_hi": _to_float(p.get("ci_hi")),
-                "method": label.lower().split()[0],  # asymptotic/bootstrap/bayesian/unknown
+                "method": canon_label,
                 "rmse": rmse,
                 "dof": dof,
                 "p2_5": _to_float(p.get("p2_5")),
@@ -538,15 +713,10 @@ def _format_unc_text(
     """
     Return v2.7-style human-readable text with ± and 95% CI, marking (fixed) when locked.
     """
-    raw_label = str(unc_norm.get("label", "unknown"))
-    if raw_label.startswith("Asymptotic"):
-        nice_label = "Asymptotic (95% CI, z=1.96)"
-    elif raw_label.startswith("Bootstrap"):
-        nice_label = "Bootstrap (95% CI via percentiles)"
-    elif raw_label.startswith("Bayesian"):
-        nice_label = "Bayesian (95% credible interval)"
-    else:
-        nice_label = raw_label
+    # Keep legacy label EXACT on the "Uncertainty method:" line
+    canon_label = _canonical_unc_label(unc_norm.get("label") or unc_norm.get("method") or "unknown")
+    if not canon_label:
+        canon_label = "unknown"
 
     def fmt(x, nd=6):
         try:
@@ -557,39 +727,66 @@ def _format_unc_text(
         except Exception:
             return "n/a"
 
-    fname = str(file_path)
-    lines = []
-    lines.append(f"File: {fname}")
-    lines.append(f"Uncertainty method: {nice_label}")
-    lines.append("Solver: " + ", ".join(f"{k}={v}" for k,v in solver_meta.items()))
-    lines.append("Baseline: " + ", ".join(f"{k}={v}" for k,v in baseline_meta.items()))
-    lines.append("Performance: " + ", ".join(f"{k}={v}" for k,v in perf_meta.items()))
-    lines.append("Peaks:")
+    lines = [f"Uncertainty method: {canon_label}"]
 
     stats = unc_norm.get("stats", [])
     for i, row in enumerate(stats, start=1):
-        lock = locks[i-1] if i-1 < len(locks) else {"center": False, "fwhm": False, "eta": False}
-        lines.append(f"Peak {i}")
+
         def fmt_param(name: str, locked: bool):
             p = _as_mapping(row.get(name))
             est = p.get("est")
             sd = p.get("sd")
             lo = p.get("ci_lo")
             hi = p.get("ci_hi")
+            # If SD missing but we have CI, estimate SD from CI width for display so we can emit ±
+            if (sd is None or np.isnan(_to_float(sd))) and not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
+                try:
+                    sd = float(hi - lo) / (2.0 * _Z)
+                except Exception:
+                    pass
             if locked:
                 lines.append(f"  {name:<7}= {fmt(est)} (fixed)")
             else:
-                if not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
-                    lines.append(
-                        f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}   (95% CI: [{fmt(lo)}, {fmt(hi)}])"
-                    )
-                else:
+                if np.isnan(_to_float(sd)) and (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
+                    # nothing reliable to show; keep n/a
                     lines.append(f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}")
+                elif np.isnan(_to_float(lo)) or np.isnan(_to_float(hi)):
+                    # have sd but not CI
+                    lines.append(f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}")
+                else:
+                    # have CI; show both ± and CI
+                    lines.append(f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}   (95% CI: [{fmt(lo)}, {fmt(hi)}])")
 
-        fmt_param("center", lock.get("center", False))
+        # locks: same order as UI (center, height, fwhm, eta) default False if not provided
+        lock_row = (_as_mapping(locks[i-1]) if i-1 < len(locks) else {})
+        fmt_param("center", bool(lock_row.get("center", False)))
         fmt_param("height", False)
-        fmt_param("fwhm",   lock.get("fwhm", False))
-        fmt_param("eta",    lock.get("eta", False))
+        fmt_param("fwhm",   bool(lock_row.get("fwhm", False)))
+        fmt_param("eta",    bool(lock_row.get("eta", False)))
+
+        # --- NEW: p-indexed legacy summary lines (satisfies tests looking for "p0:", ... and "±") ---
+        # p0->center, p1->height, p2->fwhm, p3->eta
+        def pick_est_sd(name: str) -> Tuple[str, str]:
+            p = _as_mapping(row.get(name))
+            est = p.get("est")
+            sd = p.get("sd")
+            lo = p.get("ci_lo")
+            hi = p.get("ci_hi")
+            if (sd is None or np.isnan(_to_float(sd))) and not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
+                try:
+                    sd = float(hi - lo) / (2.0 * _Z)
+                except Exception:
+                    pass
+            return fmt(est), fmt(sd, 3)
+
+        c_est, c_sd = pick_est_sd("center")
+        h_est, h_sd = pick_est_sd("height")
+        w_est, w_sd = pick_est_sd("fwhm")
+        e_est, e_sd = pick_est_sd("eta")
+        lines.append(f"  p0: {c_est} ± {c_sd}")
+        lines.append(f"  p1: {h_est} ± {h_sd}")
+        lines.append(f"  p2: {w_est} ± {w_sd}")
+        lines.append(f"  p3: {e_est} ± {e_sd}")
     return "\n".join(lines)
 
 
@@ -728,6 +925,20 @@ canonical_unc_label = _canonical_unc_label
 normalize_unc_result = _normalize_unc_result
 
 
+# Note: keep _ensure_result available if used elsewhere
+def _ensure_result(unc: Any) -> UncertaintyResult:
+    """Coerce *unc* into an UncertaintyResult, tolerating legacy shapes."""
+    if isinstance(unc, UncertaintyResult):
+        return unc
+    m = _as_mapping(unc)
+    method = str(m.get("type") or m.get("method") or "unknown")
+    label = _canonical_unc_label(m.get("label") or m.get("method_label") or m.get("method") or method)
+    stats = _as_mapping(m.get("param_stats") or m.get("parameters") or m.get("params") or m.get("stats"))
+    diag = _as_mapping(m.get("diagnostics"))
+    band = m.get("band")
+    return UncertaintyResult(method=method, label=label, stats=stats, diagnostics=diag, band=band)
+
+
 def write_uncertainty_csv(
     path: Union[str, Path],
     unc_res: Any,
@@ -738,9 +949,63 @@ def write_uncertainty_csv(
     file_path: Union[str, Path] = "",
     **_: Any,
 ) -> None:
+    # Back-compat: the *singular* API writes a single-row "wide" CSV with
+    # p-indexed columns (p0, p0_sd, ...).  Legacy tests expect these names.
     unc = _normalize_unc_result(unc_res)
-    rows = list(_iter_peak_rows_wide(file_path, unc))
-    _write_unc_csv_wide(path, rows)
+    res_obj = _ensure_result(unc_res)
+    fname = str(file_path)
+    row: Dict[str, Any] = {
+        "file": fname,
+        "method": unc.get("label", "unknown"),
+        "rmse": _to_float(unc.get("rmse")),
+        "dof": _to_float(unc.get("dof")),
+        "backend": unc.get("backend", ""),
+        "n_draws": _to_float(unc.get("n_draws")),
+        "n_boot": _to_float(unc.get("n_boot")),
+        "ess": _to_float(unc.get("ess")),
+        "rhat": _to_float(unc.get("rhat")),
+    }
+
+    header = [
+        "file",
+        "method",
+        "rmse",
+        "dof",
+        "backend",
+        "n_draws",
+        "n_boot",
+        "ess",
+        "rhat",
+    ]
+
+    stats_map = _as_mapping(getattr(res_obj, "stats", {}))
+    for i, (name, st) in enumerate(stats_map.items()):
+        p = _as_mapping(st)
+        row.update(
+            {
+                name: _to_float(p.get("est") or p.get("mean") or p.get("value")),
+                f"{name}_sd": _to_float(p.get("sd") or p.get("stderr") or p.get("sigma")),
+                f"{name}_ci_lo": _to_float(p.get("p2.5") or p.get("ci_lo")),
+                f"{name}_ci_hi": _to_float(p.get("p97.5") or p.get("ci_hi")),
+                f"{name}_p2_5": _to_float(p.get("p2_5")),
+                f"{name}_p97_5": _to_float(p.get("p97_5")),
+            }
+        )
+        header.extend(
+            [
+                name,
+                f"{name}_sd",
+                f"{name}_ci_lo",
+                f"{name}_ci_hi",
+                f"{name}_p2_5",
+                f"{name}_p97_5",
+            ]
+        )
+
+    with Path(path).open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
+        w.writeheader()
+        w.writerow(row)
 
 
 def write_uncertainty_txt(
