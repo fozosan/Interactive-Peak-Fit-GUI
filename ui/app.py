@@ -2948,7 +2948,7 @@ class PeakFitApp:
         write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
         long_csv, wide_csv = write_uncertainty_csvs(out_base, file_path, unc_norm, write_wide=write_wide)
 
-        solver_opts = getattr(self, "_solver_options", lambda *_: SimpleNamespace())()
+        solver_opts = getattr(self, "_solver_options", lambda *_: {})()
         if hasattr(solver_opts, "__dict__"):
             solver_opts = solver_opts.__dict__
         solver_meta = {"solver": self.solver_choice.get(), **solver_opts}
@@ -2986,8 +2986,9 @@ class PeakFitApp:
             if band is not None:
                 xb, lob, hib = band
                 band_csv = out_base.with_name(out_base.name + "_uncertainty_band.csv")
+                import csv as _csv
                 with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                    w = csv.writer(fh, lineterminator="\n")
+                    w = _csv.writer(fh, lineterminator="\n")
                     w.writerow(["x", "y_lo95", "y_hi95"])
                     for xi, lo, hi in zip(xb, lob, hib):
                         w.writerow([float(xi), float(lo), float(hi)])
