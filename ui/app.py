@@ -2693,11 +2693,29 @@ class PeakFitApp:
         self.cfg["batch_reheight"] = bool(self.batch_reheight.get())
         self.cfg["batch_auto_max"] = int(self.batch_auto_max.get())
         self.cfg["batch_save_traces"] = bool(self.batch_save_traces.get())
-        self.cfg["batch_compute_uncertainty"] = bool(self.batch_unc_enabled.get())
+        try:
+            self.cfg["batch_compute_uncertainty"] = bool(self.batch_unc_enabled.get())
+        except Exception:
+            try:
+                self.cfg["batch_compute_uncertainty"] = bool(self.compute_uncertainty_batch.get())
+            except Exception:
+                self.cfg["batch_compute_uncertainty"] = True
         save_config(self.cfg)
 
-        compute_unc = bool(self.batch_unc_enabled.get())
+        # Respect the UI toggle if present; otherwise default ON to avoid silent skips.
+        compute_unc = True
+        try:
+            compute_unc = bool(self.batch_unc_enabled.get())
+        except Exception:
+            try:
+                compute_unc = bool(self.compute_uncertainty_batch.get())
+            except Exception:
+                compute_unc = True
         unc_method = str(self.unc_method.get()).strip()
+
+        self.log("Starting batch…")
+        # Helpful visibility when debugging batch behavior:
+        self.log(f"Batch: compute_uncertainty={compute_unc} | method={unc_method}")
 
         def work():
             def prog(i, total, path):
