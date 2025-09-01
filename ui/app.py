@@ -3361,12 +3361,10 @@ class PeakFitApp:
         with trace_csv.open("w", encoding="utf-8", newline="") as fh:
             fh.write(trace_csv_s)
 
-        # Decide if we should compute uncertainty for this file
-        compute_unc_batch = self._batch_unc_enabled()
+        # Always attempt uncertainty when peaks are present
         write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
 
-        # don't try uncertainty if there are no peaks
-        if compute_unc_batch and self.peaks:
+        if self.peaks:
             try:
                 method_key = self._unc_selected_method_key()
                 add_mode = (self.baseline_mode.get() == "add")
@@ -3417,7 +3415,7 @@ class PeakFitApp:
                 self._export_uncertainty_from_result(unc_norm, out_base, str(in_path), write_wide=write_wide)
                 if unc_rows is not None:
                     unc_rows.extend(_dio.iter_uncertainty_rows(in_path, unc_norm))
-                self.status_info(f"[Batch] Computed {label} uncertainty for {in_path.name}.")
+                self.status_info(f"[Batch] Uncertainty: {label} for {in_path.name}.")
             except Exception as e:
                 self.status_warn(f"[Batch] Uncertainty skipped for {in_path.name} ({e.__class__.__name__}).")
 
@@ -3545,7 +3543,7 @@ class PeakFitApp:
         saved = [paths["fit"], paths["trace"]]
         saved_unc: List[str] = []
         try:
-            base = Path(out_csv).with_suffix("")
+            export_base = Path(out_csv).with_suffix("")
             write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
             add_mode = (self.baseline_mode.get() == "add")
             x_fit = self.x[mask]
@@ -3569,9 +3567,11 @@ class PeakFitApp:
             unc_norm["label"] = label
             unc_norm["rmse"] = rmse
             unc_norm["dof"] = dof
+            if not unc_norm.get("stats"):
+                raise RuntimeError("Export uncertainty normalization produced no stats")
 
             long_csv, wide_csv = write_uncertainty_csvs(
-                base, self.current_file or "", unc_norm, write_wide=write_wide
+                export_base, self.current_file or "", unc_norm, write_wide=write_wide
             )
 
             solver_opts = getattr(self, "_solver_options", lambda: SimpleNamespace())()
@@ -3596,7 +3596,7 @@ class PeakFitApp:
                 "max_workers": int(self.perf_max_workers.get()),
             }
             locks = getattr(self, "_last_unc_locks", [])
-            txt_path = base.with_name(base.name + "_uncertainty.txt")
+            txt_path = export_base.with_name(export_base.name + "_uncertainty.txt")
             write_uncertainty_txt(
                 txt_path,
                 unc_norm,
@@ -3613,7 +3613,7 @@ class PeakFitApp:
             band = unc_norm.get("band")
             if band is not None:
                 xb, lob, hib = band
-                band_csv = base.with_name(base.name + "_uncertainty_band.csv")
+                band_csv = export_base.with_name(export_base.name + "_uncertainty_band.csv")
                 with band_csv.open("w", newline="", encoding="utf-8") as fh:
                     w = csv.writer(fh, lineterminator="\n")
                     w.writerow(["x", "y_lo95", "y_hi95"])

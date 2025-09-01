@@ -25,7 +25,9 @@ from core.residuals import build_residual
 from core import uncertainty as unc
 
 
-def _auto_seed(x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: int = 5) -> List[peaks.Peak]:
+def _auto_seed(
+    x: np.ndarray, y: np.ndarray, baseline: np.ndarray, max_peaks: int = 5
+) -> List[peaks.Peak]:
     """Return up to ``max_peaks`` automatically seeded peaks."""
 
     sig = y - baseline
@@ -102,14 +104,19 @@ def run_batch(
     if unc_workers <= 0:
         unc_workers = int(config.get("perf_max_workers", 0)) or os.cpu_count() or 1
 
-    out_dir = Path(config.get("output_dir", Path(config.get("peak_output", "peaks.csv")).parent))
+    out_dir = Path(
+        config.get("output_dir", Path(config.get("peak_output", "peaks.csv")).parent)
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     base_name = config.get("output_base")
     if base_name is None:
         peak_output_cfg = config.get("peak_output", out_dir / "batch_fit.csv")
         base_name = Path(peak_output_cfg).stem.replace("_fit", "")
     peak_output = out_dir / f"{base_name}_fit.csv"
-    export_unc_wide = bool(config.get("export_unc_wide", True))
+    export_unc_wide = bool(config.get("export_unc_wide", False))
+    unc_method = str(
+        config.get("unc_method") or config.get("uncertainty_method") or "asymptotic"
+    )
 
     records = []
     unc_rows = []
@@ -155,7 +162,9 @@ def run_batch(
             template = _auto_seed(x, y, baseline, max_peaks=auto_max)
         else:
             template = [
-                peaks.Peak(p.center, p.height, p.fwhm, p.eta, p.lock_center, p.lock_width)
+                peaks.Peak(
+                    p.center, p.height, p.fwhm, p.eta, p.lock_center, p.lock_width
+                )
                 for p in base_template
             ]
 
@@ -176,8 +185,8 @@ def run_batch(
             reheight=reheight,
             rng_seed=seed,
             verbose=bool(log),
-            return_jacobian=compute_uncertainty,
-            return_predictors=compute_uncertainty,
+            return_jacobian=True,
+            return_predictors=True,
         )
 
         fitted = res["peaks_out"]
@@ -187,7 +196,9 @@ def run_batch(
             x_fit = x[mask]
             y_fit = (y if mode == "add" else y - baseline)[mask]
             base_fit = baseline[mask] if mode == "add" else None
-            resid_fn = build_residual(x_fit, y_fit, fitted, mode, base_fit, "linear", None)
+            resid_fn = build_residual(
+                x_fit, y_fit, fitted, mode, base_fit, "linear", None
+            )
             r = resid_fn(theta)
             rmse_shadow = float(np.sqrt(np.mean(r * r))) if r.size else float("nan")
             if abs(rmse_shadow - rmse) > 1e-8 and log:
@@ -243,7 +254,9 @@ def run_batch(
                 "solver_jitter_pct": config.get("solver_jitter_pct", np.nan),
                 "use_baseline": True,
                 "baseline_mode": mode,
-                "baseline_uses_fit_range": bool(config.get("baseline_uses_fit_range", True)),
+                "baseline_uses_fit_range": bool(
+                    config.get("baseline_uses_fit_range", True)
+                ),
                 "als_niter": base_cfg.get("niter"),
                 "als_thresh": base_cfg.get("thresh"),
                 **perf_extras,
@@ -258,28 +271,37 @@ def run_batch(
             local_records.append(rec)
 
         fit_csv = data_io.build_peak_table(local_records)
-        with (out_dir / f"{Path(path).stem}_fit.csv").open("w", encoding="utf-8", newline="") as fh:
+        with (out_dir / f"{Path(path).stem}_fit.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as fh:
             fh.write(fit_csv)
 
         unc_res = None
-        if compute_uncertainty and res["fit_ok"]:
+        if res["fit_ok"] and fitted:
             try:
                 if "boot" in unc_method.lower():
-                    unc_res = unc.bootstrap_ci(fit_ctx=res, n_boot=100, workers=unc_workers)
+                    unc_res = unc.bootstrap_ci(
+                        fit_ctx=res, n_boot=100, workers=unc_workers
+                    )
                 elif "bayes" in unc_method.lower() or "mcmc" in unc_method.lower():
                     unc_res = unc.bayesian_ci(fit_ctx=res)
                 else:
                     unc_res = unc.asymptotic_ci(
-                        res["theta"], res["residual_fn"], res["jacobian"], res["ymodel_fn"]
+                        res["theta"],
+                        res["residual_fn"],
+                        res["jacobian"],
+                        res["ymodel_fn"],
                     )
             except Exception:
                 unc_res = None
 
-        if compute_uncertainty and unc_res is not None:
+        if unc_res is not None:
             stem = Path(path).stem
 
             unc_norm = data_io.normalize_unc_result(unc_res)
-            method_lbl = data_io.canonical_unc_label(unc_norm.get("label") or unc_method)
+            method_lbl = data_io.canonical_unc_label(
+                unc_norm.get("label") or unc_method
+            )
             unc_norm["label"] = method_lbl
             unc_norm["rmse"] = rmse
             unc_norm["dof"] = res.get("dof", 0) if isinstance(res, dict) else 0
@@ -311,6 +333,8 @@ def run_batch(
                         bw.writerow([float(xi), float(lo), float(hi)])
 
             unc_rows.extend(data_io.iter_uncertainty_rows(path, unc_norm))
+            if log:
+                log(f"{Path(path).name}: uncertainty={method_lbl}")
 
         trace_path = None
         if save_traces:
@@ -330,7 +354,7 @@ def run_batch(
     peak_csv = data_io.build_peak_table(records)
     with peak_output.open("w", encoding="utf-8", newline="") as fh:
         fh.write(peak_csv)
-    if compute_uncertainty and unc_rows:
+    if unc_rows:
         data_io.write_batch_uncertainty_long(out_dir, unc_rows)
 
     return ok, processed
@@ -396,4 +420,3 @@ def run(patterns: Iterable[str], config: dict, progress=None, log=None):
         progress=progress,
         log=log,
     )
-
