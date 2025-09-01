@@ -125,6 +125,7 @@ def run_batch(
     unc_method_canon = data_io.canonical_unc_label(unc_choice)
     if log:
         log(f"batch uncertainty method={unc_method_canon}")
+        log(f"batch compute_uncertainty={bool(compute_uncertainty)}")
 
     records = []
     unc_rows = []
@@ -295,11 +296,12 @@ def run_batch(
                 elif "bayes" in mode_lower or "mcmc" in mode_lower:
                     unc_res = unc.bayesian_ci(fit_ctx=res)
                 else:
+                    # NOTE: fit_api returns `predict_full` for the model evaluator
                     unc_res = unc.asymptotic_ci(
                         res["theta"],
                         res["residual_fn"],
                         res["jacobian"],
-                        res["ymodel_fn"],
+                        res["predict_full"],
                     )
             except Exception:
                 unc_res = None
