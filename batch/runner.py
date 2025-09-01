@@ -98,11 +98,6 @@ def run_batch(
     base_cfg = config.get("baseline", {})
     save_traces = bool(config.get("save_traces", False))
     source = config.get("source", "template")
-    # Fallback: if no seed peaks provided and not explicitly auto, switch to auto seeding
-    if source != "auto" and not base_template:
-        if log:
-            log("no seed peaks provided; switching source=auto")
-        source = "auto"
     reheight = bool(config.get("reheight", False))
     auto_max = int(config.get("auto_max", 5))
     unc_workers = int(config.get("unc_workers", 0))

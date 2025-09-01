@@ -1171,31 +1171,14 @@ def write_batch_uncertainty_long(
       - batch_uncertainty.csv      (legacy-compatible mirror)
     """
     out_dir = Path(out_dir)
-    header = ["file","peak","param","value","stderr","ci_lo","ci_hi","method","rmse","dof"]
+    header = ["file","peak","param","value","stderr","p2_5","p97_5","method","rmse","dof"]
 
     def _write(path: Path):
         with path.open("w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
             w.writeheader()
             for r in rows:
-                val = _to_float(r.get("value"))
-                sd = _to_float(r.get("stderr"))
-                qlo = _to_float(r.get("p2_5"))
-                qhi = _to_float(r.get("p97_5"))
-                if (math.isnan(qlo) or math.isnan(qhi)) and math.isfinite(val) and math.isfinite(sd):
-                    qlo, qhi = val - _Z * sd, val + _Z * sd
-                w.writerow({
-                    "file": r.get("file", ""),
-                    "peak": r.get("peak", ""),
-                    "param": r.get("param", ""),
-                    "value": val,
-                    "stderr": sd,
-                    "ci_lo": qlo,
-                    "ci_hi": qhi,
-                    "method": r.get("method", ""),
-                    "rmse": r.get("rmse", ""),
-                    "dof": r.get("dof", ""),
-                })
+                w.writerow(r)
 
     long_path = out_dir / "batch_uncertainty_long.csv"
     legacy_path = out_dir / "batch_uncertainty.csv"
