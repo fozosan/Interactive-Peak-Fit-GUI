@@ -1170,26 +1170,22 @@ def write_batch_uncertainty_long(
       - batch_uncertainty_long.csv (preferred)
       - batch_uncertainty.csv      (legacy-compatible mirror)
 
-    Output schema uses unified quantile names (ci_lo/ci_hi).
-    Input rows may carry either ci_lo/ci_hi or p2_5/p97_5; we map to ci_lo/ci_hi.
+    Output schema intentionally keeps legacy quantile names (p2_5/p97_5).
+    Input rows may carry either p2_5/p97_5 or ci_lo/ci_hi; we map to p2_5/p97_5.
     """
     out_dir = Path(out_dir)
-    header = ["file","peak","param","value","stderr","ci_lo","ci_hi","method","rmse","dof"]
+    header = ["file","peak","param","value","stderr","p2_5","p97_5","method","rmse","dof"]
 
     def _pick_quantiles(r: dict) -> tuple[float, float]:
-        """
-        Accept either legacy p2_5/p97_5 or unified ci_lo/ci_hi; synthesize from
-        value±Z*stderr if neither present.
-        """
+        # Accept either legacy or unified field names; synthesize if needed.
         val = _to_float(r.get("value"))
         sd  = _to_float(r.get("stderr"))
-        # Prefer unified names if already present
-        qlo = _to_float(r.get("ci_lo"))
-        qhi = _to_float(r.get("ci_hi"))
+        qlo = _to_float(r.get("p2_5"))
+        qhi = _to_float(r.get("p97_5"))
         if math.isnan(qlo) or math.isnan(qhi):
-            # Try legacy names
-            qlo = _to_float(r.get("p2_5"))
-            qhi = _to_float(r.get("p97_5"))
+            # try unified names
+            qlo = _to_float(r.get("ci_lo"))
+            qhi = _to_float(r.get("ci_hi"))
         if (math.isnan(qlo) or math.isnan(qhi)) and math.isfinite(val) and math.isfinite(sd):
             qlo, qhi = val - _Z * sd, val + _Z * sd
         return qlo, qhi
@@ -1208,8 +1204,8 @@ def write_batch_uncertainty_long(
                     "param": r.get("param", ""),
                     "value": val,
                     "stderr": sd,
-                    "ci_lo": qlo,
-                    "ci_hi": qhi,
+                    "p2_5": qlo,
+                    "p97_5": qhi,
                     "method": r.get("method", ""),
                     "rmse": r.get("rmse", ""),
                     "dof": r.get("dof", ""),
