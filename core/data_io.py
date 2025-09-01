@@ -19,6 +19,11 @@ import pandas as pd
 
 from .uncertainty import UncertaintyResult
 
+# 95% normal quantile used when p2_5/p97_5 are absent but stderr exists
+_Z = 1.96
+# Conversion from Gaussian sigma to FWHM
+_FWHM_SIGMA = 2.0 * math.sqrt(2.0 * math.log(2.0))
+
 
 def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
     """Load two-column numeric data from ``path``.
@@ -201,8 +206,6 @@ def write_dataframe(df: pd.DataFrame, path: Path) -> None:
     with path.open("w", newline="", encoding="utf-8") as fh:
         df.to_csv(fh, index=False, lineterminator="\n")
 
-_Z = 1.96  # 95% normal approx
-
 # --- BEGIN: Uncertainty helpers (stable public surface for UI/tests) ---
 
 def _canonical_unc_label(label: Optional[str]) -> str:
@@ -288,25 +291,25 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
 
         # alias sets
         aliases = {
-            "center": {"center", "centre", "mu", "x0", "pos"},
-            "height": {"height", "amp", "amplitude"},
-            "fwhm":   {"fwhm", "width", "gamma", "sigma"},
-            "eta":    {"eta", "mix", "mixing"},
+            "center": {"center", "centre", "mu", "x0", "pos", "c"},
+            "height": {"height", "amp", "amplitude", "a"},
+            "fwhm":   {"fwhm", "width", "gamma", "sigma", "stddev"},
+            "eta":    {"eta", "mix", "mixing", "gl", "frac_lorentzian"},
         }
 
         # reverse index for quick lookup
-        def _find_block(target: str) -> Mapping[str, Any]:
+        def _find_block(target: str) -> tuple[Mapping[str, Any], str]:
             keys = aliases[target]
             for k in rows_map.keys():
                 kk = str(k).strip().lower()
                 if kk in keys:
-                    return rows_map[k]
+                    return rows_map[k], kk
             # tolerate pluralization
             for k in rows_map.keys():
                 kk = str(k).strip().lower().rstrip("s")
                 if kk in keys:
-                    return rows_map[k]
-            return {}
+                    return rows_map[k], kk
+            return {}, ""
 
         blocks = {
             "center": _find_block("center"),
@@ -315,14 +318,18 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
             "eta":    _find_block("eta"),
         }
 
-        def _vec_len(rec: Mapping[str, Any]) -> int:
-            for key in ("est", "value", "mean", "median", "sd", "stderr", "sigma", "ci_lo", "ci_hi", "p2_5", "p97_5"):
+        def _vec_len(rec_alias: tuple[Mapping[str, Any], str]) -> int:
+            rec, _ = rec_alias
+            for key in (
+                "est","value","mean","median","sd","stderr","sigma",
+                "ci_lo","ci_hi","p2_5","p97_5","p2.5","p97.5","q2_5","q97_5","lo95","hi95"
+            ):
                 v = rec.get(key)
                 if isinstance(v, (list, tuple, np.ndarray)):
                     return len(v)
             return 1 if rec else 0
 
-        has_any = any(bool(b) for b in blocks.values())
+        has_any = any(bool(b[0]) for b in blocks.values())
         n_peaks = max((_vec_len(b) for b in blocks.values()), default=0) if has_any else 0
         if has_any and n_peaks == 0:
             n_peaks = 1
@@ -335,13 +342,46 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
             for i in range(n_peaks):
                 row: Dict[str, Any] = {"index": i + 1}
                 for pname in ("center", "height", "fwhm", "eta"):
-                    rec = blocks[pname] or {}
-                    est   = pick(rec.get("est")    or rec.get("value") or rec.get("mean")   or rec.get("median"), i)
-                    sd    = pick(rec.get("sd")     or rec.get("stderr") or rec.get("sigma"), i)
-                    lo    = pick(rec.get("ci_lo")  or rec.get("lo"), i)
-                    hi    = pick(rec.get("ci_hi")  or rec.get("hi"), i)
-                    p2_5  = pick(rec.get("p2_5")   or rec.get("p2.5")  or rec.get("q025")  or rec.get("q2_5"), i)
-                    p97_5 = pick(rec.get("p97_5")  or rec.get("p97.5") or rec.get("q975")  or rec.get("q97_5"), i)
+                    rec, alias = blocks[pname]
+                    rec = rec or {}
+                    est   = pick(rec.get("est")    or rec.get("value") or rec.get("mean") or rec.get("median"), i)
+                    sd    = pick(rec.get("sd")     or rec.get("stderr") or rec.get("std") or rec.get("stdev") or rec.get("sigma"), i)
+                    lo    = pick(rec.get("ci_lo")  or rec.get("lo95") or rec.get("lo"), i)
+                    hi    = pick(rec.get("ci_hi")  or rec.get("hi95") or rec.get("hi"), i)
+                    p2_5  = pick(rec.get("p2_5")   or rec.get("p2.5") or rec.get("q025") or rec.get("q2_5") or rec.get("lo95") or rec.get("ci_lo"), i)
+                    p97_5 = pick(rec.get("p97_5")  or rec.get("p97.5") or rec.get("q975") or rec.get("q97_5") or rec.get("hi95") or rec.get("ci_hi"), i)
+
+                    if pname == "fwhm" and alias in {"sigma", "stddev", "width"}:
+                        try:
+                            if est is not None:
+                                est = float(est) * _FWHM_SIGMA
+                        except Exception:
+                            pass
+                        try:
+                            if sd is not None:
+                                sd = float(sd) * _FWHM_SIGMA
+                        except Exception:
+                            pass
+                        try:
+                            if lo is not None:
+                                lo = float(lo) * _FWHM_SIGMA
+                        except Exception:
+                            pass
+                        try:
+                            if hi is not None:
+                                hi = float(hi) * _FWHM_SIGMA
+                        except Exception:
+                            pass
+                        try:
+                            if p2_5 is not None:
+                                p2_5 = float(p2_5) * _FWHM_SIGMA
+                        except Exception:
+                            pass
+                        try:
+                            if p97_5 is not None:
+                                p97_5 = float(p97_5) * _FWHM_SIGMA
+                        except Exception:
+                            pass
 
                     # synthesize CI if missing but SD present
                     if (
@@ -352,6 +392,19 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                         try:
                             e = float(est); s = float(sd)
                             lo, hi = e - _Z * s, e + _Z * s
+                        except Exception:
+                            pass
+
+                    if (
+                        (p2_5 is None or np.isnan(_to_float(p2_5))) or
+                        (p97_5 is None or np.isnan(_to_float(p97_5)))
+                    ) and est is not None and sd is not None:
+                        try:
+                            e = float(est); s = float(sd)
+                            if p2_5 is None or np.isnan(_to_float(p2_5)):
+                                p2_5 = e - _Z * s
+                            if p97_5 is None or np.isnan(_to_float(p97_5)):
+                                p97_5 = e + _Z * s
                         except Exception:
                             pass
 
@@ -382,11 +435,11 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                     for j, pname in enumerate(("center", "height", "fwhm", "eta")):
                         rec = idx_map.get(pk * n_params + j, {})
                         est   = rec.get("est")    or rec.get("value") or rec.get("mean")   or rec.get("median")
-                        sd    = rec.get("sd")     or rec.get("stderr") or rec.get("sigma")
-                        lo    = rec.get("ci_lo")  or rec.get("lo")
-                        hi    = rec.get("ci_hi")  or rec.get("hi")
-                        p2_5  = rec.get("p2_5")   or rec.get("p2.5")   or rec.get("q025")  or rec.get("q2_5")
-                        p97_5 = rec.get("p97_5")  or rec.get("p97.5")  or rec.get("q975")  or rec.get("q97_5")
+                        sd    = rec.get("sd")     or rec.get("stderr") or rec.get("std") or rec.get("stdev") or rec.get("sigma")
+                        lo    = rec.get("ci_lo")  or rec.get("lo95") or rec.get("lo")
+                        hi    = rec.get("ci_hi")  or rec.get("hi95") or rec.get("hi")
+                        p2_5  = rec.get("p2_5")   or rec.get("p2.5")   or rec.get("q025")  or rec.get("q2_5") or rec.get("lo95") or rec.get("ci_lo")
+                        p97_5 = rec.get("p97_5")  or rec.get("p97.5")  or rec.get("q975")  or rec.get("q97_5") or rec.get("hi95") or rec.get("ci_hi")
                         if (
                             (lo is None or np.isnan(_to_float(lo))) and
                             (hi is None or np.isnan(_to_float(hi))) and
@@ -395,6 +448,19 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                             try:
                                 e = float(est); s = float(sd)
                                 lo, hi = e - _Z * s, e + _Z * s
+                            except Exception:
+                                pass
+
+                        if (
+                            (p2_5 is None or np.isnan(_to_float(p2_5))) or
+                            (p97_5 is None or np.isnan(_to_float(p97_5)))
+                        ) and est is not None and sd is not None:
+                            try:
+                                e = float(est); s = float(sd)
+                                if p2_5 is None or np.isnan(_to_float(p2_5)):
+                                    p2_5 = e - _Z * s
+                                if p97_5 is None or np.isnan(_to_float(p97_5)):
+                                    p97_5 = e + _Z * s
                             except Exception:
                                 pass
                         row[pname] = {
@@ -419,13 +485,13 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
         if not isinstance(s, str):
             return None
         ss = s.strip().lower()
-        if ss in ("center", "centre", "mu", "x0", "pos"):
+        if ss in ("center", "centre", "mu", "x0", "pos", "c"):
             return "center"
-        if ss in ("height", "amp", "amplitude"):
+        if ss in ("height", "amp", "amplitude", "a"):
             return "height"
-        if ss in ("fwhm", "width", "gamma", "sigma"):
+        if ss in ("fwhm", "width", "gamma", "sigma", "stddev"):
             return "fwhm"
-        if ss in ("eta", "mix", "mixing"):
+        if ss in ("eta", "mix", "mixing", "gl", "frac_lorentzian"):
             return "eta"
         return None
 
@@ -457,19 +523,69 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
             if not pname:
                 continue
 
+            alias = str(rawp).strip().lower() if isinstance(rawp, str) else ""
             est = pick(rm, "est", "value", "mean", "median")
-            sd = pick(rm, "sd", "stderr", "std", "stdev")
-            p2_5 = pick(rm, "p2_5", "p2.5", "q025", "q2_5")
-            p97_5 = pick(rm, "p97_5", "p97.5", "q975", "q97_5")
-            ci_lo = pick(rm, "ci_lo")
-            ci_hi = pick(rm, "ci_hi")
+            sd = pick(rm, "sd", "stderr", "std", "stdev", "sigma")
+            p2_5 = pick(rm, "p2_5", "p2.5", "q025", "q2_5", "lo95", "ci_lo")
+            p97_5 = pick(rm, "p97_5", "p97.5", "q975", "q97_5", "hi95", "ci_hi")
+            ci_lo = pick(rm, "ci_lo", "lo95")
+            ci_hi = pick(rm, "ci_hi", "hi95")
+
+            if pname == "fwhm" and alias in {"sigma", "stddev", "width"}:
+                try:
+                    if est is not None:
+                        est = float(est) * _FWHM_SIGMA
+                except Exception:
+                    pass
+                try:
+                    if sd is not None:
+                        sd = float(sd) * _FWHM_SIGMA
+                except Exception:
+                    pass
+                try:
+                    if p2_5 is not None:
+                        p2_5 = float(p2_5) * _FWHM_SIGMA
+                except Exception:
+                    pass
+                try:
+                    if p97_5 is not None:
+                        p97_5 = float(p97_5) * _FWHM_SIGMA
+                except Exception:
+                    pass
+                try:
+                    if ci_lo is not None:
+                        ci_lo = float(ci_lo) * _FWHM_SIGMA
+                except Exception:
+                    pass
+                try:
+                    if ci_hi is not None:
+                        ci_hi = float(ci_hi) * _FWHM_SIGMA
+                except Exception:
+                    pass
 
             # Synthesize CI from sd if missing
-            if (ci_lo is None or ci_hi is None) and est is not None and sd is not None:
+            if (
+                (ci_lo is None or np.isnan(_to_float(ci_lo))) and
+                (ci_hi is None or np.isnan(_to_float(ci_hi))) and
+                est is not None and sd is not None
+            ):
                 try:
                     e = float(est)
                     s = float(sd)
                     ci_lo, ci_hi = e - _Z * s, e + _Z * s
+                except Exception:
+                    pass
+
+            if (
+                (p2_5 is None or np.isnan(_to_float(p2_5))) or
+                (p97_5 is None or np.isnan(_to_float(p97_5)))
+            ) and est is not None and sd is not None:
+                try:
+                    e = float(est); s = float(sd)
+                    if p2_5 is None or np.isnan(_to_float(p2_5)):
+                        p2_5 = e - _Z * s
+                    if p97_5 is None or np.isnan(_to_float(p97_5)):
+                        p97_5 = e + _Z * s
                 except Exception:
                     pass
 
@@ -543,19 +659,19 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
         def param_block(base: str) -> Mapping[str, float]:
             block = _as_mapping(rmap.get(base))
             if block:
-                est = block.get("est", block.get("value", np.nan))
-                sd = block.get("sd", block.get("stderr", np.nan))
-                lo = block.get("ci_lo", block.get("lo", np.nan))
-                hi = block.get("ci_hi", block.get("hi", np.nan))
-                p2_5 = block.get("p2_5", np.nan)
-                p97_5 = block.get("p97_5", np.nan)
+                est = block.get("est", block.get("value", block.get("mean", block.get("median", np.nan))))
+                sd = block.get("sd", block.get("stderr", block.get("sigma", np.nan)))
+                lo = block.get("ci_lo", block.get("lo95", block.get("lo", np.nan)))
+                hi = block.get("ci_hi", block.get("hi95", block.get("hi", np.nan)))
+                p2_5 = block.get("p2_5", block.get("p2.5", block.get("q2_5", block.get("lo95", block.get("ci_lo", np.nan)))))
+                p97_5 = block.get("p97_5", block.get("p97.5", block.get("q97_5", block.get("hi95", block.get("ci_hi", np.nan)))))
             else:
                 est = rmap.get(f"{base}_est", rmap.get(base, np.nan))
-                sd = rmap.get(f"{base}_sd", rmap.get(f"{base}_stderr", np.nan))
-                lo = rmap.get(f"{base}_ci_lo", np.nan)
-                hi = rmap.get(f"{base}_ci_hi", np.nan)
-                p2_5 = rmap.get(f"{base}_p2_5", np.nan)
-                p97_5 = rmap.get(f"{base}_p97_5", np.nan)
+                sd = rmap.get(f"{base}_sd", rmap.get(f"{base}_stderr", rmap.get(f"{base}_sigma", np.nan)))
+                lo = rmap.get(f"{base}_ci_lo", rmap.get(f"{base}_lo95", np.nan))
+                hi = rmap.get(f"{base}_ci_hi", rmap.get(f"{base}_hi95", np.nan))
+                p2_5 = rmap.get(f"{base}_p2_5", rmap.get(f"{base}_lo95", rmap.get(f"{base}_ci_lo", np.nan)))
+                p97_5 = rmap.get(f"{base}_p97_5", rmap.get(f"{base}_hi95", rmap.get(f"{base}_ci_hi", np.nan)))
             # synthesize CI if missing but sd present
             if (
                 (lo is None or np.isnan(_to_float(lo)))
@@ -567,6 +683,18 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                     e = float(est)
                     s = float(sd)
                     lo, hi = e - _Z * s, e + _Z * s
+                except Exception:
+                    pass
+            if (
+                (p2_5 is None or np.isnan(_to_float(p2_5))) or
+                (p97_5 is None or np.isnan(_to_float(p97_5)))
+            ) and est is not None and sd is not None:
+                try:
+                    e = float(est); s = float(sd)
+                    if p2_5 is None or np.isnan(_to_float(p2_5)):
+                        p2_5 = e - _Z * s
+                    if p97_5 is None or np.isnan(_to_float(p97_5)):
+                        p97_5 = e + _Z * s
                 except Exception:
                     pass
             return {
@@ -594,9 +722,18 @@ def _to_float(x: Any) -> float:
     if x is None:
         return float("nan")
     try:
+        if isinstance(x, (list, tuple, np.ndarray)):
+            if len(x) == 0:
+                return float("nan")
+            x = x[0]
+        if hasattr(x, "item"):
+            return float(x.item())
         return float(x)
     except Exception:
-        return float("nan")
+        try:
+            return float(np.asarray(x).flatten()[0])
+        except Exception:
+            return float("nan")
 
 
 def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
@@ -882,21 +1019,83 @@ def _iter_peak_rows_wide(
         yield out
 
 
-def _write_unc_csv_wide(csv_path: Union[str, "Path"], rows: Iterable[Mapping[str, Any]]) -> None:
-    """Write wide per-peak rows (legacy-friendly)."""
-    csv_path = Path(csv_path)
+def iter_uncertainty_rows(
+    file_path: Union[str, Path],
+    unc_norm: Mapping[str, Any],
+) -> List[dict]:
+    """
+    Build long-format rows with guaranteed canonical labels and p2_5/p97_5.
+    Columns: file, peak, param, value, stderr, p2_5, p97_5, method, rmse, dof.
+    If quantiles are missing but stderr is present, synthesize via ±1.96*stderr.
+    """
+    fname = Path(file_path).name if file_path else ""
+    method = str(unc_norm.get("label") or unc_norm.get("method") or "unknown")
+    rmse = unc_norm.get("rmse", float("nan"))
+    dof = unc_norm.get("dof", float("nan"))
+
+    rows: List[dict] = []
+    stats = unc_norm.get("stats") or []
+    for i, row in enumerate(stats, start=1):
+        for param in ("center", "height", "fwhm", "eta"):
+            blk = (row or {}).get(param) or {}
+            est = _to_float(blk.get("est"))
+            sd = _to_float(blk.get("sd"))
+            qlo = _to_float(blk.get("p2_5"))
+            qhi = _to_float(blk.get("p97_5"))
+            if (isnan(qlo) or isnan(qhi)) and not isnan(est) and not isnan(sd):
+                try:
+                    qlo, qhi = est - _Z * sd, est + _Z * sd
+                except Exception:
+                    pass
+            rows.append(
+                {
+                    "file": fname,
+                    "peak": i,
+                    "param": param,
+                    "value": est,
+                    "stderr": sd,
+                    "p2_5": qlo,
+                    "p97_5": qhi,
+                    "method": method,
+                    "rmse": rmse,
+                    "dof": dof,
+                }
+            )
+    return rows
+
+
+def write_uncertainty_csv_legacy(
+    base_path: Union[str, Path],
+    file_path: Union[str, Path],
+    unc_norm: Mapping[str, Any],
+) -> Path:
+    """
+    Write <base>_uncertainty.csv (long format).
+    """
+    base = Path(base_path).with_suffix("")
+    out_csv = base.with_name(base.name + "_uncertainty.csv")
+    rows = iter_uncertainty_rows(file_path, unc_norm)
     header = [
-        "file","peak","method","rmse","dof","backend","n_draws","n_boot","ess","rhat",
-        "center","center_stderr","center_ci_lo","center_ci_hi","center_p2_5","center_p97_5",
-        "height","height_stderr","height_ci_lo","height_ci_hi","height_p2_5","height_p97_5",
-        "fwhm","fwhm_stderr","fwhm_ci_lo","fwhm_ci_hi","fwhm_p2_5","fwhm_p97_5",
-        "eta","eta_stderr","eta_ci_lo","eta_ci_hi","eta_p2_5","eta_p97_5",
+        "file","peak","param","value","stderr",
+        "p2_5","p97_5","ci_lo","ci_hi","method","rmse","dof"
     ]
-    with Path(csv_path).open("w", newline="", encoding="utf-8") as fh:
+    with out_csv.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in header})
+            val = _to_float(r.get("value"))
+            sd = _to_float(r.get("stderr"))
+            qlo = _to_float(r.get("p2_5"))
+            qhi = _to_float(r.get("p97_5"))
+            if (math.isnan(qlo) or math.isnan(qhi)) and math.isfinite(val) and math.isfinite(sd):
+                qlo, qhi = val - _Z * sd, val + _Z * sd
+            r_out = dict(r)
+            r_out["p2_5"] = qlo
+            r_out["p97_5"] = qhi
+            r_out["ci_lo"] = qlo
+            r_out["ci_hi"] = qhi
+            w.writerow(r_out)
+    return out_csv
 
 
 def write_uncertainty_csvs(
@@ -907,90 +1106,23 @@ def write_uncertainty_csvs(
     write_wide: bool = True,
 ):
     """
-    Write per-file uncertainty CSVs for a single spectrum.
-
-    base_path: Path WITHOUT suffix (e.g., /out/dir/sample1)
-    Produces:
-      {base}_uncertainty_long.csv  (always)
-      {base}_uncertainty_wide.csv  (optional)
-    Returns: (long_csv_path, wide_csv_path_or_None)
+    Write per-file uncertainty CSVs:
+      - always: <base>_uncertainty.csv   (long)
+      - optional: <base>_uncertainty_wide.csv (wide)
     """
     base_path = Path(base_path).with_suffix("")
-    long_path = base_path.with_name(base_path.name + "_uncertainty_long.csv")
-    legacy_path = base_path.with_name(base_path.name + "_uncertainty.csv")
-    wide_path = base_path.with_name(base_path.name + "_uncertainty_wide.csv")
-
-    rows = []
-    label = unc_norm.get("label", "unknown")
-    rmse = unc_norm.get("rmse", np.nan)
-    dof = unc_norm.get("dof", np.nan)
-
-    stats = unc_norm.get("stats") or []
-    for i, row in enumerate(stats, start=1):
-        for param in ("center", "height", "fwhm", "eta"):
-            blk = (row or {}).get(param) or {}
-            est = blk.get("est")
-            sd = blk.get("sd")
-            lo = blk.get("p2_5")
-            hi = blk.get("p97_5")
-            rows.append(
-                {
-                    "file": Path(file_path).name if file_path else "",
-                    "peak": i,
-                    "param": param,
-                    "value": est,
-                    "stderr": sd,
-                    "ci_lo": lo,
-                    "ci_hi": hi,
-                    "method": label,
-                    "rmse": rmse,
-                    "dof": dof,
-                }
-            )
-
-    header = [
-        "file",
-        "peak",
-        "param",
-        "value",
-        "stderr",
-        "ci_lo",
-        "ci_hi",
-        "method",
-        "rmse",
-        "dof",
-    ]
-    for path in (long_path, legacy_path):
-        with Path(path).open("w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=header)
-            w.writeheader()
-            for r in rows:
-                w.writerow(r)
+    long_written = write_uncertainty_csv_legacy(base_path, file_path, unc_norm)
 
     wide_written = None
     if write_wide:
+        rows = iter_uncertainty_rows(file_path, unc_norm)
+        wide_path = base_path.with_name(base_path.name + "_uncertainty_wide.csv")
         header = [
-            "file",
-            "peak",
-            "method",
-            "rmse",
-            "dof",
-            "center",
-            "center_stderr",
-            "center_ci_lo",
-            "center_ci_hi",
-            "height",
-            "height_stderr",
-            "height_ci_lo",
-            "height_ci_hi",
-            "fwhm",
-            "fwhm_stderr",
-            "fwhm_ci_lo",
-            "fwhm_ci_hi",
-            "eta",
-            "eta_stderr",
-            "eta_ci_lo",
-            "eta_ci_hi",
+            "file","peak","method","rmse","dof",
+            "center","center_stderr","center_ci_lo","center_ci_hi",
+            "height","height_stderr","height_ci_lo","height_ci_hi",
+            "fwhm","fwhm_stderr","fwhm_ci_lo","fwhm_ci_hi",
+            "eta","eta_stderr","eta_ci_lo","eta_ci_hi",
         ]
         by_peak: dict[int, dict[str, Any]] = {}
         for r in rows:
@@ -1008,17 +1140,51 @@ def write_uncertainty_csvs(
             p = r["param"]
             d[f"{p}"] = r["value"]
             d[f"{p}_stderr"] = r["stderr"]
-            d[f"{p}_ci_lo"] = r["ci_lo"]
-            d[f"{p}_ci_hi"] = r["ci_hi"]
+            qlo, qhi = r.get("p2_5"), r.get("p97_5")
+            if (qlo is None or qhi is None) and (r.get("value") is not None and r.get("stderr") is not None):
+                try:
+                    e = float(r["value"])
+                    s = float(r["stderr"])
+                    qlo, qhi = e - _Z * s, e + _Z * s
+                except Exception:
+                    pass
+            d[f"{p}_ci_lo"] = qlo
+            d[f"{p}_ci_hi"] = qhi
 
         with wide_path.open("w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=header)
+            w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
             w.writeheader()
             for pk in sorted(by_peak):
                 w.writerow(by_peak[pk])
         wide_written = wide_path
 
-    return str(long_path), (str(wide_written) if wide_written else None)
+    return str(long_written), (str(wide_written) if wide_written else None)
+
+
+def write_batch_uncertainty_long(
+    out_dir: Union[str, Path],
+    rows: List[dict],
+) -> tuple[Path, Path]:
+    """
+    Write aggregated rows to:
+      - batch_uncertainty_long.csv (preferred)
+      - batch_uncertainty.csv      (legacy-compatible mirror)
+    """
+    out_dir = Path(out_dir)
+    header = ["file","peak","param","value","stderr","p2_5","p97_5","method","rmse","dof"]
+
+    def _write(path: Path):
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+
+    long_path = out_dir / "batch_uncertainty_long.csv"
+    legacy_path = out_dir / "batch_uncertainty.csv"
+    _write(long_path)
+    _write(legacy_path)
+    return long_path, legacy_path
 
 # --- END: add wide exporter ---
 
