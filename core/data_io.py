@@ -622,34 +622,23 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
 
     # Pull band in a tolerant way
     band = None
-    for key in ("band", "prediction_band", "ci_band", "curve_band"):
+    for key in ("band", "prediction_band", "ci_band"):
         if key in m and m[key] is not None:
             b = m[key]
             if isinstance(b, (list, tuple)) and len(b) >= 3:
                 x, lo, hi = b[0], b[1], b[2]
-                # keep JSON-friendly lists while allowing upstream arrays
-                band = (
-                    np.asarray(x, float).tolist(),
-                    np.asarray(lo, float).tolist(),
-                    np.asarray(hi, float).tolist(),
-                )
+                band = (np.asarray(x, float), np.asarray(lo, float), np.asarray(hi, float))
             break
 
     diag = _as_mapping(m.get("diagnostics"))
 
-    samples_val = m.get("samples", diag.get("n_draws", 0))
-    if isinstance(samples_val, (list, tuple, np.ndarray)):
-        try:
-            samples_val = len(samples_val)
-        except Exception:
-            samples_val = 0
     out = {
         "label": canon,
         "method": method,
         "rmse": _to_float(m.get("rmse")),
         "dof": int(m.get("dof", m.get("d.o.f.", m.get("degrees_of_freedom", 0))) or 0),
         "backend": str(m.get("backend") or diag.get("backend") or m.get("engine") or ""),
-        "n_draws": int(m.get("n_draws", samples_val) or 0),
+        "n_draws": int(m.get("n_draws", m.get("samples", diag.get("n_draws", 0))) or 0),
         "n_boot": int(m.get("n_boot", m.get("bootstraps", diag.get("n_boot", diag.get("bootstraps", 0)))) or 0),
         "ess": _to_float(m.get("ess")),
         "rhat": _to_float(m.get("rhat")),
