@@ -296,12 +296,15 @@ def run_batch(
                 elif "bayes" in mode_lower or "mcmc" in mode_lower:
                     unc_res = unc.bayesian_ci(fit_ctx=res)
                 else:
-                    # NOTE: fit_api returns `predict_full` for the model evaluator
+                    # Choose model evaluator key safely
+                    model_eval = res.get("predict_full") or res.get("ymodel_fn")
+                    if model_eval is None:
+                        raise KeyError("fit_ctx missing model evaluator: expected 'predict_full' or 'ymodel_fn'")
                     unc_res = unc.asymptotic_ci(
                         res["theta"],
                         res["residual_fn"],
                         res["jacobian"],
-                        res["predict_full"],
+                        model_eval,
                     )
             except Exception:
                 unc_res = None
@@ -335,9 +338,8 @@ def run_batch(
             band = unc_norm.get("band")
             if band is not None:
                 xb, lob, hib = band
-                with (out_dir / f"{stem}_uncertainty_band.csv").open(
-                    "w", newline="", encoding="utf-8"
-                ) as fh:
+                band_csv = out_dir / f"{stem}_uncertainty_band.csv"
+                with band_csv.open("w", newline="", encoding="utf-8") as fh:
                     bw = csv.writer(fh, lineterminator="\n")
                     bw.writerow(["x", "y_lo95", "y_hi95"])
                     for xi, lo, hi in zip(xb, lob, hib):

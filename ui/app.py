@@ -3598,6 +3598,19 @@ class PeakFitApp:
                     add_mode=add_mode,
                 )
 
+                # Build model on full x to compute RMSE/DOF using the current fit window
+                total_peaks = np.zeros_like(self.x, float)
+                for p in self.peaks:
+                    total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
+
+                base_array = (
+                    self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
+                )
+                model = base_array + total_peaks if add_mode else total_peaks
+
+                rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float("nan")
+                dof = int(np.sum(mask)) - 4 * len(self.peaks)
+
                 # Normalize + canonicalize label, then attach RMSE/DOF from current export context
                 unc_norm = _normalize_unc_result(unc)
                 raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_key)
@@ -3661,7 +3674,7 @@ class PeakFitApp:
                             w.writerow([float(xi), float(lo), float(hi)])
                     saved_unc.append(str(band_csv))
 
-                self.log(f"Export: computed uncertainty = {label} (history-independent).")
+                self.log(f"Exported uncertainty ({label}).")
             else:
                 self.log("Export: no peaks, uncertainty not computed.")
         except Exception as e:  # pragma: no cover - defensive
