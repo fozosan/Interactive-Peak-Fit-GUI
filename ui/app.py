@@ -187,7 +187,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple, Optional
-from types import SimpleNamespace
+from types import SimpleNamespace  # ensure this import exists
 from core.data_io import (
     write_uncertainty_csvs,
     write_uncertainty_txt,
