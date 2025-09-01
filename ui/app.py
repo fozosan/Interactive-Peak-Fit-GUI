@@ -3355,6 +3355,7 @@ class PeakFitApp:
         with trace_csv.open("w", encoding="utf-8", newline="") as fh:
             fh.write(trace_csv_s)
 
+        # Always decide via the batch toggle (not GUI history). If disabled or no peaks, skip with a log line.
         write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
 
         if self.peaks and self._batch_unc_enabled():
@@ -3362,12 +3363,9 @@ class PeakFitApp:
                 method_key = self._unc_selected_method_key()
                 add_mode = (self.baseline_mode.get() == "add")
 
-                # --- match single-file uncertainty inputs (fit window + target + add/sub baseline) ---
+                # Fit window mask: fall back to full range if empty
                 mask = self.current_fit_mask()
-
-                # If the prior file’s window doesn’t overlap this file’s x-domain, mask can be empty.
-                # In batch, fall back to full range so we still compute uncertainty instead of silently skipping.
-                if mask is None or (isinstance(mask, np.ndarray) and mask.size == 0) or not np.any(mask):
+                if mask is None or (isinstance(mask, np.ndarray) and (mask.size == 0 or not np.any(mask))):
                     mask = np.ones_like(self.x, dtype=bool)
 
                 x_fit = self.x[mask]
@@ -3385,12 +3383,11 @@ class PeakFitApp:
                     base_fit=base_for_unc,
                     add_mode=add_mode,
                 )
-                # Normalize + canonicalize the label so exports/logs are consistent
+
+                # Normalize, label, attach RMSE/DOF (using current file context)
                 unc_norm = _normalize_unc_result(unc_res)
                 raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or "")
-                label = _canonical_unc_label(raw_lbl)
-                if label == "unknown":
-                    label = self._unc_method_label({"method": method_key})
+                label = _canonical_unc_label(raw_lbl) or self._unc_method_label({"method": method_key})
                 unc_norm["label"] = label
 
                 y_target = self.get_fit_target()
@@ -3406,8 +3403,11 @@ class PeakFitApp:
 
                 out_base = out_dir / in_path.stem
                 self._export_uncertainty_from_result(unc_norm, out_base, str(in_path), write_wide=write_wide)
+
+                # Append to batch-unc summary rows
                 if unc_rows is not None:
                     unc_rows.extend(_dio.iter_uncertainty_rows(in_path, unc_norm))
+
                 self.status_info(f"[Batch] Uncertainty: {label} for {in_path.name}.")
             except Exception as e:
                 self.status_warn(f"[Batch] Uncertainty skipped for {in_path.name} ({e.__class__.__name__}).")
@@ -3416,28 +3416,30 @@ class PeakFitApp:
 
     def start_batch(self, in_folder: str, out_folder: str):
         """Process all spectra in ``in_folder`` writing results to ``out_folder``."""
-        # Ensure batch sees the selected uncertainty method and defaults to computing uncertainty
+        # Persist the selected uncertainty method for future sessions
         try:
             method_key = self._unc_selected_method_key()
             self.cfg["unc_method"] = method_key
-            if "compute_uncertainty_batch" not in self.cfg:
-                self.cfg["compute_uncertainty_batch"] = True
             save_config(self.cfg)
         except Exception:
             pass
+
         in_dir = Path(in_folder)
         out_dir = Path(out_folder)
         out_dir.mkdir(parents=True, exist_ok=True)
         files = sorted([p for p in in_dir.iterdir() if p.suffix.lower() in {".csv", ".txt", ".dat"}])
+
         all_rows: List[dict] = []
         for p in files:
             if getattr(self, "_abort_evt", None) and self._abort_evt.is_set():
                 self.status_warn("[Batch] Aborted by user.")
                 break
             self._batch_process_file(p, out_dir, all_rows)
+
+        # Batch summaries (fit already written per-file; now write uncertainty summaries if any rows)
         if all_rows:
             _dio.write_batch_uncertainty_long(out_dir, all_rows)
-    # --- END: hook batch runner to compute + export uncertainty ---
+        self.status_info(f"Batch done: processed {len(files)} files.")
 
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:
@@ -3548,34 +3550,34 @@ class PeakFitApp:
             export_base = Path(out_csv).with_suffix("")
             write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
 
-            # 1) Reuse last run’s uncertainty if we have it
-            unc = getattr(self, "last_uncertainty", None)
-            if unc is None:
-                # fallback: compute now using the selected method
-                method_key = self._unc_selected_method_key()
-                add_mode = (self.baseline_mode.get() == "add")
-                x_fit = self.x[mask]
-                y_fit_target = self.get_fit_target()[mask]
-                base_for_unc = (
-                    self.baseline[mask]
-                    if (self.use_baseline.get() and add_mode and self.baseline is not None)
-                    else None
-                )
-                unc = self._compute_uncertainty_sync(
-                    method_key,
-                    x_fit=x_fit,
-                    y_fit=y_fit_target,
-                    base_fit=base_for_unc,
-                    add_mode=add_mode,
-                )
+            # --- Always compute uncertainty fresh at export time ---
+            method_key = self._unc_selected_method_key()
+            add_mode = (self.baseline_mode.get() == "add")
 
-            # 2) Normalize, label, and set rmse/dof
-            unc_norm = _normalize_unc_result(unc)
-            raw_lbl = (
-                unc_norm.get("label")
-                or unc_norm.get("method")
-                or self._unc_selected_method_key()
+            # Fit window mask: if empty or None, fall back to full range so we never skip
+            mask = self.current_fit_mask()
+            if mask is None or (isinstance(mask, np.ndarray) and (mask.size == 0 or not np.any(mask))):
+                mask = np.ones_like(self.x, dtype=bool)
+
+            x_fit = self.x[mask]
+            y_fit_target = self.get_fit_target()[mask]
+            base_for_unc = (
+                self.baseline[mask]
+                if (self.use_baseline.get() and add_mode and self.baseline is not None)
+                else None
             )
+
+            unc = self._compute_uncertainty_sync(
+                method_key,
+                x_fit=x_fit,
+                y_fit=y_fit_target,
+                base_fit=base_for_unc,
+                add_mode=add_mode,
+            )
+
+            # Normalize + canonicalize label, then attach RMSE/DOF from current export context
+            unc_norm = _normalize_unc_result(unc)
+            raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_key)
             label = _canonical_unc_label(raw_lbl)
             unc_norm["label"] = label
             unc_norm["rmse"] = rmse
@@ -3583,12 +3585,12 @@ class PeakFitApp:
             if not unc_norm.get("stats"):
                 raise RuntimeError("Export uncertainty normalization produced no stats")
 
-            # 3) CSVs
+            # CSVs (long + optional wide)
             long_csv, wide_csv = write_uncertainty_csvs(
                 export_base, self.current_file or "", unc_norm, write_wide=write_wide
             )
 
-            # 4) TXT — IMPORTANT: pass peaks + method_label
+            # TXT — pass peaks + method_label and metadata as before
             solver_opts = getattr(self, "_solver_options", lambda: SimpleNamespace())()
             if hasattr(solver_opts, "__dict__"):
                 solver_opts = solver_opts.__dict__
@@ -3625,7 +3627,7 @@ class PeakFitApp:
             if wide_csv:
                 saved_unc.append(str(wide_csv))
 
-            # band, if present
+            # Band, if present (asymptotic and any method that provides it)
             band = unc_norm.get("band")
             if band is not None:
                 xb, lob, hib = band
