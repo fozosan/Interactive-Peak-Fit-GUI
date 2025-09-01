@@ -56,7 +56,7 @@ def run_batch(
     patterns: Iterable[str],
     config: dict,
     *,
-    compute_uncertainty: bool = False,
+    compute_uncertainty: bool = True,
     unc_method: str | None = None,
     progress=None,
     log=None,

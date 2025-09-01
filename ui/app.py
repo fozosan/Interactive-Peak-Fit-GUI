@@ -3323,10 +3323,6 @@ class PeakFitApp:
             pass
         self._do_fit()
 
-        # if no peaks were found/fitted for this file, warn but still write outputs below
-        if not self.peaks:
-            self.status_warn(f"[Batch] No peaks for {in_path.name}; skipping uncertainty.")
-
         base_csv = out_dir / f"{in_path.stem}_fit.csv"
         trace_csv = out_dir / f"{in_path.stem}_trace.csv"
 
@@ -3359,10 +3355,9 @@ class PeakFitApp:
         with trace_csv.open("w", encoding="utf-8", newline="") as fh:
             fh.write(trace_csv_s)
 
-        # Always attempt uncertainty when peaks are present
         write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
 
-        if self.peaks:
+        if self.peaks and self._batch_unc_enabled():
             try:
                 method_key = self._unc_selected_method_key()
                 add_mode = (self.baseline_mode.get() == "add")
@@ -3416,13 +3411,17 @@ class PeakFitApp:
                 self.status_info(f"[Batch] Uncertainty: {label} for {in_path.name}.")
             except Exception as e:
                 self.status_warn(f"[Batch] Uncertainty skipped for {in_path.name} ({e.__class__.__name__}).")
+        else:
+            self.status_info(f"[Batch] Skipping uncertainty for {in_path.name} (disabled or no peaks).")
 
     def start_batch(self, in_folder: str, out_folder: str):
         """Process all spectra in ``in_folder`` writing results to ``out_folder``."""
-        # Ensure batch sees the selected uncertainty method
+        # Ensure batch sees the selected uncertainty method and defaults to computing uncertainty
         try:
             method_key = self._unc_selected_method_key()
             self.cfg["unc_method"] = method_key
+            if "compute_uncertainty_batch" not in self.cfg:
+                self.cfg["compute_uncertainty_batch"] = True
             save_config(self.cfg)
         except Exception:
             pass
