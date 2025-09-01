@@ -189,10 +189,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple, Optional
 from types import SimpleNamespace
 from core.data_io import (
-    _normalize_unc_result,
-    _canonical_unc_label,
     write_uncertainty_csvs,
-    _write_unc_txt,
+    write_uncertainty_txt,
+    normalize_unc_result as _normalize_unc_result,
+    canonical_unc_label as _canonical_unc_label,
 )
 
 import numpy as np
@@ -2857,6 +2857,147 @@ class PeakFitApp:
         )
         return lines, warns
 
+    # --- BEGIN: batch uncertainty helpers ---
+    def _unc_selected_method_key(self) -> str:
+        """Return the canonical uncertainty method key."""
+        label = str(self.unc_method.get()).lower()
+        if label.startswith("asymptotic"):
+            return "asymptotic"
+        if label.startswith("bootstrap"):
+            return "bootstrap"
+        if label.startswith("bayes"):
+            return "bayesian"
+        return label.strip()
+
+    def _compute_uncertainty_sync(self, method: str, x_fit, y_fit, base_fit, add_mode: bool):
+        """Compute uncertainty synchronously for batch processing."""
+        mode = "add" if add_mode else "subtract"
+        theta: list[float] = []
+        for p in self.peaks:
+            theta.extend([p.center, p.height, p.fwhm, p.eta])
+        theta = np.asarray(theta, dtype=float)
+
+        resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
+
+        method_key = method.strip().lower()
+        if method_key.startswith("bootstrap"):
+            method_key = "bootstrap"
+        elif method_key.startswith("asymptotic"):
+            method_key = "asymptotic"
+        elif method_key.startswith("bayes"):
+            method_key = "bayesian"
+
+        if method_key == "asymptotic":
+            res = self._run_asymptotic_uncertainty()
+            if res is None:
+                return {"label": "unknown", "stats": []}
+            cov, _th, _info = res
+            sigma = self._safe_sqrt_vec(np.diag(np.asarray(cov, float)))
+            param_stats = {
+                "center": {"est": [p.center for p in self.peaks], "sd": sigma[0::4].tolist()},
+                "height": {"est": [p.height for p in self.peaks], "sd": sigma[1::4].tolist()},
+                "fwhm": {"est": [p.fwhm for p in self.peaks], "sd": sigma[2::4].tolist()},
+                "eta": {"est": [p.eta for p in self.peaks], "sd": sigma[3::4].tolist()},
+            }
+            out: dict[str, Any] = {
+                "method": "asymptotic",
+                "method_label": "Asymptotic (JᵀJ)",
+                "band": getattr(self, "ci_band", None) or None,
+                "param_stats": param_stats,
+            }
+        elif method_key == "bootstrap":
+            cfg = {
+                "x": x_fit,
+                "y": y_fit,
+                "peaks": self.peaks,
+                "mode": mode,
+                "baseline": base_fit,
+                "theta": theta,
+                "options": self._solver_options(self.bootstrap_solver_choice.get()),
+                "n": 100,
+                "workers": self._resolve_unc_workers(),
+            }
+            res = bootstrap.bootstrap(self.bootstrap_solver_choice.get(), cfg, resid_fn)
+            out = dict(res) if isinstance(res, dict) else {"label": "unknown", "stats": []}
+        elif method_key == "bayesian":
+            init = {
+                "x": x_fit,
+                "y": y_fit,
+                "peaks": self.peaks,
+                "mode": mode,
+                "baseline": base_fit,
+                "theta": theta,
+            }
+            res = bayes.bayesian({}, "gaussian", init, {}, resid_fn)
+            out = dict(res) if isinstance(res, dict) else {"label": "unknown", "stats": []}
+        else:
+            return {"label": "unknown", "stats": []}
+
+        if isinstance(out, dict):
+            out.setdefault("method", method_key)
+            if "label" not in out and "method_label" not in out:
+                out["method_label"] = _unc_method_label({"method": method_key})
+            ps = out.get("param_stats")
+            if isinstance(ps, dict):
+                for blk in ps.values():
+                    if isinstance(blk, dict):
+                        for k, v in list(blk.items()):
+                            if isinstance(v, np.ndarray):
+                                blk[k] = v.tolist()
+
+        return _normalize_unc_result(out)
+
+    def _export_uncertainty_from_result(self, unc_norm, out_base: Path, file_path: str):
+        """Export uncertainty results to CSV(s) and TXT."""
+        write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
+        long_csv, wide_csv = write_uncertainty_csvs(out_base, file_path, unc_norm, write_wide=write_wide)
+
+        solver_opts = getattr(self, "_solver_options", lambda *_: SimpleNamespace())()
+        if hasattr(solver_opts, "__dict__"):
+            solver_opts = solver_opts.__dict__
+        solver_meta = {"solver": self.solver_choice.get(), **solver_opts}
+        baseline_meta = {
+            "uses_fit_range": bool(self.baseline_use_range.get()),
+            "lam": float(self.als_lam.get()),
+            "p": float(self.als_asym.get()),
+            "niter": int(self.als_niter.get()),
+            "thresh": float(self.als_thresh.get()),
+        }
+        perf_meta = {
+            "numba": bool(self.perf_numba.get()),
+            "gpu": bool(self.perf_gpu.get()),
+            "cache_baseline": bool(self.perf_cache_baseline.get()),
+            "seed_all": bool(self.perf_seed_all.get()),
+            "max_workers": int(self.perf_max_workers.get()),
+        }
+        locks = [{"center": bool(getattr(pk, "lock_center", False)),
+                  "fwhm": bool(getattr(pk, "lock_width", False)),
+                  "eta": False} for pk in self.peaks]
+
+        txt_path = out_base.with_name(out_base.name + "_uncertainty.txt")
+        write_uncertainty_txt(
+            txt_path,
+            unc_norm,
+            file_path=file_path,
+            solver_meta=solver_meta,
+            baseline_meta=baseline_meta,
+            perf_meta=perf_meta,
+            locks=locks,
+        )
+
+        if str(unc_norm.get("label", "")).startswith("Asymptotic"):
+            band = unc_norm.get("band")
+            if band is not None:
+                xb, lob, hib = band
+                band_csv = out_base.with_name(out_base.name + "_uncertainty_band.csv")
+                with band_csv.open("w", newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh, lineterminator="\n")
+                    w.writerow(["x", "y_lo95", "y_hi95"])
+                    for xi, lo, hi in zip(xb, lob, hib):
+                        w.writerow([float(xi), float(lo), float(hi)])
+        return long_csv, wide_csv
+    # --- END: batch uncertainty helpers ---
+
     def run_uncertainty(self):
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Uncertainty", "Load data and perform a fit first.")
@@ -2896,9 +3037,22 @@ class PeakFitApp:
                 cov, th, _info = res
                 sigma = self._safe_sqrt_vec(np.diag(np.asarray(cov, float)))
                 param_stats = {
-                    "center": {"est": [p.center for p in self.peaks], "sd": sigma[0::4]},
-                    "fwhm": {"est": [p.fwhm for p in self.peaks], "sd": sigma[2::4]},
-                    "height": {"est": [p.height for p in self.peaks], "sd": sigma[1::4]},
+                    "center": {
+                        "est": [p.center for p in self.peaks],
+                        "sd": sigma[0::4].tolist(),
+                    },
+                    "height": {
+                        "est": [p.height for p in self.peaks],
+                        "sd": sigma[1::4].tolist(),
+                    },
+                    "fwhm": {
+                        "est": [p.fwhm for p in self.peaks],
+                        "sd": sigma[2::4].tolist(),
+                    },
+                    "eta": {
+                        "est": [p.eta for p in self.peaks],
+                        "sd": sigma[3::4].tolist(),
+                    },
                 }
                 return {
                     "method": "asymptotic",
@@ -2943,21 +3097,30 @@ class PeakFitApp:
                                 p_hi = np.quantile(samp, 0.975, axis=0)
 
                             def slice_stats(idx: int) -> Dict[str, Any]:
-                                est = th[idx::4] if th.size else None
-                                sd_i = sd[idx::4] if sd is not None else None
+                                est = th[idx::4].tolist() if th.size else None
+                                sd_i = sd[idx::4].tolist() if sd is not None else None
                                 d: Dict[str, Any] = {"est": est, "sd": sd_i}
                                 if p_lo is not None and p_hi is not None:
-                                    d["p2_5"] = p_lo[idx::4]
-                                    d["p97_5"] = p_hi[idx::4]
+                                    d["p2_5"] = p_lo[idx::4].tolist()
+                                    d["p97_5"] = p_hi[idx::4].tolist()
                                 return d
 
                             res["param_stats"] = {
                                 "center": slice_stats(0),
                                 "height": slice_stats(1),
                                 "fwhm": slice_stats(2),
+                                "eta": slice_stats(3),
                             }
                         except Exception:
                             pass
+                    # Ensure param_stats arrays are lists
+                    ps = res.get("param_stats")
+                    if isinstance(ps, dict):
+                        for blk in ps.values():
+                            if isinstance(blk, dict):
+                                for k, v in blk.items():
+                                    if isinstance(v, np.ndarray):
+                                        blk[k] = v.tolist()
                 return res
             if method == "bayesian":
                 init = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
@@ -2987,21 +3150,29 @@ class PeakFitApp:
                                 p_hi = np.quantile(samp, 0.975, axis=0)
 
                             def slice_stats(idx: int) -> Dict[str, Any]:
-                                est = th[idx::4] if th.size else None
-                                sd_i = sd[idx::4] if sd is not None else None
+                                est = th[idx::4].tolist() if th.size else None
+                                sd_i = sd[idx::4].tolist() if sd is not None else None
                                 d: Dict[str, Any] = {"est": est, "sd": sd_i}
                                 if p_lo is not None and p_hi is not None:
-                                    d["p2_5"] = p_lo[idx::4]
-                                    d["p97_5"] = p_hi[idx::4]
+                                    d["p2_5"] = p_lo[idx::4].tolist()
+                                    d["p97_5"] = p_hi[idx::4].tolist()
                                 return d
 
                             res["param_stats"] = {
                                 "center": slice_stats(0),
                                 "height": slice_stats(1),
                                 "fwhm": slice_stats(2),
+                                "eta": slice_stats(3),
                             }
                         except Exception:
                             pass
+                    ps = res.get("param_stats")
+                    if isinstance(ps, dict):
+                        for blk in ps.values():
+                            if isinstance(blk, dict):
+                                for k, v in blk.items():
+                                    if isinstance(v, np.ndarray):
+                                        blk[k] = v.tolist()
                 return res
             return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
 
@@ -3020,8 +3191,15 @@ class PeakFitApp:
                 self.status_error(f"Uncertainty failed: {error}")
                 return
 
+            res = result
             try:
-                self.last_uncertainty = _normalize_unc_result(result)
+                # Ensure method/label hints are present to avoid 'unknown' in logs/exports
+                if isinstance(res, dict):
+                    # Add robust defaults if the backend didn't set these fields
+                    res.setdefault("method", method)
+                    if "label" not in res and "method_label" not in res:
+                        res["method_label"] = _unc_method_label({"method": method})
+                self.last_uncertainty = _normalize_unc_result(res)
             except Exception:
                 self.last_uncertainty = {"label": "unknown", "stats": []}
 
@@ -3034,8 +3212,29 @@ class PeakFitApp:
                 })
             self._last_unc_locks = locks
 
-            label = _canonical_unc_label(self.last_uncertainty.get("label"))
+            # Derive a stable, canonical label; fall back to the selected method
+            raw_lbl = (self.last_uncertainty.get("label") or self.last_uncertainty.get("method") or "")
+            label = _canonical_unc_label(raw_lbl)
+            if label == "unknown":
+                # Fallback to UI-selected method if the payload didn't specify a label/method
+                label = _unc_method_label({"method": method})
+                self.last_uncertainty["method"] = method
             self.last_uncertainty["label"] = label
+
+            # Guarantee per-peak stats even if backend omitted blocks
+            if not (self.last_uncertainty.get("stats") or []):
+                pm = None
+                if isinstance(res, dict):
+                    pm = (
+                        res.get("param_stats")
+                        or res.get("parameters")
+                        or res.get("params")
+                    )
+                if pm is not None:
+                    rebuilt = {"param_stats": pm}
+                    self.last_uncertainty["stats"] = (
+                        _normalize_unc_result(rebuilt).get("stats") or []
+                    )
 
             if label.startswith("Asymptotic"):
                 band = self.last_uncertainty.get("band")
@@ -3080,8 +3279,9 @@ class PeakFitApp:
                     c_est, c_sd = _fmt(row.get("center", {}).get("est"), row.get("center", {}).get("sd"))
                     h_est, h_sd = _fmt(row.get("height", {}).get("est"), row.get("height", {}).get("sd"))
                     w_est, w_sd = _fmt(row.get("fwhm", {}).get("est"), row.get("fwhm", {}).get("sd"))
+                    e_est, e_sd = _fmt(row.get("eta", {}).get("est"), row.get("eta", {}).get("sd"))
                     self.status_info(
-                        f"Peak {i}: center={c_est} ± {c_sd} | height={h_est} ± {h_sd} | FWHM={w_est} ± {w_sd}"
+                        f"Peak {i}: center={c_est} ± {c_sd} | height={h_est} ± {h_sd} | FWHM={w_est} ± {w_sd} | eta={e_est} ± {e_sd}"
                     )
             except Exception as _e:
                 self.status_warn(f"Uncertainty stats formatting skipped ({_e.__class__.__name__}).")
@@ -3117,6 +3317,106 @@ class PeakFitApp:
         save_config(self.cfg)
         self.log(f"Backend: {performance.which_backend()} | workers={performance.get_max_workers()}")
         self.status_var.set("Performance options applied.")
+
+    # --- BEGIN: hook batch runner to compute + export uncertainty ---
+    def _batch_process_file(self, in_path: Path, out_dir: Path):
+        """Fit a single file then optionally compute uncertainty and export."""
+        self._open_file(str(in_path))
+        self._do_fit()
+
+        base_csv = out_dir / f"{in_path.stem}_fit.csv"
+        trace_csv = out_dir / f"{in_path.stem}_trace.csv"
+
+        rows = []
+        areas = [pseudo_voigt_area(p.height, p.fwhm, p.eta) for p in self.peaks]
+        total_area = float(np.sum(areas)) if areas else 1.0
+        opts = self._solver_options()
+        center_bounds = (self.fit_xmin, self.fit_xmax) if (opts.get("centers_in_window") or opts.get("bound_centers_to_window")) else (np.nan, np.nan)
+        med_dx = float(np.median(np.diff(np.sort(self.x)))) if (self.x is not None and self.x.size > 1) else 0.0
+        fwhm_lo = opts.get("min_fwhm", max(1e-6, 2.0 * med_dx))
+        for i, (p, a) in enumerate(zip(self.peaks, areas), 1):
+            rows.append(
+                {
+                    "center": p.center,
+                    "height": p.height,
+                    "fwhm": p.fwhm,
+                    "eta": p.eta,
+                    "bounds_center_lo": center_bounds[0],
+                    "bounds_center_hi": center_bounds[1],
+                    "bounds_fwhm_lo": fwhm_lo,
+                    "bounds_height_lo": 0.0,
+                    "bounds_height_hi": np.nan,
+                    "x_scale": opts.get("x_scale", np.nan),
+                }
+            )
+        fit_csv = _dio.build_peak_table(rows)
+        with base_csv.open("w", encoding="utf-8", newline="") as fh:
+            fh.write(fit_csv)
+
+        base_fit = self.baseline if self.use_baseline.get() else None
+        trace_csv_s = _dio.build_trace_table(self.x, self.y_raw, base_fit, self.peaks)
+        with trace_csv.open("w", encoding="utf-8", newline="") as fh:
+            fh.write(trace_csv_s)
+
+        try:
+            # use the real checkbox var; fall back if needed
+            compute_unc_batch = bool(
+                getattr(
+                    self,
+                    "compute_uncertainty_batch",
+                    getattr(self, "batch_unc_enabled", tk.BooleanVar(value=False)),
+                ).get()
+            )
+        except Exception:
+            compute_unc_batch = False
+
+        if compute_unc_batch:
+            try:
+                method_key = self._unc_selected_method_key()
+                add_mode = bool(self.baseline_mode.get() == "add")
+
+                # --- match single-file uncertainty inputs (fit window + target + add/sub baseline) ---
+                mask = self.current_fit_mask()
+                if mask is None or not np.any(mask):
+                    raise RuntimeError("Fit range is empty during batch.")
+                x_fit = self.x[mask]
+                y_fit = self.get_fit_target()[mask]
+                base_for_unc = (
+                    self.baseline[mask]
+                    if (self.use_baseline.get() and add_mode and self.baseline is not None)
+                    else None
+                )
+
+                unc_norm = self._compute_uncertainty_sync(
+                    method_key,
+                    x_fit=x_fit,
+                    y_fit=y_fit,
+                    base_fit=base_for_unc,
+                    add_mode=add_mode,
+                )
+                raw_lbl = unc_norm.get("label") or unc_norm.get("method") or ""
+                label = _canonical_unc_label(raw_lbl)
+                if label == "unknown":
+                    label = _unc_method_label({"method": method_key})
+                unc_norm["label"] = label
+                out_base = out_dir / in_path.stem
+                self._export_uncertainty_from_result(unc_norm, out_base, str(in_path))
+                self.status_info(f"[Batch] Computed {label} uncertainty for {in_path.name}.")
+            except Exception as e:
+                self.status_warn(f"[Batch] Uncertainty skipped for {in_path.name} ({e.__class__.__name__}).")
+
+    def start_batch(self, in_folder: str, out_folder: str):
+        """Process all spectra in ``in_folder`` writing results to ``out_folder``."""
+        in_dir = Path(in_folder)
+        out_dir = Path(out_folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        files = sorted([p for p in in_dir.iterdir() if p.suffix.lower() in {".csv", ".txt", ".dat"}])
+        for p in files:
+            if getattr(self, "_abort_evt", None) and self._abort_evt.is_set():
+                self.status_warn("[Batch] Aborted by user.")
+                break
+            self._batch_process_file(p, out_dir)
+    # --- END: hook batch runner to compute + export uncertainty ---
 
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:
@@ -3228,9 +3528,6 @@ class PeakFitApp:
                 base = Path(out_csv).with_suffix("")
                 write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
 
-                # ensure mapping shape for exporter
-                unc = _normalize_unc_result(unc)
-
                 long_csv, wide_csv = write_uncertainty_csvs(
                     base, self.current_file or "", unc, write_wide=write_wide
                 )
@@ -3258,14 +3555,14 @@ class PeakFitApp:
                 }
                 locks = getattr(self, "_last_unc_locks", [])
                 txt_path = base.with_name(base.name + "_uncertainty.txt")
-                _write_unc_txt(
+                write_uncertainty_txt(
                     txt_path,
-                    self.current_file or "",
                     unc,
-                    solver_meta,
-                    baseline_meta,
-                    perf_meta,
-                    locks,
+                    file_path=self.current_file or "",
+                    solver_meta=solver_meta,
+                    baseline_meta=baseline_meta,
+                    perf_meta=perf_meta,
+                    locks=locks,
                 )
 
                 method_label = unc.get("label", "unknown")
