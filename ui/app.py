@@ -541,23 +541,6 @@ def load_xy_any(path: str):
     """Wrapper around :func:`core.data_io.load_xy` for backwards compatibility."""
     return _dio.load_xy(path)
 
-
-def _unc_method_label(res: Any) -> str:
-    for k in ("method_label", "label", "method", "type"):
-        v = getattr(res, k, None) if not isinstance(res, dict) else res.get(k)
-        if isinstance(v, str) and v.strip():
-            m = v.strip()
-            break
-    else:
-        return "Unknown"
-    m_low = m.lower()
-    return {
-        "asymptotic": "Asymptotic (JᵀJ)",
-        "bootstrap": "Bootstrap (residual)",
-        "bayesian": "Bayesian (MCMC)",
-    }.get(m_low, m)
-
-
 def _coerce_param_stats(res: Any) -> Dict[str, Dict[str, Any]]:
     """Return normalized parameter stats mapping."""
 
@@ -2857,6 +2840,19 @@ class PeakFitApp:
         )
         return lines, warns
 
+    # --- BEGIN: local helper for canonical method labels ---
+    def _unc_method_label(self, info: dict) -> str:
+        """Return a stable canonical label for an uncertainty method key."""
+        m = str((info or {}).get("method", "")).strip().lower()
+        if m.startswith("asymptotic"):
+            return "Asymptotic (JᵀJ)"
+        if m.startswith("bootstrap"):
+            return "Bootstrap (residual)"
+        if m.startswith("bayes"):
+            return "Bayesian (MCMC)"
+        return "unknown"
+    # --- END: local helper ---
+
     # --- BEGIN: batch uncertainty helpers ---
     def _unc_selected_method_key(self) -> str:
         """Return the canonical uncertainty method key."""
@@ -2936,7 +2932,7 @@ class PeakFitApp:
         if isinstance(out, dict):
             out.setdefault("method", method_key)
             if "label" not in out and "method_label" not in out:
-                out["method_label"] = _unc_method_label({"method": method_key})
+                out["method_label"] = self._unc_method_label({"method": method_key})
             ps = out.get("param_stats")
             if isinstance(ps, dict):
                 for blk in ps.values():
@@ -3198,7 +3194,7 @@ class PeakFitApp:
                     # Add robust defaults if the backend didn't set these fields
                     res.setdefault("method", method)
                     if "label" not in res and "method_label" not in res:
-                        res["method_label"] = _unc_method_label({"method": method})
+                        res["method_label"] = self._unc_method_label({"method": method})
                 self.last_uncertainty = _normalize_unc_result(res)
             except Exception:
                 self.last_uncertainty = {"label": "unknown", "stats": []}
@@ -3217,7 +3213,7 @@ class PeakFitApp:
             label = _canonical_unc_label(raw_lbl)
             if label == "unknown":
                 # Fallback to UI-selected method if the payload didn't specify a label/method
-                label = _unc_method_label({"method": method})
+                label = self._unc_method_label({"method": method})
                 self.last_uncertainty["method"] = method
             self.last_uncertainty["label"] = label
 
@@ -3320,7 +3316,7 @@ class PeakFitApp:
 
     # --- BEGIN: hook batch runner to compute + export uncertainty ---
     def _batch_process_file(self, in_path: Path, out_dir: Path):
-        """Fit a single file then optionally compute uncertainty and export."""
+        """Process one spectrum: reset band, fit, export fit/trace, then compute and export uncertainty if enabled."""
         # reset any previous band so batch files don't leak state
         self.ci_band = None
         self._open_file(str(in_path))
@@ -3404,7 +3400,7 @@ class PeakFitApp:
                 raw_lbl = unc_norm.get("label") or unc_norm.get("method") or ""
                 label = _canonical_unc_label(raw_lbl)
                 if label == "unknown":
-                    label = _unc_method_label({"method": method_key})
+                    label = self._unc_method_label({"method": method_key})
                 unc_norm["label"] = label
                 out_base = out_dir / in_path.stem
                 self._export_uncertainty_from_result(unc_norm, out_base, str(in_path))
