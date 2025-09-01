@@ -287,41 +287,54 @@ def run_batch(
 
         if compute_uncertainty and unc_res is not None:
             stem = Path(path).stem
+
+            unc_norm = data_io.normalize_unc_result(unc_res)
+            method_lbl = data_io.canonical_unc_label(unc_norm.get("label") or unc_method)
+            unc_norm["label"] = method_lbl
+
             data_io.write_uncertainty_txt(
                 out_dir / f"{stem}_uncertainty.txt",
-                unc_res,
+                unc_norm,
                 peaks=fitted,
-                method_label=unc_method,
+                method_label=method_lbl,
+                file_path=path,
             )
-            data_io.write_uncertainty_csv(
-                out_dir / f"{stem}_uncertainty.csv",
-                unc_res,
-                peaks=fitted,
-                method_label=unc_method,
+
+            data_io.write_uncertainty_csvs(
+                out_dir / stem,
+                path,
+                unc_norm,
+                write_wide=True,
             )
-            band = getattr(unc_res, "band", None)
+
+            band = unc_norm.get("band")
             if band is not None:
                 xb, lob, hib = band
-                with (out_dir / f"{stem}_uncertainty_band.csv").open("w", newline="", encoding="utf-8") as fh:
+                with (out_dir / f"{stem}_uncertainty_band.csv").open(
+                    "w", newline="", encoding="utf-8"
+                ) as fh:
                     bw = csv.writer(fh, lineterminator="\n")
                     bw.writerow(["x", "y_lo95", "y_hi95"])
                     for xi, lo, hi in zip(xb, lob, hib):
-                        bw.writerow([xi, lo, hi])
-            for row in data_io._iter_param_rows(unc_res, fitted, unc_method):
-                unc_rows.append(
-                    {
-                        "file": Path(path).name,
-                        "peak": row.get("peak"),
-                        "param": row.get("param"),
-                        "value": row.get("est"),
-                        "stderr": row.get("sd"),
-                        "ci_lo": row.get("p2_5"),
-                        "ci_hi": row.get("p97_5"),
-                        "method": unc_method,
-                        "rmse": rmse,
-                        "dof": np.nan,
-                    }
-                )
+                        bw.writerow([float(xi), float(lo), float(hi)])
+
+            for i, row in enumerate(unc_norm.get("stats", []), start=1):
+                for param in ("center", "height", "fwhm", "eta"):
+                    blk = row.get(param, {}) or {}
+                    unc_rows.append(
+                        {
+                            "file": Path(path).name,
+                            "peak": i,
+                            "param": param,
+                            "value": blk.get("est"),
+                            "stderr": blk.get("sd"),
+                            "ci_lo": blk.get("p2_5"),
+                            "ci_hi": blk.get("p97_5"),
+                            "method": method_lbl,
+                            "rmse": rmse,
+                            "dof": res.get("dof", 0) if isinstance(res, dict) else 0,
+                        }
+                    )
 
         trace_path = None
         if save_traces:
