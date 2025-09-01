@@ -3321,8 +3321,14 @@ class PeakFitApp:
     # --- BEGIN: hook batch runner to compute + export uncertainty ---
     def _batch_process_file(self, in_path: Path, out_dir: Path):
         """Fit a single file then optionally compute uncertainty and export."""
+        # reset any previous band so batch files don't leak state
+        self.ci_band = None
         self._open_file(str(in_path))
         self._do_fit()
+
+        # if no peaks were found/fitted for this file, warn but still write outputs below
+        if not self.peaks:
+            self.status_warn(f"[Batch] No peaks for {in_path.name}; skipping uncertainty.")
 
         base_csv = out_dir / f"{in_path.stem}_fit.csv"
         trace_csv = out_dir / f"{in_path.stem}_trace.csv"
@@ -3370,14 +3376,15 @@ class PeakFitApp:
         except Exception:
             compute_unc_batch = False
 
-        if compute_unc_batch:
+        # don't try uncertainty if there are no peaks
+        if compute_unc_batch and self.peaks:
             try:
                 method_key = self._unc_selected_method_key()
                 add_mode = bool(self.baseline_mode.get() == "add")
 
                 # --- match single-file uncertainty inputs (fit window + target + add/sub baseline) ---
                 mask = self.current_fit_mask()
-                if mask is None or not np.any(mask):
+                if mask is None or (isinstance(mask, np.ndarray) and mask.size == 0) or not np.any(mask):
                     raise RuntimeError("Fit range is empty during batch.")
                 x_fit = self.x[mask]
                 y_fit = self.get_fit_target()[mask]
