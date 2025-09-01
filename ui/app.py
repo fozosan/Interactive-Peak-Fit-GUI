@@ -219,7 +219,8 @@ import traceback
 
 from scipy.signal import find_peaks
 
-from core import signals, data_io as _dio
+from core import signals
+import core.data_io as _dio
 try:
     from core.uncertainty import UncertaintyResult, NotAvailable
 except Exception:  # pragma: no cover - NotAvailable may be absent
