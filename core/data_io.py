@@ -6,8 +6,7 @@ artifacts. Implementations follow the Peakfit 3.x blueprint.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-from collections.abc import Mapping
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, Mapping
 
 import csv
 import io
@@ -901,29 +900,125 @@ def _write_unc_csv_wide(csv_path: Union[str, "Path"], rows: Iterable[Mapping[str
 
 
 def write_uncertainty_csvs(
-    base_path: Union[str, "Path"],
-    file_path: Union[str, "Path"],
+    base_path: Path,
+    file_path: Union[str, Path],
     unc_norm: Mapping[str, Any],
     *,
-    write_wide: bool = False,
-) -> Tuple[Path, Optional[Path]]:
+    write_wide: bool = True,
+):
     """
-    Convenience: write long CSV to <base>_uncertainty.csv.
-    If write_wide=True, also write <base>_uncertainty_wide.csv.
-    Returns (long_csv_path, wide_csv_path_or_None).
-    """
-    base = Path(base_path).with_suffix("")
-    long_csv = base.with_name(base.name + "_uncertainty.csv")
-    rows_long = list(_iter_param_rows(file_path, unc_norm))
-    _write_unc_csv(long_csv, rows_long)
+    Write per-file uncertainty CSVs for a single spectrum.
 
-    wide_csv = None
+    base_path: Path WITHOUT suffix (e.g., /out/dir/sample1)
+    Produces:
+      {base}_uncertainty_long.csv  (always)
+      {base}_uncertainty_wide.csv  (optional)
+    Returns: (long_csv_path, wide_csv_path_or_None)
+    """
+    base_path = Path(base_path).with_suffix("")
+    long_path = base_path.with_name(base_path.name + "_uncertainty_long.csv")
+    legacy_path = base_path.with_name(base_path.name + "_uncertainty.csv")
+    wide_path = base_path.with_name(base_path.name + "_uncertainty_wide.csv")
+
+    rows = []
+    label = unc_norm.get("label", "unknown")
+    rmse = unc_norm.get("rmse", np.nan)
+    dof = unc_norm.get("dof", np.nan)
+
+    stats = unc_norm.get("stats") or []
+    for i, row in enumerate(stats, start=1):
+        for param in ("center", "height", "fwhm", "eta"):
+            blk = (row or {}).get(param) or {}
+            est = blk.get("est")
+            sd = blk.get("sd")
+            lo = blk.get("p2_5")
+            hi = blk.get("p97_5")
+            rows.append(
+                {
+                    "file": Path(file_path).name if file_path else "",
+                    "peak": i,
+                    "param": param,
+                    "value": est,
+                    "stderr": sd,
+                    "ci_lo": lo,
+                    "ci_hi": hi,
+                    "method": label,
+                    "rmse": rmse,
+                    "dof": dof,
+                }
+            )
+
+    header = [
+        "file",
+        "peak",
+        "param",
+        "value",
+        "stderr",
+        "ci_lo",
+        "ci_hi",
+        "method",
+        "rmse",
+        "dof",
+    ]
+    for path in (long_path, legacy_path):
+        with Path(path).open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=header)
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+
+    wide_written = None
     if write_wide:
-        wide_csv = base.with_name(base.name + "_uncertainty_wide.csv")
-        rows_wide = list(_iter_peak_rows_wide(file_path, unc_norm))
-        _write_unc_csv_wide(wide_csv, rows_wide)
+        header = [
+            "file",
+            "peak",
+            "method",
+            "rmse",
+            "dof",
+            "center",
+            "center_stderr",
+            "center_ci_lo",
+            "center_ci_hi",
+            "height",
+            "height_stderr",
+            "height_ci_lo",
+            "height_ci_hi",
+            "fwhm",
+            "fwhm_stderr",
+            "fwhm_ci_lo",
+            "fwhm_ci_hi",
+            "eta",
+            "eta_stderr",
+            "eta_ci_lo",
+            "eta_ci_hi",
+        ]
+        by_peak: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            pk = r["peak"]
+            d = by_peak.setdefault(
+                pk,
+                {
+                    "file": r["file"],
+                    "peak": pk,
+                    "method": r["method"],
+                    "rmse": r["rmse"],
+                    "dof": r["dof"],
+                },
+            )
+            p = r["param"]
+            d[f"{p}"] = r["value"]
+            d[f"{p}_stderr"] = r["stderr"]
+            d[f"{p}_ci_lo"] = r["ci_lo"]
+            d[f"{p}_ci_hi"] = r["ci_hi"]
 
-    return long_csv, wide_csv
+        with wide_path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=header)
+            w.writeheader()
+            for pk in sorted(by_peak):
+                w.writerow(by_peak[pk])
+        wide_written = wide_path
+
+    return str(long_path), (str(wide_written) if wide_written else None)
 
 # --- END: add wide exporter ---
 
@@ -1018,9 +1113,10 @@ def write_uncertainty_csv(
 
 
 def write_uncertainty_txt(
-    path: Union[str, Path],
-    unc_res: Any,
-    peaks: Any | None = None,
+    out_path: Union[str, Path],
+    unc_norm: Mapping[str, Any] | Any,
+    *,
+    peaks=None,
     method_label: str = "",
     file_path: Union[str, Path] = "",
     solver_meta: Mapping[str, Any] | None = None,
@@ -1029,8 +1125,41 @@ def write_uncertainty_txt(
     locks: Sequence[Mapping[str, bool]] | None = None,
     **_: Any,
 ) -> None:
-    unc = _normalize_unc_result(unc_res)
-    _write_unc_txt(path, file_path, unc, solver_meta or {}, baseline_meta or {}, perf_meta or {}, locks or [])
+    """
+    Public wrapper for writing a human-readable uncertainty report.
+    Delegate to existing internal writer if available.
+    """
+    try:
+        unc = normalize_unc_result(unc_norm)
+        return _write_unc_txt(
+            out_path,
+            file_path,
+            unc,
+            solver_meta or {},
+            baseline_meta or {},
+            perf_meta or {},
+            locks or [],
+        )
+    except NameError:
+        unc = normalize_unc_result(unc_norm)
+        label = unc.get("label", "unknown")
+        with Path(out_path).open("w", encoding="utf-8") as fh:
+            fh.write(f"Uncertainty method: {label}\n")
+            fh.write(f"File: {Path(file_path).name if file_path else ''}\n\n")
+            for i, row in enumerate(unc.get('stats', []), start=1):
+                c = (row.get('center', {}) or {})
+                h = (row.get('height', {}) or {})
+                w = (row.get('fwhm', {}) or {})
+                e = (row.get('eta', {}) or {})
+
+                def fmt(blk):
+                    est = blk.get('est')
+                    sd = blk.get('sd')
+                    return f"{est if est is not None else 'n/a'} ± {sd if sd is not None else 'n/a'}"
+
+                fh.write(
+                    f"Peak {i}: center={fmt(c)} | height={fmt(h)} | FWHM={fmt(w)} | eta={fmt(e)}\n"
+                )
 
 
 def export_uncertainty_pair(
