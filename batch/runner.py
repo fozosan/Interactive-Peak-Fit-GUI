@@ -117,6 +117,7 @@ def run_batch(
     unc_method = str(
         config.get("unc_method") or config.get("uncertainty_method") or "asymptotic"
     )
+    unc_method_canon = data_io.canonical_unc_label(unc_method)
 
     records = []
     unc_rows = []
@@ -279,11 +280,12 @@ def run_batch(
         unc_res = None
         if res["fit_ok"] and fitted:
             try:
-                if "boot" in unc_method.lower():
+                mode_lower = unc_method_canon.lower()
+                if "boot" in mode_lower:
                     unc_res = unc.bootstrap_ci(
                         fit_ctx=res, n_boot=100, workers=unc_workers
                     )
-                elif "bayes" in unc_method.lower() or "mcmc" in unc_method.lower():
+                elif "bayes" in mode_lower or "mcmc" in mode_lower:
                     unc_res = unc.bayesian_ci(fit_ctx=res)
                 else:
                     unc_res = unc.asymptotic_ci(
@@ -300,7 +302,7 @@ def run_batch(
 
             unc_norm = data_io.normalize_unc_result(unc_res)
             method_lbl = data_io.canonical_unc_label(
-                unc_norm.get("label") or unc_method
+                unc_norm.get("label") or unc_method_canon
             )
             unc_norm["label"] = method_lbl
             unc_norm["rmse"] = rmse

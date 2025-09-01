@@ -3545,24 +3545,35 @@ class PeakFitApp:
         try:
             export_base = Path(out_csv).with_suffix("")
             write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
-            add_mode = (self.baseline_mode.get() == "add")
-            x_fit = self.x[mask]
-            y_fit_target = self.get_fit_target()[mask]
-            base_for_unc = (
-                self.baseline[mask]
-                if (self.use_baseline.get() and add_mode and self.baseline is not None)
-                else None
+
+            # 1) Reuse last run’s uncertainty if we have it
+            unc = getattr(self, "last_uncertainty", None)
+            if unc is None:
+                # fallback: compute now using the selected method
+                method_key = self._unc_selected_method_key()
+                add_mode = (self.baseline_mode.get() == "add")
+                x_fit = self.x[mask]
+                y_fit_target = self.get_fit_target()[mask]
+                base_for_unc = (
+                    self.baseline[mask]
+                    if (self.use_baseline.get() and add_mode and self.baseline is not None)
+                    else None
+                )
+                unc = self._compute_uncertainty_sync(
+                    method_key,
+                    x_fit=x_fit,
+                    y_fit=y_fit_target,
+                    base_fit=base_for_unc,
+                    add_mode=add_mode,
+                )
+
+            # 2) Normalize, label, and set rmse/dof
+            unc_norm = _normalize_unc_result(unc)
+            raw_lbl = (
+                unc_norm.get("label")
+                or unc_norm.get("method")
+                or self._unc_selected_method_key()
             )
-            method_key = self._unc_selected_method_key()
-            unc_res = self._compute_uncertainty_sync(
-                method_key,
-                x_fit=x_fit,
-                y_fit=y_fit_target,
-                base_fit=base_for_unc,
-                add_mode=add_mode,
-            )
-            unc_norm = _normalize_unc_result(unc_res)
-            raw_lbl = unc_norm.get("label") or unc_norm.get("method") or method_key
             label = _canonical_unc_label(raw_lbl)
             unc_norm["label"] = label
             unc_norm["rmse"] = rmse
@@ -3570,17 +3581,16 @@ class PeakFitApp:
             if not unc_norm.get("stats"):
                 raise RuntimeError("Export uncertainty normalization produced no stats")
 
+            # 3) CSVs
             long_csv, wide_csv = write_uncertainty_csvs(
                 export_base, self.current_file or "", unc_norm, write_wide=write_wide
             )
 
+            # 4) TXT — IMPORTANT: pass peaks + method_label
             solver_opts = getattr(self, "_solver_options", lambda: SimpleNamespace())()
             if hasattr(solver_opts, "__dict__"):
                 solver_opts = solver_opts.__dict__
-            solver_meta = {
-                "solver": self.solver_choice.get(),
-                **solver_opts,
-            }
+            solver_meta = {"solver": self.solver_choice.get(), **solver_opts}
             baseline_meta = {
                 "uses_fit_range": bool(self.baseline_use_range.get()),
                 "lam": float(self.als_lam.get()),
@@ -3600,6 +3610,8 @@ class PeakFitApp:
             write_uncertainty_txt(
                 txt_path,
                 unc_norm,
+                peaks=self.peaks,
+                method_label=label,
                 file_path=self.current_file or "",
                 solver_meta=solver_meta,
                 baseline_meta=baseline_meta,
@@ -3610,6 +3622,8 @@ class PeakFitApp:
             saved_unc.extend([str(long_csv), str(txt_path)])
             if wide_csv:
                 saved_unc.append(str(wide_csv))
+
+            # band, if present
             band = unc_norm.get("band")
             if band is not None:
                 xb, lob, hib = band
