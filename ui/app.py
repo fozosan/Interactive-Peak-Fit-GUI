@@ -187,7 +187,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple, Optional
-from types import SimpleNamespace
+from types import SimpleNamespace  # ensure this import exists
 from core.data_io import (
     write_uncertainty_csvs,
     write_uncertainty_txt,
@@ -3331,13 +3331,11 @@ class PeakFitApp:
         trace_csv = out_dir / f"{in_path.stem}_trace.csv"
 
         rows = []
-        areas = [pseudo_voigt_area(p.height, p.fwhm, p.eta) for p in self.peaks]
-        total_area = float(np.sum(areas)) if areas else 1.0
         opts = self._solver_options()
         center_bounds = (self.fit_xmin, self.fit_xmax) if (opts.get("centers_in_window") or opts.get("bound_centers_to_window")) else (np.nan, np.nan)
         med_dx = float(np.median(np.diff(np.sort(self.x)))) if (self.x is not None and self.x.size > 1) else 0.0
         fwhm_lo = opts.get("min_fwhm", max(1e-6, 2.0 * med_dx))
-        for i, (p, a) in enumerate(zip(self.peaks, areas), 1):
+        for i, p in enumerate(self.peaks, 1):
             rows.append(
                 {
                     "center": p.center,
@@ -3421,6 +3419,13 @@ class PeakFitApp:
 
     def start_batch(self, in_folder: str, out_folder: str):
         """Process all spectra in ``in_folder`` writing results to ``out_folder``."""
+        # Ensure batch sees the selected uncertainty method
+        try:
+            method_key = self._unc_selected_method_key()
+            self.cfg["unc_method"] = method_key
+            save_config(self.cfg)
+        except Exception:
+            pass
         in_dir = Path(in_folder)
         out_dir = Path(out_folder)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -3462,10 +3467,8 @@ class PeakFitApp:
         base = self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
         if self.use_baseline.get() and self.baseline_mode.get() == "add":
             y_fit = base + total_peaks
-            y_corr = self.y_raw - base  # for reference
         else:
             y_fit = total_peaks
-            y_corr = self.y_raw - base if self.use_baseline.get() else self.y_raw
 
         mask = self.current_fit_mask()
         if mask is None or not np.any(mask):

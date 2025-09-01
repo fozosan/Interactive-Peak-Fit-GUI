@@ -57,7 +57,7 @@ def run_batch(
     config: dict,
     *,
     compute_uncertainty: bool = False,
-    unc_method: str = "asymptotic",
+    unc_method: str | None = None,
     progress=None,
     log=None,
     abort_evt=None,
@@ -114,10 +114,17 @@ def run_batch(
         base_name = Path(peak_output_cfg).stem.replace("_fit", "")
     peak_output = out_dir / f"{base_name}_fit.csv"
     export_unc_wide = bool(config.get("export_unc_wide", False))
-    unc_method = str(
-        config.get("unc_method") or config.get("uncertainty_method") or "asymptotic"
+    # Choose uncertainty method: explicit arg > config aliases > default
+    unc_choice = (
+        unc_method
+        or config.get("unc_method")
+        or config.get("uncertainty_method")
+        or config.get("uncertainty")
+        or "asymptotic"
     )
-    unc_method_canon = data_io.canonical_unc_label(unc_method)
+    unc_method_canon = data_io.canonical_unc_label(unc_choice)
+    if log:
+        log(f"batch uncertainty method={unc_method_canon}")
 
     records = []
     unc_rows = []
@@ -278,7 +285,7 @@ def run_batch(
             fh.write(fit_csv)
 
         unc_res = None
-        if res["fit_ok"] and fitted:
+        if res["fit_ok"] and fitted and compute_uncertainty:
             try:
                 mode_lower = unc_method_canon.lower()
                 if "boot" in mode_lower:
@@ -408,17 +415,34 @@ def run_from_dir(
         cfg["perf_gpu"] = False
         cfg["perf_numba"] = False
         cfg["perf_max_workers"] = 0
-
-    run_batch(patterns, cfg)
+    # Forward uncertainty selection to the batch runner
+    um = (
+        cfg.get("unc_method")
+        or cfg.get("uncertainty_method")
+        or cfg.get("uncertainty")
+        or None
+    )
+    run_batch(
+        patterns,
+        cfg,
+        compute_uncertainty=True,
+        unc_method=um,
+    )
 
 
 def run(patterns: Iterable[str], config: dict, progress=None, log=None):
     """Compatibility wrapper using legacy signature."""
+    um = (
+        config.get("unc_method")
+        or config.get("uncertainty_method")
+        or config.get("uncertainty")
+        or None
+    )
     return run_batch(
         patterns,
         config,
         compute_uncertainty=True,
-        unc_method=config.get("unc_method", "asymptotic"),
+        unc_method=um,
         progress=progress,
         log=log,
     )
