@@ -16,7 +16,6 @@ import csv
 import os
 import copy
 import numpy as np
-import pandas as pd
 
 if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safeguard
     os.environ.setdefault("MPLBACKEND", "Agg")
@@ -110,16 +109,7 @@ def run_batch(
         peak_output_cfg = config.get("peak_output", out_dir / "batch_fit.csv")
         base_name = Path(peak_output_cfg).stem.replace("_fit", "")
     peak_output = out_dir / f"{base_name}_fit.csv"
-    unc_output = out_dir / f"{base_name}_uncertainty.csv"
-
-    out_dir = Path(config.get("output_dir", Path(config.get("peak_output", "peaks.csv")).parent))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    base_name = config.get("output_base")
-    if base_name is None:
-        peak_output_cfg = config.get("peak_output", out_dir / "batch_fit.csv")
-        base_name = Path(peak_output_cfg).stem.replace("_fit", "")
-    peak_output = out_dir / f"{base_name}_fit.csv"
-    unc_output = out_dir / f"{base_name}_uncertainty.csv"
+    export_unc_wide = bool(config.get("export_unc_wide", True))
 
     records = []
     unc_rows = []
@@ -291,6 +281,8 @@ def run_batch(
             unc_norm = data_io.normalize_unc_result(unc_res)
             method_lbl = data_io.canonical_unc_label(unc_norm.get("label") or unc_method)
             unc_norm["label"] = method_lbl
+            unc_norm["rmse"] = rmse
+            unc_norm["dof"] = res.get("dof", 0) if isinstance(res, dict) else 0
 
             data_io.write_uncertainty_txt(
                 out_dir / f"{stem}_uncertainty.txt",
@@ -304,7 +296,7 @@ def run_batch(
                 out_dir / stem,
                 path,
                 unc_norm,
-                write_wide=True,
+                write_wide=export_unc_wide,
             )
 
             band = unc_norm.get("band")
@@ -318,23 +310,7 @@ def run_batch(
                     for xi, lo, hi in zip(xb, lob, hib):
                         bw.writerow([float(xi), float(lo), float(hi)])
 
-            for i, row in enumerate(unc_norm.get("stats", []), start=1):
-                for param in ("center", "height", "fwhm", "eta"):
-                    blk = row.get(param, {}) or {}
-                    unc_rows.append(
-                        {
-                            "file": Path(path).name,
-                            "peak": i,
-                            "param": param,
-                            "value": blk.get("est"),
-                            "stderr": blk.get("sd"),
-                            "ci_lo": blk.get("p2_5"),
-                            "ci_hi": blk.get("p97_5"),
-                            "method": method_lbl,
-                            "rmse": rmse,
-                            "dof": res.get("dof", 0) if isinstance(res, dict) else 0,
-                        }
-                    )
+            unc_rows.extend(data_io.iter_uncertainty_rows(path, unc_norm))
 
         trace_path = None
         if save_traces:
@@ -355,7 +331,7 @@ def run_batch(
     with peak_output.open("w", encoding="utf-8", newline="") as fh:
         fh.write(peak_csv)
     if compute_uncertainty and unc_rows:
-        data_io.write_dataframe(pd.DataFrame(unc_rows), unc_output)
+        data_io.write_batch_uncertainty_long(out_dir, unc_rows)
 
     return ok, processed
 
