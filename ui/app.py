@@ -3416,45 +3416,28 @@ class PeakFitApp:
 
     def start_batch(self, in_folder: str, out_folder: str):
         """Process all spectra in ``in_folder`` writing results to ``out_folder``."""
-        # Persist the selected uncertainty method for future sessions
+        # Ensure batch sees the selected uncertainty method and defaults to computing uncertainty
         try:
             method_key = self._unc_selected_method_key()
             self.cfg["unc_method"] = method_key
+            if "compute_uncertainty_batch" not in self.cfg:
+                self.cfg["compute_uncertainty_batch"] = True
             save_config(self.cfg)
         except Exception:
             pass
-        # Seed the batch runner with the current peaks and selected uncertainty method.
-        # Use the template seeds for all files; let batch reheight per spectrum.
-        from batch import runner as batch_runner
-        seed_peaks = [
-            {
-                "center": p.center,
-                "height": p.height,
-                "fwhm": p.fwhm,
-                "eta": p.eta,
-                "lock_center": getattr(p, "lock_center", False),
-                "lock_width": getattr(p, "lock_width", False),
-            }
-            for p in (self.peaks or [])
-        ]
-        batch_runner.run_from_dir(
-            input_dir=in_folder,
-            output_dir=out_folder,
-            # IMPORTANT: use template seeds we just passed
-            source_mode="template",
-            workers=int(self.perf_max_workers.get()),
-            perf_overrides={
-                "peaks": seed_peaks,
-                "reheight": True,
-                # forward uncertainty selection + exporting preference
-                "unc_method": self._unc_selected_method_key(),
-                "export_unc_wide": bool(getattr(self, "cfg", {}).get("export_unc_wide", False)),
-                # fit window + baseline behavior, so per-file uncertainty matches single-file UI
-                "fit_xmin": getattr(self, "fit_xmin", None),
-                "fit_xmax": getattr(self, "fit_xmax", None),
-                "baseline_uses_fit_range": bool(getattr(self, "baseline_use_range", tk.BooleanVar(value=True)).get()),
-            },
-        )
+        in_dir = Path(in_folder)
+        out_dir = Path(out_folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        files = sorted([p for p in in_dir.iterdir() if p.suffix.lower() in {".csv", ".txt", ".dat"}])
+        all_rows: List[dict] = []
+        for p in files:
+            if getattr(self, "_abort_evt", None) and self._abort_evt.is_set():
+                self.status_warn("[Batch] Aborted by user.")
+                break
+            self._batch_process_file(p, out_dir, all_rows)
+        if all_rows:
+            _dio.write_batch_uncertainty_long(out_dir, all_rows)
+    # --- END: hook batch runner to compute + export uncertainty ---
 
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:
