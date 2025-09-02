@@ -3008,6 +3008,8 @@ class PeakFitApp:
                 w = _csv.writer(fh, lineterminator="\n")
                 w.writerow(["x", "y_lo95", "y_hi95"])
                 for xi, lo, hi in zip(xb, lob, hib):
+                    if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
+                        continue
                     w.writerow([float(xi), float(lo), float(hi)])
     # --- END: batch uncertainty helpers ---
 
@@ -3417,8 +3419,8 @@ class PeakFitApp:
                     total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
                 base_array = self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
                 model = base_array + total_peaks if add_mode else total_peaks
-                rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float("nan")
-                dof = int(np.sum(mask)) - 4 * len(self.peaks)
+                rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float(np.sqrt(np.mean((y_target - model) ** 2)))
+                dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
                 unc_norm["rmse"] = rmse
                 unc_norm["dof"] = dof
 
@@ -3495,8 +3497,8 @@ class PeakFitApp:
         mask = self.current_fit_mask()
         if mask is None or not np.any(mask):
             mask = np.ones_like(self.x, dtype=bool)
-        rmse = float(np.sqrt(np.mean((y_target[mask] - y_fit[mask]) ** 2))) if np.any(mask) else float("nan")
-        dof = int(np.sum(mask)) - 4 * len(self.peaks)
+        rmse = float(np.sqrt(np.mean((y_target[mask] - y_fit[mask]) ** 2))) if np.any(mask) else float(np.sqrt(np.mean((y_target - y_fit) ** 2)))
+        dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
 
         rows = []
         fname = self.current_file.name if self.current_file else ""
@@ -3608,8 +3610,8 @@ class PeakFitApp:
                 )
                 model = base_array + total_peaks if add_mode else total_peaks
 
-                rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float("nan")
-                dof = int(np.sum(mask)) - 4 * len(self.peaks)
+                rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float(np.sqrt(np.mean((y_target - model) ** 2)))
+                dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
 
                 # Normalize + canonicalize label, then attach RMSE/DOF from current export context
                 unc_norm = _normalize_unc_result(unc)
@@ -3671,6 +3673,8 @@ class PeakFitApp:
                         w = csv.writer(fh, lineterminator="\n")
                         w.writerow(["x", "y_lo95", "y_hi95"])
                         for xi, lo, hi in zip(xb, lob, hib):
+                            if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
+                                continue
                             w.writerow([float(xi), float(lo), float(hi)])
                     saved_unc.append(str(band_csv))
 

@@ -718,6 +718,23 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     return norm_rows
 
 
+def _finite(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        if math.isfinite(v):
+            return v
+    except Exception:
+        pass
+    return float(default)
+
+
+def _synth_q(val: float, sd: float) -> tuple[float, float]:
+    # If sd==0, both quantiles collapse to value
+    if not math.isfinite(sd) or sd <= 0.0:
+        return val, val
+    return (val - _Z * sd, val + _Z * sd)
+
+
 def _to_float(x: Any) -> float:
     if x is None:
         return float("nan")
@@ -1083,18 +1100,34 @@ def write_uncertainty_csv_legacy(
         w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
         w.writeheader()
         for r in rows:
-            val = _to_float(r.get("value"))
-            sd = _to_float(r.get("stderr"))
-            qlo = _to_float(r.get("p2_5"))
-            qhi = _to_float(r.get("p97_5"))
-            if (math.isnan(qlo) or math.isnan(qhi)) and math.isfinite(val) and math.isfinite(sd):
-                qlo, qhi = val - _Z * sd, val + _Z * sd
-            r_out = dict(r)
-            r_out["p2_5"] = qlo
-            r_out["p97_5"] = qhi
-            r_out["ci_lo"] = qlo
-            r_out["ci_hi"] = qhi
-            w.writerow(r_out)
+            val = _finite(r.get("value"), 0.0)
+            sd  = _finite(r.get("stderr"), 0.0)
+            qlo = r.get("p2_5"); qhi = r.get("p97_5")
+            if not (isinstance(qlo, (int, float)) and math.isfinite(float(qlo))) or \
+               not (isinstance(qhi, (int, float)) and math.isfinite(float(qhi))):
+                qlo2 = r.get("ci_lo"); qhi2 = r.get("ci_hi")
+                if qlo2 is None or qhi2 is None:
+                    qlo, qhi = _synth_q(val, sd)
+                else:
+                    qlo = _finite(qlo2, val); qhi = _finite(qhi2, val)
+            else:
+                qlo = _finite(qlo, val); qhi = _finite(qhi, val)
+            rmse = _finite(r.get("rmse"), 0.0)
+            dof  = max(1, int(_finite(r.get("dof"), 1.0)))
+            w.writerow({
+                "file": r.get("file", ""),
+                "peak": r.get("peak", ""),
+                "param": r.get("param", ""),
+                "value": val,
+                "stderr": sd,
+                "p2_5": qlo,
+                "p97_5": qhi,
+                "ci_lo": qlo,
+                "ci_hi": qhi,
+                "method": r.get("method", ""),
+                "rmse": rmse,
+                "dof": dof,
+            })
     return out_csv
 
 
@@ -1133,21 +1166,21 @@ def write_uncertainty_csvs(
                     "file": r["file"],
                     "peak": pk,
                     "method": r["method"],
-                    "rmse": r["rmse"],
-                    "dof": r["dof"],
+                    "rmse": _finite(r["rmse"], 0.0),
+                    "dof": max(1, int(_finite(r["dof"], 1.0))),
                 },
             )
             p = r["param"]
-            d[f"{p}"] = r["value"]
-            d[f"{p}_stderr"] = r["stderr"]
-            qlo, qhi = r.get("p2_5"), r.get("p97_5")
-            if (qlo is None or qhi is None) and (r.get("value") is not None and r.get("stderr") is not None):
-                try:
-                    e = float(r["value"])
-                    s = float(r["stderr"])
-                    qlo, qhi = e - _Z * s, e + _Z * s
-                except Exception:
-                    pass
+            e = _finite(d.get(p, r.get("value")), 0.0)
+            s = _finite(r.get("stderr"), 0.0)
+            qlo = r.get("p2_5"); qhi = r.get("p97_5")
+            if not (isinstance(qlo, (int, float)) and math.isfinite(float(qlo))) or \
+               not (isinstance(qhi, (int, float)) and math.isfinite(float(qhi))):
+                qlo, qhi = _synth_q(e, s)
+            else:
+                qlo = _finite(qlo, e); qhi = _finite(qhi, e)
+            d[p] = e
+            d[f"{p}_stderr"] = s
             d[f"{p}_ci_lo"] = qlo
             d[f"{p}_ci_hi"] = qhi
 
@@ -1195,9 +1228,13 @@ def write_batch_uncertainty_long(
             w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
             w.writeheader()
             for r in rows:
-                val = _to_float(r.get("value"))
-                sd  = _to_float(r.get("stderr"))
+                val = _finite(r.get("value"), 0.0)
+                sd  = _finite(r.get("stderr"), 0.0)
                 qlo, qhi = _pick_quantiles(r)
+                qlo = _finite(qlo, val)
+                qhi = _finite(qhi, val)
+                rmse = _finite(r.get("rmse"), 0.0)
+                dof  = max(1, int(_finite(r.get("dof"), 1.0)))
                 w.writerow({
                     "file": r.get("file", ""),
                     "peak": r.get("peak", ""),
@@ -1207,8 +1244,8 @@ def write_batch_uncertainty_long(
                     "p2_5": qlo,
                     "p97_5": qhi,
                     "method": r.get("method", ""),
-                    "rmse": r.get("rmse", ""),
-                    "dof": r.get("dof", ""),
+                    "rmse": rmse,
+                    "dof": dof,
                 })
 
     long_path = out_dir / "batch_uncertainty_long.csv"

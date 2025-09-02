@@ -16,6 +16,7 @@ import csv
 import os
 import copy
 import numpy as np
+import math
 
 if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safeguard
     os.environ.setdefault("MPLBACKEND", "Agg")
@@ -317,8 +318,8 @@ def run_batch(
                 unc_norm.get("label") or unc_method_canon
             )
             unc_norm["label"] = method_lbl
-            unc_norm["rmse"] = rmse
-            unc_norm["dof"] = res.get("dof", 0) if isinstance(res, dict) else 0
+            unc_norm["rmse"] = _rmse = rmse if math.isfinite(rmse) else 0.0
+            unc_norm["dof"] = max(1, int(res.get("dof", 0))) if isinstance(res, dict) else 1
 
             data_io.write_uncertainty_txt(
                 out_dir / f"{stem}_uncertainty.txt",
@@ -343,6 +344,8 @@ def run_batch(
                     bw = csv.writer(fh, lineterminator="\n")
                     bw.writerow(["x", "y_lo95", "y_hi95"])
                     for xi, lo, hi in zip(xb, lob, hib):
+                        if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
+                            continue
                         bw.writerow([float(xi), float(lo), float(hi)])
 
             unc_rows.extend(data_io.iter_uncertainty_rows(path, unc_norm))
