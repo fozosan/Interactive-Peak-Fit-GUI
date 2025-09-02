@@ -16,6 +16,7 @@ import csv
 import os
 import copy
 import numpy as np
+import math
 
 if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safeguard
     os.environ.setdefault("MPLBACKEND", "Agg")
@@ -296,12 +297,15 @@ def run_batch(
                 elif "bayes" in mode_lower or "mcmc" in mode_lower:
                     unc_res = unc.bayesian_ci(fit_ctx=res)
                 else:
-                    # NOTE: fit_api returns `predict_full` for the model evaluator
+                    # Choose model evaluator key safely
+                    model_eval = res.get("predict_full") or res.get("ymodel_fn")
+                    if model_eval is None:
+                        raise KeyError("fit_ctx missing model evaluator: expected 'predict_full' or 'ymodel_fn'")
                     unc_res = unc.asymptotic_ci(
                         res["theta"],
                         res["residual_fn"],
                         res["jacobian"],
-                        res["predict_full"],
+                        model_eval,
                     )
             except Exception:
                 unc_res = None
@@ -314,8 +318,8 @@ def run_batch(
                 unc_norm.get("label") or unc_method_canon
             )
             unc_norm["label"] = method_lbl
-            unc_norm["rmse"] = rmse
-            unc_norm["dof"] = res.get("dof", 0) if isinstance(res, dict) else 0
+            unc_norm["rmse"] = _rmse = rmse if math.isfinite(rmse) else 0.0
+            unc_norm["dof"] = max(1, int(res.get("dof", 0))) if isinstance(res, dict) else 1
 
             data_io.write_uncertainty_txt(
                 out_dir / f"{stem}_uncertainty.txt",
@@ -335,12 +339,13 @@ def run_batch(
             band = unc_norm.get("band")
             if band is not None:
                 xb, lob, hib = band
-                with (out_dir / f"{stem}_uncertainty_band.csv").open(
-                    "w", newline="", encoding="utf-8"
-                ) as fh:
+                band_csv = out_dir / f"{stem}_uncertainty_band.csv"
+                with band_csv.open("w", newline="", encoding="utf-8") as fh:
                     bw = csv.writer(fh, lineterminator="\n")
                     bw.writerow(["x", "y_lo95", "y_hi95"])
                     for xi, lo, hi in zip(xb, lob, hib):
+                        if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
+                            continue
                         bw.writerow([float(xi), float(lo), float(hi)])
 
             unc_rows.extend(data_io.iter_uncertainty_rows(path, unc_norm))

@@ -180,7 +180,7 @@ Known limitations / tips
 """
 
 import json
-import math
+import math  # used for band row filtering
 import re
 import time
 import csv
@@ -2694,12 +2694,14 @@ class PeakFitApp:
         self.cfg["batch_auto_max"] = int(self.batch_auto_max.get())
         self.cfg["batch_save_traces"] = bool(self.batch_save_traces.get())
         try:
-            self.cfg["batch_compute_uncertainty"] = bool(self.batch_unc_enabled.get())
+            val = bool(self.batch_unc_enabled.get())
         except Exception:
             try:
-                self.cfg["batch_compute_uncertainty"] = bool(self.compute_uncertainty_batch.get())
+                val = bool(self.compute_uncertainty_batch.get())
             except Exception:
-                self.cfg["batch_compute_uncertainty"] = True
+                val = True
+        self.cfg["batch_compute_uncertainty"] = val
+        self.cfg["compute_uncertainty_batch"] = val
         save_config(self.cfg)
 
         # Respect the UI toggle if present; otherwise default ON to avoid silent skips.
@@ -2980,7 +2982,8 @@ class PeakFitApp:
         except Exception:
             pass
         # Safe config fallback; default True so batch jobs compute uncertainty unless explicitly disabled.
-        return bool(getattr(self, "cfg", {}).get("compute_uncertainty_batch", True))
+        cfg = getattr(self, "cfg", {}) or {}
+        return bool(cfg.get("batch_compute_uncertainty", cfg.get("compute_uncertainty_batch", True)))
 
     def _export_uncertainty_from_result(self, unc_norm, out_base: Path, file_path: str, *, write_wide: bool = True):
         # Always write long CSV and optional wide CSV
@@ -3005,6 +3008,8 @@ class PeakFitApp:
                 w = _csv.writer(fh, lineterminator="\n")
                 w.writerow(["x", "y_lo95", "y_hi95"])
                 for xi, lo, hi in zip(xb, lob, hib):
+                    if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
+                        continue
                     w.writerow([float(xi), float(lo), float(hi)])
     # --- END: batch uncertainty helpers ---
 
@@ -3414,8 +3419,8 @@ class PeakFitApp:
                     total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
                 base_array = self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
                 model = base_array + total_peaks if add_mode else total_peaks
-                rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float("nan")
-                dof = int(np.sum(mask)) - 4 * len(self.peaks)
+                rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float(np.sqrt(np.mean((y_target - model) ** 2)))
+                dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
                 unc_norm["rmse"] = rmse
                 unc_norm["dof"] = dof
 
@@ -3492,8 +3497,8 @@ class PeakFitApp:
         mask = self.current_fit_mask()
         if mask is None or not np.any(mask):
             mask = np.ones_like(self.x, dtype=bool)
-        rmse = float(np.sqrt(np.mean((y_target[mask] - y_fit[mask]) ** 2))) if np.any(mask) else float("nan")
-        dof = int(np.sum(mask)) - 4 * len(self.peaks)
+        rmse = float(np.sqrt(np.mean((y_target[mask] - y_fit[mask]) ** 2))) if np.any(mask) else float(np.sqrt(np.mean((y_target - y_fit) ** 2)))
+        dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
 
         rows = []
         fname = self.current_file.name if self.current_file else ""
@@ -3568,96 +3573,114 @@ class PeakFitApp:
             export_base = Path(out_csv).with_suffix("")
             write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
 
-            # --- Always compute uncertainty fresh at export time ---
-            method_key = self._unc_selected_method_key()
-            add_mode = (self.baseline_mode.get() == "add")
+            # Single export: always compute uncertainty regardless of GUI history or batch toggle
+            if self.peaks:
+                method_key = self._unc_selected_method_key()
+                add_mode = (self.baseline_mode.get() == "add")
 
-            # Fit window mask: if empty or None, fall back to full range so we never skip
-            mask = self.current_fit_mask()
-            if mask is None or (isinstance(mask, np.ndarray) and (mask.size == 0 or not np.any(mask))):
-                mask = np.ones_like(self.x, dtype=bool)
+                mask = self.current_fit_mask()
+                if mask is None or not np.any(mask):
+                    mask = np.ones_like(self.x, dtype=bool)
 
-            x_fit = self.x[mask]
-            y_fit_target = self.get_fit_target()[mask]
-            base_for_unc = (
-                self.baseline[mask]
-                if (self.use_baseline.get() and add_mode and self.baseline is not None)
-                else None
-            )
+                x_fit = self.x[mask]
+                y_target = self.get_fit_target()
+                y_fit_target = y_target[mask]
+                base_for_unc = (
+                    self.baseline[mask]
+                    if (self.use_baseline.get() and add_mode and self.baseline is not None)
+                    else None
+                )
 
-            unc = self._compute_uncertainty_sync(
-                method_key,
-                x_fit=x_fit,
-                y_fit=y_fit_target,
-                base_fit=base_for_unc,
-                add_mode=add_mode,
-            )
+                # recompute uncertainty on export regardless of what the user did before
+                unc = self._compute_uncertainty_sync(
+                    method_key,
+                    x_fit=x_fit,
+                    y_fit=y_fit_target,
+                    base_fit=base_for_unc,
+                    add_mode=add_mode,
+                )
 
-            # Normalize + canonicalize label, then attach RMSE/DOF from current export context
-            unc_norm = _normalize_unc_result(unc)
-            raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_key)
-            label = _canonical_unc_label(raw_lbl)
-            unc_norm["label"] = label
-            unc_norm["rmse"] = rmse
-            unc_norm["dof"] = dof
-            if not unc_norm.get("stats"):
-                raise RuntimeError("Export uncertainty normalization produced no stats")
+                # Build model on full x to compute RMSE/DOF using the current fit window
+                total_peaks = np.zeros_like(self.x, float)
+                for p in self.peaks:
+                    total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
 
-            # CSVs (long + optional wide)
-            long_csv, wide_csv = write_uncertainty_csvs(
-                export_base, self.current_file or "", unc_norm, write_wide=write_wide
-            )
+                base_array = (
+                    self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
+                )
+                model = base_array + total_peaks if add_mode else total_peaks
 
-            # TXT — pass peaks + method_label and metadata as before
-            solver_opts = getattr(self, "_solver_options", lambda: SimpleNamespace())()
-            if hasattr(solver_opts, "__dict__"):
-                solver_opts = solver_opts.__dict__
-            solver_meta = {"solver": self.solver_choice.get(), **solver_opts}
-            baseline_meta = {
-                "uses_fit_range": bool(self.baseline_use_range.get()),
-                "lam": float(self.als_lam.get()),
-                "p": float(self.als_asym.get()),
-                "niter": int(self.als_niter.get()),
-                "thresh": float(self.als_thresh.get()),
-            }
-            perf_meta = {
-                "numba": bool(self.perf_numba.get()),
-                "gpu": bool(self.perf_gpu.get()),
-                "cache_baseline": bool(self.perf_cache_baseline.get()),
-                "seed_all": bool(self.perf_seed_all.get()),
-                "max_workers": int(self.perf_max_workers.get()),
-            }
-            locks = getattr(self, "_last_unc_locks", [])
-            txt_path = export_base.with_name(export_base.name + "_uncertainty.txt")
-            write_uncertainty_txt(
-                txt_path,
-                unc_norm,
-                peaks=self.peaks,
-                method_label=label,
-                file_path=self.current_file or "",
-                solver_meta=solver_meta,
-                baseline_meta=baseline_meta,
-                perf_meta=perf_meta,
-                locks=locks,
-            )
+                rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float(np.sqrt(np.mean((y_target - model) ** 2)))
+                dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
 
-            saved_unc.extend([str(long_csv), str(txt_path)])
-            if wide_csv:
-                saved_unc.append(str(wide_csv))
+                # Normalize + canonicalize label, then attach RMSE/DOF from current export context
+                unc_norm = _normalize_unc_result(unc)
+                raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_key)
+                label = _canonical_unc_label(raw_lbl)
+                unc_norm["label"] = label
+                unc_norm["rmse"] = rmse
+                unc_norm["dof"] = dof
+                if not unc_norm.get("stats"):
+                    raise RuntimeError("Export uncertainty normalization produced no stats")
 
-            # Band, if present (asymptotic and any method that provides it)
-            band = unc_norm.get("band")
-            if band is not None:
-                xb, lob, hib = band
-                band_csv = export_base.with_name(export_base.name + "_uncertainty_band.csv")
-                with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                    w = csv.writer(fh, lineterminator="\n")
-                    w.writerow(["x", "y_lo95", "y_hi95"])
-                    for xi, lo, hi in zip(xb, lob, hib):
-                        w.writerow([float(xi), float(lo), float(hi)])
-                saved_unc.append(str(band_csv))
+                # CSVs (long + optional wide)
+                long_csv, wide_csv = write_uncertainty_csvs(
+                    export_base, self.current_file or "", unc_norm, write_wide=write_wide
+                )
+                saved_unc.extend([str(long_csv)] + ([str(wide_csv)] if wide_csv else []))
 
-            self.log(f"Exported uncertainty ({label}).")
+                # TXT — pass peaks + method_label and metadata as before
+                solver_opts = getattr(self, "_solver_options", lambda: SimpleNamespace())()
+                if hasattr(solver_opts, "__dict__"):
+                    solver_opts = solver_opts.__dict__
+                solver_meta = {"solver": self.solver_choice.get(), **solver_opts}
+                baseline_meta = {
+                    "uses_fit_range": bool(self.baseline_use_range.get()),
+                    "lam": float(self.als_lam.get()),
+                    "p": float(self.als_asym.get()),
+                    "niter": int(self.als_niter.get()),
+                    "thresh": float(self.als_thresh.get()),
+                }
+                perf_meta = {
+                    "numba": bool(self.perf_numba.get()),
+                    "gpu": bool(self.perf_gpu.get()),
+                    "cache_baseline": bool(self.perf_cache_baseline.get()),
+                    "seed_all": bool(self.perf_seed_all.get()),
+                    "max_workers": int(self.perf_max_workers.get()),
+                }
+                locks = getattr(self, "_last_unc_locks", [])
+
+                txt_path = export_base.with_name(export_base.name + "_uncertainty.txt")
+                write_uncertainty_txt(
+                    txt_path,
+                    unc_norm,
+                    peaks=self.peaks,
+                    method_label=label,
+                    file_path=self.current_file or "",
+                    solver_meta=solver_meta,
+                    baseline_meta=baseline_meta,
+                    perf_meta=perf_meta,
+                    locks=locks,
+                )
+                saved_unc.append(str(txt_path))
+
+                # Band, if present (asymptotic and any method that provides it)
+                band = unc_norm.get("band")
+                if band is not None:
+                    xb, lob, hib = band
+                    band_csv = export_base.with_name(export_base.name + "_uncertainty_band.csv")
+                    with band_csv.open("w", newline="", encoding="utf-8") as fh:
+                        w = csv.writer(fh, lineterminator="\n")
+                        w.writerow(["x", "y_lo95", "y_hi95"])
+                        for xi, lo, hi in zip(xb, lob, hib):
+                            if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
+                                continue
+                            w.writerow([float(xi), float(lo), float(hi)])
+                    saved_unc.append(str(band_csv))
+
+                self.log(f"Exported uncertainty ({label}).")
+            else:
+                self.log("Export: no peaks, uncertainty not computed.")
         except Exception as e:  # pragma: no cover - defensive
             self.status_warn(f"Uncertainty export failed: {e}")
 
