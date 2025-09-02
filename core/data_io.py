@@ -1207,7 +1207,25 @@ def write_batch_uncertainty_long(
     Input rows may carry either p2_5/p97_5 or ci_lo/ci_hi; we map to p2_5/p97_5.
     """
     out_dir = Path(out_dir)
-    header = ["file","peak","param","value","stderr","p2_5","p97_5","method","rmse","dof"]
+    header = ["file","peak","param","value","stderr","ci_lo","ci_hi","method","rmse","dof"]
+
+    def _pick_quantiles(r: dict) -> tuple[float, float]:
+        """
+        Accept either legacy p2_5/p97_5 or unified ci_lo/ci_hi; synthesize from
+        value±Z*stderr if neither present.
+        """
+        val = _to_float(r.get("value"))
+        sd  = _to_float(r.get("stderr"))
+        # Prefer unified names if already present
+        qlo = _to_float(r.get("ci_lo"))
+        qhi = _to_float(r.get("ci_hi"))
+        if math.isnan(qlo) or math.isnan(qhi):
+            # Try legacy names
+            qlo = _to_float(r.get("p2_5"))
+            qhi = _to_float(r.get("p97_5"))
+        if (math.isnan(qlo) or math.isnan(qhi)) and math.isfinite(val) and math.isfinite(sd):
+            qlo, qhi = val - _Z * sd, val + _Z * sd
+        return qlo, qhi
 
     def _pick_quantiles(r: dict) -> tuple[float, float]:
         # Accept either legacy or unified field names; synthesize if needed.
