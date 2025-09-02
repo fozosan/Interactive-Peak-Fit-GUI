@@ -180,7 +180,7 @@ Known limitations / tips
 """
 
 import json
-import math
+import math  # used for band row filtering
 import re
 import time
 import csv
