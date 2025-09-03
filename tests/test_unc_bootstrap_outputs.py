@@ -1,4 +1,5 @@
 import numpy as np
+import math
 from pathlib import Path
 from core import fit_api, uncertainty, data_io
 from tests.conftest import _maybe_read_unc_files, _pivot_long_to_wide
@@ -13,6 +14,11 @@ def test_unc_bootstrap_outputs(two_peak_data, tmp_path):
 
     base = Path(tmp_path / "out.csv")
     unc_norm = data_io.normalize_unc_result(res1)
+    for row in unc_norm["stats"]:
+        for pname in ("center", "height", "fwhm", "eta"):
+            p = row[pname]
+            assert math.isfinite(p.get("est", float("nan")))
+            assert math.isfinite(p.get("sd", float("nan")))
     data_io.write_uncertainty_csvs(base, "", unc_norm, write_wide=True)
     basedir = Path(tmp_path)
     stem = "out"

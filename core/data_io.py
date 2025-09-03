@@ -283,6 +283,25 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     if rows is None:
         return []
 
+    # Common alias groups for statistic fields
+    val_keys = ("est", "mean", "value", "mu")
+    sd_keys = ("sd", "stderr", "se", "std", "stdev", "sigma")
+    lo_keys = ("ci_lo", "ci_low", "lo", "lower", "lo95")
+    hi_keys = ("ci_hi", "ci_high", "hi", "upper", "hi95")
+    qlo_keys = ("p2_5", "p2.5", "q025", "q2_5")
+    qhi_keys = ("p97_5", "p97.5", "q975", "q97_5")
+
+    def _pull(rec: Mapping[str, Any], keys: Sequence[str], idx: int | None = None):
+        for k in keys:
+            if k in rec and rec[k] is not None:
+                v = rec[k]
+                if isinstance(v, Mapping):
+                    v = _pull(v, keys, idx)
+                if idx is not None and isinstance(v, (list, tuple, np.ndarray)):
+                    return v[idx] if idx < len(v) else None
+                return v
+        return None
+
     # --- mapping-of-lists path (param -> {est:[...], sd:[...], ci_lo:[...], ...}) ---
     # Accepts legacy/alias param names like mu/x0/pos -> center, amp/amplitude -> height,
     # sigma/gamma/width -> fwhm, mix/mixing -> eta
@@ -321,8 +340,11 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
         def _vec_len(rec_alias: tuple[Mapping[str, Any], str]) -> int:
             rec, _ = rec_alias
             for key in (
-                "est","value","mean","median","sd","stderr","sigma",
-                "ci_lo","ci_hi","p2_5","p97_5","p2.5","p97.5","q2_5","q97_5","lo95","hi95"
+                "est","value","mean","median","mu",
+                "sd","stderr","se","std","stdev","sigma",
+                "ci_lo","ci_low","ci_hi","ci_high","lo","hi","lower","upper",
+                "p2_5","p97_5","p2.5","p97.5","q2_5","q97_5","q025","q975",
+                "lo95","hi95"
             ):
                 v = rec.get(key)
                 if isinstance(v, (list, tuple, np.ndarray)):
@@ -344,12 +366,12 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                 for pname in ("center", "height", "fwhm", "eta"):
                     rec, alias = blocks[pname]
                     rec = rec or {}
-                    est   = pick(rec.get("est")    or rec.get("value") or rec.get("mean") or rec.get("median"), i)
-                    sd    = pick(rec.get("sd")     or rec.get("stderr") or rec.get("std") or rec.get("stdev") or rec.get("sigma"), i)
-                    lo    = pick(rec.get("ci_lo")  or rec.get("lo95") or rec.get("lo"), i)
-                    hi    = pick(rec.get("ci_hi")  or rec.get("hi95") or rec.get("hi"), i)
-                    p2_5  = pick(rec.get("p2_5")   or rec.get("p2.5") or rec.get("q025") or rec.get("q2_5") or rec.get("lo95") or rec.get("ci_lo"), i)
-                    p97_5 = pick(rec.get("p97_5")  or rec.get("p97.5") or rec.get("q975") or rec.get("q97_5") or rec.get("hi95") or rec.get("ci_hi"), i)
+                    est   = pick(_pull(rec, val_keys), i)
+                    sd    = pick(_pull(rec, sd_keys), i)
+                    lo    = pick(_pull(rec, lo_keys), i)
+                    hi    = pick(_pull(rec, hi_keys), i)
+                    p2_5  = pick(_pull(rec, qlo_keys), i)
+                    p97_5 = pick(_pull(rec, qhi_keys), i)
 
                     if pname == "fwhm" and alias in {"sigma", "stddev", "width"}:
                         try:
@@ -434,12 +456,12 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                     row: Dict[str, Any] = {"index": pk + 1}
                     for j, pname in enumerate(("center", "height", "fwhm", "eta")):
                         rec = idx_map.get(pk * n_params + j, {})
-                        est   = rec.get("est")    or rec.get("value") or rec.get("mean")   or rec.get("median")
-                        sd    = rec.get("sd")     or rec.get("stderr") or rec.get("std") or rec.get("stdev") or rec.get("sigma")
-                        lo    = rec.get("ci_lo")  or rec.get("lo95") or rec.get("lo")
-                        hi    = rec.get("ci_hi")  or rec.get("hi95") or rec.get("hi")
-                        p2_5  = rec.get("p2_5")   or rec.get("p2.5")   or rec.get("q025")  or rec.get("q2_5") or rec.get("lo95") or rec.get("ci_lo")
-                        p97_5 = rec.get("p97_5")  or rec.get("p97.5")  or rec.get("q975")  or rec.get("q97_5") or rec.get("hi95") or rec.get("ci_hi")
+                        est   = _pull(rec, val_keys)
+                        sd    = _pull(rec, sd_keys)
+                        lo    = _pull(rec, lo_keys)
+                        hi    = _pull(rec, hi_keys)
+                        p2_5  = _pull(rec, qlo_keys)
+                        p97_5 = _pull(rec, qhi_keys)
                         if (
                             (lo is None or np.isnan(_to_float(lo))) and
                             (hi is None or np.isnan(_to_float(hi))) and
@@ -473,6 +495,69 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                         }
                     out.append(row)
                 return out
+
+        # param-indexed flat mapping like {'center1': {...}, 'height1': {...}, ...}
+        param_idx_re = re.compile(r"(.*?)(\d+)$")
+        tmp: Dict[int, Dict[str, Any]] = {}
+        ok_keys = set().union(*aliases.values())
+        for k, rec in rows_map.items():
+            name = str(k).strip().lower()
+            m = param_idx_re.match(name)
+            if not m:
+                continue
+            base, idx_s = m.group(1), m.group(2)
+            if base not in ok_keys:
+                continue
+            idx = int(idx_s)
+            blk = tmp.setdefault(idx, {"index": idx})
+            if base in aliases["center"]:
+                pname = "center"
+            elif base in aliases["height"]:
+                pname = "height"
+            elif base in aliases["fwhm"]:
+                pname = "fwhm"
+            elif base in aliases["eta"]:
+                pname = "eta"
+            else:
+                continue
+            est   = _pull(rec, val_keys)
+            sd    = _pull(rec, sd_keys)
+            lo    = _pull(rec, lo_keys)
+            hi    = _pull(rec, hi_keys)
+            p2_5  = _pull(rec, qlo_keys)
+            p97_5 = _pull(rec, qhi_keys)
+            if (
+                (lo is None or np.isnan(_to_float(lo))) and
+                (hi is None or np.isnan(_to_float(hi))) and
+                est is not None and sd is not None
+            ):
+                try:
+                    e = float(est); s = float(sd)
+                    lo, hi = e - _Z * s, e + _Z * s
+                except Exception:
+                    pass
+            if (
+                (p2_5 is None or np.isnan(_to_float(p2_5))) or
+                (p97_5 is None or np.isnan(_to_float(p97_5)))
+            ) and est is not None and sd is not None:
+                try:
+                    e = float(est); s = float(sd)
+                    if p2_5 is None or np.isnan(_to_float(p2_5)):
+                        p2_5 = e - _Z * s
+                    if p97_5 is None or np.isnan(_to_float(p97_5)):
+                        p97_5 = e + _Z * s
+                except Exception:
+                    pass
+            blk[pname] = {
+                "est": _to_float(est),
+                "sd": _to_float(sd),
+                "ci_lo": _to_float(lo),
+                "ci_hi": _to_float(hi),
+                "p2_5": _to_float(p2_5),
+                "p97_5": _to_float(p97_5),
+            }
+        if tmp:
+            return [tmp[i] for i in sorted(tmp)]
 
     # Helper pickers
     def pick(d, *keys):
@@ -659,19 +744,51 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
         def param_block(base: str) -> Mapping[str, float]:
             block = _as_mapping(rmap.get(base))
             if block:
-                est = block.get("est", block.get("value", block.get("mean", block.get("median", np.nan))))
-                sd = block.get("sd", block.get("stderr", block.get("sigma", np.nan)))
-                lo = block.get("ci_lo", block.get("lo95", block.get("lo", np.nan)))
-                hi = block.get("ci_hi", block.get("hi95", block.get("hi", np.nan)))
-                p2_5 = block.get("p2_5", block.get("p2.5", block.get("q2_5", block.get("lo95", block.get("ci_lo", np.nan)))))
-                p97_5 = block.get("p97_5", block.get("p97.5", block.get("q97_5", block.get("hi95", block.get("ci_hi", np.nan)))))
+                est = _pull(block, val_keys)
+                sd = _pull(block, sd_keys)
+                lo = _pull(block, lo_keys)
+                hi = _pull(block, hi_keys)
+                p2_5 = _pull(block, qlo_keys)
+                p97_5 = _pull(block, qhi_keys)
             else:
-                est = rmap.get(f"{base}_est", rmap.get(base, np.nan))
-                sd = rmap.get(f"{base}_sd", rmap.get(f"{base}_stderr", rmap.get(f"{base}_sigma", np.nan)))
-                lo = rmap.get(f"{base}_ci_lo", rmap.get(f"{base}_lo95", np.nan))
-                hi = rmap.get(f"{base}_ci_hi", rmap.get(f"{base}_hi95", np.nan))
-                p2_5 = rmap.get(f"{base}_p2_5", rmap.get(f"{base}_lo95", rmap.get(f"{base}_ci_lo", np.nan)))
-                p97_5 = rmap.get(f"{base}_p97_5", rmap.get(f"{base}_hi95", rmap.get(f"{base}_ci_hi", np.nan)))
+                est = (
+                    rmap.get(f"{base}_est")
+                    or rmap.get(f"{base}_mean")
+                    or rmap.get(f"{base}_value")
+                    or rmap.get(f"{base}_mu")
+                    or rmap.get(base)
+                )
+                sd = (
+                    rmap.get(f"{base}_sd")
+                    or rmap.get(f"{base}_stderr")
+                    or rmap.get(f"{base}_se")
+                    or rmap.get(f"{base}_std")
+                    or rmap.get(f"{base}_sigma")
+                )
+                lo = (
+                    rmap.get(f"{base}_ci_lo")
+                    or rmap.get(f"{base}_ci_low")
+                    or rmap.get(f"{base}_lo")
+                    or rmap.get(f"{base}_lower")
+                )
+                hi = (
+                    rmap.get(f"{base}_ci_hi")
+                    or rmap.get(f"{base}_ci_high")
+                    or rmap.get(f"{base}_hi")
+                    or rmap.get(f"{base}_upper")
+                )
+                p2_5 = (
+                    rmap.get(f"{base}_p2_5")
+                    or rmap.get(f"{base}_p2.5")
+                    or rmap.get(f"{base}_q025")
+                    or rmap.get(f"{base}_q2_5")
+                )
+                p97_5 = (
+                    rmap.get(f"{base}_p97_5")
+                    or rmap.get(f"{base}_p97.5")
+                    or rmap.get(f"{base}_q975")
+                    or rmap.get(f"{base}_q97_5")
+                )
             # synthesize CI if missing but sd present
             if (
                 (lo is None or np.isnan(_to_float(lo)))
@@ -785,18 +902,129 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
 
     diag = _as_mapping(m.get("diagnostics"))
 
+    params_map = _as_mapping(m.get("params"))
+    samples = params_map.get("samples") if isinstance(params_map, Mapping) else None
+    if samples is not None and len(params_map) <= 1:
+        m2 = dict(m)
+        m2.pop("params", None)
+        stats_tbl = _extract_stats_table(m2)
+    else:
+        stats_tbl = _extract_stats_table(m)
+    if not stats_tbl and samples is not None:
+        arr = np.asarray(samples, float)
+        if arr.ndim == 2 and arr.size:
+            mean = arr.mean(axis=0)
+            sd = arr.std(axis=0, ddof=1)
+            ci_lo = mean - _Z * sd
+            ci_hi = mean + _Z * sd
+            stats_tbl = []
+            n_peaks = mean.size // 4
+            for i in range(n_peaks):
+                idx = 4 * i
+                row = {
+                    "index": i + 1,
+                    "center": {
+                        "est": float(mean[idx + 0]),
+                        "sd": float(sd[idx + 0]),
+                        "ci_lo": float(ci_lo[idx + 0]),
+                        "ci_hi": float(ci_hi[idx + 0]),
+                        "p2_5": float(ci_lo[idx + 0]),
+                        "p97_5": float(ci_hi[idx + 0]),
+                    },
+                    "height": {
+                        "est": float(mean[idx + 1]),
+                        "sd": float(sd[idx + 1]),
+                        "ci_lo": float(ci_lo[idx + 1]),
+                        "ci_hi": float(ci_hi[idx + 1]),
+                        "p2_5": float(ci_lo[idx + 1]),
+                        "p97_5": float(ci_hi[idx + 1]),
+                    },
+                    "fwhm": {
+                        "est": float(mean[idx + 2]),
+                        "sd": float(sd[idx + 2]),
+                        "ci_lo": float(ci_lo[idx + 2]),
+                        "ci_hi": float(ci_hi[idx + 2]),
+                        "p2_5": float(ci_lo[idx + 2]),
+                        "p97_5": float(ci_hi[idx + 2]),
+                    },
+                    "eta": {
+                        "est": float(mean[idx + 3]),
+                        "sd": float(sd[idx + 3]),
+                        "ci_lo": float(ci_lo[idx + 3]),
+                        "ci_hi": float(ci_hi[idx + 3]),
+                        "p2_5": float(ci_lo[idx + 3]),
+                        "p97_5": float(ci_hi[idx + 3]),
+                    },
+                }
+                stats_tbl.append(row)
+    if not stats_tbl:
+        mean_vec = m.get("param_mean")
+        std_vec = m.get("param_std")
+        if mean_vec is not None and std_vec is not None:
+            mean = np.asarray(mean_vec, float)
+            sd = np.asarray(std_vec, float)
+            if mean.shape == sd.shape and mean.ndim == 1 and mean.size:
+                ci_lo = mean - _Z * sd
+                ci_hi = mean + _Z * sd
+                stats_tbl = []
+                n_peaks = mean.size // 4
+                for i in range(n_peaks):
+                    idx = 4 * i
+                    row = {
+                        "index": i + 1,
+                        "center": {
+                            "est": float(mean[idx + 0]),
+                            "sd": float(sd[idx + 0]),
+                            "ci_lo": float(ci_lo[idx + 0]),
+                            "ci_hi": float(ci_hi[idx + 0]),
+                            "p2_5": float(ci_lo[idx + 0]),
+                            "p97_5": float(ci_hi[idx + 0]),
+                        },
+                        "height": {
+                            "est": float(mean[idx + 1]),
+                            "sd": float(sd[idx + 1]),
+                            "ci_lo": float(ci_lo[idx + 1]),
+                            "ci_hi": float(ci_hi[idx + 1]),
+                            "p2_5": float(ci_lo[idx + 1]),
+                            "p97_5": float(ci_hi[idx + 1]),
+                        },
+                        "fwhm": {
+                            "est": float(mean[idx + 2]),
+                            "sd": float(sd[idx + 2]),
+                            "ci_lo": float(ci_lo[idx + 2]),
+                            "ci_hi": float(ci_hi[idx + 2]),
+                            "p2_5": float(ci_lo[idx + 2]),
+                            "p97_5": float(ci_hi[idx + 2]),
+                        },
+                        "eta": {
+                            "est": float(mean[idx + 3]),
+                            "sd": float(sd[idx + 3]),
+                            "ci_lo": float(ci_lo[idx + 3]),
+                            "ci_hi": float(ci_hi[idx + 3]),
+                            "p2_5": float(ci_lo[idx + 3]),
+                            "p97_5": float(ci_hi[idx + 3]),
+                        },
+                    }
+                    stats_tbl.append(row)
+    dof_val = m.get("dof")
+    if dof_val is None:
+        dof_val = m.get("d.o.f.")
+    if dof_val is None:
+        dof_val = m.get("degrees_of_freedom")
+
     out = {
         "label": canon,
         "method": method,
         "rmse": _to_float(m.get("rmse")),
-        "dof": int(m.get("dof", m.get("d.o.f.", m.get("degrees_of_freedom", 0))) or 0),
+        "dof": _to_float(dof_val),
         "backend": str(m.get("backend") or diag.get("backend") or m.get("engine") or ""),
         "n_draws": int(m.get("n_draws", m.get("samples", diag.get("n_draws", 0))) or 0),
         "n_boot": int(m.get("n_boot", m.get("bootstraps", diag.get("n_boot", diag.get("bootstraps", 0)))) or 0),
         "ess": _to_float(m.get("ess")),
         "rhat": _to_float(m.get("rhat")),
         "band": band,
-        "stats": _extract_stats_table(m),
+        "stats": stats_tbl,
+        "param_stats": stats_tbl,
     }
 
     if out["label"] == "unknown":
@@ -832,7 +1060,7 @@ def _iter_param_rows(
         unc_norm.get("label") or unc_norm.get("method") or "unknown"
     )
     rmse  = _to_float(unc_norm.get("rmse"))
-    dof   = int(unc_norm.get("dof", 0))
+    dof   = _to_float(unc_norm.get("dof"))
     backend = unc_norm.get("backend", "")
     n_draws = int(unc_norm.get("n_draws", 0))
     n_boot  = int(unc_norm.get("n_boot", 0))
@@ -1207,7 +1435,9 @@ def write_batch_uncertainty_long(
     Input rows may carry either p2_5/p97_5 or ci_lo/ci_hi; we map to p2_5/p97_5.
     """
     out_dir = Path(out_dir)
-    header = ["file","peak","param","value","stderr","ci_lo","ci_hi","method","rmse","dof"]
+    header = [
+        "file","peak","param","value","stderr","p2_5","p97_5","method","rmse","dof"
+    ]
 
     def _pick_quantiles(r: dict) -> tuple[float, float]:
         """
@@ -1243,7 +1473,7 @@ def write_batch_uncertainty_long(
 
     def _write(path: Path):
         with path.open("w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
+            w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n", extrasaction="ignore")
             w.writeheader()
             for r in rows:
                 val = _finite(r.get("value"), 0.0)

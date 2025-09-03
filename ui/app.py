@@ -221,6 +221,7 @@ from scipy.signal import find_peaks
 
 from core import signals
 import core.data_io as _dio
+import core.uncertainty as core_uncertainty
 try:
     from core.uncertainty import UncertaintyResult, NotAvailable
 except Exception:  # pragma: no cover - NotAvailable may be absent
@@ -2923,19 +2924,36 @@ class PeakFitApp:
                 "param_stats": param_stats,
             }
         elif method_key == "bootstrap":
-            cfg = {
+            r0 = resid_fn(theta)
+            J = jacobian_fd(resid_fn, theta)
+
+            def predict_full(th):
+                total = np.zeros_like(x_fit, float)
+                for i in range(len(self.peaks)):
+                    c, h, fw, eta = th[4 * i : 4 * (i + 1)]
+                    total += pseudo_voigt(x_fit, h, c, fw, eta)
+                if add_mode and base_fit is not None:
+                    total = total + base_fit
+                return total
+
+            fit_ctx = {
                 "x": x_fit,
                 "y": y_fit,
-                "peaks": self.peaks,
-                "mode": mode,
                 "baseline": base_fit,
-                "theta": theta,
-                "options": self._solver_options(self.bootstrap_solver_choice.get()),
-                "n": 100,
-                "workers": self._resolve_unc_workers(),
+                "mode": mode,
+                "predict_full": predict_full,
             }
-            res = bootstrap.bootstrap(self.bootstrap_solver_choice.get(), cfg, resid_fn)
-            out = dict(res) if isinstance(res, dict) else {"label": "unknown", "stats": []}
+            res = core_uncertainty.bootstrap_ci(
+                theta=theta,
+                residual=r0,
+                jacobian=J,
+                predict_full=predict_full,
+                fit_ctx=fit_ctx,
+                n_boot=int(self.bootstrap_n.get()),
+                seed=(int(self.bootstrap_seed.get()) or None),
+                workers=int(self.perf_max_workers.get()),
+            )
+            out = res
         elif method_key == "bayesian":
             init = {
                 "x": x_fit,
@@ -2986,19 +3004,22 @@ class PeakFitApp:
         return bool(cfg.get("batch_compute_uncertainty", cfg.get("compute_uncertainty_batch", True)))
 
     def _export_uncertainty_from_result(self, unc_norm, out_base: Path, file_path: str, *, write_wide: bool = True):
-        # Always write long CSV and optional wide CSV
-        write_uncertainty_csvs(out_base, file_path, unc_norm, write_wide=write_wide)
+        saved: list[str] = []
+        long_csv, wide_csv = write_uncertainty_csvs(out_base, file_path, unc_norm, write_wide=write_wide)
+        saved.append(str(long_csv))
+        if wide_csv:
+            saved.append(str(wide_csv))
 
-        # Write a text report (use the canonical label in the header)
+        txt_path = out_base.with_name(out_base.name + "_uncertainty.txt")
         write_uncertainty_txt(
-            out_base.with_name(out_base.name + "_uncertainty.txt"),
+            txt_path,
             unc_norm,
             peaks=self.peaks,
             method_label=str(unc_norm.get("label", "")),
             file_path=file_path,
         )
+        saved.append(str(txt_path))
 
-        # Optional CI band (write whenever present)
         band = unc_norm.get("band")
         if band is not None:
             xb, lob, hib = band
@@ -3011,6 +3032,11 @@ class PeakFitApp:
                     if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
                         continue
                     w.writerow([float(xi), float(lo), float(hi)])
+            saved.append(str(band_csv))
+
+        for p in saved:
+            self.log(f"  wrote: {p}")
+        return saved
     # --- END: batch uncertainty helpers ---
 
     def run_uncertainty(self):
@@ -3679,6 +3705,8 @@ class PeakFitApp:
                     saved_unc.append(str(band_csv))
 
                 self.log(f"Exported uncertainty ({label}).")
+                for pth in saved_unc:
+                    self.log(f"  wrote: {pth}")
             else:
                 self.log("Export: no peaks, uncertainty not computed.")
         except Exception as e:  # pragma: no cover - defensive
@@ -3686,6 +3714,8 @@ class PeakFitApp:
 
         saved.extend(saved_unc)
         saved_lines = [str(p) for p in saved if p]
+        for p in saved_lines:
+            self.log(f"Export: wrote {p}")
         messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved_lines))
 
 

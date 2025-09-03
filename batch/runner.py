@@ -22,7 +22,7 @@ if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safegu
     os.environ.setdefault("MPLBACKEND", "Agg")
 
 from core import data_io, models, peaks, signals, fit_api
-from core.residuals import build_residual
+from core.residuals import build_residual, build_residual_jac
 from core import uncertainty as unc
 
 
@@ -297,17 +297,33 @@ def run_batch(
                 elif "bayes" in mode_lower or "mcmc" in mode_lower:
                     unc_res = unc.bayesian_ci(fit_ctx=res)
                 else:
-                    # Choose model evaluator key safely
+                    rj = res.get("residual_jac")
+                    if rj is not None:
+                        def _residual(theta):
+                            return rj(theta)[0]
+                        def _jacobian(theta):
+                            return rj(theta)[1]
+                    else:
+                        residual_fn = res.get("residual_fn")
+                        jac_arr = res.get("jacobian")
+                        if residual_fn is None or jac_arr is None:
+                            raise KeyError("fit_ctx missing residual_jac")
+                        def _residual(theta):
+                            return residual_fn(theta)
+                        def _jacobian(theta):
+                            return jac_arr
                     model_eval = res.get("predict_full") or res.get("ymodel_fn")
                     if model_eval is None:
-                        raise KeyError("fit_ctx missing model evaluator: expected 'predict_full' or 'ymodel_fn'")
+                        raise KeyError("fit_ctx missing model evaluator")
                     unc_res = unc.asymptotic_ci(
                         res["theta"],
-                        res["residual_fn"],
-                        res["jacobian"],
+                        _residual,
+                        _jacobian,
                         model_eval,
                     )
-            except Exception:
+            except Exception as exc:
+                if log:
+                    log(f"{Path(path).name}: {exc}")
                 unc_res = None
 
         if unc_res is not None:
@@ -318,8 +334,15 @@ def run_batch(
                 unc_norm.get("label") or unc_method_canon
             )
             unc_norm["label"] = method_lbl
-            unc_norm["rmse"] = _rmse = rmse if math.isfinite(rmse) else 0.0
-            unc_norm["dof"] = max(1, int(res.get("dof", 0))) if isinstance(res, dict) else 1
+            unc_norm["rmse"] = rmse if math.isfinite(rmse) else 0.0
+            dof_raw = unc_norm.get("dof")
+            try:
+                dof_val = float(dof_raw)
+            except Exception:
+                dof_val = float("nan")
+            if not math.isfinite(dof_val):
+                dof_val = float(res.get("dof", 1)) if isinstance(res, dict) else 1.0
+            unc_norm["dof"] = max(1, int(dof_val))
 
             data_io.write_uncertainty_txt(
                 out_dir / f"{stem}_uncertainty.txt",
