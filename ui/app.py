@@ -355,17 +355,30 @@ def load_config():
             elif sc == "lmfit":
                 cfg["solver_choice"] = "lmfit_vp"
             cfg.pop("ui_theme", None)
-            if "baseline_defaults" not in cfg:
-                cfg["baseline_defaults"] = {
-                    "method": "als",
-                    "als": {
-                        "lam": cfg.get("als_lam", 1e5),
-                        "p": cfg.get("als_asym", 0.001),
-                        "niter": cfg.get("als_niter", 10),
-                        "thresh": cfg.get("als_thresh", 0.0),
-                    },
-                    "polynomial": {"degree": 2, "normalize_x": True},
-                }
+            # Migration: if the user file lacked baseline_defaults, construct
+            # one from any legacy ALS keys present.  We look at the original
+            # ``data`` rather than the merged cfg so that default values don't
+            # mask legacy settings the user supplied.
+            if "baseline_defaults" not in data:
+                has_legacy = any(
+                    k in data for k in ("als_lam", "als_asym", "als_niter", "als_thresh")
+                )
+                if has_legacy:
+                    als_block = {
+                        "lam": float(cfg.get("als_lam", 1e5)),
+                        "p": float(cfg.get("als_asym", 0.001)),
+                        "niter": int(cfg.get("als_niter", 10)),
+                        "thresh": float(cfg.get("als_thresh", 0.0)),
+                    }
+                    existing_bd = cfg.get("baseline_defaults", {})
+                    poly_block = (
+                        existing_bd.get("polynomial") if isinstance(existing_bd, dict) else None
+                    ) or {"degree": 2, "normalize_x": True}
+                    cfg["baseline_defaults"] = {
+                        "method": "als",
+                        "als": als_block,
+                        "polynomial": poly_block,
+                    }
             return cfg
         except Exception:
             return dict(DEFAULTS)
