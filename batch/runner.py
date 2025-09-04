@@ -22,7 +22,7 @@ if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safegu
     os.environ.setdefault("MPLBACKEND", "Agg")
 
 from core import data_io, models, peaks, signals, fit_api
-from core.residuals import build_residual, build_residual_jac
+from core.residuals import build_residual, jacobian_fd
 from core import uncertainty as unc
 
 
@@ -290,35 +290,65 @@ def run_batch(
         if res["fit_ok"] and fitted and compute_uncertainty:
             try:
                 mode_lower = unc_method_canon.lower()
+
+                theta_hat = res["theta"]
+                x_fit = np.asarray(res.get("x_fit") or res.get("x"), float)
+                y_fit = np.asarray(res.get("y_fit") or res.get("y"), float)
+                peaks_obj = res.get("peaks", [])
+                base_fit = res.get("baseline")
+                mode = res.get("mode", "add")
+
+                rj = res.get("residual_jac")
+                residual_fn = res.get("residual_fn")
+                if residual_fn is None and rj is not None:
+                    residual_fn = lambda th: rj(th)[0]
+                if residual_fn is None:
+                    residual_fn = build_residual(x_fit, y_fit, peaks_obj, mode, base_fit, "linear", None)
+
+                jac = res.get("jacobian")
+                if jac is None and rj is not None:
+                    jac = lambda th: rj(th)[1]
+                if jac is None:
+                    jac = jacobian_fd(residual_fn, theta_hat)
+                J = jac(theta_hat) if callable(jac) else jac
+
+                model_eval = res.get("predict_full") or res.get("ymodel_fn")
+                if model_eval is None:
+                    def model_eval(th):
+                        total = np.zeros_like(x_fit, float)
+                        for i in range(len(peaks_obj)):
+                            c, h, fw, eta = th[4 * i : 4 * (i + 1)]
+                            total += models.pseudo_voigt(x_fit, h, c, fw, eta)
+                        if mode == "add" and base_fit is not None:
+                            total = total + base_fit
+                        return total
+
+                fit_ctx = dict(res)
+                fit_ctx.update({"residual_fn": residual_fn, "predict_full": model_eval, "x_all": x_fit})
+
                 if "boot" in mode_lower:
+                    r0 = residual_fn(theta_hat)
                     unc_res = unc.bootstrap_ci(
-                        fit_ctx=res, n_boot=100, workers=unc_workers
+                        theta=theta_hat,
+                        residual=r0,
+                        jacobian=J,
+                        predict_full=model_eval,
+                        fit_ctx=fit_ctx,
+                        n_boot=100,
+                        workers=unc_workers,
                     )
                 elif "bayes" in mode_lower or "mcmc" in mode_lower:
-                    unc_res = unc.bayesian_ci(fit_ctx=res)
+                    unc_res = unc.bayesian_ci(
+                        theta_hat=theta_hat,
+                        model=model_eval,
+                        residual_fn=residual_fn,
+                        fit_ctx=fit_ctx,
+                    )
                 else:
-                    rj = res.get("residual_jac")
-                    if rj is not None:
-                        def _residual(theta):
-                            return rj(theta)[0]
-                        def _jacobian(theta):
-                            return rj(theta)[1]
-                    else:
-                        residual_fn = res.get("residual_fn")
-                        jac_arr = res.get("jacobian")
-                        if residual_fn is None or jac_arr is None:
-                            raise KeyError("fit_ctx missing residual_jac")
-                        def _residual(theta):
-                            return residual_fn(theta)
-                        def _jacobian(theta):
-                            return jac_arr
-                    model_eval = res.get("predict_full") or res.get("ymodel_fn")
-                    if model_eval is None:
-                        raise KeyError("fit_ctx missing model evaluator")
                     unc_res = unc.asymptotic_ci(
-                        res["theta"],
-                        _residual,
-                        _jacobian,
+                        theta_hat,
+                        residual_fn,
+                        (lambda _th: J),
                         model_eval,
                     )
             except Exception as exc:

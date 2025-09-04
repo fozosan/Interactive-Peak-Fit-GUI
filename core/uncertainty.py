@@ -422,7 +422,7 @@ def bootstrap_ci(*args: Any, fit_ctx: Optional[Dict[str, Any]] = None, **kwargs:
         theta = kwargs.pop("theta", kwargs.pop("theta_hat", None))
         residual = kwargs.pop("residual")
         jac = kwargs.pop("jacobian")
-        predict_full = kwargs.pop("predict_full", kwargs.pop("predict_fn"))
+        predict_full = kwargs.pop("predict_full", kwargs.pop("predict_fn", None))
         bounds = kwargs.pop("bounds", None)
         param_names = kwargs.pop("param_names", None)
         locked_mask = kwargs.pop("locked_mask", None)
@@ -618,6 +618,10 @@ def bayesian_ci(
     if "return_band" in kwargs:
         return_band = bool(kwargs.pop("return_band"))
 
+    residual_fn_kw = kwargs.pop("residual_fn", None)
+    param_names_kw = kwargs.pop("param_names", None)
+    locked_mask_kw = kwargs.pop("locked_mask", None)
+
     for k in list(kwargs.keys()):
         log.debug("bayesian_ci ignoring argument %s", k)
         kwargs.pop(k)
@@ -631,10 +635,10 @@ def bayesian_ci(
         fit = {
             "theta": np.asarray(theta_hat, float) if theta_hat is not None else None,
             "predict_full": model,
-            "residual_fn": kwargs.get("residual_fn"),
+            "residual_fn": residual_fn_kw,
             "bounds": bounds,
-            "param_names": kwargs.get("param_names"),
-            "locked_mask": kwargs.get("locked_mask"),
+            "param_names": param_names_kw,
+            "locked_mask": locked_mask_kw,
             "x": x_all,
             "baseline": base_all,
             "mode": "add" if add_mode else "subtract",

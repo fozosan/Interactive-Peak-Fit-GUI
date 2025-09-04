@@ -251,7 +251,6 @@ if lmfit_backend is not None:
     BACKENDS["lmfit_vp"] = lmfit_backend
 from infra import performance
 from batch import runner as batch_runner
-from uncertainty import asymptotic, bayes, bootstrap
 
 MODERN_LOSSES = ["linear", "soft_l1", "huber", "cauchy"]
 MODERN_WEIGHTS = ["none", "poisson", "inv_y"]
@@ -1405,6 +1404,17 @@ class PeakFitApp:
     def _on_unc_workers_change(self, *_):
         self.cfg["unc_workers"] = int(self.unc_workers_var.get())
         save_config(self.cfg)
+
+    def _get_int(self, name: str, default: int) -> int:
+        try:
+            v = getattr(self, name)
+            return int(v.get()) if hasattr(v, "get") else int(v)
+        except Exception:
+            try:
+                cfg_val = int(self.cfg.get(name, self.cfg.get(f"unc_{name}", default)))
+                return cfg_val
+            except Exception:
+                return default
 
     def _resolve_unc_workers(self) -> int:
         w = int(self.unc_workers_var.get())
@@ -2941,30 +2951,51 @@ class PeakFitApp:
                 "y": y_fit,
                 "baseline": base_fit,
                 "mode": mode,
+                "residual_fn": (lambda th: resid_fn(th)),
                 "predict_full": predict_full,
+                "x_all": x_fit,
             }
+
+            n_boot = self._get_int("bootstrap_n", 200)
+            seed_val = self._get_int("bootstrap_seed", 0) or None
+            workers = self._get_int("perf_max_workers", 0)
+
             res = core_uncertainty.bootstrap_ci(
                 theta=theta,
                 residual=r0,
                 jacobian=J,
                 predict_full=predict_full,
                 fit_ctx=fit_ctx,
-                n_boot=int(self.bootstrap_n.get()),
-                seed=(int(self.bootstrap_seed.get()) or None),
-                workers=int(self.perf_max_workers.get()),
+                n_boot=n_boot,
+                seed=seed_val,
+                workers=workers,
             )
             out = res
         elif method_key == "bayesian":
-            init = {
+            def predict_full(th):
+                total = np.zeros_like(x_fit, float)
+                for i in range(len(self.peaks)):
+                    c, h, fw, eta = th[4 * i : 4 * (i + 1)]
+                    total += pseudo_voigt(x_fit, h, c, fw, eta)
+                if add_mode and base_fit is not None:
+                    total = total + base_fit
+                return total
+
+            fit_ctx = {
                 "x": x_fit,
                 "y": y_fit,
-                "peaks": self.peaks,
-                "mode": mode,
                 "baseline": base_fit,
-                "theta": theta,
+                "mode": mode,
+                "residual_fn": (lambda th: resid_fn(th)),
+                "predict_full": predict_full,
+                "x_all": x_fit,
             }
-            res = bayes.bayesian({}, "gaussian", init, {}, resid_fn)
-            out = dict(res) if isinstance(res, dict) else {"label": "unknown", "stats": []}
+            out = core_uncertainty.bayesian_ci(
+                theta_hat=theta,
+                model=predict_full,
+                residual_fn=(lambda th: resid_fn(th)),
+                fit_ctx=fit_ctx,
+            )
         else:
             return {"label": "unknown", "stats": []}
 
@@ -2980,7 +3011,29 @@ class PeakFitApp:
                             if isinstance(v, np.ndarray):
                                 blk[k] = v.tolist()
 
-        return _normalize_unc_result(out)
+        # --- Inject RMSE and DoF so exports have meaningful values (parity with batch) ---
+        try:
+            r = np.asarray(resid_fn(theta), float)
+            rmse_val = float(np.sqrt(np.mean(r ** 2))) if r.size else float("nan")
+            dof_val = max(1, int(r.size - int(theta.size)))
+        except Exception:
+            rmse_val = float("nan")
+            dof_val = 1
+
+        norm = _normalize_unc_result(out)
+        if isinstance(norm, dict):
+            if not np.isfinite(norm.get("rmse", float("nan"))):
+                norm["rmse"] = rmse_val if np.isfinite(rmse_val) else 0.0
+            # tolerate float dof in norm and coerce to int≥1
+            try:
+                dv = float(norm.get("dof", float("nan")))
+            except Exception:
+                dv = float("nan")
+            if not np.isfinite(dv):
+                norm["dof"] = dof_val
+            else:
+                norm["dof"] = max(1, int(dv))
+        return norm
 
     def _batch_unc_enabled(self) -> bool:
         """
@@ -3102,119 +3155,73 @@ class PeakFitApp:
                     "param_stats": param_stats,
                 }
             if method == "bootstrap":
-                cfg = {
+                n_boot = self._get_int("bootstrap_n", 200)
+                seed_val = self._get_int("bootstrap_seed", 0) or None
+                workers = self._get_int("perf_max_workers", 0)
+
+                r0 = resid_fn(theta)
+                J = jacobian_fd(resid_fn, theta)
+
+                def predict_full(th):
+                    total = np.zeros_like(x_fit, float)
+                    for i in range(len(self.peaks)):
+                        c, h, fw, eta = th[4 * i : 4 * (i + 1)]
+                        total += pseudo_voigt(x_fit, h, c, fw, eta)
+                    if add_mode and base_fit is not None:
+                        total = total + base_fit
+                    return total
+
+                fit_ctx = {
                     "x": x_fit,
                     "y": y_fit,
-                    "peaks": self.peaks,
-                    "mode": mode,
                     "baseline": base_fit,
-                    "theta": theta,
-                    "options": self._solver_options(self.bootstrap_solver_choice.get()),
-                    "n": 100,
-                    "workers": self._resolve_unc_workers(),
+                    "mode": mode,
+                    "residual_fn": (lambda th: resid_fn(th)),
+                    "predict_full": predict_full,
+                    "x_all": x_fit,
                 }
-                res = bootstrap.bootstrap(self.bootstrap_solver_choice.get(), cfg, resid_fn)
+
+                out = core_uncertainty.bootstrap_ci(
+                    theta=theta,
+                    residual=r0,
+                    jacobian=J,
+                    predict_full=predict_full,
+                    fit_ctx=fit_ctx,
+                    n_boot=n_boot,
+                    seed=seed_val,
+                    workers=workers,
+                )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
-                if isinstance(res, dict):
-                    cb = res.get("curve_band") or {}
-                    if isinstance(cb, dict) and {"x", "lo", "hi"} <= set(cb.keys()):
-                        res["band"] = (cb.get("x"), cb.get("lo"), cb.get("hi"))
-                    if "params" in res and "param_stats" not in res:
-                        try:
-                            params = res.get("params", {})
-                            th = np.asarray(params.get("theta", []), float)
-                            cov = params.get("cov")
-                            sd = (
-                                np.sqrt(np.diag(np.asarray(cov, float)))
-                                if cov is not None and np.size(cov) > 0
-                                else None
-                            )
-                            samples = params.get("samples")
-                            p_lo = p_hi = None
-                            if samples is not None and np.size(samples) > 0:
-                                samp = np.asarray(samples, float)
-                                p_lo = np.quantile(samp, 0.025, axis=0)
-                                p_hi = np.quantile(samp, 0.975, axis=0)
-
-                            def slice_stats(idx: int) -> Dict[str, Any]:
-                                est = th[idx::4].tolist() if th.size else None
-                                sd_i = sd[idx::4].tolist() if sd is not None else None
-                                d: Dict[str, Any] = {"est": est, "sd": sd_i}
-                                if p_lo is not None and p_hi is not None:
-                                    d["p2_5"] = p_lo[idx::4].tolist()
-                                    d["p97_5"] = p_hi[idx::4].tolist()
-                                return d
-
-                            res["param_stats"] = {
-                                "center": slice_stats(0),
-                                "height": slice_stats(1),
-                                "fwhm": slice_stats(2),
-                                "eta": slice_stats(3),
-                            }
-                        except Exception:
-                            pass
-                    # Ensure param_stats arrays are lists
-                    ps = res.get("param_stats")
-                    if isinstance(ps, dict):
-                        for blk in ps.values():
-                            if isinstance(blk, dict):
-                                for k, v in blk.items():
-                                    if isinstance(v, np.ndarray):
-                                        blk[k] = v.tolist()
-                return res
+                return out
             if method == "bayesian":
-                init = {"x": x_fit, "y": y_fit, "peaks": self.peaks, "mode": mode,
-                        "baseline": base_fit, "theta": theta}
-                res = bayes.bayesian({}, "gaussian", init, {}, resid_fn)
+                def predict_full(th):
+                    total = np.zeros_like(x_fit, float)
+                    for i in range(len(self.peaks)):
+                        c, h, fw, eta = th[4 * i : 4 * (i + 1)]
+                        total += pseudo_voigt(x_fit, h, c, fw, eta)
+                    if add_mode and base_fit is not None:
+                        total = total + base_fit
+                    return total
+
+                fit_ctx = {
+                    "x": x_fit,
+                    "y": y_fit,
+                    "baseline": base_fit,
+                    "mode": mode,
+                    "residual_fn": (lambda th: resid_fn(th)),
+                    "predict_full": predict_full,
+                    "x_all": x_fit,
+                }
+                out = core_uncertainty.bayesian_ci(
+                    theta_hat=theta,
+                    model=predict_full,
+                    residual_fn=(lambda th: resid_fn(th)),
+                    fit_ctx=fit_ctx,
+                )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
-                if isinstance(res, dict):
-                    cb = res.get("curve_band") or {}
-                    if isinstance(cb, dict) and {"x", "lo", "hi"} <= set(cb.keys()):
-                        res["band"] = (cb.get("x"), cb.get("lo"), cb.get("hi"))
-                    if "params" in res and "param_stats" not in res:
-                        try:
-                            params = res.get("params", {})
-                            th = np.asarray(params.get("theta", []), float)
-                            cov = params.get("cov")
-                            sd = (
-                                np.sqrt(np.diag(np.asarray(cov, float)))
-                                if cov is not None and np.size(cov) > 0
-                                else None
-                            )
-                            samples = params.get("samples")
-                            p_lo = p_hi = None
-                            if samples is not None and np.size(samples) > 0:
-                                samp = np.asarray(samples, float)
-                                p_lo = np.quantile(samp, 0.025, axis=0)
-                                p_hi = np.quantile(samp, 0.975, axis=0)
-
-                            def slice_stats(idx: int) -> Dict[str, Any]:
-                                est = th[idx::4].tolist() if th.size else None
-                                sd_i = sd[idx::4].tolist() if sd is not None else None
-                                d: Dict[str, Any] = {"est": est, "sd": sd_i}
-                                if p_lo is not None and p_hi is not None:
-                                    d["p2_5"] = p_lo[idx::4].tolist()
-                                    d["p97_5"] = p_hi[idx::4].tolist()
-                                return d
-
-                            res["param_stats"] = {
-                                "center": slice_stats(0),
-                                "height": slice_stats(1),
-                                "fwhm": slice_stats(2),
-                                "eta": slice_stats(3),
-                            }
-                        except Exception:
-                            pass
-                    ps = res.get("param_stats")
-                    if isinstance(ps, dict):
-                        for blk in ps.values():
-                            if isinstance(blk, dict):
-                                for k, v in blk.items():
-                                    if isinstance(v, np.ndarray):
-                                        blk[k] = v.tolist()
-                return res
+                return out
             return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
 
         def done(result, error):

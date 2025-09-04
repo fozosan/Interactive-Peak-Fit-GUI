@@ -892,7 +892,7 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
 
     # Pull band in a tolerant way
     band = None
-    for key in ("band", "prediction_band", "ci_band"):
+    for key in ("band", "prediction_band", "ci_band", "curve_band"):
         if key in m and m[key] is not None:
             b = m[key]
             if isinstance(b, (list, tuple)) and len(b) >= 3:
@@ -903,13 +903,23 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
     diag = _as_mapping(m.get("diagnostics"))
 
     params_map = _as_mapping(m.get("params"))
-    samples = params_map.get("samples") if isinstance(params_map, Mapping) else None
-    if samples is not None and len(params_map) <= 1:
-        m2 = dict(m)
-        m2.pop("params", None)
-        stats_tbl = _extract_stats_table(m2)
-    else:
-        stats_tbl = _extract_stats_table(m)
+    posterior_map = _as_mapping(m.get("posterior"))
+    samples = None
+    for cand in (
+        params_map.get("samples"),
+        posterior_map.get("samples"),
+        m.get("theta_samples"),
+        m.get("samples"),
+    ):
+        if cand is not None:
+            samples = cand
+            break
+    m_for_table = dict(m)
+    if params_map.get("samples") is not None and len(params_map) <= 1:
+        m_for_table.pop("params", None)
+    if posterior_map.get("samples") is not None and len(posterior_map) <= 1:
+        m_for_table.pop("posterior", None)
+    stats_tbl = _extract_stats_table(m_for_table)
     if not stats_tbl and samples is not None:
         arr = np.asarray(samples, float)
         if arr.ndim == 2 and arr.size:
@@ -958,8 +968,26 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
                 }
                 stats_tbl.append(row)
     if not stats_tbl:
-        mean_vec = m.get("param_mean")
-        std_vec = m.get("param_std")
+        mean_vec = None
+        for cand in (
+            m.get("param_mean"),
+            m.get("theta_mean"),
+            params_map.get("mean"),
+            posterior_map.get("mean"),
+        ):
+            if cand is not None:
+                mean_vec = cand
+                break
+        std_vec = None
+        for cand in (
+            m.get("param_std"),
+            m.get("theta_std"),
+            params_map.get("std"),
+            posterior_map.get("std"),
+        ):
+            if cand is not None:
+                std_vec = cand
+                break
         if mean_vec is not None and std_vec is not None:
             mean = np.asarray(mean_vec, float)
             sd = np.asarray(std_vec, float)
