@@ -1009,13 +1009,26 @@ class PeakFitApp:
         )
         method_cb.pack(side=tk.LEFT)
         method_cb.bind("<<ComboboxSelected>>", self._on_base_method_change)
+        add_tooltip(
+            method_cb,
+            "Choose baseline method:\n"
+            "- ALS: Smooth, asymmetric penalization (λ, p, iterations, threshold)\n"
+            "- Polynomial: Weighted LS polynomial (degree, optional x-normalization)\n"
+            "Tip: Use 'Save as default' to persist your choice."
+        )
 
         mode_row = ttk.Frame(baseline_box); mode_row.pack(fill=tk.X, pady=2)
         ttk.Label(mode_row, text="Mode:").pack(side=tk.LEFT)
         ttk.Radiobutton(mode_row, text="Add to fit", variable=self.baseline_mode, value="add", command=self.refresh_plot).pack(side=tk.LEFT)
         ttk.Radiobutton(mode_row, text="Subtract",  variable=self.baseline_mode, value="subtract", command=self.refresh_plot).pack(side=tk.LEFT, padx=4)
 
-        ttk.Checkbutton(baseline_box, text="Baseline uses fit range", variable=self.baseline_use_range).pack(anchor="w", pady=(2,0))
+        _chk_range = ttk.Checkbutton(baseline_box, text="Baseline uses fit range", variable=self.baseline_use_range)
+        _chk_range.pack(anchor="w", pady=(2,0))
+        add_tooltip(
+            _chk_range,
+            "When enabled, baseline is estimated only within the current fit window.\n"
+            "Outside the window, the result is smoothly extended."
+        )
 
         self.als_frame = ttk.Frame(baseline_box)
         row = ttk.Frame(self.als_frame); row.pack(fill=tk.X, pady=2)
@@ -1032,13 +1045,30 @@ class PeakFitApp:
 
         self.poly_frame = ttk.Frame(baseline_box)
         ttk.Label(self.poly_frame, text="Degree:").pack(side=tk.LEFT)
-        ttk.Spinbox(self.poly_frame, from_=0, to=10, width=5, textvariable=self.poly_degree_var).pack(side=tk.LEFT, padx=4)
-        ttk.Checkbutton(self.poly_frame, text="Normalize x to [-1,1]", variable=self.poly_norm_var).pack(side=tk.LEFT, padx=4)
+        _poly_deg = ttk.Spinbox(self.poly_frame, from_=0, to=10, width=5, textvariable=self.poly_degree_var)
+        _poly_deg.pack(side=tk.LEFT, padx=4)
+        add_tooltip(
+            _poly_deg,
+            "Polynomial degree.\n"
+            "If the fit range has too few points, the effective degree is clamped to N-1.\n"
+            "The UI will auto-reduce and display a status message."
+        )
+        _poly_norm = ttk.Checkbutton(self.poly_frame, text="Normalize x to [-1,1]", variable=self.poly_norm_var)
+        _poly_norm.pack(side=tk.LEFT, padx=4)
+        add_tooltip(
+            _poly_norm,
+            "Improves numerical conditioning by mapping x to [-1, 1] for the fit."
+        )
 
         self._update_baseline_frames()
 
         ttk.Button(baseline_box, text="Recompute baseline", command=self.compute_baseline).pack(side=tk.LEFT, pady=2)
-        ttk.Button(baseline_box, text="Save as default", command=self.save_baseline_default).pack(side=tk.LEFT, padx=4)
+        _save_default_btn = ttk.Button(baseline_box, text="Save as default", command=self.save_baseline_default)
+        _save_default_btn.pack(side=tk.LEFT, padx=4)
+        add_tooltip(
+            _save_default_btn,
+            "Persist the current baseline method and its parameters as the default for future sessions."
+        )
         ttk.Label(baseline_box, textvariable=self.snr_text).pack(side=tk.LEFT, padx=8)
 
         # Eta box
