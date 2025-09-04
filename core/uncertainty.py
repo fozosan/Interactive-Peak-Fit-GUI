@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union, List
 
 import logging
 import warnings
+import time
 
 import numpy as np
 import pandas as pd
@@ -385,194 +386,169 @@ def asymptotic_ci(
     )
 
 
-# ---------------------------------------------------------------------------
-# Residual bootstrap
-# ---------------------------------------------------------------------------
+def bootstrap_ci(
+    theta: np.ndarray,
+    residual: np.ndarray,
+    jacobian: np.ndarray,
+    *,
+    predict_full=None,
+    x_all: Optional[np.ndarray] = None,
+    y_all: Optional[np.ndarray] = None,
+    bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    param_names: Optional[Sequence[str]] = None,
+    locked_mask: Optional[np.ndarray] = None,
+    fit_ctx: Optional[Dict[str, Any]] = None,
+    n_boot: int = 1000,
+    seed: Optional[int] = None,
+    workers: int = 0,
+    alpha: float = 0.05,
+    center_residuals: bool = True,
+    return_band: bool = False,
+) -> UncertaintyResult:
+    """Residual bootstrap with refitting through ``fit_ctx``."""
 
-def bootstrap_ci(*args: Any, fit_ctx: Optional[Dict[str, Any]] = None, **kwargs: Any) -> UncertaintyResult:
-    """Residual bootstrap with extensive compatibility shim.
+    t0 = float(time.time())
+    theta = np.asarray(theta, float)
+    r = np.asarray(residual, float)
+    jacobian = np.asarray(jacobian, float)  # unused, kept for API parity
+    if center_residuals:
+        r = r - r.mean()
 
-    ``fit_ctx`` may supply ``predict_full`` and ``x_all`` used for
-    prediction band construction.  When omitted the information is extracted
-    from the provided fit object if possible.
-    """
+    if x_all is None or y_all is None:
+        raise ValueError("x_all and y_all required for residual bootstrap")
 
-    alias_map = {
-        "n": "n_boot",
-        "n_resamples": "n_boot",
-        "seed_root": "seed",
-        "random_state": "seed",
-        "max_workers": "workers",
-        "n_jobs": "workers",
-        "return_bands": "return_band",
-        "prediction_band": "return_band",
-        "conf_alpha": "alpha",
-        "band_alpha": "alpha",
-    }
-    for old, new in list(alias_map.items()):
-        if old in kwargs and new not in kwargs:
-            kwargs[new] = kwargs.pop(old)
+    refit = None
+    if fit_ctx:
+        if callable(fit_ctx.get("refit")):
+            refit = fit_ctx["refit"]
+        elif hasattr(fit_ctx.get("solver_adapter", None), "refit"):
+            refit = fit_ctx["solver_adapter"].refit
+    if refit is None:
+        from . import fit_api as _fit_api
+        from .data_io import peaks_to_dicts
 
-    band_percentiles = kwargs.pop("band_percentiles", None)
-    n_boot = int(kwargs.pop("n_boot", 300))
-    seed = kwargs.pop("seed", None)
-    workers = int(kwargs.pop("workers", 0))
-    alpha = float(kwargs.pop("alpha", 0.05))
-    return_band = bool(kwargs.pop("return_band", True))
-    if band_percentiles is not None:
+        peaks_obj = fit_ctx.get("peaks") if fit_ctx else None
+        mode = (fit_ctx.get("mode") if fit_ctx else "add") or "add"
+        baseline = fit_ctx.get("baseline") if fit_ctx else None
+        solver = (fit_ctx.get("solver") if fit_ctx else None) or "classic"
+
+        def refit(theta_init, locked_mask, bounds, x, y):
+            cfg = {"solver": solver, "mode": mode, "peaks": peaks_to_dicts(peaks_obj)}
+            res = _fit_api.run_fit_consistent(
+                x,
+                y,
+                cfg,
+                theta_init=theta_init,
+                locked_mask=locked_mask,
+                bounds=bounds,
+                baseline=baseline,
+            )
+            if not res.get("fit_ok", False):
+                raise RuntimeError("refit failed")
+            return np.asarray(res["theta"], float)
+
+    P = theta.size
+    free_mask = np.ones(P, bool) if locked_mask is None else ~np.asarray(locked_mask, bool)
+
+    def one_boot(i: int) -> Optional[np.ndarray]:
+        local = np.random.default_rng(None if seed is None else seed + i)
+        idx = local.integers(0, r.size, size=r.size)
+        r_star = r[idx]
+        y_hat = y_all - residual
+        y_star = y_hat + r_star
         try:
-            lo_p, hi_p = band_percentiles
-            alpha = 1.0 - (hi_p - lo_p) / 100.0
-        except Exception:  # pragma: no cover
-            pass
+            th_new = np.asarray(refit(theta, locked_mask, bounds, x_all, y_star), float)
+            th_new[~free_mask] = theta[~free_mask]
+            if bounds is not None:
+                lo, hi = bounds
+                if lo is not None:
+                    th_new = np.maximum(th_new, lo)
+                if hi is not None:
+                    th_new = np.minimum(th_new, hi)
+            return th_new
+        except Exception:
+            return None
 
-    # Determine call style -------------------------------------------------
-    if args and isinstance(args[0], dict):
-        fit = args[0]
-    elif "fit" in kwargs:
-        fit = kwargs.pop("fit")
-    elif "engine" in kwargs and "data" in kwargs:
-        engine = kwargs.pop("engine")
-        data = kwargs.pop("data")
-        fit = engine(**data, return_jacobian=True, return_predictors=True)
+    if n_boot <= 0:
+        raise ValueError("n_boot must be > 0")
+
+    if workers and workers > 0:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=int(workers)) as ex:
+            thetas = list(ex.map(one_boot, range(n_boot)))
     else:
-        theta = kwargs.pop("theta", kwargs.pop("theta_hat", None))
-        residual = kwargs.pop("residual")
-        jac = kwargs.pop("jacobian")
-        predict_full = kwargs.pop("predict_full", None)
-        if "predict_fn" in kwargs:
-            warnings.warn("predict_fn is deprecated; use predict_full", DeprecationWarning, stacklevel=2)
-            if predict_full is None:
-                predict_full = kwargs.pop("predict_fn")
-            else:
-                kwargs.pop("predict_fn")
-        bounds = kwargs.pop("bounds", None)
-        param_names = kwargs.pop("param_names", None)
-        locked_mask = kwargs.pop("locked_mask", None)
-        fit = {
-            "theta": np.asarray(theta, float),
-            "residual": residual(theta) if callable(residual) else np.asarray(residual, float),
-            "jacobian": jac(theta) if callable(jac) else np.asarray(jac, float),
-            "predict_full": predict_full,
-            "bounds": bounds,
-            "param_names": param_names,
-            "locked_mask": locked_mask,
-        }
+        thetas = [one_boot(i) for i in range(n_boot)]
 
-    for k in list(kwargs.keys()):
-        log.debug("bootstrap_ci ignoring argument %s", k)
+    theta_succ = [t for t in thetas if t is not None]
+    n_success = len(theta_succ)
+    n_fail = n_boot - n_success
+    if n_success < 2:
+        raise RuntimeError("Insufficient successful bootstrap refits")
 
-    theta = np.asarray(fit["theta"], float)
-    r = -np.asarray(fit["residual"], float)
-    J = np.asarray(fit["jacobian"], float)
-    predict_full = fit.get("predict_full")
-    bounds = fit.get("bounds")
-    param_names = fit.get("param_names") or [f"p{i}" for i in range(theta.size)]
-    locked = np.asarray(fit.get("locked_mask"), bool)
-    if locked.size != theta.size:
-        locked = np.zeros(theta.size, bool)
-    x_full = fit.get("x")
+    T = np.vstack(theta_succ)
+    mean = T.mean(axis=0)
+    sd = T.std(axis=0, ddof=1)
+    qlo = np.quantile(T, alpha / 2, axis=0)
+    qhi = np.quantile(T, 1 - alpha / 2, axis=0)
 
-    if fit_ctx is None and isinstance(fit, dict) and "fit_ctx" in fit:
-        fit_ctx = dict(fit["fit_ctx"])
-    if fit_ctx is None:
-        fit_ctx = {}
-    if "predict_full" not in fit_ctx and predict_full is not None:
-        fit_ctx["predict_full"] = predict_full
-    if "x_all" not in fit_ctx and x_full is not None:
-        fit_ctx["x_all"] = x_full
-    if "theta_hat" not in fit_ctx:
-        fit_ctx["theta_hat"] = theta
-    if "param_names" not in fit_ctx:
-        fit_ctx["param_names"] = list(param_names)
-
-    J_pinv = np.linalg.pinv(J)
-    rng = np.random.default_rng(seed)
-    theta_samples: list[np.ndarray] = []
-    for _ in range(int(n_boot)):
-        idx = rng.integers(0, r.size, r.size)
-        delta = J_pinv @ r[idx]
-        th = theta + delta
-        th[locked] = theta[locked]
-        if bounds is not None:
-            lo_b, hi_b = bounds
-            th = np.clip(th, lo_b, hi_b)
-        theta_samples.append(th)
-
-    samples_arr = np.vstack(theta_samples) if theta_samples else theta[None, :]
-    mean = samples_arr.mean(axis=0)
-    std = samples_arr.std(axis=0, ddof=1)
-    ci_lo = np.quantile(samples_arr, alpha / 2, axis=0)
-    ci_hi = np.quantile(samples_arr, 1 - alpha / 2, axis=0)
-    mean[locked] = theta[locked]
-    std[locked] = 0.0
-    ci_lo[locked] = theta[locked]
-    ci_hi[locked] = theta[locked]
+    names = param_names or [f"p{i}" for i in range(P)]
     stats = {
         name: {
             "est": float(mean[i]),
-            "sd": float(std[i]),
-            "p2.5": float(ci_lo[i]),
-            "p97.5": float(ci_hi[i]),
+            "sd": float(sd[i]),
+            "p2.5": float(qlo[i]),
+            "p97.5": float(qhi[i]),
         }
-        for i, name in enumerate(param_names)
+        for i, name in enumerate(names)
     }
+
+    pct_at_bounds = (
+        float(
+            np.mean(
+                (
+                    (bounds[0] is not None)
+                    and np.any(np.isclose(T, bounds[0], rtol=0, atol=0), axis=1)
+                )
+                |
+                (
+                    (bounds[1] is not None)
+                    and np.any(np.isclose(T, bounds[1], rtol=0, atol=0), axis=1)
+                )
+            )
+        )
+        if bounds
+        else 0.0
+    )
 
     band = None
-    reason = None
-    if workers:  # pragma: no cover - workers ignored in this simplified impl
-        log.debug("bootstrap_ci called with workers=%d (serial)", workers)
+    band_reason = None
+    if return_band:
+        if predict_full is None or n_success < BOOT_BAND_MIN_SAMPLES:
+            band_reason = "missing model or insufficient samples"
+        else:
+            Ys = np.vstack([predict_full(th) for th in theta_succ])
+            lo = np.quantile(Ys, alpha / 2, axis=0)
+            hi = np.quantile(Ys, 1 - alpha / 2, axis=0)
+            band = (x_all, lo, hi)
 
-    diagnostics: Dict[str, object] = {
+    diag = {
         "B": int(n_boot),
-        "n_success": int(len(theta_samples)),
+        "n_boot": int(n_boot),
+        "n_success": int(n_success),
+        "n_fail": int(n_fail),
+        "seed": seed,
+        "pct_at_bounds": pct_at_bounds,
+        "runtime_s": float(time.time() - t0),
+        "band_source": "bootstrap-percentile" if band is not None else None,
+        "band_reason": band_reason,
     }
 
-    fc = fit_ctx or {}
-    if return_band and fc.get("predict_full") is None:
-        return_band = False
-        diagnostics["band_disabled_no_model"] = True
-        if isinstance(fit_ctx, dict):
-            diag_fc = fc.get("diagnostics", {})
-            diag_fc["band_disabled_no_model"] = True
-            fit_ctx["diagnostics"] = diag_fc
-
-    if return_band:
-        try:
-            if fc.get("solver_kind") == "vp":
-                struct = fc.get("vp_struct", [])
-                theta_nl_samples: List[np.ndarray] = []
-                for th in theta_samples:
-                    th = np.asarray(th, float)
-                    tnl: List[float] = []
-                    for i, s in enumerate(struct):
-                        if s.get("ic") is not None:
-                            tnl.append(th[4 * i + 0])
-                        if s.get("iw") is not None:
-                            tnl.append(th[4 * i + 2])
-                    theta_nl_samples.append(np.asarray(tnl, float))
-                if len(theta_nl_samples) >= BOOT_BAND_MIN_SAMPLES:
-                    band = _prediction_band_vp(theta_nl_samples, fc)
-                else:
-                    reason = "insufficient_vp_samples"
-            else:
-                pred = fc.get("predict_full")
-                x_all = fc.get("x_all")
-                if pred is not None and x_all is not None and len(theta_samples) >= BOOT_BAND_MIN_SAMPLES:
-                    band = _prediction_band_from_thetas(theta_samples, pred, np.asarray(x_all, float))
-                else:
-                    reason = "missing_predict_full_or_samples"
-        except Exception as e:  # pragma: no cover
-            reason = f"band_failed:{type(e).__name__}"
-
-    if band is None and reason:
-        diagnostics["band_reason"] = reason
-    label = "Bootstrap (residual)"
     return UncertaintyResult(
         method="bootstrap",
-        label=label,
+        label="Bootstrap",
         stats=stats,
-        diagnostics=diagnostics,
+        diagnostics=diag,
         band=band,
     )
 

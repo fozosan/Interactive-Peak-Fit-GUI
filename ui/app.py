@@ -1512,7 +1512,7 @@ class PeakFitApp:
         if "bayes" in s or "mcmc" in s:
             return "Bayesian (MCMC)"
         if "boot" in s:
-            return "Bootstrap (residual)"
+            return "Bootstrap"
         return str(lab)
 
     def _band_tuple_from(self, m):
@@ -1782,7 +1782,7 @@ class PeakFitApp:
         if "asym" in text or "j" in text and "t" in text and "j" in text:  # covers "jtj", "j^t j"
             return "Asymptotic (JᵀJ)"
         if "boot" in text or "resid" in text:
-            return "Bootstrap (residual)"
+            return "Bootstrap"
         if "bayes" in text or "mcmc" in text:
             return "Bayesian (MCMC)"
         # Fallback to original label or generic
@@ -2879,7 +2879,7 @@ class PeakFitApp:
         if m.startswith("asymptotic"):
             return "Asymptotic (JᵀJ)"
         if m.startswith("bootstrap"):
-            return "Bootstrap (residual)"
+            return "Bootstrap"
         if m.startswith("bayes"):
             return "Bayesian (MCMC)"
         return "unknown"

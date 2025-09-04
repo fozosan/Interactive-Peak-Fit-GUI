@@ -88,6 +88,24 @@ def derive_export_paths(user_path: str) -> dict:
     }
 
 
+def peaks_to_dicts(peaks: Iterable[Any]) -> List[Dict[str, Any]]:
+    """Return a list of ``peaks`` encoded as simple dictionaries."""
+
+    out: List[Dict[str, Any]] = []
+    for p in peaks or []:
+        out.append(
+            {
+                "center": float(getattr(p, "center", 0.0)),
+                "height": float(getattr(p, "height", 0.0)),
+                "fwhm": float(getattr(p, "fwhm", 0.0)),
+                "eta": float(getattr(p, "eta", 0.0)),
+                "lock_center": bool(getattr(p, "lock_center", False)),
+                "lock_width": bool(getattr(p, "lock_width", False)),
+            }
+        )
+    return out
+
+
 def build_peak_table(records: Iterable[dict]) -> str:
     """Return a CSV-formatted peak table built from ``records``.
 
@@ -253,7 +271,7 @@ def _canonical_unc_label(label: Optional[str]) -> str:
     if asym_hits:
         return "Asymptotic (JᵀJ)"
     if boot_hits:
-        return "Bootstrap (residual)"
+        return "Bootstrap"
     if bayes_hits:
         return "Bayesian (MCMC)"
     return "unknown"
@@ -1079,7 +1097,7 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
         backend_s = str(out.get("backend", "")).lower()
         n_boot_i = int(out.get("n_boot") or 0)
         if n_boot_i > 0:
-            out["label"] = "Bootstrap (residual)"
+            out["label"] = "Bootstrap"
         elif any(k in backend_s for k in ("emcee", "pymc", "numpyro", "mcmc", "hmc", "nuts")):
             out["label"] = "Bayesian (MCMC)"
         elif any(k in backend_s for k in ("jtj", "j^tj", "jᵀj", "gauss", "hessian", "linearized", "cov")):

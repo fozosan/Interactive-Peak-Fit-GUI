@@ -121,8 +121,8 @@ def run_batch(
     reheight = bool(config.get("reheight", False))
     auto_max = int(config.get("auto_max", 5))
     unc_workers = int(config.get("unc_workers", 0))
-    if unc_workers <= 0:
-        unc_workers = int(config.get("perf_max_workers", 0)) or os.cpu_count() or 1
+    if unc_workers < 0:
+        unc_workers = 0
 
     out_dir = Path(
         config.get("output_dir", Path(config.get("peak_output", "peaks.csv")).parent)
@@ -341,6 +341,52 @@ def run_batch(
                     {"residual_fn": residual_fn, "predict_full": model_eval, "x_all": x_fit}
                 )
 
+                from core import fit_api as _fit_api
+
+                def _refit_wrapper(
+                    theta_init,
+                    locked_mask,
+                    bounds,
+                    x,
+                    y,
+                    res=res,
+                    config=config,
+                ):
+                    peaks_in = res.get("peaks_out") or res.get("peaks") or []
+                    cfg = copy.deepcopy(config)
+                    mask = np.ones_like(x, bool)
+                    try:
+                        out = _fit_api.run_fit_consistent(
+                            x,
+                            y,
+                            peaks_in,
+                            cfg,
+                            res.get("baseline"),
+                            res.get("mode", "add"),
+                            mask,
+                            theta_init=theta_init,
+                            locked_mask=locked_mask,
+                            bounds=bounds,
+                            baseline=res.get("baseline"),
+                        )
+                        return out["theta"]
+                    except Exception:
+                        try:
+                            out = _fit_api.run_fit_consistent(
+                                x,
+                                y,
+                                peaks_in,
+                                cfg,
+                                res.get("baseline"),
+                                res.get("mode", "add"),
+                                mask,
+                            )
+                            return out["theta"]
+                        except Exception:
+                            return np.asarray(theta_init, float)
+
+                fit_ctx.update({"refit": _refit_wrapper})
+
                 unc_res = route_uncertainty(
                     unc_method_canon,
                     theta_hat=theta_hat,
@@ -348,6 +394,8 @@ def run_batch(
                     jacobian=jac,
                     model_eval=model_eval,
                     fit_ctx=fit_ctx,
+                    x_all=x_fit,
+                    y_all=y_fit,
                     workers=unc_workers,
                     seed=None,
                     n_boot=100,
