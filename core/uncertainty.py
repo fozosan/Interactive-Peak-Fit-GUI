@@ -27,6 +27,9 @@ __all__ = ["asymptotic_ci", "bootstrap_ci", "bayesian_ci", "UncertaintyResult"]
 
 log = logging.getLogger(__name__)
 
+BOOT_BAND_MIN_SAMPLES = 16
+BAYES_BAND_MIN_DRAWS = 50
+
 
 @dataclass
 class UncertaintyResult:
@@ -422,7 +425,13 @@ def bootstrap_ci(*args: Any, fit_ctx: Optional[Dict[str, Any]] = None, **kwargs:
         theta = kwargs.pop("theta", kwargs.pop("theta_hat", None))
         residual = kwargs.pop("residual")
         jac = kwargs.pop("jacobian")
-        predict_full = kwargs.pop("predict_full", kwargs.pop("predict_fn"))
+        predict_full = kwargs.pop("predict_full", None)
+        if "predict_fn" in kwargs:
+            warnings.warn("predict_fn is deprecated; use predict_full", DeprecationWarning, stacklevel=2)
+            if predict_full is None:
+                predict_full = kwargs.pop("predict_fn")
+            else:
+                kwargs.pop("predict_fn")
         bounds = kwargs.pop("bounds", None)
         param_names = kwargs.pop("param_names", None)
         locked_mask = kwargs.pop("locked_mask", None)
@@ -505,33 +514,42 @@ def bootstrap_ci(*args: Any, fit_ctx: Optional[Dict[str, Any]] = None, **kwargs:
         "n_success": int(len(theta_samples)),
     }
 
-    try:
-        fc = fit_ctx or {}
-        if fc.get("solver_kind") == "vp":
-            struct = fc.get("vp_struct", [])
-            theta_nl_samples: List[np.ndarray] = []
-            for th in theta_samples:
-                th = np.asarray(th, float)
-                tnl: List[float] = []
-                for i, s in enumerate(struct):
-                    if s.get("ic") is not None:
-                        tnl.append(th[4 * i + 0])
-                    if s.get("iw") is not None:
-                        tnl.append(th[4 * i + 2])
-                theta_nl_samples.append(np.asarray(tnl, float))
-            if len(theta_nl_samples) >= 16:
-                band = _prediction_band_vp(theta_nl_samples, fc)
+    fc = fit_ctx or {}
+    if return_band and fc.get("predict_full") is None:
+        return_band = False
+        diagnostics["band_disabled_no_model"] = True
+        if isinstance(fit_ctx, dict):
+            diag_fc = fc.get("diagnostics", {})
+            diag_fc["band_disabled_no_model"] = True
+            fit_ctx["diagnostics"] = diag_fc
+
+    if return_band:
+        try:
+            if fc.get("solver_kind") == "vp":
+                struct = fc.get("vp_struct", [])
+                theta_nl_samples: List[np.ndarray] = []
+                for th in theta_samples:
+                    th = np.asarray(th, float)
+                    tnl: List[float] = []
+                    for i, s in enumerate(struct):
+                        if s.get("ic") is not None:
+                            tnl.append(th[4 * i + 0])
+                        if s.get("iw") is not None:
+                            tnl.append(th[4 * i + 2])
+                    theta_nl_samples.append(np.asarray(tnl, float))
+                if len(theta_nl_samples) >= BOOT_BAND_MIN_SAMPLES:
+                    band = _prediction_band_vp(theta_nl_samples, fc)
+                else:
+                    reason = "insufficient_vp_samples"
             else:
-                reason = "insufficient_vp_samples"
-        else:
-            pred = fc.get("predict_full")
-            x_all = fc.get("x_all")
-            if pred is not None and x_all is not None and len(theta_samples) >= 16:
-                band = _prediction_band_from_thetas(theta_samples, pred, np.asarray(x_all, float))
-            else:
-                reason = "missing_predict_full_or_samples"
-    except Exception as e:  # pragma: no cover
-        reason = f"band_failed:{type(e).__name__}"
+                pred = fc.get("predict_full")
+                x_all = fc.get("x_all")
+                if pred is not None and x_all is not None and len(theta_samples) >= BOOT_BAND_MIN_SAMPLES:
+                    band = _prediction_band_from_thetas(theta_samples, pred, np.asarray(x_all, float))
+                else:
+                    reason = "missing_predict_full_or_samples"
+        except Exception as e:  # pragma: no cover
+            reason = f"band_failed:{type(e).__name__}"
 
     if band is None and reason:
         diagnostics["band_reason"] = reason
@@ -618,6 +636,10 @@ def bayesian_ci(
     if "return_band" in kwargs:
         return_band = bool(kwargs.pop("return_band"))
 
+    residual_fn_kw = kwargs.pop("residual_fn", None)
+    param_names_kw = kwargs.pop("param_names", None)
+    locked_mask_kw = kwargs.pop("locked_mask", None)
+
     for k in list(kwargs.keys()):
         log.debug("bayesian_ci ignoring argument %s", k)
         kwargs.pop(k)
@@ -631,10 +653,10 @@ def bayesian_ci(
         fit = {
             "theta": np.asarray(theta_hat, float) if theta_hat is not None else None,
             "predict_full": model,
-            "residual_fn": kwargs.get("residual_fn"),
+            "residual_fn": residual_fn_kw,
             "bounds": bounds,
-            "param_names": kwargs.get("param_names"),
-            "locked_mask": kwargs.get("locked_mask"),
+            "param_names": param_names_kw,
+            "locked_mask": locked_mask_kw,
             "x": x_all,
             "baseline": base_all,
             "mode": "add" if add_mode else "subtract",
@@ -665,8 +687,8 @@ def bayesian_ci(
     if "param_names" not in fit_ctx:
         fit_ctx["param_names"] = list(param_names)
 
-    if residual_fn is None or predict_full is None:
-        raise ValueError("residual_fn and predict_full required")
+    if residual_fn is None:
+        raise ValueError("residual_fn required")
 
     r0 = residual_fn(theta)
     rss = float(np.dot(r0, r0))
@@ -736,6 +758,15 @@ def bayesian_ci(
     band = None
     reason = None
     diagnostics: Dict[str, object] = {"n_draws": int(len(theta_samples))}
+
+    if return_band and ctx.get("predict_full") is None:
+        return_band = False
+        diagnostics["band_disabled_no_model"] = True
+        if isinstance(fit_ctx, dict):
+            diag_fc = ctx.get("diagnostics", {})
+            diag_fc["band_disabled_no_model"] = True
+            fit_ctx["diagnostics"] = diag_fc
+
     try:
         fc = ctx
         if fc.get("solver_kind") == "vp":
@@ -751,19 +782,17 @@ def bayesian_ci(
                         if s.get("iw") is not None:
                             tnl.append(th[4 * i + 2])
                     theta_nl_samples.append(np.asarray(tnl, float))
-                if len(theta_nl_samples) >= 50:
+                if len(theta_nl_samples) >= BAYES_BAND_MIN_DRAWS:
                     band = _prediction_band_vp(theta_nl_samples, fc)
                 else:
                     reason = "insufficient_vp_draws"
-            else:
-                reason = "missing_predict_full_or_draws"
         else:
             pred = fc.get("predict_full")
             x_all = fc.get("x_all")
-            if return_band and pred is not None and x_all is not None and len(theta_samples) >= 50:
+            if return_band and pred is not None and x_all is not None and len(theta_samples) >= BAYES_BAND_MIN_DRAWS:
                 xb, lob, hib = _prediction_band_from_thetas(theta_samples, pred, np.asarray(x_all, float))
                 band = (xb, _smooth_envelope(lob), _smooth_envelope(hib))
-            else:
+            elif return_band:
                 reason = "missing_predict_full_or_draws"
     except Exception as e:  # pragma: no cover
         reason = f"band_failed:{type(e).__name__}"
