@@ -353,9 +353,12 @@ def run_batch(
                     n_boot=100,
                 )
             except Exception as exc:
+                msg = str(exc)
+                if "Unknown uncertainty method" in msg:
+                    raise
                 if log:
-                    log(f"{Path(path).name}: {exc}")
-                raise
+                    log(f"{Path(path).name}: uncertainty failed: {exc}")
+                unc_res = None
 
         if unc_res is not None:
             stem = Path(path).stem
