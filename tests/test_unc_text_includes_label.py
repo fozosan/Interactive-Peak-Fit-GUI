@@ -10,6 +10,6 @@ def test_unc_text_includes_label_and_pm(tmp_path):
     path = tmp_path / "unc.txt"
     data_io.write_uncertainty_txt(path, res_dict)
     lines = path.read_text(encoding="utf-8").splitlines()
-    assert "Bootstrap (residual)" in lines[0]
+    assert "Bootstrap" in lines[0]
     assert "±" in lines[1]
 

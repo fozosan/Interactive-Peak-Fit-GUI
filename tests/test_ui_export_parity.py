@@ -27,16 +27,19 @@ def test_ui_export_parity_smoke():
     J = jacobian_fd(resid_fn, theta)
 
     fit_ctx = {
-        "x": x,
-        "y": y,
-        "baseline": None,
-        "mode": "add",
-        "residual_fn": resid_fn,
-        "predict_full": predict_full,
-        "x_all": x,
+        "refit": lambda th, locked, bounds, xx, yy: th,
     }
 
-    out = bootstrap_ci(theta=theta, residual=r0, jacobian=J, predict_full=predict_full, fit_ctx=fit_ctx, n_boot=8)
+    out = bootstrap_ci(
+        theta=theta,
+        residual=r0,
+        jacobian=J,
+        predict_full=predict_full,
+        x_all=x,
+        y_all=y,
+        fit_ctx=fit_ctx,
+        n_boot=8,
+    )
     norm = normalize_unc_result(out)
 
     rmse = float(np.sqrt(np.mean(r0 ** 2)))

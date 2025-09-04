@@ -12,9 +12,6 @@ def test_canonical_unc_label_aliases():
         "Asymptotic (J^T J)",
         "Asymptotic (JᵀJ)",
     )
-    assert data_io.canonical_unc_label("bootstrap") in (
-        "Bootstrap",
-        "Bootstrap (residual)",
-    )
+    assert data_io.canonical_unc_label("bootstrap") in ("Bootstrap",)
     assert data_io.canonical_unc_label("bayes") in ("Bayesian", "MCMC", "Bayesian (MCMC)")
 

@@ -50,7 +50,7 @@ def test_normalize_unc_result_handles_numpy_and_missing_label():
     inp = {"method": "bootstrap", "param_stats": ps}
     out = normalize_unc_result(inp)
     assert out.get("method") == "bootstrap"
-    assert out.get("label") == "Bootstrap (residual)"
+    assert out.get("label") == "Bootstrap"
     assert isinstance(out.get("stats"), list)
     assert len(out["stats"]) == 2
     for row in out["stats"]:

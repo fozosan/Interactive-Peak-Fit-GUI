@@ -5,12 +5,37 @@ from core import fit_api, uncertainty, data_io
 from tests.conftest import _maybe_read_unc_files, _pivot_long_to_wide
 
 
-def test_unc_bootstrap_outputs(two_peak_data, tmp_path):
+def test_unc_bootstrap_outputs(two_peak_data, tmp_path, monkeypatch):
     fit = fit_api.run_fit_consistent(
         **two_peak_data, return_jacobian=True, return_predictors=True
     )
-    res1 = uncertainty.bootstrap_ci(fit, n_boot=20, seed=42, workers=0)
-    assert res1.method_label == "Bootstrap (residual)"
+
+    def fake_run_fit_consistent(x, y, cfg, theta_init=None, locked_mask=None, bounds=None, baseline=None):
+        locked_mask = np.asarray(locked_mask, bool)
+        th = np.asarray(theta_init, float).copy()
+        mean_y = float(np.mean(y))
+        th[~locked_mask] += mean_y * 0.01
+        return {"fit_ok": True, "theta": th}
+
+    monkeypatch.setattr(fit_api, "run_fit_consistent", fake_run_fit_consistent)
+
+    args = dict(
+        theta=fit["theta"],
+        residual=fit["residual"],
+        jacobian=fit["jacobian"],
+        predict_full=fit["predict_full"],
+        x_all=fit["x"],
+        y_all=two_peak_data["y"],
+        bounds=fit.get("bounds"),
+        param_names=fit.get("param_names"),
+        locked_mask=fit.get("locked_mask"),
+        fit_ctx=fit,
+        n_boot=20,
+        seed=42,
+        workers=0,
+    )
+    res1 = uncertainty.bootstrap_ci(**args)
+    assert res1.method_label == "Bootstrap"
 
     base = Path(tmp_path / "out.csv")
     unc_norm = data_io.normalize_unc_result(res1)
@@ -36,6 +61,6 @@ def test_unc_bootstrap_outputs(two_peak_data, tmp_path):
         assert col in wide_df.columns, f"missing column {col}"
         assert str(wide_df[col].dtype).startswith(("float","int","UInt")), f"{col} must be numeric"
 
-    res2 = uncertainty.bootstrap_ci(fit, n_boot=20, seed=42, workers=0)
+    res2 = uncertainty.bootstrap_ci(**args)
     assert np.allclose(res1["param_mean"], res2["param_mean"])
     assert np.allclose(res1["param_std"], res2["param_std"])
