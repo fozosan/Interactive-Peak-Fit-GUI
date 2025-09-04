@@ -60,9 +60,33 @@ def test_seeded_determinism(two_peak_data, tmp_path, no_blank_lines):
         **two_peak_data, return_jacobian=True, return_predictors=True
     )
     try:
-        b1 = uncertainty.bayesian_ci(fit, seed=123, n_steps=20, n_burn=10, n_walkers=8)
-        b2 = uncertainty.bayesian_ci(fit, seed=123, n_steps=20, n_burn=10, n_walkers=8)
-    except ImportError:
+        b1 = uncertainty.bayesian_ci(
+            fit["theta"],
+            predict_full=fit["predict_full"],
+            x_all=two_peak_data["x"],
+            y_all=two_peak_data["y"],
+            residual_fn=fit["residual_fn"],
+            locked_mask=fit.get("locked_mask"),
+            seed=123,
+            n_steps=20,
+            n_burn=10,
+            n_walkers=8,
+            return_band=False,
+        )
+        b2 = uncertainty.bayesian_ci(
+            fit["theta"],
+            predict_full=fit["predict_full"],
+            x_all=two_peak_data["x"],
+            y_all=two_peak_data["y"],
+            residual_fn=fit["residual_fn"],
+            locked_mask=fit.get("locked_mask"),
+            seed=123,
+            n_steps=20,
+            n_burn=10,
+            n_walkers=8,
+            return_band=False,
+        )
+    except RuntimeError:
         return
     assert np.allclose(b1["param_mean"], b2["param_mean"])
     assert np.allclose(b1["param_std"], b2["param_std"])

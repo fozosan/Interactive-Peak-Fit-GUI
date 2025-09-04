@@ -338,7 +338,12 @@ def run_batch(
 
                 fit_ctx = dict(res)
                 fit_ctx.update(
-                    {"residual_fn": residual_fn, "predict_full": model_eval, "x_all": x_fit}
+                    {
+                        "residual_fn": residual_fn,
+                        "predict_full": model_eval,
+                        "x_all": x_fit,
+                        "y_all": y_fit,
+                    }
                 )
 
                 from core import fit_api as _fit_api

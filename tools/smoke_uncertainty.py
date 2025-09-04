@@ -50,7 +50,17 @@ if args.method == "asymptotic":
 elif args.method == "bootstrap":
     res = bootstrap_ci(fit, n_boot=args.nboot, seed=args.seed, workers=0)
 else:
-    res = bayesian_ci(fit, seed=args.seed, n_steps=args.nboot)
+    res = bayesian_ci(
+        fit["theta"],
+        predict_full=fit["predict_full"],
+        x_all=x,
+        y_all=y,
+        residual_fn=fit["residual_fn"],
+        seed=args.seed,
+        n_steps=args.nboot,
+        n_burn=0,
+        return_band=False,
+    )
 
 if isinstance(res, NotAvailable):
     print("Bayesian not available:", res.reason)

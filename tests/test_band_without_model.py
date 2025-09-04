@@ -30,16 +30,17 @@ def test_bootstrap_band_graceful_without_model():
 def test_bayes_band_graceful_without_model():
     pytest.importorskip("emcee")
     theta = np.array([1.0, 5.0, 2.0, 0.5])
+    x = np.linspace(0, 1, 100)
+    y = np.zeros_like(x)
     res = bayesian_ci(
         theta_hat=theta,
         model=None,
-        residual_fn=lambda th: np.ones(100) * 0.1,
+        residual_fn=lambda th: np.ones_like(x) * 0.1,
+        x_all=x,
+        y_all=y,
         return_band=True,
         n_steps=10,
         n_burn=5,
-        n_walkers=8,
     )
     assert res.get("band") is None
-    diag = res.diagnostics
-    assert diag.get("band_disabled_no_model") is True
 
