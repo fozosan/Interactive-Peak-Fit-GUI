@@ -166,26 +166,37 @@ def run_batch(
         else:
             mask = np.ones_like(x, bool)
 
+        method = str(base_cfg.get("method", "als")).lower()
         use_slice = bool(config.get("baseline_uses_fit_range", True))
-        if use_slice and np.any(mask) and not np.all(mask):
-            x_sub = x[mask]
-            y_sub = y[mask]
-            z_sub = signals.als_baseline(
-                y_sub,
-                lam=base_cfg.get("lam", 1e5),
-                p=base_cfg.get("p", 0.001),
-                niter=base_cfg.get("niter", 10),
-                tol=base_cfg.get("thresh", 0.0),
+        mask_eff = mask if use_slice else None
+        if method == "als":
+            if mask_eff is not None and np.any(mask_eff) and not np.all(mask_eff):
+                x_sub = x[mask_eff]
+                y_sub = y[mask_eff]
+                z_sub = signals.als_baseline(
+                    y_sub,
+                    lam=base_cfg.get("lam", 1e5),
+                    p=base_cfg.get("p", 0.001),
+                    niter=base_cfg.get("niter", 10),
+                    tol=base_cfg.get("thresh", 0.0),
+                )
+                baseline = np.interp(x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
+            else:
+                baseline = signals.als_baseline(
+                    y,
+                    lam=base_cfg.get("lam", 1e5),
+                    p=base_cfg.get("p", 0.001),
+                    niter=base_cfg.get("niter", 10),
+                    tol=base_cfg.get("thresh", 0.0),
+                )
+        elif method == "polynomial":
+            deg = int(base_cfg.get("degree", 2))
+            norm_x = bool(base_cfg.get("normalize_x", True))
+            baseline = signals.polynomial_baseline(
+                x, y, degree=deg, mask=mask_eff, normalize_x=norm_x
             )
-            baseline = np.interp(x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
         else:
-            baseline = signals.als_baseline(
-                y,
-                lam=base_cfg.get("lam", 1e5),
-                p=base_cfg.get("p", 0.001),
-                niter=base_cfg.get("niter", 10),
-                tol=base_cfg.get("thresh", 0.0),
-            )
+            raise ValueError(f"Unknown baseline method: {method}")
 
         if source == "auto":
             template = _auto_seed(x, y, baseline, max_peaks=auto_max)
@@ -270,8 +281,6 @@ def run_batch(
                 "rmse": rmse,
                 "fit_ok": bool(res["fit_ok"]),
                 "mode": mode,
-                "als_lam": base_cfg.get("lam"),
-                "als_p": base_cfg.get("p"),
                 "fit_xmin": fit_lo,
                 "fit_xmax": fit_hi,
                 "solver_choice": solver_name,
@@ -286,8 +295,6 @@ def run_batch(
                 "baseline_uses_fit_range": bool(
                     config.get("baseline_uses_fit_range", True)
                 ),
-                "als_niter": base_cfg.get("niter"),
-                "als_thresh": base_cfg.get("thresh"),
                 **perf_extras,
                 "bounds_center_lo": center_bounds[0],
                 "bounds_center_hi": center_bounds[1],
@@ -296,6 +303,16 @@ def run_batch(
                 "bounds_height_hi": np.nan,
                 "x_scale": np.nan,
             }
+            baseline_method = str(base_cfg.get("method", "als")).lower()
+            als_fields = {
+                "als_lam": base_cfg.get("lam"),
+                "als_p": base_cfg.get("p"),
+                "als_niter": base_cfg.get("niter"),
+                "als_thresh": base_cfg.get("thresh"),
+            }
+            if baseline_method != "als":
+                als_fields = {k: np.nan for k in als_fields}
+            rec.update(als_fields)
             records.append(rec)
             local_records.append(rec)
 

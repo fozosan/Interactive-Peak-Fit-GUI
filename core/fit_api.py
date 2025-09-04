@@ -21,6 +21,8 @@ from .peaks import Peak
 from . import models
 from .weights import noise_weights
 from .residuals import build_residual, jacobian_fd, build_residual_jac
+from . import signals
+from .signals import polynomial_baseline
 from fit import orchestrator
 from fit.bounds import pack_theta_bounds
 from infra import performance
@@ -117,10 +119,41 @@ def run_fit_consistent(
     mask = np.asarray(fit_mask, bool)
     if mask.shape != x.shape:
         raise ValueError("fit_mask shape mismatch")
+
+    base_cfg = (cfg.get("baseline") or {})
+    method = str(base_cfg.get("method", "als")).strip().lower()
+    uses_fit_range = bool(cfg.get("baseline_uses_fit_range", True))
+    fit_mask_eff = mask if uses_fit_range else None
+
     if baseline is not None:
         baseline = np.asarray(baseline, float)
         if baseline.shape != x.shape:
             raise ValueError("baseline shape mismatch")
+    elif base_cfg:
+        if method == "als":
+            lam = float(base_cfg.get("lam", 1e5))
+            p = float(base_cfg.get("p", 0.001))
+            niter = int(base_cfg.get("niter", 10))
+            thresh = float(base_cfg.get("thresh", 0.0))
+            if fit_mask_eff is not None and np.any(fit_mask_eff) and not np.all(fit_mask_eff):
+                x_sub = x[fit_mask_eff]
+                y_sub = y[fit_mask_eff]
+                z_sub = signals.als_baseline(
+                    y_sub, lam=lam, p=p, niter=niter, tol=thresh
+                )
+                baseline = np.interp(x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
+            else:
+                baseline = signals.als_baseline(
+                    y, lam=lam, p=p, niter=niter, tol=thresh
+                )
+        elif method == "polynomial":
+            deg = int(base_cfg.get("degree", 2))
+            norm_x = bool(base_cfg.get("normalize_x", True))
+            baseline = polynomial_baseline(
+                x, y, degree=deg, mask=fit_mask_eff, normalize_x=norm_x
+            )
+        else:
+            raise ValueError(f"Unknown baseline method: {method}")
 
     peaks0 = copy.deepcopy(peaks_in)
     if reheight:
@@ -240,7 +273,7 @@ def run_fit_consistent(
             pk.append((h, c, fw, eta))
         return performance.eval_total(x_data, pk)
 
-    baseline_cfg = cfg.get("baseline", {})
+    baseline_cfg = base_cfg
     baseline_params = {
         "lam": baseline_cfg.get("lam"),
         "p": baseline_cfg.get("p"),
@@ -317,6 +350,7 @@ def run_fit_consistent(
 
     base_all = baseline if baseline is not None else np.zeros_like(x)
     add_mode = bool(mode == "add")
+    result.update({"baseline": baseline, "base_all": base_all, "x": x, "mode": mode})
     solver_used = best_res.solver if best_res is not None else solver_name
     if solver_used in ("modern_vp", "lmfit_vp"):
         solver_kind = "vp"

@@ -302,10 +302,11 @@ class Peak:
 # ---------- Config persistence ----------
 CONFIG_PATH = Path.home() / ".gl_peakfit_config.json"
 DEFAULTS = {
-    "als_lam": 1e5,
-    "als_asym": 0.001,
-    "als_niter": 10,
-    "als_thresh": 0.0,
+    "baseline_defaults": {
+        "method": "als",
+        "als": {"lam": 1e5, "p": 0.001, "niter": 10, "thresh": 0.0},
+        "polynomial": {"degree": 2, "normalize_x": True},
+    },
     # Legacy single template (migrated to templates/default if present)
     "saved_peaks": [],
     # Multiple templates live here as {"name": [peak dicts...]}
@@ -354,6 +355,17 @@ def load_config():
             elif sc == "lmfit":
                 cfg["solver_choice"] = "lmfit_vp"
             cfg.pop("ui_theme", None)
+            if "baseline_defaults" not in cfg:
+                cfg["baseline_defaults"] = {
+                    "method": "als",
+                    "als": {
+                        "lam": cfg.get("als_lam", 1e5),
+                        "p": cfg.get("als_asym", 0.001),
+                        "niter": cfg.get("als_niter", 10),
+                        "thresh": cfg.get("als_thresh", 0.0),
+                    },
+                    "polynomial": {"degree": 2, "normalize_x": True},
+                }
             return cfg
         except Exception:
             return dict(DEFAULTS)
@@ -727,11 +739,16 @@ class PeakFitApp:
         self.baseline_use_range = tk.BooleanVar(value=bool(self.cfg.get("baseline_uses_fit_range", True)))
         self.baseline_use_range.trace_add("write", self.on_baseline_use_range_toggle)
 
-        # Config
-        self.als_lam = tk.DoubleVar(value=self.cfg["als_lam"])
-        self.als_asym = tk.DoubleVar(value=self.cfg["als_asym"])
-        self.als_niter = tk.IntVar(value=self.cfg["als_niter"])
-        self.als_thresh = tk.DoubleVar(value=self.cfg["als_thresh"])
+        bd = self.cfg.get("baseline_defaults", {})
+        als_def = bd.get("als", {})
+        poly_def = bd.get("polynomial", {})
+        self.base_method_var = tk.StringVar(value=bd.get("method", "als"))
+        self.als_lam = tk.DoubleVar(value=als_def.get("lam", 1e5))
+        self.als_asym = tk.DoubleVar(value=als_def.get("p", 0.001))
+        self.als_niter = tk.IntVar(value=als_def.get("niter", 10))
+        self.als_thresh = tk.DoubleVar(value=als_def.get("thresh", 0.0))
+        self.poly_degree_var = tk.IntVar(value=poly_def.get("degree", 2))
+        self.poly_norm_var = tk.BooleanVar(value=poly_def.get("normalize_x", True))
         self.global_eta = tk.DoubleVar(value=self.cfg.get("ui_eta", 0.5))
         self.global_eta.trace_add("write", lambda *_: self._on_eta_change())
         self.auto_apply_template = tk.BooleanVar(value=bool(self.cfg.get("auto_apply_template", False)))
@@ -978,8 +995,20 @@ class PeakFitApp:
             pass
 
         # Baseline box
-        baseline_box = ttk.Labelframe(right, text="Baseline (ALS)"); baseline_box.pack(fill=tk.X, pady=4)
+        baseline_box = ttk.Labelframe(right, text="Baseline"); baseline_box.pack(fill=tk.X, pady=4)
         ttk.Checkbutton(baseline_box, text="Apply baseline", variable=self.use_baseline, command=self.refresh_plot).pack(anchor="w")
+
+        method_row = ttk.Frame(baseline_box); method_row.pack(fill=tk.X, pady=2)
+        ttk.Label(method_row, text="Method:").pack(side=tk.LEFT)
+        method_cb = ttk.Combobox(
+            method_row,
+            textvariable=self.base_method_var,
+            values=["als", "polynomial"],
+            state="readonly",
+            width=12,
+        )
+        method_cb.pack(side=tk.LEFT)
+        method_cb.bind("<<ComboboxSelected>>", self._on_base_method_change)
 
         mode_row = ttk.Frame(baseline_box); mode_row.pack(fill=tk.X, pady=2)
         ttk.Label(mode_row, text="Mode:").pack(side=tk.LEFT)
@@ -988,17 +1017,25 @@ class PeakFitApp:
 
         ttk.Checkbutton(baseline_box, text="Baseline uses fit range", variable=self.baseline_use_range).pack(anchor="w", pady=(2,0))
 
-        row = ttk.Frame(baseline_box); row.pack(fill=tk.X, pady=2)
+        self.als_frame = ttk.Frame(baseline_box)
+        row = ttk.Frame(self.als_frame); row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text="λ (smooth):").pack(side=tk.LEFT)
         ttk.Entry(row, width=10, textvariable=self.als_lam).pack(side=tk.LEFT, padx=4)
         ttk.Label(row, text="p (asym):").pack(side=tk.LEFT)
         ttk.Entry(row, width=10, textvariable=self.als_asym).pack(side=tk.LEFT, padx=4)
 
-        row2 = ttk.Frame(baseline_box); row2.pack(fill=tk.X, pady=2)
+        row2 = ttk.Frame(self.als_frame); row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="Iterations:").pack(side=tk.LEFT)
         ttk.Entry(row2, width=5, textvariable=self.als_niter).pack(side=tk.LEFT, padx=4)
         ttk.Label(row2, text="Threshold:").pack(side=tk.LEFT)
         ttk.Entry(row2, width=7, textvariable=self.als_thresh).pack(side=tk.LEFT, padx=4)
+
+        self.poly_frame = ttk.Frame(baseline_box)
+        ttk.Label(self.poly_frame, text="Degree:").pack(side=tk.LEFT)
+        ttk.Spinbox(self.poly_frame, from_=0, to=10, width=5, textvariable=self.poly_degree_var).pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(self.poly_frame, text="Normalize x to [-1,1]", variable=self.poly_norm_var).pack(side=tk.LEFT, padx=4)
+
+        self._update_baseline_frames()
 
         ttk.Button(baseline_box, text="Recompute baseline", command=self.compute_baseline).pack(side=tk.LEFT, pady=2)
         ttk.Button(baseline_box, text="Save as default", command=self.save_baseline_default).pack(side=tk.LEFT, padx=4)
@@ -1941,6 +1978,20 @@ class PeakFitApp:
             return
         self.compute_baseline()
 
+    def _update_baseline_frames(self):
+        method = self.base_method_var.get().strip().lower()
+        if method == "als":
+            self.poly_frame.forget()
+            self.als_frame.pack(fill=tk.X, pady=2)
+        else:
+            self.als_frame.forget()
+            self.poly_frame.pack(fill=tk.X, pady=2)
+
+    def _on_base_method_change(self, *_):
+        self._update_baseline_frames()
+        if self.y_raw is not None:
+            self.compute_baseline()
+
     def _range_mask(self):
         if self.x is None:
             return None
@@ -1952,38 +2003,57 @@ class PeakFitApp:
     def compute_baseline(self):
         if self.y_raw is None:
             return
-        lam = float(self.als_lam.get())
-        asym = float(self.als_asym.get())
-        niter = int(self.als_niter.get())
-        thresh = float(self.als_thresh.get())
+        method = self.base_method_var.get().strip().lower()
         use_slice = bool(self.baseline_use_range.get())
         mask = self._range_mask() if use_slice else None
 
-        key = None
-        if performance.cache_baseline_enabled():
-            mkey = None
-            if mask is not None and np.any(mask):
-                mkey = (float(self.x[mask][0]), float(self.x[mask][-1]))
-            key = (hash(self.y_raw.tobytes()), lam, asym, niter, thresh, mkey)
-        if key is not None and key in self._baseline_cache:
-            self.baseline = self._baseline_cache[key]
-        else:
+        if method == "als":
+            lam = float(self.als_lam.get())
+            asym = float(self.als_asym.get())
+            niter = int(self.als_niter.get())
+            thresh = float(self.als_thresh.get())
+            key = None
+            if performance.cache_baseline_enabled():
+                mkey = None
+                if mask is not None and np.any(mask):
+                    mkey = (float(self.x[mask][0]), float(self.x[mask][-1]))
+                key = (hash(self.y_raw.tobytes()), lam, asym, niter, thresh, mkey)
+            if key is not None and key in self._baseline_cache:
+                self.baseline = self._baseline_cache[key]
+            else:
+                try:
+                    if mask is None or not np.any(mask):
+                        base = signals.als_baseline(
+                            self.y_raw, lam=lam, p=asym, niter=niter, tol=thresh
+                        )
+                    else:
+                        x_sub = self.x[mask]
+                        y_sub = self.y_raw[mask]
+                        z_sub = signals.als_baseline(
+                            y_sub, lam=lam, p=asym, niter=niter, tol=thresh
+                        )
+                        base = np.interp(
+                            self.x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1]
+                        )
+                    self.baseline = base
+                    if key is not None:
+                        self._baseline_cache[key] = base
+                except Exception as e:
+                    messagebox.showwarning("Baseline", f"ALS baseline failed: {e}")
+                    self.baseline = np.zeros_like(self.y_raw)
+        elif method == "polynomial":
+            deg = int(self.poly_degree_var.get())
+            norm_x = bool(self.poly_norm_var.get())
             try:
-                if mask is None or not np.any(mask):
-                    base = signals.als_baseline(self.y_raw, lam=lam, p=asym,
-                                                niter=niter, tol=thresh)
-                else:
-                    x_sub = self.x[mask]
-                    y_sub = self.y_raw[mask]
-                    z_sub = signals.als_baseline(y_sub, lam=lam, p=asym,
-                                                 niter=niter, tol=thresh)
-                    base = np.interp(self.x, x_sub, z_sub, left=z_sub[0], right=z_sub[-1])
-                self.baseline = base
-                if key is not None:
-                    self._baseline_cache[key] = base
+                self.baseline = signals.polynomial_baseline(
+                    self.x, self.y_raw, degree=deg, mask=mask, normalize_x=norm_x
+                )
             except Exception as e:
-                messagebox.showwarning("Baseline", f"ALS baseline failed: {e}")
+                messagebox.showwarning("Baseline", f"Polynomial baseline failed: {e}")
                 self.baseline = np.zeros_like(self.y_raw)
+        else:
+            messagebox.showwarning("Baseline", f"Unknown baseline method: {method}")
+            self.baseline = np.zeros_like(self.y_raw)
 
         try:
             y_t = self.get_fit_target()
@@ -1995,12 +2065,41 @@ class PeakFitApp:
         self.refresh_plot()
 
     def save_baseline_default(self):
-        self.cfg["als_lam"] = float(self.als_lam.get())
-        self.cfg["als_asym"] = float(self.als_asym.get())
-        self.cfg["als_niter"] = int(self.als_niter.get())
-        self.cfg["als_thresh"] = float(self.als_thresh.get())
+        self.cfg["baseline_defaults"] = {
+            "method": self.base_method_var.get().strip().lower(),
+            "als": {
+                "lam": float(self.als_lam.get()),
+                "p": float(self.als_asym.get()),
+                "niter": int(self.als_niter.get()),
+                "thresh": float(self.als_thresh.get()),
+            },
+            "polynomial": {
+                "degree": int(self.poly_degree_var.get()),
+                "normalize_x": bool(self.poly_norm_var.get()),
+            },
+        }
         save_config(self.cfg)
         messagebox.showinfo("Baseline", "Saved as default for future sessions.")
+
+    def _current_baseline_cfg(self):
+        base = {"method": self.base_method_var.get().strip().lower()}
+        if base["method"] == "polynomial":
+            base.update(
+                {
+                    "degree": int(self.poly_degree_var.get()),
+                    "normalize_x": bool(self.poly_norm_var.get()),
+                }
+            )
+        elif base["method"] == "als":
+            base.update(
+                {
+                    "lam": float(self.als_lam.get()),
+                    "p": float(self.als_asym.get()),
+                    "niter": int(self.als_niter.get()),
+                    "thresh": float(self.als_thresh.get()),
+                }
+            )
+        return base
 
     # ----- Signals for seeding and fitting -----
     def get_seed_signal(self):
@@ -2673,12 +2772,7 @@ class PeakFitApp:
             "peaks": peaks_list,
             "solver": solver,
             "mode": self.baseline_mode.get(),
-            "baseline": {
-                "lam": float(self.als_lam.get()),
-                "p": float(self.als_asym.get()),
-                "niter": int(self.als_niter.get()),
-                "thresh": float(self.als_thresh.get()),
-            },
+            "baseline": self._current_baseline_cfg(),
             "save_traces": bool(self.batch_save_traces.get()),
             "source": source,
             "reheight": bool(self.batch_reheight.get()),
@@ -3573,8 +3667,6 @@ class PeakFitApp:
                 "rmse": rmse,
                 "fit_ok": True,
                 "mode": self.baseline_mode.get(),
-                "als_lam": float(self.als_lam.get()),
-                "als_p": float(self.als_asym.get()),
                 "fit_xmin": self.fit_xmin if self.fit_xmin is not None else float(self.x.min()),
                 "fit_xmax": self.fit_xmax if self.fit_xmax is not None else float(self.x.max()),
                 "solver_choice": solver,
@@ -3587,8 +3679,6 @@ class PeakFitApp:
                 "use_baseline": bool(self.use_baseline.get()),
                 "baseline_mode": self.baseline_mode.get(),
                 "baseline_uses_fit_range": bool(self.baseline_use_range.get()),
-                "als_niter": int(self.als_niter.get()),
-                "als_thresh": float(self.als_thresh.get()),
                 **perf_extras,
                 "bounds_center_lo": center_bounds[0],
                 "bounds_center_hi": center_bounds[1],
@@ -3597,6 +3687,16 @@ class PeakFitApp:
                 "bounds_height_hi": np.nan,
                 "x_scale": opts.get("x_scale", np.nan),
             }
+            baseline_method = self.base_method_var.get().strip().lower()
+            als_fields = {
+                "als_lam": float(self.als_lam.get()),
+                "als_p": float(self.als_asym.get()),
+                "als_niter": int(self.als_niter.get()),
+                "als_thresh": float(self.als_thresh.get()),
+            }
+            if baseline_method != "als":
+                als_fields = {k: np.nan for k in als_fields}
+            row.update(als_fields)
             rows.append(row)
         peak_csv = _dio.build_peak_table(rows)
         with open(paths["fit"], "w", encoding="utf-8", newline="") as fh:
@@ -3675,12 +3775,14 @@ class PeakFitApp:
                 if hasattr(solver_opts, "__dict__"):
                     solver_opts = solver_opts.__dict__
                 solver_meta = {"solver": self.solver_choice.get(), **solver_opts}
+                baseline_method = self.base_method_var.get().strip().lower()
                 baseline_meta = {
                     "uses_fit_range": bool(self.baseline_use_range.get()),
-                    "lam": float(self.als_lam.get()),
-                    "p": float(self.als_asym.get()),
-                    "niter": int(self.als_niter.get()),
-                    "thresh": float(self.als_thresh.get()),
+                    "method": baseline_method,
+                    "lam": float(self.als_lam.get()) if baseline_method == "als" else np.nan,
+                    "p": float(self.als_asym.get()) if baseline_method == "als" else np.nan,
+                    "niter": int(self.als_niter.get()) if baseline_method == "als" else np.nan,
+                    "thresh": float(self.als_thresh.get()) if baseline_method == "als" else np.nan,
                 }
                 perf_meta = {
                     "numba": bool(self.perf_numba.get()),
