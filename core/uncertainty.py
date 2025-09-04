@@ -27,6 +27,9 @@ __all__ = ["asymptotic_ci", "bootstrap_ci", "bayesian_ci", "UncertaintyResult"]
 
 log = logging.getLogger(__name__)
 
+BOOT_BAND_MIN_SAMPLES = 16
+BAYES_BAND_MIN_DRAWS = 50
+
 
 @dataclass
 class UncertaintyResult:
@@ -422,7 +425,13 @@ def bootstrap_ci(*args: Any, fit_ctx: Optional[Dict[str, Any]] = None, **kwargs:
         theta = kwargs.pop("theta", kwargs.pop("theta_hat", None))
         residual = kwargs.pop("residual")
         jac = kwargs.pop("jacobian")
-        predict_full = kwargs.pop("predict_full", kwargs.pop("predict_fn", None))
+        predict_full = kwargs.pop("predict_full", None)
+        if "predict_fn" in kwargs:
+            warnings.warn("predict_fn is deprecated; use predict_full", DeprecationWarning, stacklevel=2)
+            if predict_full is None:
+                predict_full = kwargs.pop("predict_fn")
+            else:
+                kwargs.pop("predict_fn")
         bounds = kwargs.pop("bounds", None)
         param_names = kwargs.pop("param_names", None)
         locked_mask = kwargs.pop("locked_mask", None)
@@ -528,14 +537,14 @@ def bootstrap_ci(*args: Any, fit_ctx: Optional[Dict[str, Any]] = None, **kwargs:
                         if s.get("iw") is not None:
                             tnl.append(th[4 * i + 2])
                     theta_nl_samples.append(np.asarray(tnl, float))
-                if len(theta_nl_samples) >= 16:
+                if len(theta_nl_samples) >= BOOT_BAND_MIN_SAMPLES:
                     band = _prediction_band_vp(theta_nl_samples, fc)
                 else:
                     reason = "insufficient_vp_samples"
             else:
                 pred = fc.get("predict_full")
                 x_all = fc.get("x_all")
-                if pred is not None and x_all is not None and len(theta_samples) >= 16:
+                if pred is not None and x_all is not None and len(theta_samples) >= BOOT_BAND_MIN_SAMPLES:
                     band = _prediction_band_from_thetas(theta_samples, pred, np.asarray(x_all, float))
                 else:
                     reason = "missing_predict_full_or_samples"
@@ -773,14 +782,14 @@ def bayesian_ci(
                         if s.get("iw") is not None:
                             tnl.append(th[4 * i + 2])
                     theta_nl_samples.append(np.asarray(tnl, float))
-                if len(theta_nl_samples) >= 50:
+                if len(theta_nl_samples) >= BAYES_BAND_MIN_DRAWS:
                     band = _prediction_band_vp(theta_nl_samples, fc)
                 else:
                     reason = "insufficient_vp_draws"
         else:
             pred = fc.get("predict_full")
             x_all = fc.get("x_all")
-            if return_band and pred is not None and x_all is not None and len(theta_samples) >= 50:
+            if return_band and pred is not None and x_all is not None and len(theta_samples) >= BAYES_BAND_MIN_DRAWS:
                 xb, lob, hib = _prediction_band_from_thetas(theta_samples, pred, np.asarray(x_all, float))
                 band = (xb, _smooth_envelope(lob), _smooth_envelope(hib))
             elif return_band:
