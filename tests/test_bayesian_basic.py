@@ -10,11 +10,15 @@ def test_bayesian_basic(two_peak_data, tmp_path):
         **two_peak_data, return_jacobian=True, return_predictors=True
     )
     res = uncertainty.bayesian_ci(
-        fit,
+        fit["theta"],
+        predict_full=fit["predict_full"],
+        x_all=two_peak_data["x"],
+        y_all=two_peak_data["y"],
+        residual_fn=fit["residual_fn"],
+        locked_mask=fit.get("locked_mask"),
         seed=123,
         n_steps=200,
         n_burn=100,
-        n_walkers=32,
         thin=5,
         return_band=True,
     )

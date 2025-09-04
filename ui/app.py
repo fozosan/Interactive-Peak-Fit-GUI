@@ -2989,10 +2989,14 @@ class PeakFitApp:
                 "residual_fn": (lambda th: resid_fn(th)),
                 "predict_full": predict_full,
                 "x_all": x_fit,
+                "y_all": y_fit,
             }
             out = core_uncertainty.bayesian_ci(
                 theta_hat=theta,
                 model=predict_full,
+                predict_full=predict_full,
+                x_all=x_fit,
+                y_all=y_fit,
                 residual_fn=(lambda th: resid_fn(th)),
                 fit_ctx=fit_ctx,
             )
@@ -3212,10 +3216,14 @@ class PeakFitApp:
                     "residual_fn": (lambda th: resid_fn(th)),
                     "predict_full": predict_full,
                     "x_all": x_fit,
+                    "y_all": y_fit,
                 }
                 out = core_uncertainty.bayesian_ci(
                     theta_hat=theta,
                     model=predict_full,
+                    predict_full=predict_full,
+                    x_all=x_fit,
+                    y_all=y_fit,
                     residual_fn=(lambda th: resid_fn(th)),
                     fit_ctx=fit_ctx,
                 )

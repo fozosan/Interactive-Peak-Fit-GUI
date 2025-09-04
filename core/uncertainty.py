@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union, List
 import logging
 import warnings
 import time
+import math
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,7 @@ except Exception:  # pragma: no cover - optional dependency
     _nnls = None
 
 from .fit_api import _vp_design_columns
+from .mcmc_utils import ess_autocorr, rhat_split
 
 __all__ = [
     "asymptotic_ci",
@@ -576,260 +578,188 @@ def _smooth_envelope(y: np.ndarray) -> np.ndarray:
 
 
 def bayesian_ci(
-    engine: Optional[Any] = None,
-    data: Optional[dict] = None,
-    model: Optional[Any] = None,
-    theta_hat: Optional[np.ndarray] = None,
-    bounds: Optional[Any] = None,
-    seed: Optional[int] = None,
-    n_walkers: int = 32,
-    n_burn: int = 1000,
-    n_steps: int = 2000,
-    thin: int = 10,
-    return_band: bool = False,
-    fit_ctx: Optional[Dict[str, Any]] = None,
-    x_all: Optional[np.ndarray] = None,
-    base_all: Optional[np.ndarray] = None,
-    add_mode: bool = False,
-    **kwargs: Any,
+    theta_hat: np.ndarray, *,
+    model=None, predict_full=None, x_all=None, y_all=None,
+    residual_fn=None, bounds=None, param_names=None, locked_mask=None,
+    fit_ctx=None, n_walkers=None, n_burn=2000, n_steps=8000, thin=1,
+    seed=None, return_band=True, prior_sigma="half_cauchy"
 ) -> UncertaintyResult:
-    """Bayesian posterior sampling using :mod:`emcee`.
-
-    Parameters mirror the legacy implementation and extra ``kwargs`` are
-    silently ignored after alias normalisation."""
-
+    """
+    Sample posterior of free θ and σ with emcee. Deterministic with seed.
+    Returns posterior stats and optional posterior predictive band.
+    """
     try:
-        import emcee  # type: ignore
-    except Exception as exc:  # pragma: no cover - missing dependency
-        raise ImportError("emcee is required for bayesian_ci") from exc
+        import emcee
+    except Exception as e:
+        raise RuntimeError("Bayesian method requires emcee>=3") from e
 
-    alias_map = {
-        "samples": "n_steps",
-        "walkers": "n_walkers",
-        "burn": "n_burn",
-        "random_state": "seed",
-        "prediction_band": "return_band",
-    }
-    for old, new in alias_map.items():
-        if old in kwargs and new not in kwargs:
-            locals()[new] = kwargs.pop(old)  # type: ignore[misc]
-
-    # normalise recognised kwargs overriding defaults
-    if "n_steps" in kwargs:
-        n_steps = int(kwargs.pop("n_steps"))
-    if "n_walkers" in kwargs:
-        n_walkers = int(kwargs.pop("n_walkers"))
-    if "n_burn" in kwargs:
-        n_burn = int(kwargs.pop("n_burn"))
-    if "seed" in kwargs:
-        seed = kwargs.pop("seed")
-    if "return_band" in kwargs:
-        return_band = bool(kwargs.pop("return_band"))
-
-    residual_fn_kw = kwargs.pop("residual_fn", None)
-    param_names_kw = kwargs.pop("param_names", None)
-    locked_mask_kw = kwargs.pop("locked_mask", None)
-
-    for k in list(kwargs.keys()):
-        log.debug("bayesian_ci ignoring argument %s", k)
-        kwargs.pop(k)
-
-    # Determine call style -------------------------------------------------
-    if isinstance(engine, dict) and data is None and model is None and theta_hat is None:
-        fit = engine
-    elif engine is not None and data is not None:
-        fit = engine(**data, return_jacobian=True, return_predictors=True)
-    else:
-        fit = {
-            "theta": np.asarray(theta_hat, float) if theta_hat is not None else None,
-            "predict_full": model,
-            "residual_fn": residual_fn_kw,
-            "bounds": bounds,
-            "param_names": param_names_kw,
-            "locked_mask": locked_mask_kw,
-            "x": x_all,
-            "baseline": base_all,
-            "mode": "add" if add_mode else "subtract",
-        }
-
-    theta = np.asarray(fit.get("theta", theta_hat), float)
-    residual_fn = fit.get("residual_fn")
-    predict_full = fit.get("predict_full")
-    bounds = fit.get("bounds", bounds)
-    param_names = fit.get("param_names") or [f"p{i}" for i in range(theta.size)]
-    locked = np.asarray(fit.get("locked_mask"), bool)
-    if locked.size != theta.size:
-        locked = np.zeros(theta.size, bool)
-    x_all = fit.get("x", x_all)
-    base_all = fit.get("baseline", base_all)
-    add_mode = bool(fit.get("mode", "add") == "add")
-
-    if fit_ctx is None and isinstance(fit, dict) and "fit_ctx" in fit:
-        fit_ctx = dict(fit["fit_ctx"])
-    if fit_ctx is None:
-        fit_ctx = {}
-    if "predict_full" not in fit_ctx and predict_full is not None:
-        fit_ctx["predict_full"] = predict_full
-    if "x_all" not in fit_ctx and x_all is not None:
-        fit_ctx["x_all"] = x_all
-    if "theta_hat" not in fit_ctx:
-        fit_ctx["theta_hat"] = theta
-    if "param_names" not in fit_ctx:
-        fit_ctx["param_names"] = list(param_names)
-
-    if residual_fn is None:
-        raise ValueError("residual_fn required")
-
-    r0 = residual_fn(theta)
-    rss = float(np.dot(r0, r0))
-    dof = max(r0.size - theta.size, 1)
-    s2 = rss / dof
-
-    def loglike(th: np.ndarray) -> float:
-        if bounds is not None:
-            lo_b, hi_b = bounds
-            if np.any(th < lo_b) or np.any(th > hi_b):
-                return -np.inf
-        r = residual_fn(th)
-        return -0.5 * np.dot(r, r) / s2
-
+    theta_hat = np.asarray(theta_hat, float)
+    locked = np.asarray(locked_mask, bool) if locked_mask is not None else np.zeros(theta_hat.size, bool)
     free_idx = np.where(~locked)[0]
-    ndim = int(free_idx.size)
-    if ndim == 0:
-        y0 = predict_full(theta)
-        x = x_all if x_all is not None else np.arange(y0.size)
-        band = (x, y0, y0) if return_band else None
-        stats = {
-            name: {"est": float(theta[i]), "sd": 0.0, "p2.5": float(theta[i]), "p97.5": float(theta[i])}
-            for i, name in enumerate(param_names)
-        }
-        diag = {"n_samples": 0, "param_order": param_names}
-        label = "Bayesian (MCMC)"
-        return UncertaintyResult(
-            method="bayesian",
-            label=label,
-            stats=stats,
-            diagnostics=diag,
-            band=band,
-        )
+    th_free = theta_hat[free_idx]
+    P_free = th_free.size
+    if P_free == 0:
+        free_idx = np.array([], int)
 
-    n_walkers = max(n_walkers, 2 * ndim)
-    np.random.seed(seed)
+    pred = predict_full or model
+    if pred is None and residual_fn is not None:
+        if x_all is None:
+            x_all = np.arange(residual_fn(theta_hat).size, dtype=float)
+        def pred_from_res(th):
+            return (y_all if y_all is not None else 0.0) - residual_fn(th)
+        pred = pred_from_res
+    if pred is None or x_all is None or y_all is None:
+        raise ValueError("predict_full/model and x_all, y_all are required for Bayesian")
 
-    def log_prob_free(th_free: np.ndarray) -> float:
-        th = theta.copy()
-        th[free_idx] = th_free
-        return loglike(th)
+    x_all = np.asarray(x_all, float)
+    y_all = np.asarray(y_all, float)
+    n = y_all.size
 
-    p0 = theta[free_idx] + 1e-4 * np.random.standard_normal((n_walkers, ndim))
-    sampler = emcee.EnsembleSampler(n_walkers, ndim, log_prob_free)
-    sampler.run_mcmc(p0, n_burn + n_steps, progress=False)
-    chain = sampler.get_chain(discard=n_burn, thin=thin, flat=False)
-    flat = chain.reshape(-1, ndim)
+    lo = np.full(theta_hat.size, -np.inf)
+    hi = np.full(theta_hat.size,  np.inf)
+    if bounds is not None:
+        lo_b, hi_b = bounds
+        if lo_b is not None: lo = np.asarray(lo_b, float)
+        if hi_b is not None: hi = np.asarray(hi_b, float)
+    lo_f = lo[free_idx]; hi_f = hi[free_idx]
 
-    samples_full = np.tile(theta, (flat.shape[0], 1))
-    samples_full[:, free_idx] = flat
+    resid0 = y_all - pred(theta_hat)
+    rmse = float(np.sqrt(np.mean(resid0**2))) if resid0.size else 1.0
+    if not math.isfinite(rmse) or rmse <= 0: rmse = 1.0
 
-    mean = samples_full.mean(axis=0)
-    std = samples_full.std(axis=0, ddof=1)
-    ci_lo = np.quantile(samples_full, 0.025, axis=0)
-    ci_hi = np.quantile(samples_full, 0.975, axis=0)
-
-    mean[locked] = theta[locked]
-    std[locked] = 0.0
-    ci_lo[locked] = theta[locked]
-    ci_hi[locked] = theta[locked]
-
-    draws = samples_full
-    ctx = fit_ctx or {}
-    theta_samples = _coerce_draws_to_thetas(
-        draws, ctx.get("param_names"), ctx.get("theta_hat")
-    )
-    band = None
-    reason = None
-    diagnostics: Dict[str, object] = {"n_draws": int(len(theta_samples))}
-
-    if return_band and ctx.get("predict_full") is None:
-        return_band = False
-        diagnostics["band_disabled_no_model"] = True
-        if isinstance(fit_ctx, dict):
-            diag_fc = ctx.get("diagnostics", {})
-            diag_fc["band_disabled_no_model"] = True
-            fit_ctx["diagnostics"] = diag_fc
-
-    try:
-        fc = ctx
-        if fc.get("solver_kind") == "vp":
-            if return_band:
-                struct = fc.get("vp_struct", [])
-                theta_nl_samples: List[np.ndarray] = []
-                for th in theta_samples:
-                    th = np.asarray(th, float)
-                    tnl: List[float] = []
-                    for i, s in enumerate(struct):
-                        if s.get("ic") is not None:
-                            tnl.append(th[4 * i + 0])
-                        if s.get("iw") is not None:
-                            tnl.append(th[4 * i + 2])
-                    theta_nl_samples.append(np.asarray(tnl, float))
-                if len(theta_nl_samples) >= BAYES_BAND_MIN_DRAWS:
-                    band = _prediction_band_vp(theta_nl_samples, fc)
-                else:
-                    reason = "insufficient_vp_draws"
+    th_loc = th_free.copy()
+    th_scale = np.maximum(1e-6, np.where(np.isfinite(hi_f-lo_f), 0.1*(hi_f-lo_f), 10*np.maximum(1e-6, np.abs(th_free))))
+    def log_prior(th_f, log_sigma):
+        if np.any(th_f < lo_f) or np.any(th_f > hi_f):
+            return -np.inf
+        lp = -0.5*np.sum(((th_f - th_loc)/th_scale)**2)
+        sigma = np.exp(log_sigma)
+        if prior_sigma == "half_normal":
+            lp += -0.5*(sigma/rmse)**2 + math.log(2.0) + math.log(1.0/max(sigma,1e-300))
         else:
-            pred = fc.get("predict_full")
-            x_all = fc.get("x_all")
-            if return_band and pred is not None and x_all is not None and len(theta_samples) >= BAYES_BAND_MIN_DRAWS:
-                xb, lob, hib = _prediction_band_from_thetas(theta_samples, pred, np.asarray(x_all, float))
-                band = (xb, _smooth_envelope(lob), _smooth_envelope(hib))
-            elif return_band:
-                reason = "missing_predict_full_or_draws"
-    except Exception as e:  # pragma: no cover
-        reason = f"band_failed:{type(e).__name__}"
+            s = rmse
+            lp += math.log(2.0/ math.pi) - math.log(s*(1.0 + (sigma/s)**2)) + math.log(1.0/max(sigma,1e-300))
+        return lp
 
-    if band is None and reason:
-        diagnostics["band_reason"] = reason
+    def log_likelihood(th_f, log_sigma):
+        th_full = theta_hat.copy()
+        th_full[free_idx] = th_f
+        mu = pred(th_full)
+        if mu.shape != y_all.shape: return -np.inf
+        sigma = np.exp(log_sigma)
+        if not np.isfinite(sigma) or sigma <= 0: return -np.inf
+        r = y_all - mu
+        return -0.5*np.sum((r/sigma)**2) - n*np.log(sigma) - 0.5*n*math.log(2*math.pi)
 
-    # Diagnostics ---------------------------------------------------------
+    def log_prob(z):
+        th_f = z[:-1]
+        log_sigma = z[-1]
+        lp = log_prior(th_f, log_sigma)
+        if not np.isfinite(lp): return -np.inf
+        return lp + log_likelihood(th_f, log_sigma)
+
+    dim = P_free + 1
+    if n_walkers is None:
+        n_walkers = max(4*dim, 16)
+    rng = np.random.default_rng(seed)
+    np.random.seed(seed)
+    p0 = np.empty((n_walkers, dim), float)
+    for k in range(n_walkers):
+        jitter = rng.normal(scale=0.01, size=P_free)
+        th0 = th_free + np.maximum(th_scale, 1e-3) * jitter
+        th0 = np.clip(th0, lo_f, hi_f)
+        p0[k, :P_free] = th0
+        p0[k, -1] = math.log(max(rmse*abs(rng.normal(loc=1.0, scale=0.1)), 1e-6))
+
+    sampler = emcee.EnsembleSampler(n_walkers, dim, lambda z: log_prob(z))
+
+    draws = []
+    accept = []
+    aborted = False
+    chunk = 500
+    state = p0
+    total = n_burn + n_steps
+    done = 0
+    while done < total:
+        step = min(chunk, total - done)
+        state, lnp, _ = sampler.run_mcmc(state, step, progress=False, skip_initial_state_check=True)
+        done += step
+        if fit_ctx and getattr(fit_ctx.get("abort_event", None), "is_set", None):
+            try:
+                if fit_ctx["abort_event"].is_set():
+                    aborted = True
+                    break
+            except Exception:
+                pass
+
+    chain = sampler.get_chain(discard=n_burn, thin=thin)
+    acc_frac = float(np.mean(sampler.acceptance_fraction))
+    if chain.ndim != 3:
+        chain = np.asarray(chain)
+        chain = chain.reshape((n_walkers, -1, dim))
+    n_samp = chain.shape[1]*n_walkers
+
+    if n_samp < 2:
+        raise RuntimeError("insufficient MCMC draws")
+    flat = chain.reshape(-1, dim)
+    th_draws = flat[:, :P_free]
+    log_sigma_draws = flat[:, -1]
+    sigma_draws = np.exp(log_sigma_draws)
+
+    T = np.tile(theta_hat, (th_draws.shape[0], 1))
+    if P_free:
+        T[:, free_idx] = th_draws
+    mean = T.mean(axis=0)
+    sd = T.std(axis=0, ddof=1)
+    qlo = np.quantile(T, 0.025, axis=0); qhi = np.quantile(T, 0.975, axis=0)
+
+    names = param_names or [f"p{i}" for i in range(theta_hat.size)]
+    stats = {names[i]: {"est": float(mean[i]), "sd": float(sd[i]), "p2.5": float(qlo[i]), "p97.5": float(qhi[i])}
+             for i in range(theta_hat.size)}
+    stats["sigma"] = {
+        "est": float(np.mean(sigma_draws)),
+        "sd": float(np.std(sigma_draws, ddof=1)),
+        "p2.5": float(np.quantile(sigma_draws, 0.025)),
+        "p97.5": float(np.quantile(sigma_draws, 0.975)),
+    }
+
     try:
-        tau = sampler.get_autocorr_time(quiet=True)
-        ess = flat.shape[0] / tau
-    except Exception:  # pragma: no cover - autocorr failure
-        ess = np.full(ndim, flat.shape[0])
-
-    N = chain.shape[0]
-    K = chain.shape[1]
-    mean_chain = chain.mean(axis=0)
-    var_chain = chain.var(axis=0, ddof=1)
-    B = N * mean_chain.var(axis=0, ddof=1)
-    W = var_chain.mean(axis=0)
-    var_hat = ((N - 1) / N) * W + B / N
-    rhat = np.sqrt(var_hat / W)
-    if np.any(ess < 200) or np.any(rhat > 1.1):
-        warnings.warn("MCMC diagnostics indicate poor convergence", RuntimeWarning)
-
-    stats = {
-        name: {
-            "est": float(mean[i]),
-            "sd": float(std[i]),
-            "p2.5": float(ci_lo[i]),
-            "p97.5": float(ci_hi[i]),
-        }
-        for i, name in enumerate(param_names)
+        _ = sampler.get_autocorr_time(quiet=True)
+    except Exception:
+        pass
+    chains = chain
+    ess_min = ess_autocorr(chains)
+    rhat_max = rhat_split(chains)
+    diag = {
+        "n_draws": int(n_samp),
+        "ess_min": float(ess_min),
+        "rhat_max": float(rhat_max),
+        "accept_frac_mean": acc_frac,
+        "seed": seed,
+        "aborted": bool(aborted),
+        "band_source": None,
     }
 
-    diag: Dict[str, object] = {
-        "ess": {name: float(ess[i]) for i, name in enumerate(param_names)},
-        "rhat": {name: float(rhat[i]) for i, name in enumerate(param_names)},
-        "n_samples": int(samples_full.shape[0]),
-        "n_chains": int(chain.shape[1]),
-        "param_order": param_names,
-    }
-    diag.update(diagnostics)
-    label = "Bayesian (MCMC)"
+    band = None
+    if return_band and predict_full is not None and x_all is not None and n_samp >= BAYES_BAND_MIN_DRAWS:
+        max_use = min(n_samp, 4096)
+        sel = np.linspace(0, n_samp-1, max_use, dtype=int)
+        T_sel = T[sel]
+        sig_sel = sigma_draws[sel]
+        Y = []
+        for t_i, s_i in zip(T_sel, sig_sel):
+            mu = pred(t_i)
+            eps = rng.normal(0.0, s_i, size=mu.shape)
+            Y.append(mu + eps)
+        Y = np.vstack(Y)
+        lo = np.quantile(Y, 0.025, axis=0)
+        hi = np.quantile(Y, 0.975, axis=0)
+        band = (np.asarray(x_all, float), lo, hi)
+        diag["band_source"] = "bayes-posterior-predictive"
+
     return UncertaintyResult(
         method="bayesian",
-        label=label,
+        label="Bayesian (MCMC)",
         stats=stats,
         diagnostics=diag,
         band=band,

@@ -58,6 +58,9 @@ def route_uncertainty(
         return unc.bayesian_ci(
             theta_hat=theta_hat,
             model=model_eval,
+            predict_full=model_eval,
+            x_all=fit_ctx.get("x_all") if fit_ctx else x_all,
+            y_all=fit_ctx.get("y_all") if fit_ctx else y_all,
             residual_fn=residual_fn,
             fit_ctx=fit_ctx or {},
             n_steps=int(bayes_steps),
