@@ -870,6 +870,19 @@ def _to_float(x: Any) -> float:
             return float("nan")
 
 
+def _stats_to_param_blocks(stats_tbl: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, List[float]]]:
+    """Return canonical param-wise blocks from a row-oriented stats table."""
+    blocks: Dict[str, Dict[str, List[float]]] = {
+        pname: {k: [] for k in ("est", "sd", "ci_lo", "ci_hi", "p2_5", "p97_5")}
+        for pname in ("center", "height", "fwhm", "eta")
+    }
+    for row in stats_tbl:
+        for pname in ("center", "height", "fwhm", "eta"):
+            blk = _as_mapping(row.get(pname))
+            for key in ("est", "sd", "ci_lo", "ci_hi", "p2_5", "p97_5"):
+                blocks[pname][key].append(_to_float(blk.get(key)))
+    return blocks
+
 def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
     """Normalize arbitrary uncertainty payloads into a common mapping."""
     m = _as_mapping(unc)
@@ -1051,9 +1064,16 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
         "ess": _to_float(m.get("ess")),
         "rhat": _to_float(m.get("rhat")),
         "band": band,
-        "stats": stats_tbl,
-        "param_stats": stats_tbl,
     }
+
+    if stats_tbl:
+        # Build canonical param blocks and a row-oriented table
+        param_blocks = _stats_to_param_blocks(stats_tbl)
+        out.setdefault("param_stats", param_blocks)
+        out.setdefault("stats", stats_tbl)
+    else:
+        out.setdefault("param_stats", {})
+        out.setdefault("stats", [])
 
     if out["label"] == "unknown":
         backend_s = str(out.get("backend", "")).lower()
