@@ -2044,13 +2044,35 @@ class PeakFitApp:
         elif method == "polynomial":
             deg = int(self.poly_degree_var.get())
             norm_x = bool(self.poly_norm_var.get())
-            try:
-                self.baseline = signals.polynomial_baseline(
-                    self.x, self.y_raw, degree=deg, mask=mask, normalize_x=norm_x
-                )
-            except Exception as e:
-                messagebox.showwarning("Baseline", f"Polynomial baseline failed: {e}")
-                self.baseline = np.zeros_like(self.y_raw)
+            key = None
+            if performance.cache_baseline_enabled():
+                slice_key = None
+                if mask is not None and np.any(mask):
+                    slice_key = (float(self.x[mask][0]), float(self.x[mask][-1]))
+                key = (hash(self.y_raw.tobytes()), "poly", int(deg), bool(norm_x), slice_key)
+            if key is not None and key in self._baseline_cache:
+                self.baseline = self._baseline_cache[key]
+            else:
+                try:
+                    base, used_deg = signals.polynomial_baseline(
+                        self.x,
+                        self.y_raw,
+                        degree=deg,
+                        mask=mask,
+                        normalize_x=norm_x,
+                        return_used_degree=True,
+                    )
+                    if used_deg != deg:
+                        self.poly_degree_var.set(used_deg)
+                        self.status_var.set(
+                            f"Polynomial baseline: degree reduced to {used_deg} due to fit-range points."
+                        )
+                    self.baseline = base
+                    if key is not None:
+                        self._baseline_cache[key] = base
+                except Exception as e:
+                    messagebox.showwarning("Baseline", f"Polynomial baseline failed: {e}")
+                    self.baseline = np.zeros_like(self.y_raw)
         else:
             messagebox.showwarning("Baseline", f"Unknown baseline method: {method}")
             self.baseline = np.zeros_like(self.y_raw)
@@ -3696,7 +3718,21 @@ class PeakFitApp:
             }
             if baseline_method != "als":
                 als_fields = {k: np.nan for k in als_fields}
+            # Polynomial metadata: values only for polynomial; NaN for ALS
+            if baseline_method == "polynomial":
+                poly_fields = {
+                    "poly_degree": int(self.poly_degree_var.get()),
+                    "poly_normalize_x": bool(self.poly_norm_var.get()),
+                }
+            else:
+                poly_fields = {
+                    "poly_degree": np.nan,
+                    "poly_normalize_x": np.nan,
+                }
+            # Method label + fields
+            row["baseline_method"] = baseline_method
             row.update(als_fields)
+            row.update(poly_fields)
             rows.append(row)
         peak_csv = _dio.build_peak_table(rows)
         with open(paths["fit"], "w", encoding="utf-8", newline="") as fh:
