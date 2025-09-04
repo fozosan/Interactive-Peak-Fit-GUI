@@ -3718,7 +3718,21 @@ class PeakFitApp:
             }
             if baseline_method != "als":
                 als_fields = {k: np.nan for k in als_fields}
+            # Polynomial metadata: values only for polynomial; NaN for ALS
+            if baseline_method == "polynomial":
+                poly_fields = {
+                    "poly_degree": int(self.poly_degree_var.get()),
+                    "poly_normalize_x": bool(self.poly_norm_var.get()),
+                }
+            else:
+                poly_fields = {
+                    "poly_degree": np.nan,
+                    "poly_normalize_x": np.nan,
+                }
+            # Method label + fields
+            row["baseline_method"] = baseline_method
             row.update(als_fields)
+            row.update(poly_fields)
             rows.append(row)
         peak_csv = _dio.build_peak_table(rows)
         with open(paths["fit"], "w", encoding="utf-8", newline="") as fh:

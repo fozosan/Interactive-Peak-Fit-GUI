@@ -41,10 +41,13 @@ def test_export_als_fields_nan_with_poly(tmp_path):
                 "use_baseline": True,
                 "baseline_mode": "add",
                 "baseline_uses_fit_range": True,
+                "baseline_method": "polynomial",
                 "als_lam": np.nan,
                 "als_p": np.nan,
                 "als_niter": np.nan,
                 "als_thresh": np.nan,
+                "poly_degree": 2,
+                "poly_normalize_x": True,
             }
         )
     csv = data_io.build_peak_table(records)
@@ -54,3 +57,7 @@ def test_export_als_fields_nan_with_poly(tmp_path):
     for col in ["als_lam", "als_p", "als_niter", "als_thresh"]:
         assert col in df.columns
         assert df[col].isna().all()
+    # baseline metadata present and populated for polynomial
+    assert (df["baseline_method"] == "polynomial").all()
+    assert (df["poly_degree"] == 2).all()
+    assert df["poly_normalize_x"].astype(bool).all()

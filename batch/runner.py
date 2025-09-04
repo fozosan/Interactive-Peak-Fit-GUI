@@ -312,7 +312,21 @@ def run_batch(
             }
             if baseline_method != "als":
                 als_fields = {k: np.nan for k in als_fields}
+            # Polynomial metadata: values only for polynomial; NaN for ALS
+            if baseline_method == "polynomial":
+                poly_fields = {
+                    "poly_degree": int(base_cfg.get("degree", 2)),
+                    "poly_normalize_x": bool(base_cfg.get("normalize_x", True)),
+                }
+            else:
+                poly_fields = {
+                    "poly_degree": np.nan,
+                    "poly_normalize_x": np.nan,
+                }
+            # Method label + fields
+            rec["baseline_method"] = baseline_method
             rec.update(als_fields)
+            rec.update(poly_fields)
             records.append(rec)
             local_records.append(rec)
 
