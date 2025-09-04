@@ -23,7 +23,13 @@ except Exception:  # pragma: no cover - optional dependency
 
 from .fit_api import _vp_design_columns
 
-__all__ = ["asymptotic_ci", "bootstrap_ci", "bayesian_ci", "UncertaintyResult"]
+__all__ = [
+    "asymptotic_ci",
+    "bootstrap_ci",
+    "bayesian_ci",
+    "UncertaintyResult",
+    "finite_diff_jacobian",
+]
 
 log = logging.getLogger(__name__)
 
@@ -151,16 +157,24 @@ def complex_step_jacobian(f: Callable[[np.ndarray], np.ndarray], theta: np.ndarr
     return J
 
 
-def finite_diff_jacobian(f: Callable[[np.ndarray], np.ndarray], theta: np.ndarray, scale: float = 1e-6) -> np.ndarray:
+def finite_diff_jacobian(
+    residual_fn: Callable[[np.ndarray], np.ndarray],
+    theta: np.ndarray,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """Forward-difference Jacobian of ``residual_fn`` evaluated at ``theta``."""
+
     theta = np.asarray(theta, float)
-    n = theta.size
-    f0 = f(theta)
-    J = np.empty((f0.size, n), float)
-    for j in range(n):
-        step = scale * max(1.0, abs(theta[j]))
-        tp = theta.copy(); tp[j] += step
-        tm = theta.copy(); tm[j] -= step
-        J[:, j] = (f(tp) - f(tm)) / (2.0 * step)
+    r0 = np.asarray(residual_fn(theta), float)
+    m = r0.size
+    p = theta.size
+    J = np.empty((m, p), float)
+    for j in range(p):
+        h = eps * (1.0 + abs(theta[j]))
+        th = theta.copy()
+        th[j] += h
+        r1 = np.asarray(residual_fn(th), float)
+        J[:, j] = (r1 - r0) / h
     return J
 
 

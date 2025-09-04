@@ -22,8 +22,9 @@ if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safegu
     os.environ.setdefault("MPLBACKEND", "Agg")
 
 from core import data_io, models, peaks, signals, fit_api
-from core.residuals import build_residual, jacobian_fd
-from core import uncertainty as unc
+from core.residuals import build_residual
+from core.uncertainty import finite_diff_jacobian
+from core.uncertainty_router import route_uncertainty
 
 
 def _auto_seed(
@@ -51,6 +52,24 @@ def _auto_seed(
         found.append(peaks.Peak(float(x[i]), h, float(default_w), 0.5))
     found.sort(key=lambda p: p.center)
     return found
+
+
+def predict_full(
+    x: np.ndarray,
+    peaks_obj: Sequence[peaks.Peak],
+    baseline: np.ndarray | None,
+    mode: str,
+    theta: np.ndarray,
+) -> np.ndarray:
+    """Evaluate the full model for ``theta`` on ``x``."""
+
+    total = np.zeros_like(x, float)
+    for i in range(len(peaks_obj)):
+        c, h, fw, eta = theta[4 * i : 4 * (i + 1)]
+        total += models.pseudo_voigt(x, h, c, fw, eta)
+    if mode == "add" and baseline is not None:
+        total = total + baseline
+    return total
 
 
 def run_batch(
@@ -289,8 +308,6 @@ def run_batch(
         unc_res = None
         if res["fit_ok"] and fitted and compute_uncertainty:
             try:
-                mode_lower = unc_method_canon.lower()
-
                 theta_hat = res["theta"]
                 x_fit = np.asarray(res.get("x_fit") or res.get("x"), float)
                 y_fit = np.asarray(res.get("y_fit") or res.get("y"), float)
@@ -303,57 +320,44 @@ def run_batch(
                 if residual_fn is None and rj is not None:
                     residual_fn = lambda th: rj(th)[0]
                 if residual_fn is None:
-                    residual_fn = build_residual(x_fit, y_fit, peaks_obj, mode, base_fit, "linear", None)
+                    residual_fn = build_residual(
+                        x_fit, y_fit, peaks_obj, mode, base_fit, "linear", None
+                    )
 
                 jac = res.get("jacobian")
                 if jac is None and rj is not None:
                     jac = lambda th: rj(th)[1]
                 if jac is None:
-                    jac = jacobian_fd(residual_fn, theta_hat)
-                J = jac(theta_hat) if callable(jac) else jac
+                    jac = finite_diff_jacobian(residual_fn, theta_hat)
 
-                model_eval = res.get("predict_full") or res.get("ymodel_fn")
+                model_eval = res.get("predict_full")
                 if model_eval is None:
-                    def model_eval(th):
-                        total = np.zeros_like(x_fit, float)
-                        for i in range(len(peaks_obj)):
-                            c, h, fw, eta = th[4 * i : 4 * (i + 1)]
-                            total += models.pseudo_voigt(x_fit, h, c, fw, eta)
-                        if mode == "add" and base_fit is not None:
-                            total = total + base_fit
-                        return total
+                    model_eval = lambda th, x=x_fit: predict_full(
+                        x, peaks_obj, base_fit, mode, th
+                    )
 
                 fit_ctx = dict(res)
-                fit_ctx.update({"residual_fn": residual_fn, "predict_full": model_eval, "x_all": x_fit})
+                fit_ctx.update(
+                    {"residual_fn": residual_fn, "predict_full": model_eval, "x_all": x_fit}
+                )
 
-                if "boot" in mode_lower:
-                    r0 = residual_fn(theta_hat)
-                    unc_res = unc.bootstrap_ci(
-                        theta=theta_hat,
-                        residual=r0,
-                        jacobian=J,
-                        predict_full=model_eval,
-                        fit_ctx=fit_ctx,
-                        n_boot=100,
-                        workers=unc_workers,
-                    )
-                elif "bayes" in mode_lower or "mcmc" in mode_lower:
-                    unc_res = unc.bayesian_ci(
-                        theta_hat=theta_hat,
-                        model=model_eval,
-                        residual_fn=residual_fn,
-                        fit_ctx=fit_ctx,
-                    )
-                else:
-                    unc_res = unc.asymptotic_ci(
-                        theta_hat,
-                        residual_fn,
-                        (lambda _th: J),
-                        model_eval,
-                    )
+                unc_res = route_uncertainty(
+                    unc_method_canon,
+                    theta_hat=theta_hat,
+                    residual_fn=residual_fn,
+                    jacobian=jac,
+                    model_eval=model_eval,
+                    fit_ctx=fit_ctx,
+                    workers=unc_workers,
+                    seed=None,
+                    n_boot=100,
+                )
             except Exception as exc:
+                msg = str(exc)
+                if "Unknown uncertainty method" in msg:
+                    raise
                 if log:
-                    log(f"{Path(path).name}: {exc}")
+                    log(f"{Path(path).name}: uncertainty failed: {exc}")
                 unc_res = None
 
         if unc_res is not None:
