@@ -42,8 +42,8 @@
 - **Data loading**  
   Robust import for **CSV/TXT/DAT** (2 columns x,y). Delimiters auto-detected; lines with `# % //` and text headers ignored. Non-numeric columns dropped; non-finite rows removed; x sorted ascending if needed.
 
-- **ALS baseline (Eilers–Boelens)**  
-  λ (smooth), p (asym), Iterations, Threshold (early stop). Optionally compute ALS **within the fit window** then interpolate to full x.
+ - **Baseline correction (ALS or Polynomial)**
+  ALS (λ, p, iterations, threshold) or polynomial (degree, optional normalization). Optionally compute the baseline **within the fit window** then interpolate to full x.
 
 - **Fit modes**
   - **Add**: model = baseline + Σ(peaks) vs raw y (WYSIWYG plotting).
@@ -70,6 +70,67 @@
 
 - **Unified exports**
   - `_fit.csv`, `_trace.csv`, `_uncertainty.csv`, `_uncertainty.txt` for **single** runs and **per-file** in **batch**; plus a batch **summary CSV**.
+
+## Baseline methods
+Peakfit now supports two baseline estimators:
+
+**ALS (Asymmetric Least Squares)**  \
+Smooth, robust baseline that penalizes points above the baseline. Tunables:
+`lam` (smoothness), `p` (asymmetry), `niter` (iterations), `thresh` (optional stop threshold).
+
+**Polynomial**  \
+Weighted least-squares polynomial baseline on `(x, y)`. Tunables:
+`degree` (non-negative integer), `normalize_x` (bool; if `true`, fits in scaled `[-1, 1]` to improve conditioning).
+When fitting only a slice (fit range), the polynomial degree is automatically clamped to
+`min(requested_degree, n_points_in_range - 1)`. The UI surfaces this adjustment.
+
+### Choosing a method (GUI)
+- In the **Baseline** panel, pick **Method: als** or **polynomial**.
+- Use **Save as default** to persist the current method and its parameters for future sessions.
+- The last used method is restored on next launch.
+
+### Choosing a method (programmatic / batch)
+Configure the run with:
+```json
+{
+  "baseline": {
+    "method": "als",
+    "lam": 1e5,
+    "p": 0.001,
+    "niter": 10,
+    "thresh": 0.0
+  }
+}
+```
+or
+```json
+{
+  "baseline": {
+    "method": "polynomial",
+    "degree": 2,
+    "normalize_x": true
+  }
+}
+```
+Set `baseline_uses_fit_range: true` to estimate the baseline only inside the fit window; otherwise the full trace is used.
+
+### Exports
+CSV peak tables include baseline metadata:
+`baseline_method`, `als_*` fields (filled for ALS, `NaN` under polynomial),
+and `poly_degree`, `poly_normalize_x` (filled for polynomial, `NaN` under ALS).
+
+### Defaults & persistence
+The app stores per-method defaults and the last used method under
+`~/.gl_peakfit_config.json` in a `baseline_defaults` block:
+```json
+{
+  "baseline_defaults": {
+    "method": "polynomial",
+    "als":  { "lam": 1e5, "p": 0.001, "niter": 10, "thresh": 0.0 },
+    "polynomial": { "degree": 2, "normalize_x": true }
+  }
+}
+```
 
 ---
 

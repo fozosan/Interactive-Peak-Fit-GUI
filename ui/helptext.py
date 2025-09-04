@@ -103,6 +103,21 @@ def build_help(opts: dict) -> str:
           – Add     : model = baseline + Σ peaks; residuals vs raw y.
           – Subtract: model = Σ peaks; residuals vs (y − baseline).
 
+        Baseline methods (ALS & Polynomial)
+        -----------------------------------
+        • Choosing a method: Baseline panel → Method: als or polynomial. “Save as default” persists
+          the method and parameters; last used method is restored on next launch.
+        • ALS (Asymmetric Least Squares): λ (smoothness), p (asymmetry), Iterations, Threshold
+          (early stop). Optionally limit to the fit range, then interpolate to the full x-range.
+        • Polynomial baseline: Degree (≥0) and optional “Normalize x to [-1,1]”. If the fit window
+          has too few points, the degree is auto-clamped to min(requested, N−1); the UI updates the
+          field and posts a status note.
+        • Baseline uses fit range: When enabled, baseline is estimated only inside the current fit
+          window and smoothly extended outside.
+        • Exports: peak table includes baseline_method; ALS fields (als_*) are populated for ALS
+          and NaN under polynomial; polynomial fields (poly_degree, poly_normalize_x) are populated
+          for polynomial and NaN under ALS.
+
         Peaks: add, edit, lock
         ----------------------
         • “Add peaks on click” toggles interactive placement at the click x.
