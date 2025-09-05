@@ -25,9 +25,8 @@ def test_bayesian_basic(two_peak_data, tmp_path):
     assert res.get("method") != "NotAvailable"
     stats = res["param_stats"]
     assert np.any(stats["std"] > 0)
-    band = res["band"]
-    x, lo, hi = band["x"], band["lo"], band["hi"]
-    assert len(x) == len(lo) == len(hi)
+    # Bands are disabled for Bayesian uncertainty
+    assert res.get("band") is None
     paths = data_io.derive_export_paths(str(tmp_path / "out.csv"))
     data_io.write_uncertainty_csv(paths["unc_csv"], res)
     data_io.write_uncertainty_txt(paths["unc_txt"], res)
