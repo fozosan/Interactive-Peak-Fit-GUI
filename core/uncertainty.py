@@ -542,6 +542,7 @@ def bootstrap_ci(
     next_pulse_at = 0
     pulse_step = max(1, int(n_boot // 20))
     last_pulse_t = time.monotonic()
+    jitter_scale = float((fit_ctx or {}).get("bootstrap_jitter", 0.02))  # 2% default
     for b in range(int(n_boot)):
         # Abort quickly if requested
         if abort_evt is not None and getattr(abort_evt, "is_set", None):
@@ -566,7 +567,11 @@ def bootstrap_ci(
         r_star = r[idx]
         y_star = y_hat + r_star
         try:
-            ref_res = refit(theta0, locked_mask, bounds, x_all, y_star)
+            theta_init = theta0.copy()
+            if jitter_scale > 0 and np.any(free_mask):
+                step = jitter_scale * np.maximum(np.abs(theta_init), 1.0)
+                theta_init[free_mask] += rng.normal(0.0, step[free_mask])
+            ref_res = refit(theta_init, locked_mask, bounds, x_all, y_star)
             if isinstance(ref_res, tuple):
                 th_new, ok = ref_res
             else:
@@ -737,6 +742,7 @@ def bootstrap_ci(
         "pct_at_bounds": pct_at_bounds,
         "aborted": bool(aborted),
         "runtime_s": float(time.time() - t0),
+        "theta_jitter_scale": float(jitter_scale),
         "band_source": "bootstrap-percentile" if band is not None else None,
         "band_reason": band_reason,
     }
@@ -790,10 +796,26 @@ def bayesian_ci(
         raise RuntimeError("Bayesian method requires emcee>=3") from e
 
     theta_hat = np.asarray(theta_hat, float)
-    locked = np.asarray(locked_mask, bool) if locked_mask is not None else np.zeros(theta_hat.size, bool)
-    free_idx = np.where(~locked)[0]
+    # Optional tying (LMFIT "share FWHM/eta"): collapse tied params to one free scalar
+    share_fwhm = bool((fit_ctx or {}).get("lmfit_share_fwhm", False))
+    share_eta = bool((fit_ctx or {}).get("lmfit_share_eta", False))
+    locked_eff = locked_mask.copy() if locked_mask is not None else np.zeros(theta_hat.size, bool)
+    tie_groups: list[tuple[int, list[int]]] = []
+    if share_fwhm:
+        idx = [4 * i + 2 for i in range(theta_hat.size // 4)]
+        leader = idx[0]
+        for j in idx[1:]:
+            locked_eff[j] = True
+        tie_groups.append((leader, idx))
+    if share_eta:
+        idx = [4 * i + 3 for i in range(theta_hat.size // 4)]
+        leader = idx[0]
+        for j in idx[1:]:
+            locked_eff[j] = True
+        tie_groups.append((leader, idx))
+    free_idx = np.where(~np.asarray(locked_eff, bool))[0]
+    P_free = int(free_idx.size)
     th_free = theta_hat[free_idx]
-    P_free = th_free.size
     if P_free == 0:
         free_idx = np.array([], int)
 
@@ -837,9 +859,17 @@ def bayesian_ci(
             lp += math.log(2.0/ math.pi) - math.log(s*(1.0 + (sigma/s)**2)) + math.log(1.0/max(sigma,1e-300))
         return lp
 
-    def log_likelihood(th_f, log_sigma):
+    def _project_full(th_f):
         th_full = theta_hat.copy()
-        th_full[free_idx] = th_f
+        if P_free:
+            th_full[free_idx] = th_f
+        # replicate leaders to their tied group members
+        for leader, group in tie_groups:
+            th_full[group] = th_full[leader]
+        return th_full
+
+    def log_likelihood(th_f, log_sigma):
+        th_full = _project_full(th_f)
         mu = pred(th_full)
         if mu.shape != y_all.shape: return -np.inf
         sigma = np.exp(log_sigma)
@@ -961,6 +991,16 @@ def bayesian_ci(
     if n_samp < 2:
         raise RuntimeError("insufficient MCMC draws")
     flat = chain.reshape(-1, dim)
+    # Guard against NaNs/Infs
+    flat = flat[np.all(np.isfinite(flat), axis=1)]
+    if flat.size == 0:
+        return UncertaintyResult(
+            method="bayesian",
+            label="Bayesian (MCMC)",
+            stats={},
+            diagnostics={"aborted": True, "n_draws": 0, "accept_frac_mean": acc_frac, "band_source": None},
+            band=None,
+        )
     th_draws = flat[:, :P_free]
     log_sigma_draws = flat[:, -1]
     sigma_draws = np.exp(log_sigma_draws)
@@ -968,6 +1008,9 @@ def bayesian_ci(
     T = np.tile(theta_hat, (th_draws.shape[0], 1))
     if P_free:
         T[:, free_idx] = th_draws
+    # Apply ties on all draws
+    for leader, group in tie_groups:
+        T[:, group] = T[:, [leader]]
     mean = T.mean(axis=0)
     sd = T.std(axis=0, ddof=1)
     qlo = np.quantile(T, 0.025, axis=0); qhi = np.quantile(T, 0.975, axis=0)
@@ -994,7 +1037,7 @@ def bayesian_ci(
         "band_source": None,
     }
 
-    # Never compute bands for Bayesian (too heavy / not helpful here)
+    # Never compute bands for Bayesian (disabled)
     return UncertaintyResult(
         method="bayesian",
         label="Bayesian (MCMC)",
