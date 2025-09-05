@@ -18,6 +18,7 @@ import math
 import numpy as np
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 
 try:
     from scipy.optimize import nnls as _nnls
@@ -557,8 +558,11 @@ def bootstrap_ci(
                 return np.asarray(yhat)
 
             Y_list: List[np.ndarray] = []
-            if int(workers) > 0:
-                with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+            # Cap workers to CPU count
+            w_req = int(workers)
+            w = max(0, min(w_req, (os.cpu_count() or 1)))
+            if w > 0:
+                with ThreadPoolExecutor(max_workers=w) as ex:
                     futs = {ex.submit(_eval_one, int(i)): int(i) for i in sel}
                     for f in as_completed(futs):
                         Y_list.append(f.result())
@@ -570,8 +574,14 @@ def bootstrap_ci(
             lo = np.quantile(Y, alpha / 2, axis=0)
             hi = np.quantile(Y, 1 - alpha / 2, axis=0)
             band = (x_all, lo, hi)
-            diagnostics["workers_used"] = int(workers)
+            diagnostics["workers_used"] = int(w)
             diagnostics["band_backend"] = "numpy"
+            # Free any CuPy cached blocks if available
+            try:
+                import cupy as cp  # type: ignore
+                cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
 
     diag = {
         "B": int(n_boot),
@@ -711,26 +721,45 @@ def bayesian_ci(
         p0[k, :P_free] = th0
         p0[k, -1] = math.log(max(rmse*abs(rng.normal(loc=1.0, scale=0.1)), 1e-6))
 
-    sampler = emcee.EnsembleSampler(n_walkers, dim, lambda z: log_prob(z))
+    # Optional parallel pool for emcee log_prob; cap workers
+    workers_req = 0
+    try:
+        workers_req = int((fit_ctx or {}).get("unc_workers", 0))
+    except Exception:
+        workers_req = 0
+    w = max(0, min(workers_req, (os.cpu_count() or 1)))
+    pool = ThreadPoolExecutor(max_workers=w) if w > 0 else None
+    try:
+        sampler = emcee.EnsembleSampler(
+            n_walkers, dim, lambda z: log_prob(z), pool=pool
+        )
+        # Guardrails before sampling for very high dimension
+        if dim > 40:
+            n_burn = min(int(n_burn), 1000)
+            n_steps = min(int(n_steps), 4000)
 
-    draws = []
-    accept = []
-    aborted = False
-    chunk = 500
-    state = p0
-    total = n_burn + n_steps
-    done = 0
-    while done < total:
-        step = min(chunk, total - done)
-        state, lnp, _ = sampler.run_mcmc(state, step, progress=False, skip_initial_state_check=True)
-        done += step
-        if fit_ctx and getattr(fit_ctx.get("abort_event", None), "is_set", None):
-            try:
-                if fit_ctx["abort_event"].is_set():
-                    aborted = True
-                    break
-            except Exception:
-                pass
+        draws = []
+        accept = []
+        aborted = False
+        # Smaller chunks improve abort responsiveness
+        chunk = 100 if (fit_ctx and fit_ctx.get("abort_event")) else 200
+        state = p0
+        total = n_burn + n_steps
+        done = 0
+        while done < total:
+            step = min(chunk, total - done)
+            state, lnp, _ = sampler.run_mcmc(state, step, progress=False, skip_initial_state_check=True)
+            done += step
+            if fit_ctx and getattr(fit_ctx.get("abort_event", None), "is_set", None):
+                try:
+                    if fit_ctx["abort_event"].is_set():
+                        aborted = True
+                        break
+                except Exception:
+                    pass
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
 
     chain = sampler.get_chain(discard=n_burn, thin=thin)
     acc_frac = float(np.mean(sampler.acceptance_fraction))
@@ -799,13 +828,15 @@ def bayesian_ci(
             return mu + eps
 
         Y_list: List[np.ndarray] = []
-        workers = 0
+        # Thread predictive draws; cap workers
+        workers_req = 0
         try:
-            workers = int((fit_ctx or {}).get("unc_workers", 0))
+            workers_req = int((fit_ctx or {}).get("unc_workers", 0))
         except Exception:
-            workers = 0
-        if workers > 0:
-            with ThreadPoolExecutor(max_workers=workers) as ex:
+            workers_req = 0
+        w = max(0, min(workers_req, (os.cpu_count() or 1)))
+        if w > 0:
+            with ThreadPoolExecutor(max_workers=w) as ex:
                 futs = {ex.submit(_eval_one, int(i)): int(i) for i in range(len(sel))}
                 for f in as_completed(futs):
                     Y_list.append(f.result())
@@ -819,7 +850,7 @@ def bayesian_ci(
         band = (np.asarray(x_all, float), lo, hi)
         diag["band_source"] = "bayes-posterior-predictive"
         diag["band_backend"] = "numpy"
-        diag["workers_used"] = int(workers)
+        diag["workers_used"] = int(w)
         try:
             import cupy as cp  # type: ignore
             cp.get_default_memory_pool().free_all_blocks()

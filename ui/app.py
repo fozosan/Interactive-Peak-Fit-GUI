@@ -705,6 +705,14 @@ def _format_unc_row(i: int, row: Dict[str, Any]) -> str:
 
 # ---------- Main GUI ----------
 class PeakFitApp:
+    # --- small config helper used by Bootstrap controls ---
+    def _cfg_set(self, key, value):
+        try:
+            self.cfg[key] = value
+            save_config(self.cfg)
+        except Exception:
+            pass
+
     def __init__(self, root, cfg=None):
         self.root = root
         self.cfg = cfg if cfg is not None else load_config()
@@ -3324,9 +3332,17 @@ class PeakFitApp:
         abort_evt = self._abort_evt
 
         def work():
+            # Always clear abort flag at start of run
+            try:
+                abort_evt.clear()
+            except Exception:
+                pass
             if abort_evt.is_set():
                 return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
-            workers = int(self.cfg.get("unc_workers", 0))
+            # Cap workers
+            import os
+            workers_req = int(self.cfg.get("unc_workers", 0))
+            workers = max(0, min(workers_req, (os.cpu_count() or 1)))
             if method == "asymptotic":
                 res = self._run_asymptotic_uncertainty()
                 if abort_evt.is_set():
@@ -3389,6 +3405,7 @@ class PeakFitApp:
                     "x_all": x_fit,
                     "y_all": y_fit,
                     "unc_workers": workers,
+                    "abort_event": abort_evt,
                 }
 
                 out = core_uncertainty.bootstrap_ci(
@@ -3426,6 +3443,7 @@ class PeakFitApp:
                     "x_all": x_fit,
                     "y_all": y_fit,
                     "unc_workers": workers,
+                    "abort_event": abort_evt,
                 }
                 out = core_uncertainty.bayesian_ci(
                     theta_hat=theta,
