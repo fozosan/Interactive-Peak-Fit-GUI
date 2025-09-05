@@ -426,10 +426,12 @@ def bootstrap_ci(
 
     t0 = float(time.time())
     theta = np.asarray(theta, float)
-    r = np.asarray(residual, float)
+    residual_in = np.asarray(residual, float)
     jacobian = np.asarray(jacobian, float)  # unused, kept for API parity
     if center_residuals:
-        r = r - r.mean()
+        r = residual_in - residual_in.mean()
+    else:
+        r = residual_in.copy()
 
     fit = fit_ctx or {}
     x_all = fit.get("x_all", x_all)
@@ -438,6 +440,34 @@ def bootstrap_ci(
         raise ValueError("x_all and y_all required for residual bootstrap")
     x_all = np.asarray(x_all, float)
     y_all = np.asarray(y_all, float)
+    y_hat = np.asarray(y_all, float) - residual_in
+
+    peaks_obj = fit.get("peaks")
+    if not peaks_obj:
+        ymodel = predict_full if callable(predict_full) else (lambda _th: np.asarray(y_all, float))
+        res_asym = asymptotic_ci(theta, residual_in, jacobian, ymodel, alpha=alpha)
+        diag = dict(res_asym.diagnostics)
+        diag.update({
+            "aborted": False,
+            "reason": "no-peaks",
+            "n_boot": int(n_boot),
+            "n_success": 0,
+            "n_fail": 0,
+        })
+        if return_band and predict_full is not None:
+            band = res_asym.band
+            diag.setdefault("band_source", "asymptotic")
+        else:
+            band = None
+            diag.setdefault("band_source", None)
+            diag.setdefault("band_reason", "missing model")
+        return UncertaintyResult(
+            method="bootstrap",
+            label="Bootstrap",
+            stats=res_asym.stats,
+            diagnostics=diag,
+            band=band,
+        )
 
     refit = None
     if fit_ctx:
@@ -449,10 +479,6 @@ def bootstrap_ci(
         from . import fit_api as _fit_api
         from .data_io import peaks_to_dicts
 
-        peaks_obj = fit_ctx.get("peaks") if fit_ctx else None
-        # Provide progress + abort to the fallback path too
-        _progress_cb = progress_cb
-        _abort_evt = abort_evt
         mode = (fit_ctx.get("mode") if fit_ctx else "add") or "add"
         baseline = fit_ctx.get("baseline") if fit_ctx else None
         solver = (fit_ctx.get("solver") if fit_ctx else None) or "classic"
@@ -513,16 +539,15 @@ def bootstrap_ci(
 
         # Residual resample
         idx = rng.integers(0, n, size=n)
-        eps = r[idx]
-        yb = y_all + eps
+        y_star = y_hat + r[idx]
         try:
-            ref_res = refit(theta0, locked_mask, bounds, x_all, yb)
+            ref_res = refit(theta0, locked_mask, bounds, x_all, y_star)
             if isinstance(ref_res, tuple):
-                th_b, ok = ref_res
+                th_new, ok = ref_res
             else:
-                th_b, ok = ref_res, True
-            if ok and np.all(np.isfinite(th_b)):
-                T_list.append(th_b)
+                th_new, ok = ref_res, True
+            if ok and np.all(np.isfinite(th_new)):
+                T_list.append(th_new)
                 n_success += 1
             else:
                 n_fail += 1
@@ -535,7 +560,9 @@ def bootstrap_ci(
         theta_succ = np.empty((0, theta.size), float)
     T = theta_succ
     if n_success < 2:
-        raise RuntimeError("Insufficient successful bootstrap refits")
+        raise RuntimeError(
+            f"Insufficient successful bootstrap refits (success={n_success}, fail={n_fail})"
+        )
 
     mean = T.mean(axis=0)
     sd = T.std(axis=0, ddof=1)
