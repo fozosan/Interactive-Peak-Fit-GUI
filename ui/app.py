@@ -3423,6 +3423,9 @@ class PeakFitApp:
                     "x_all": x_fit,
                     "y_all": y_fit,
                     "solver": self.solver_choice.get(),
+                    # propagate sharing flags for LMFIT VP
+                    "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
+                    "lmfit_share_eta":  bool(self.lmfit_share_eta.get()),
                     "peaks": self.peaks,
                     "locked_mask": locked_mask,
                     "unc_workers": workers,
@@ -3467,6 +3470,8 @@ class PeakFitApp:
                     "x_all": x_fit,
                     "y_all": y_fit,
                     "solver": self.solver_choice.get(),
+                    "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
+                    "lmfit_share_eta":  bool(self.lmfit_share_eta.get()),
                     "peaks": self.peaks,
                     "locked_mask": locked_mask,
                     "unc_workers": workers,
@@ -3482,7 +3487,8 @@ class PeakFitApp:
                     residual_fn=(lambda th: resid_fn(th)),
                     fit_ctx=fit_ctx,
                     locked_mask=locked_mask,
-                    return_band=bool(self.show_ci_band_var.get()),
+                    # Force off: bands for MCMC are disabled
+                    return_band=False,
                 )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
