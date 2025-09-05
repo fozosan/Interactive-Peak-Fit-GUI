@@ -869,7 +869,6 @@ class PeakFitApp:
         self._last_unc_locks: List[Dict[str, bool]] = []
 
         self.current_file: Optional[Path] = None
-        self.show_ci_band.trace_add("write", self._toggle_ci_band)
         self._abort_evt = threading.Event()
 
         # Uncertainty and performance controls
@@ -914,6 +913,8 @@ class PeakFitApp:
         # UI
         self._build_ui()
         self._new_figure()
+        # attach after axes are created to avoid early refresh calls
+        self.show_ci_band.trace_add("write", self._toggle_ci_band)
         self._update_template_info()
         self.apply_performance()
 
@@ -4124,6 +4125,8 @@ class PeakFitApp:
         self.refresh_plot()
 
     def refresh_plot(self):
+        if not hasattr(self, "ax") or self.ax is None:
+            return
         LW_RAW, LW_BASE, LW_CORR, LW_COMP, LW_FIT = 1.0, 1.0, 0.9, 0.8, 1.2
         self.ax.clear()
         self.ax.set_xlabel(format_axis_label_inline(self.x_label_var.get(), self.x_label_auto_math.get()))
