@@ -726,6 +726,14 @@ class PeakFitApp:
         self.cfg.setdefault("unc_workers", 0)
         self.cfg.setdefault("last_template_name", self.cfg.get("auto_apply_template_name", ""))
         self.cfg.setdefault("export_unc_wide", False)
+        self.cfg.setdefault("unc_alpha", 0.05)
+        self.cfg.setdefault("unc_center_resid", True)
+        self.cfg.setdefault("bootstrap_jitter", 0.02)
+        self.cfg.setdefault("bayes_walkers", 0)
+        self.cfg.setdefault("bayes_burn", 1000)
+        self.cfg.setdefault("bayes_steps", 4000)
+        self.cfg.setdefault("bayes_thin", 1)
+        self.cfg.setdefault("bayes_prior_sigma", "half_cauchy")
         save_config(self.cfg)
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
 
@@ -874,6 +882,11 @@ class PeakFitApp:
             unc_label = "Asymptotic"
         self.unc_method = tk.StringVar(value=unc_label)
         self.unc_method_var = self.unc_method
+        # ensure band toggle reflects current method on startup
+        try:
+            self._on_uncertainty_method_changed()
+        except Exception:
+            pass
         self.unc_workers_var = tk.IntVar(value=int(self.cfg.get("unc_workers", 0)))
         self.unc_workers_var.trace_add("write", lambda *_: self._on_unc_workers_change())
         self.perf_numba = tk.BooleanVar(value=bool(self.cfg.get("perf_numba", False)))
@@ -886,6 +899,15 @@ class PeakFitApp:
         self.perf_cache_baseline.trace_add("write", lambda *_: self.apply_performance())
         self.perf_seed_all.trace_add("write", lambda *_: self.apply_performance())
         self.perf_max_workers.trace_add("write", lambda *_: self.apply_performance())
+        self.alpha_var = tk.DoubleVar(value=float(self.cfg.get("unc_alpha", 0.05)))
+        self.center_resid_var = tk.BooleanVar(value=bool(self.cfg.get("unc_center_resid", True)))
+        self.bootstrap_jitter_var = tk.DoubleVar(value=100.0 * float(self.cfg.get("bootstrap_jitter", 0.02)))
+
+        self.bayes_walkers_var = tk.IntVar(value=int(self.cfg.get("bayes_walkers", 0)))  # 0 => auto
+        self.bayes_burn_var = tk.IntVar(value=int(self.cfg.get("bayes_burn", 1000)))
+        self.bayes_steps_var = tk.IntVar(value=int(self.cfg.get("bayes_steps", 4000)))
+        self.bayes_thin_var = tk.IntVar(value=int(self.cfg.get("bayes_thin", 1)))
+        self.bayes_prior_var = tk.StringVar(value=str(self.cfg.get("bayes_prior_sigma", "half_cauchy")))
         self.seed_var = tk.StringVar(value="")
         self.gpu_chunk_var = tk.IntVar(value=262144)
 
@@ -1353,6 +1375,33 @@ class PeakFitApp:
         self.chk_ci_band.pack(anchor="w", padx=4)
         self.ci_toggle = self.chk_ci_band
         self._set_ci_toggle_state(False)
+
+        # Extra uncertainty controls
+        unc_frame = ttk.Frame(unc_box)
+        unc_frame.pack(fill=tk.X, pady=2)
+        r = 0
+        ttk.Label(unc_frame, text="Jitter %").grid(row=r, column=0, sticky="e")
+        self._jitter_entry = ttk.Entry(unc_frame, textvariable=self.bootstrap_jitter_var, width=6)
+        self._jitter_entry.grid(row=r, column=1, sticky="w")
+        r += 1
+        ttk.Label(unc_frame, text="CI α").grid(row=r, column=0, sticky="e")
+        ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6).grid(row=r, column=1, sticky="w")
+        ttk.Checkbutton(unc_frame, text="Center residuals", variable=self.center_resid_var).grid(row=r, column=2, sticky="w")
+        r += 1
+
+        bay = ttk.LabelFrame(unc_frame, text="Bayesian (no band)")
+        bay.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 0))
+        ttk.Label(bay, text="Walkers").grid(row=0, column=0, sticky="e")
+        ttk.Entry(bay, textvariable=self.bayes_walkers_var, width=6).grid(row=0, column=1, sticky="w")
+        ttk.Label(bay, text="Burn-in").grid(row=0, column=2, sticky="e")
+        ttk.Entry(bay, textvariable=self.bayes_burn_var, width=6).grid(row=0, column=3, sticky="w")
+        ttk.Label(bay, text="Steps").grid(row=1, column=0, sticky="e")
+        ttk.Entry(bay, textvariable=self.bayes_steps_var, width=6).grid(row=1, column=1, sticky="w")
+        ttk.Label(bay, text="Thin").grid(row=1, column=2, sticky="e")
+        ttk.Entry(bay, textvariable=self.bayes_thin_var, width=6).grid(row=1, column=3, sticky="w")
+        ttk.Label(bay, text="σ prior").grid(row=2, column=0, sticky="e")
+        ttk.Combobox(bay, textvariable=self.bayes_prior_var, width=12,
+                     values=("half_cauchy", "half_normal"), state="readonly").grid(row=2, column=1, sticky="w")
         self._update_unc_widgets()
         self._on_uncertainty_method_changed()
 
@@ -1662,10 +1711,21 @@ class PeakFitApp:
 
     def _on_uncertainty_method_changed(self, *_):
         sel = str(self.unc_method_var.get()).lower()
-        self._set_ci_toggle_state(True)
-        if "asym" not in sel:
+        is_bayes = ("bayes" in sel)
+        # toggle availability
+        self._set_ci_toggle_state(not is_bayes)
+        try:
+            state = ("normal" if "bootstrap" in sel else "disabled")
+            for w in (self._jitter_entry,):
+                w.configure(state=state)
+        except Exception:
+            pass
+        if is_bayes:
+            # hard-disable for Bayesian
+            self.show_ci_band_var.set(False)
             self.ci_band = None
             self.refresh_plot()
+        # for asymptotic/bootstrap the checkbox remains user-controlled
 
 
     def on_abort_clicked(self):
@@ -3353,6 +3413,33 @@ class PeakFitApp:
             import os
             workers_req = int(self.cfg.get("unc_workers", 0))
             workers = max(0, min(workers_req, (os.cpu_count() or 1)))
+
+            # Build locked mask (center/fwhm locks) for bootstrap/Bayesian refits
+            locked_mask = np.zeros(theta.size, dtype=bool)
+            for i, pk in enumerate(self.peaks):
+                if bool(getattr(pk, "lock_center", False)):
+                    locked_mask[4 * i + 0] = True
+                if bool(getattr(pk, "lock_width", False)):
+                    locked_mask[4 * i + 2] = True
+
+            alpha = min(max(float(self.alpha_var.get()), 1e-6), 0.5)
+            jitter_pct = max(0.0, min(float(self.bootstrap_jitter_var.get()), 50.0))
+            walkers = max(0, int(self.bayes_walkers_var.get() or 0))
+            burn = max(0, int(self.bayes_burn_var.get()))
+            steps = max(1, int(self.bayes_steps_var.get()))
+            thin = max(1, int(self.bayes_thin_var.get()))
+            self.alpha_var.set(alpha); self.bootstrap_jitter_var.set(jitter_pct)
+            self.bayes_walkers_var.set(walkers); self.bayes_burn_var.set(burn)
+            self.bayes_steps_var.set(steps); self.bayes_thin_var.set(thin)
+
+            self._cfg_set("unc_alpha", alpha)
+            self._cfg_set("unc_center_resid", bool(self.center_resid_var.get()))
+            self._cfg_set("bootstrap_jitter", jitter_pct / 100.0)
+            self._cfg_set("bayes_walkers", walkers)
+            self._cfg_set("bayes_burn", burn)
+            self._cfg_set("bayes_steps", steps)
+            self._cfg_set("bayes_thin", thin)
+            self._cfg_set("bayes_prior_sigma", str(self.bayes_prior_var.get()))
             if method == "asymptotic":
                 res = self._run_asymptotic_uncertainty()
                 if abort_evt.is_set():
@@ -3414,10 +3501,16 @@ class PeakFitApp:
                     "predict_full": predict_full,
                     "x_all": x_fit,
                     "y_all": y_fit,
+                    "solver": self.solver_choice.get(),
+                    # propagate sharing flags for LMFIT VP
+                    "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
+                    "lmfit_share_eta":  bool(self.lmfit_share_eta.get()),
                     "peaks": self.peaks,
+                    "locked_mask": locked_mask,
                     "unc_workers": workers,
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
+                    "bootstrap_jitter": jitter_pct / 100.0,
                 }
 
                 out = core_uncertainty.bootstrap_ci(
@@ -3427,11 +3520,14 @@ class PeakFitApp:
                     predict_full=predict_full,
                     x_all=x_fit,
                     y_all=y_fit,
+                    locked_mask=locked_mask,
                     fit_ctx=fit_ctx,
                     n_boot=n_boot,
                     seed=seed_val,
                     workers=workers,
                     return_band=bool(self.show_ci_band_var.get()),
+                    alpha=alpha,
+                    center_residuals=bool(self.center_resid_var.get()),
                 )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
@@ -3455,7 +3551,11 @@ class PeakFitApp:
                     "predict_full": predict_full,
                     "x_all": x_fit,
                     "y_all": y_fit,
+                    "solver": self.solver_choice.get(),
+                    "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
+                    "lmfit_share_eta":  bool(self.lmfit_share_eta.get()),
                     "peaks": self.peaks,
+                    "locked_mask": locked_mask,
                     "unc_workers": workers,
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
@@ -3468,7 +3568,14 @@ class PeakFitApp:
                     y_all=y_fit,
                     residual_fn=(lambda th: resid_fn(th)),
                     fit_ctx=fit_ctx,
-                    return_band=bool(self.show_ci_band_var.get()),
+                    locked_mask=locked_mask,
+                    # Force off: bands for MCMC are disabled
+                    return_band=False,
+                    n_walkers=(walkers or None),
+                    n_burn=burn,
+                    n_steps=steps,
+                    thin=thin,
+                    prior_sigma=str(self.bayes_prior_var.get()),
                 )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
