@@ -1300,6 +1300,42 @@ class PeakFitApp:
             width=5,
         )
         self.unc_workers_spin.pack(side=tk.LEFT, padx=2)
+
+        # Bootstrap advanced options (visible only when method == "bootstrap")
+        boot_row = ttk.Frame(unc_box); boot_row.pack(fill=tk.X, pady=2)
+        ttk.Label(boot_row, text="Draws:").pack(side=tk.LEFT)
+        self.boot_n_var = tk.IntVar(value=int(self.cfg.get("bootstrap_n", 500)))
+        ttk.Spinbox(
+            boot_row,
+            from_=50, to=100000, increment=50, width=8,
+            textvariable=self.boot_n_var,
+            command=lambda: self._cfg_set("bootstrap_n", int(self.boot_n_var.get()))
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Label(boot_row, text="Seed:").pack(side=tk.LEFT)
+        self.boot_seed_var = tk.IntVar(value=int(self.cfg.get("bootstrap_seed", 0)))
+        _boot_seed_entry = ttk.Entry(boot_row, width=10, textvariable=self.boot_seed_var)
+        _boot_seed_entry.pack(side=tk.LEFT, padx=4)
+        _boot_seed_entry.bind(
+            "<FocusOut>",
+            lambda _e: self._cfg_set("bootstrap_seed", int(self.boot_seed_var.get() or 0))
+        )
+        self._boot_options_row = boot_row
+
+        def _toggle_boot_row():
+            try:
+                mkey = self._unc_selected_method_key().lower()
+                if mkey == "bootstrap":
+                    self._boot_options_row.pack(fill=tk.X, pady=2)
+                else:
+                    self._boot_options_row.forget()
+            except Exception:
+                pass
+        _toggle_boot_row()
+        try:
+            self.unc_method_combo.bind("<<ComboboxSelected>>", lambda _e: _toggle_boot_row())
+        except Exception:
+            pass
+
         ttk.Button(unc_box, text="Run", command=self.run_uncertainty).pack(side=tk.LEFT, padx=4)
         self.chk_ci_band = ttk.Checkbutton(
             unc_box,
@@ -3113,17 +3149,21 @@ class PeakFitApp:
                 "residual_fn": (lambda th: resid_fn(th)),
                 "predict_full": predict_full,
                 "x_all": x_fit,
+                "y_all": y_fit,
+                "unc_workers": int(self.cfg.get("unc_workers", 0)),
             }
 
             n_boot = self._get_int("bootstrap_n", 200)
             seed_val = self._get_int("bootstrap_seed", 0) or None
-            workers = self._get_int("perf_max_workers", 0)
+            workers = int(self.cfg.get("unc_workers", 0))
 
             res = core_uncertainty.bootstrap_ci(
                 theta=theta,
                 residual=r0,
                 jacobian=J,
                 predict_full=predict_full,
+                x_all=x_fit,
+                y_all=y_fit,
                 fit_ctx=fit_ctx,
                 n_boot=n_boot,
                 seed=seed_val,
@@ -3149,6 +3189,7 @@ class PeakFitApp:
                 "predict_full": predict_full,
                 "x_all": x_fit,
                 "y_all": y_fit,
+                "unc_workers": int(self.cfg.get("unc_workers", 0)),
             }
             out = core_uncertainty.bayesian_ci(
                 theta_hat=theta,
@@ -3285,6 +3326,7 @@ class PeakFitApp:
         def work():
             if abort_evt.is_set():
                 return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
+            workers = int(self.cfg.get("unc_workers", 0))
             if method == "asymptotic":
                 res = self._run_asymptotic_uncertainty()
                 if abort_evt.is_set():
@@ -3318,9 +3360,12 @@ class PeakFitApp:
                     "param_stats": param_stats,
                 }
             if method == "bootstrap":
-                n_boot = self._get_int("bootstrap_n", 200)
-                seed_val = self._get_int("bootstrap_seed", 0) or None
-                workers = self._get_int("perf_max_workers", 0)
+                # Prefer live widget values; persist to cfg
+                n_boot = int(getattr(self, "boot_n_var", None).get() if hasattr(self, "boot_n_var") else self._get_int("bootstrap_n", 200))
+                seed_val = int(getattr(self, "boot_seed_var", None).get() if hasattr(self, "boot_seed_var") else self._get_int("bootstrap_seed", 0))
+                self._cfg_set("bootstrap_n", n_boot)
+                self._cfg_set("bootstrap_seed", seed_val)
+                seed_val = seed_val or None
 
                 r0 = resid_fn(theta)
                 J = jacobian_fd(resid_fn, theta)
@@ -3342,6 +3387,8 @@ class PeakFitApp:
                     "residual_fn": (lambda th: resid_fn(th)),
                     "predict_full": predict_full,
                     "x_all": x_fit,
+                    "y_all": y_fit,
+                    "unc_workers": workers,
                 }
 
                 out = core_uncertainty.bootstrap_ci(
@@ -3349,6 +3396,8 @@ class PeakFitApp:
                     residual=r0,
                     jacobian=J,
                     predict_full=predict_full,
+                    x_all=x_fit,
+                    y_all=y_fit,
                     fit_ctx=fit_ctx,
                     n_boot=n_boot,
                     seed=seed_val,
@@ -3376,6 +3425,7 @@ class PeakFitApp:
                     "predict_full": predict_full,
                     "x_all": x_fit,
                     "y_all": y_fit,
+                    "unc_workers": workers,
                 }
                 out = core_uncertainty.bayesian_ci(
                     theta_hat=theta,

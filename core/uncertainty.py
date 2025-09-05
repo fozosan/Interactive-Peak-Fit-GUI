@@ -17,6 +17,7 @@ import math
 
 import numpy as np
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from scipy.optimize import nnls as _nnls
@@ -407,7 +408,13 @@ def bootstrap_ci(
     center_residuals: bool = True,
     return_band: bool = False,
 ) -> UncertaintyResult:
-    """Residual bootstrap with refitting through ``fit_ctx``."""
+    """Residual bootstrap with refitting through ``fit_ctx``.
+
+    Notes:
+      * Requires ``x_all`` and ``y_all`` for residual resampling.
+      * Uses CPU parallelism (ThreadPool) when ``workers>0`` to evaluate prediction band.
+      * If the model backend returns CuPy arrays, band aggregation converts to NumPy to avoid GPU saturation.
+    """
 
     t0 = float(time.time())
     theta = np.asarray(theta, float)
@@ -416,8 +423,13 @@ def bootstrap_ci(
     if center_residuals:
         r = r - r.mean()
 
+    fit = fit_ctx or {}
+    x_all = fit.get("x_all", x_all)
+    y_all = fit.get("y_all", y_all)
     if x_all is None or y_all is None:
         raise ValueError("x_all and y_all required for residual bootstrap")
+    x_all = np.asarray(x_all, float)
+    y_all = np.asarray(y_all, float)
 
     refit = None
     if fit_ctx:
@@ -525,14 +537,41 @@ def bootstrap_ci(
 
     band = None
     band_reason = None
+    diagnostics: Dict[str, object] = {}
     if return_band:
         if predict_full is None or n_success < BOOT_BAND_MIN_SAMPLES:
             band_reason = "missing model or insufficient samples"
         else:
-            Ys = np.vstack([predict_full(th) for th in theta_succ])
-            lo = np.quantile(Ys, alpha / 2, axis=0)
-            hi = np.quantile(Ys, 1 - alpha / 2, axis=0)
+            max_use = min(n_success, 4096)
+            sel = np.linspace(0, n_success - 1, max_use, dtype=int)
+
+            def _eval_one(idx: int) -> np.ndarray:
+                th = theta_succ[idx]
+                yhat = predict_full(th)
+                try:
+                    import cupy as cp  # type: ignore
+                    if isinstance(yhat, cp.ndarray):
+                        return cp.asnumpy(yhat)
+                except Exception:
+                    pass
+                return np.asarray(yhat)
+
+            Y_list: List[np.ndarray] = []
+            if int(workers) > 0:
+                with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+                    futs = {ex.submit(_eval_one, int(i)): int(i) for i in sel}
+                    for f in as_completed(futs):
+                        Y_list.append(f.result())
+            else:
+                for i in sel:
+                    Y_list.append(_eval_one(int(i)))
+
+            Y = np.vstack(Y_list)
+            lo = np.quantile(Y, alpha / 2, axis=0)
+            hi = np.quantile(Y, 1 - alpha / 2, axis=0)
             band = (x_all, lo, hi)
+            diagnostics["workers_used"] = int(workers)
+            diagnostics["band_backend"] = "numpy"
 
     diag = {
         "B": int(n_boot),
@@ -545,6 +584,7 @@ def bootstrap_ci(
         "band_source": "bootstrap-percentile" if band is not None else None,
         "band_reason": band_reason,
     }
+    diag.update(diagnostics)
 
     return UncertaintyResult(
         method="bootstrap",
@@ -723,10 +763,7 @@ def bayesian_ci(
         "p97.5": float(np.quantile(sigma_draws, 0.975)),
     }
 
-    try:
-        _ = sampler.get_autocorr_time(quiet=True)
-    except Exception:
-        pass
+    # Skip emcee's get_autocorr_time() to avoid noisy warnings (short chains).
     chains = chain
     ess_min = ess_autocorr(chains)
     rhat_max = rhat_split(chains)
@@ -746,16 +783,48 @@ def bayesian_ci(
         sel = np.linspace(0, n_samp-1, max_use, dtype=int)
         T_sel = T[sel]
         sig_sel = sigma_draws[sel]
-        Y = []
-        for t_i, s_i in zip(T_sel, sig_sel):
+
+        def _eval_one(idx: int) -> np.ndarray:
+            t_i = T_sel[idx]
+            s_i = float(sig_sel[idx])
             mu = pred(t_i)
+            try:
+                import cupy as cp  # type: ignore
+                if isinstance(mu, cp.ndarray):
+                    mu = cp.asnumpy(mu)
+            except Exception:
+                pass
+            mu = np.asarray(mu, float)
             eps = rng.normal(0.0, s_i, size=mu.shape)
-            Y.append(mu + eps)
-        Y = np.vstack(Y)
+            return mu + eps
+
+        Y_list: List[np.ndarray] = []
+        workers = 0
+        try:
+            workers = int((fit_ctx or {}).get("unc_workers", 0))
+        except Exception:
+            workers = 0
+        if workers > 0:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_eval_one, int(i)): int(i) for i in range(len(sel))}
+                for f in as_completed(futs):
+                    Y_list.append(f.result())
+        else:
+            for i in range(len(sel)):
+                Y_list.append(_eval_one(int(i)))
+
+        Y = np.vstack(Y_list)
         lo = np.quantile(Y, 0.025, axis=0)
         hi = np.quantile(Y, 0.975, axis=0)
         band = (np.asarray(x_all, float), lo, hi)
         diag["band_source"] = "bayes-posterior-predictive"
+        diag["band_backend"] = "numpy"
+        diag["workers_used"] = int(workers)
+        try:
+            import cupy as cp  # type: ignore
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
 
     return UncertaintyResult(
         method="bayesian",
