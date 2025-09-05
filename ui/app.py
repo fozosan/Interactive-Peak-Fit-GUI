@@ -901,7 +901,7 @@ class PeakFitApp:
         self.perf_max_workers.trace_add("write", lambda *_: self.apply_performance())
         self.alpha_var = tk.DoubleVar(value=float(self.cfg.get("unc_alpha", 0.05)))
         self.center_resid_var = tk.BooleanVar(value=bool(self.cfg.get("unc_center_resid", True)))
-        self.bootstrap_jitter_var = tk.DoubleVar(value=float(self.cfg.get("bootstrap_jitter", 0.02)))
+        self.bootstrap_jitter_var = tk.DoubleVar(value=100.0 * float(self.cfg.get("bootstrap_jitter", 0.02)))
 
         self.bayes_walkers_var = tk.IntVar(value=int(self.cfg.get("bayes_walkers", 0)))  # 0 => auto
         self.bayes_burn_var = tk.IntVar(value=int(self.cfg.get("bayes_burn", 1000)))
@@ -1381,7 +1381,8 @@ class PeakFitApp:
         unc_frame.pack(fill=tk.X, pady=2)
         r = 0
         ttk.Label(unc_frame, text="Jitter %").grid(row=r, column=0, sticky="e")
-        ttk.Entry(unc_frame, textvariable=self.bootstrap_jitter_var, width=6).grid(row=r, column=1, sticky="w")
+        self._jitter_entry = ttk.Entry(unc_frame, textvariable=self.bootstrap_jitter_var, width=6)
+        self._jitter_entry.grid(row=r, column=1, sticky="w")
         r += 1
         ttk.Label(unc_frame, text="CI α").grid(row=r, column=0, sticky="e")
         ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6).grid(row=r, column=1, sticky="w")
@@ -1713,6 +1714,12 @@ class PeakFitApp:
         is_bayes = ("bayes" in sel)
         # toggle availability
         self._set_ci_toggle_state(not is_bayes)
+        try:
+            state = ("normal" if "bootstrap" in sel else "disabled")
+            for w in (self._jitter_entry,):
+                w.configure(state=state)
+        except Exception:
+            pass
         if is_bayes:
             # hard-disable for Bayesian
             self.show_ci_band_var.set(False)
@@ -3414,13 +3421,24 @@ class PeakFitApp:
                     locked_mask[4 * i + 0] = True
                 if bool(getattr(pk, "lock_width", False)):
                     locked_mask[4 * i + 2] = True
-            self._cfg_set("unc_alpha", float(self.alpha_var.get()))
+
+            alpha = min(max(float(self.alpha_var.get()), 1e-6), 0.5)
+            jitter_pct = max(0.0, min(float(self.bootstrap_jitter_var.get()), 50.0))
+            walkers = max(0, int(self.bayes_walkers_var.get() or 0))
+            burn = max(0, int(self.bayes_burn_var.get()))
+            steps = max(1, int(self.bayes_steps_var.get()))
+            thin = max(1, int(self.bayes_thin_var.get()))
+            self.alpha_var.set(alpha); self.bootstrap_jitter_var.set(jitter_pct)
+            self.bayes_walkers_var.set(walkers); self.bayes_burn_var.set(burn)
+            self.bayes_steps_var.set(steps); self.bayes_thin_var.set(thin)
+
+            self._cfg_set("unc_alpha", alpha)
             self._cfg_set("unc_center_resid", bool(self.center_resid_var.get()))
-            self._cfg_set("bootstrap_jitter", float(self.bootstrap_jitter_var.get()))
-            self._cfg_set("bayes_walkers", int(self.bayes_walkers_var.get()))
-            self._cfg_set("bayes_burn", int(self.bayes_burn_var.get()))
-            self._cfg_set("bayes_steps", int(self.bayes_steps_var.get()))
-            self._cfg_set("bayes_thin", int(self.bayes_thin_var.get()))
+            self._cfg_set("bootstrap_jitter", jitter_pct / 100.0)
+            self._cfg_set("bayes_walkers", walkers)
+            self._cfg_set("bayes_burn", burn)
+            self._cfg_set("bayes_steps", steps)
+            self._cfg_set("bayes_thin", thin)
             self._cfg_set("bayes_prior_sigma", str(self.bayes_prior_var.get()))
             if method == "asymptotic":
                 res = self._run_asymptotic_uncertainty()
@@ -3492,7 +3510,7 @@ class PeakFitApp:
                     "unc_workers": workers,
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
-                    "bootstrap_jitter": float(self.bootstrap_jitter_var.get()),
+                    "bootstrap_jitter": jitter_pct / 100.0,
                 }
 
                 out = core_uncertainty.bootstrap_ci(
@@ -3508,7 +3526,7 @@ class PeakFitApp:
                     seed=seed_val,
                     workers=workers,
                     return_band=bool(self.show_ci_band_var.get()),
-                    alpha=float(self.alpha_var.get()),
+                    alpha=alpha,
                     center_residuals=bool(self.center_resid_var.get()),
                 )
                 if abort_evt.is_set():
@@ -3553,10 +3571,10 @@ class PeakFitApp:
                     locked_mask=locked_mask,
                     # Force off: bands for MCMC are disabled
                     return_band=False,
-                    n_walkers=(int(self.bayes_walkers_var.get()) or None),
-                    n_burn=int(self.bayes_burn_var.get()),
-                    n_steps=int(self.bayes_steps_var.get()),
-                    thin=int(self.bayes_thin_var.get()),
+                    n_walkers=(walkers or None),
+                    n_burn=burn,
+                    n_steps=steps,
+                    thin=thin,
                     prior_sigma=str(self.bayes_prior_var.get()),
                 )
                 if abort_evt.is_set():

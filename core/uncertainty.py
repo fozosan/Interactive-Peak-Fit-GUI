@@ -803,15 +803,17 @@ def bayesian_ci(
     tie_groups: list[tuple[int, list[int]]] = []
     if share_fwhm:
         idx = [4 * i + 2 for i in range(theta_hat.size // 4)]
-        leader = idx[0]
-        for j in idx[1:]:
-            locked_eff[j] = True
+        leader = next((j for j in idx if not locked_eff[j]), idx[0])
+        for j in idx:
+            if j != leader:
+                locked_eff[j] = True
         tie_groups.append((leader, idx))
     if share_eta:
         idx = [4 * i + 3 for i in range(theta_hat.size // 4)]
-        leader = idx[0]
-        for j in idx[1:]:
-            locked_eff[j] = True
+        leader = next((j for j in idx if not locked_eff[j]), idx[0])
+        for j in idx:
+            if j != leader:
+                locked_eff[j] = True
         tie_groups.append((leader, idx))
     free_idx = np.where(~np.asarray(locked_eff, bool))[0]
     P_free = int(free_idx.size)
@@ -871,6 +873,7 @@ def bayesian_ci(
     def log_likelihood(th_f, log_sigma):
         th_full = _project_full(th_f)
         mu = pred(th_full)
+        if not np.all(np.isfinite(mu)): return -np.inf
         if mu.shape != y_all.shape: return -np.inf
         sigma = np.exp(log_sigma)
         if not np.isfinite(sigma) or sigma <= 0: return -np.inf
@@ -988,12 +991,10 @@ def bayesian_ci(
         )
     n_samp = n_post * n_walkers
 
-    if n_samp < 2:
-        raise RuntimeError("insufficient MCMC draws")
     flat = chain.reshape(-1, dim)
-    # Guard against NaNs/Infs
     flat = flat[np.all(np.isfinite(flat), axis=1)]
-    if flat.size == 0:
+    n_samp = flat.shape[0]
+    if n_samp < 2:
         return UncertaintyResult(
             method="bayesian",
             label="Bayesian (MCMC)",
