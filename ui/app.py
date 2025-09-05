@@ -3405,6 +3405,7 @@ class PeakFitApp:
                     "x_all": x_fit,
                     "y_all": y_fit,
                     "unc_workers": workers,
+                    "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
                 }
 
@@ -3443,6 +3444,7 @@ class PeakFitApp:
                     "x_all": x_fit,
                     "y_all": y_fit,
                     "unc_workers": workers,
+                    "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
                 }
                 out = core_uncertainty.bayesian_ci(

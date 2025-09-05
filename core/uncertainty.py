@@ -409,6 +409,13 @@ def bootstrap_ci(
     center_residuals: bool = True,
     return_band: bool = False,
 ) -> UncertaintyResult:
+    # Optional abort + progress callback from fit_ctx
+    abort_evt = None
+    progress_cb = None
+    if fit_ctx:
+        abort_evt = fit_ctx.get("abort_event")
+        progress_cb = fit_ctx.get("progress_cb")
+
     """Residual bootstrap with refitting through ``fit_ctx``.
 
     Notes:
@@ -443,6 +450,9 @@ def bootstrap_ci(
         from .data_io import peaks_to_dicts
 
         peaks_obj = fit_ctx.get("peaks") if fit_ctx else None
+        # Provide progress + abort to the fallback path too
+        _progress_cb = progress_cb
+        _abort_evt = abort_evt
         mode = (fit_ctx.get("mode") if fit_ctx else "add") or "add"
         baseline = fit_ctx.get("baseline") if fit_ctx else None
         solver = (fit_ctx.get("solver") if fit_ctx else None) or "classic"
@@ -458,50 +468,75 @@ def bootstrap_ci(
                 bounds=bounds,
                 baseline=baseline,
             )
-            if not res.get("fit_ok", False):
-                raise RuntimeError("refit failed")
-            return np.asarray(res["theta"], float)
+            th = np.asarray(res.get("theta", theta_init), float)
+            ok = bool(res.get("fit_ok", False))
+            return th, ok
 
+    theta0 = np.asarray(fit.get("theta0", theta), float)
     P = theta.size
-    free_mask = np.ones(P, bool) if locked_mask is None else ~np.asarray(locked_mask, bool)
 
-    def one_boot(i: int) -> Optional[np.ndarray]:
-        local = np.random.default_rng(None if seed is None else seed + i)
-        idx = local.integers(0, r.size, size=r.size)
-        r_star = r[idx]
-        y_hat = y_all - residual
-        y_star = y_hat + r_star
-        try:
-            th_new = np.asarray(refit(theta, locked_mask, bounds, x_all, y_star), float)
-            th_new[~free_mask] = theta[~free_mask]
-            if bounds is not None:
-                lo, hi = bounds
-                if lo is not None:
-                    th_new = np.maximum(th_new, lo)
-                if hi is not None:
-                    th_new = np.minimum(th_new, hi)
-            return th_new
-        except Exception:
-            return None
-
+    # ---- Bootstrap resampling loop (abort-aware with progress pulses) ----
+    # Existing variables used below (expected from prior code):
+    #   r = centered residuals, theta0 = starting theta, locked_mask, bounds,
+    #   refit() function, names/param_names, etc.
     if n_boot <= 0:
         raise ValueError("n_boot must be > 0")
 
-    if workers and workers > 0:
-        from concurrent.futures import ProcessPoolExecutor
+    n = int(x_all.size)
+    rng = np.random.default_rng(seed)
+    T_list: List[np.ndarray] = []
+    n_success = 0
+    n_fail = 0
+    aborted = False
+    # Throttle progress to ~10–20 pulses over the run
+    next_pulse_at = 0
+    pulse_step = max(1, int(n_boot // 20))
+    last_pulse_t = time.monotonic()
+    for b in range(int(n_boot)):
+        # Abort quickly if requested
+        if abort_evt is not None and getattr(abort_evt, "is_set", None):
+            try:
+                if abort_evt.is_set():
+                    aborted = True
+                    break
+            except Exception:
+                pass
+        # Progress pulse (time + count throttled)
+        if progress_cb is not None:
+            if b >= next_pulse_at or (time.monotonic() - last_pulse_t) > 0.5:
+                try:
+                    progress_cb(f"Bootstrap: {b}/{int(n_boot)}")
+                except Exception:
+                    pass
+                last_pulse_t = time.monotonic()
+                next_pulse_at = b + pulse_step
 
-        with ProcessPoolExecutor(max_workers=int(workers)) as ex:
-            thetas = list(ex.map(one_boot, range(n_boot)))
+        # Residual resample
+        idx = rng.integers(0, n, size=n)
+        eps = r[idx]
+        yb = y_all + eps
+        try:
+            ref_res = refit(theta0, locked_mask, bounds, x_all, yb)
+            if isinstance(ref_res, tuple):
+                th_b, ok = ref_res
+            else:
+                th_b, ok = ref_res, True
+            if ok and np.all(np.isfinite(th_b)):
+                T_list.append(th_b)
+                n_success += 1
+            else:
+                n_fail += 1
+        except Exception:
+            n_fail += 1
+
+    if len(T_list):
+        theta_succ = np.vstack(T_list)
     else:
-        thetas = [one_boot(i) for i in range(n_boot)]
-
-    theta_succ = [t for t in thetas if t is not None]
-    n_success = len(theta_succ)
-    n_fail = n_boot - n_success
+        theta_succ = np.empty((0, theta.size), float)
+    T = theta_succ
     if n_success < 2:
         raise RuntimeError("Insufficient successful bootstrap refits")
 
-    T = np.vstack(theta_succ)
     mean = T.mean(axis=0)
     sd = T.std(axis=0, ddof=1)
     qlo = np.quantile(T, alpha / 2, axis=0)
@@ -590,6 +625,7 @@ def bootstrap_ci(
         "n_fail": int(n_fail),
         "seed": seed,
         "pct_at_bounds": pct_at_bounds,
+        "aborted": bool(aborted),
         "runtime_s": float(time.time() - t0),
         "band_source": "bootstrap-percentile" if band is not None else None,
         "band_reason": band_reason,
@@ -712,6 +748,11 @@ def bayesian_ci(
     if n_walkers is None:
         n_walkers = max(4*dim, 16)
     rng = np.random.default_rng(seed)
+    # Optional progress + abort
+    abort_evt = None
+    progress_cb = None
+    if fit_ctx:
+        abort_evt, progress_cb = fit_ctx.get("abort_event"), fit_ctx.get("progress_cb")
     np.random.seed(seed)
     p0 = np.empty((n_walkers, dim), float)
     for k in range(n_walkers):
@@ -746,13 +787,25 @@ def bayesian_ci(
         state = p0
         total = n_burn + n_steps
         done = 0
+        next_pulse_at = 0
+        pulse_step = max(1, int(total // 20))
+        last_pulse_t = time.monotonic()
         while done < total:
             step = min(chunk, total - done)
             state, lnp, _ = sampler.run_mcmc(state, step, progress=False, skip_initial_state_check=True)
             done += step
-            if fit_ctx and getattr(fit_ctx.get("abort_event", None), "is_set", None):
+            # Progress pulse
+            if progress_cb is not None:
+                if done >= next_pulse_at or (time.monotonic() - last_pulse_t) > 0.5:
+                    try:
+                        progress_cb(f"Bayesian MCMC: {done}/{total}")
+                    except Exception:
+                        pass
+                    last_pulse_t = time.monotonic()
+                    next_pulse_at = done + pulse_step
+            if abort_evt is not None and getattr(abort_evt, "is_set", None):
                 try:
-                    if fit_ctx["abort_event"].is_set():
+                    if abort_evt.is_set():
                         aborted = True
                         break
                 except Exception:
