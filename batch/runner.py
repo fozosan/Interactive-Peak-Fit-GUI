@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import glob
 from pathlib import Path
-from typing import Iterable, Sequence, List
+from typing import Iterable, Sequence, List, Optional, Any
 
 import csv
 import os
@@ -80,7 +80,7 @@ def run_batch(
     unc_method: str | None = None,
     progress=None,
     log=None,
-    abort_evt=None,
+    abort_event: Optional[Any] = None,
 ) -> tuple[int, int]:
     """Run the peak fitting pipeline over matching files.
 
@@ -153,8 +153,8 @@ def run_batch(
     processed = 0
 
     for i, path in enumerate(files, 1):
-        if abort_evt is not None and abort_evt.is_set():
-            break
+        if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
+            return {"aborted": True, "records": [], "reason": "user-abort"}
         if progress:
             progress(i, total, path)
         x, y = data_io.load_xy(path)
@@ -485,11 +485,16 @@ def run_batch(
                     bw = csv.writer(fh, lineterminator="\n")
                     bw.writerow(["x", "y_lo95", "y_hi95"])
                     for xi, lo, hi in zip(xb, lob, hib):
+                        if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
+                            return {"aborted": True, "records": [], "reason": "user-abort"}
                         if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
                             continue
                         bw.writerow([float(xi), float(lo), float(hi)])
 
-            unc_rows.extend(data_io.iter_uncertainty_rows(path, unc_norm))
+            for row in data_io.iter_uncertainty_rows(path, unc_norm):
+                if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
+                    return {"aborted": True, "records": [], "reason": "user-abort"}
+                unc_rows.append(row)
             if log:
                 log(f"{Path(path).name}: uncertainty={method_lbl}")
 

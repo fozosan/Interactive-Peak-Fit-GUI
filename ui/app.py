@@ -717,7 +717,7 @@ class PeakFitApp:
         self.root = root
         self.cfg = cfg if cfg is not None else load_config()
         self.cfg.setdefault("baseline_uses_fit_range", True)
-        self.cfg.setdefault("ui_show_uncertainty_band", True)
+        self.cfg.setdefault("ui_show_uncertainty_band", False)
         self.cfg.setdefault("perf_numba", False)
         self.cfg.setdefault("perf_gpu", False)
         self.cfg.setdefault("perf_cache_baseline", True)
@@ -854,7 +854,7 @@ class PeakFitApp:
         self.snr_text = tk.StringVar(value="S/N: --")
 
         self.ci_band = None
-        self.show_ci_band = tk.BooleanVar(value=bool(self.cfg.get("ui_show_uncertainty_band", True)))
+        self.show_ci_band = tk.BooleanVar(value=bool(self.cfg.get("ui_show_uncertainty_band", False)))
         self.show_ci_band_var = self.show_ci_band
         # Uncertainty state
         self.last_uncertainty = None
@@ -1662,10 +1662,8 @@ class PeakFitApp:
 
     def _on_uncertainty_method_changed(self, *_):
         sel = str(self.unc_method_var.get()).lower()
-        is_asym = ("asym" in sel)
-        self._set_ci_toggle_state(enabled=is_asym)
-        if not is_asym:
-            self.show_ci_band_var.set(False)
+        self._set_ci_toggle_state(True)
+        if "asym" not in sel:
             self.ci_band = None
             self.refresh_plot()
 
@@ -2840,6 +2838,10 @@ class PeakFitApp:
 
         self.step_btn.config(state=tk.DISABLED)
         self.set_busy(True, "Fitting…")
+        try:
+            self._abort_evt.clear()
+        except Exception:
+            pass
         self.run_in_thread(work, done)
 
     def run_batch(self):
@@ -2944,16 +2946,24 @@ class PeakFitApp:
                 unc_method=unc_method,
                 progress=prog,
                 log=self.log_threadsafe,
-                abort_evt=self._abort_evt,
+                abort_event=self._abort_evt,
             )
 
         def done(res, err):
             self.abort_btn.config(state=tk.DISABLED)
+            try:
+                self._abort_evt.clear()
+            except Exception:
+                pass
             if err or res is None:
                 self.set_busy(False, "Batch failed.")
                 if err:
                     self.log(f"Batch failed: {err}", level="ERROR")
                     messagebox.showerror("Batch", f"Batch failed:\n{err}")
+                return
+            if isinstance(res, dict) and res.get("aborted"):
+                self.set_busy(False, "Batch aborted.")
+                self.log("Batch aborted by user.")
                 return
             ok, total = res
             self.set_busy(False, f"Batch done. {ok}/{total} succeeded.")
@@ -3404,6 +3414,7 @@ class PeakFitApp:
                     "predict_full": predict_full,
                     "x_all": x_fit,
                     "y_all": y_fit,
+                    "peaks": self.peaks,
                     "unc_workers": workers,
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
@@ -3420,6 +3431,7 @@ class PeakFitApp:
                     n_boot=n_boot,
                     seed=seed_val,
                     workers=workers,
+                    return_band=bool(self.show_ci_band_var.get()),
                 )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
@@ -3443,6 +3455,7 @@ class PeakFitApp:
                     "predict_full": predict_full,
                     "x_all": x_fit,
                     "y_all": y_fit,
+                    "peaks": self.peaks,
                     "unc_workers": workers,
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
@@ -3455,6 +3468,7 @@ class PeakFitApp:
                     y_all=y_fit,
                     residual_fn=(lambda th: resid_fn(th)),
                     fit_ctx=fit_ctx,
+                    return_band=bool(self.show_ci_band_var.get()),
                 )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
@@ -3471,9 +3485,24 @@ class PeakFitApp:
             self._unc_running = False
             self._progress_end("uncertainty")
             self.abort_btn.config(state=tk.DISABLED)
+            try:
+                self._abort_evt.clear()
+            except Exception:
+                pass
 
             if error is not None:
-                self.status_error(f"Uncertainty failed: {error}")
+                msg = str(error)
+                if "Insufficient successful bootstrap refits" in msg:
+                    diag = {}
+                    if isinstance(result, dict):
+                        diag = result.get("diagnostics", {})
+                    else:
+                        diag = getattr(result, "diagnostics", {}) or {}
+                    ns = diag.get("n_success")
+                    nf = diag.get("n_fail")
+                    if ns is not None or nf is not None:
+                        msg = f"{msg} (success={ns}, fail={nf})"
+                self.status_error(f"Uncertainty failed: {msg}")
                 return
 
             res = result
@@ -3521,21 +3550,15 @@ class PeakFitApp:
                         _normalize_unc_result(rebuilt).get("stats") or []
                     )
 
-            if label.startswith("Asymptotic"):
-                band = self.last_uncertainty.get("band")
-                if band is not None:
-                    xb, lob, hib = band
-                    self.ci_band = (xb, lob, hib)
-                    self.show_ci_band_var.set(True)
-                    self._set_ci_toggle_state(True)
-                    self.refresh_plot()
-                else:
-                    self.ci_band = None
-                    self._set_ci_toggle_state(True)
+            band = self.last_uncertainty.get("band")
+            if band is not None and self.show_ci_band_var.get():
+                xb, lob, hib = band
+                self.ci_band = (xb, lob, hib)
+                self._set_ci_toggle_state(True)
+                self.refresh_plot()
             else:
                 self.ci_band = None
-                self.show_ci_band_var.set(False)
-                self._set_ci_toggle_state(False)
+                self._set_ci_toggle_state(True)
 
             # persist band for export when method is asymptotic
             try:
