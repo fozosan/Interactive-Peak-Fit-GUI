@@ -3353,6 +3353,14 @@ class PeakFitApp:
             import os
             workers_req = int(self.cfg.get("unc_workers", 0))
             workers = max(0, min(workers_req, (os.cpu_count() or 1)))
+
+            # Build locked mask (center/fwhm locks) for bootstrap/Bayesian refits
+            locked_mask = np.zeros(theta.size, dtype=bool)
+            for i, pk in enumerate(self.peaks):
+                if bool(getattr(pk, "lock_center", False)):
+                    locked_mask[4 * i + 0] = True
+                if bool(getattr(pk, "lock_width", False)):
+                    locked_mask[4 * i + 2] = True
             if method == "asymptotic":
                 res = self._run_asymptotic_uncertainty()
                 if abort_evt.is_set():
@@ -3414,7 +3422,12 @@ class PeakFitApp:
                     "predict_full": predict_full,
                     "x_all": x_fit,
                     "y_all": y_fit,
+                    "solver": self.solver_choice.get(),
+                    # propagate sharing flags for LMFIT VP
+                    "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
+                    "lmfit_share_eta":  bool(self.lmfit_share_eta.get()),
                     "peaks": self.peaks,
+                    "locked_mask": locked_mask,
                     "unc_workers": workers,
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
@@ -3427,6 +3440,7 @@ class PeakFitApp:
                     predict_full=predict_full,
                     x_all=x_fit,
                     y_all=y_fit,
+                    locked_mask=locked_mask,
                     fit_ctx=fit_ctx,
                     n_boot=n_boot,
                     seed=seed_val,
@@ -3455,7 +3469,11 @@ class PeakFitApp:
                     "predict_full": predict_full,
                     "x_all": x_fit,
                     "y_all": y_fit,
+                    "solver": self.solver_choice.get(),
+                    "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
+                    "lmfit_share_eta":  bool(self.lmfit_share_eta.get()),
                     "peaks": self.peaks,
+                    "locked_mask": locked_mask,
                     "unc_workers": workers,
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
@@ -3468,7 +3486,9 @@ class PeakFitApp:
                     y_all=y_fit,
                     residual_fn=(lambda th: resid_fn(th)),
                     fit_ctx=fit_ctx,
-                    return_band=bool(self.show_ci_band_var.get()),
+                    locked_mask=locked_mask,
+                    # Force off: bands for MCMC are disabled
+                    return_band=False,
                 )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}

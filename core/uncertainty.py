@@ -427,11 +427,11 @@ def bootstrap_ci(
     t0 = float(time.time())
     theta = np.asarray(theta, float)
     residual_in = np.asarray(residual, float)
-    jacobian = np.asarray(jacobian, float)  # unused, kept for API parity
     if center_residuals:
         r = residual_in - residual_in.mean()
     else:
         r = residual_in.copy()
+    J = np.asarray(jacobian, float)
 
     fit = fit_ctx or {}
     x_all = fit.get("x_all", x_all)
@@ -440,13 +440,21 @@ def bootstrap_ci(
         raise ValueError("x_all and y_all required for residual bootstrap")
     x_all = np.asarray(x_all, float)
     y_all = np.asarray(y_all, float)
-    y_hat = np.asarray(y_all, float) - residual_in
+    # Prefer model to compute y_hat to avoid loss-mode mismatch
+    if callable(predict_full):
+        try:
+            y_hat = np.asarray(predict_full(theta), float)
+        except Exception:
+            y_hat = np.asarray(y_all, float) - residual_in
+    else:
+        y_hat = np.asarray(y_all, float) - residual_in
 
     peaks_obj = fit.get("peaks")
     if not peaks_obj:
         ymodel = predict_full if callable(predict_full) else (lambda _th: np.asarray(y_all, float))
-        res_asym = asymptotic_ci(theta, residual_in, jacobian, ymodel, alpha=alpha)
+        res_asym = asymptotic_ci(theta, residual_in, J, ymodel, alpha=alpha)
         diag = dict(res_asym.diagnostics)
+        # normalize: no refits, just asymptotic
         diag.update({
             "aborted": False,
             "reason": "no-peaks",
@@ -482,9 +490,15 @@ def bootstrap_ci(
         mode = (fit_ctx.get("mode") if fit_ctx else "add") or "add"
         baseline = fit_ctx.get("baseline") if fit_ctx else None
         solver = (fit_ctx.get("solver") if fit_ctx else None) or "classic"
+        # propagate sharing flags (only used by lmfit_vp)
+        share_fwhm = bool((fit_ctx or {}).get("lmfit_share_fwhm", False))
+        share_eta = bool((fit_ctx or {}).get("lmfit_share_eta", False))
 
         def refit(theta_init, locked_mask, bounds, x, y):
             cfg = {"solver": solver, "mode": mode, "peaks": peaks_to_dicts(peaks_obj)}
+            if str(solver).lower().startswith("lmfit"):
+                cfg["lmfit_share_fwhm"] = share_fwhm
+                cfg["lmfit_share_eta"] = share_eta
             res = _fit_api.run_fit_consistent(
                 x,
                 y,
@@ -500,6 +514,16 @@ def bootstrap_ci(
 
     theta0 = np.asarray(fit.get("theta0", theta), float)
     P = theta.size
+    free_mask = np.ones(P, dtype=bool)
+    if locked_mask is not None:
+        free_mask = ~np.asarray(locked_mask, bool)
+    Jf = J[:, free_mask] if J.ndim == 2 else None
+    # If LMFIT ties parameters across peaks, linear fallback is unsafe
+    if bool((fit_ctx or {}).get("lmfit_share_fwhm")) or bool((fit_ctx or {}).get("lmfit_share_eta")):
+        Jf = None  # disable linear fallback under sharing
+    linear_fallbacks = 0
+    # mild LM damping used for linear fallback
+    linear_lambda = None
 
     # ---- Bootstrap resampling loop (abort-aware with progress pulses) ----
     # Existing variables used below (expected from prior code):
@@ -539,7 +563,8 @@ def bootstrap_ci(
 
         # Residual resample
         idx = rng.integers(0, n, size=n)
-        y_star = y_hat + r[idx]
+        r_star = r[idx]
+        y_star = y_hat + r_star
         try:
             ref_res = refit(theta0, locked_mask, bounds, x_all, y_star)
             if isinstance(ref_res, tuple):
@@ -550,9 +575,65 @@ def bootstrap_ci(
                 T_list.append(th_new)
                 n_success += 1
             else:
-                n_fail += 1
+                # Damped GN fallback: (JᵀJ + λI)Δ = Jᵀ r*
+                used = False
+                if Jf is not None and Jf.size and np.sum(free_mask) > 0:
+                    try:
+                        AtA = Jf.T @ Jf
+                        rhs = Jf.T @ r_star
+                        lam = 5e-2 * (np.trace(AtA) / max(1, AtA.shape[0]))
+                        if not np.isfinite(lam) or lam <= 0:
+                            lam = 1e-3
+                        linear_lambda = float(lam)
+                        AtA += lam * np.eye(AtA.shape[0])
+                        delta_f = np.linalg.solve(AtA, rhs)
+                        th_lin = theta0.copy()
+                        th_lin[free_mask] = th_lin[free_mask] + delta_f
+                        if bounds is not None:
+                            lo, hi = bounds
+                            if lo is not None:
+                                th_lin = np.maximum(th_lin, lo)
+                            if hi is not None:
+                                th_lin = np.minimum(th_lin, hi)
+                        if np.all(np.isfinite(th_lin)):
+                            T_list.append(th_lin)
+                            n_success += 1
+                            linear_fallbacks += 1
+                            used = True
+                    except Exception:
+                        pass
+                if not used:
+                    n_fail += 1
         except Exception:
-            n_fail += 1
+            # Try linear fallback also on exceptions
+            used = False
+            if Jf is not None and Jf.size and np.sum(free_mask) > 0:
+                try:
+                    AtA = Jf.T @ Jf
+                    rhs = Jf.T @ r_star
+                    lam = 5e-2 * (np.trace(AtA) / max(1, AtA.shape[0]))
+                    if not np.isfinite(lam) or lam <= 0:
+                        lam = 1e-3
+                    linear_lambda = float(lam)
+                    AtA += lam * np.eye(AtA.shape[0])
+                    delta_f = np.linalg.solve(AtA, rhs)
+                    th_lin = theta0.copy()
+                    th_lin[free_mask] = th_lin[free_mask] + delta_f
+                    if bounds is not None:
+                        lo, hi = bounds
+                        if lo is not None:
+                            th_lin = np.maximum(th_lin, lo)
+                        if hi is not None:
+                            th_lin = np.minimum(th_lin, hi)
+                    if np.all(np.isfinite(th_lin)):
+                        T_list.append(th_lin)
+                        n_success += 1
+                        linear_fallbacks += 1
+                        used = True
+                except Exception:
+                    pass
+            if not used:
+                n_fail += 1
 
     if len(T_list):
         theta_succ = np.vstack(T_list)
@@ -650,6 +731,8 @@ def bootstrap_ci(
         "n_boot": int(n_boot),
         "n_success": int(n_success),
         "n_fail": int(n_fail),
+        "n_linear_fallback": int(linear_fallbacks),
+        "linear_lambda": float(linear_lambda) if linear_lambda is not None else None,
         "seed": seed,
         "pct_at_bounds": pct_at_bounds,
         "aborted": bool(aborted),
@@ -772,8 +855,15 @@ def bayesian_ci(
         return lp + log_likelihood(th_f, log_sigma)
 
     dim = P_free + 1
+    # Sane defaults if caller passes 0/None
+    if n_burn is None or n_burn <= 0:
+        n_burn = 1000
+    if n_steps is None or n_steps <= 0:
+        n_steps = 4000
+    n_burn = int(n_burn)
+    n_steps = int(n_steps)
     if n_walkers is None:
-        n_walkers = max(4*dim, 16)
+        n_walkers = max(4 * dim, 16)
     rng = np.random.default_rng(seed)
     # Optional progress + abort
     abort_evt = None
@@ -841,12 +931,32 @@ def bayesian_ci(
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
 
+    # Early abort/minimal mode: skip heavy post-processing
+    if abort_evt is not None and getattr(abort_evt, "is_set", lambda: False)():
+        return UncertaintyResult(
+            method="bayesian",
+            label="Bayesian (MCMC)",
+            stats={},
+            diagnostics={"aborted": True, "n_draws": 0, "band_source": None},
+            band=None,
+        )
+
     chain = sampler.get_chain(discard=n_burn, thin=thin)
     acc_frac = float(np.mean(sampler.acceptance_fraction))
     if chain.ndim != 3:
         chain = np.asarray(chain)
         chain = chain.reshape((n_walkers, -1, dim))
-    n_samp = chain.shape[1]*n_walkers
+    n_post = chain.shape[1]
+    if n_post <= 0:
+        # Avoid "index -1" crashes when burn==total or abort mid-burn
+        return UncertaintyResult(
+            method="bayesian",
+            label="Bayesian (MCMC)",
+            stats={},
+            diagnostics={"aborted": True, "n_draws": 0, "accept_frac_mean": acc_frac, "band_source": None},
+            band=None,
+        )
+    n_samp = n_post * n_walkers
 
     if n_samp < 2:
         raise RuntimeError("insufficient MCMC draws")
@@ -872,10 +982,8 @@ def bayesian_ci(
         "p97.5": float(np.quantile(sigma_draws, 0.975)),
     }
 
-    # Skip emcee's get_autocorr_time() to avoid noisy warnings (short chains).
-    chains = chain
-    ess_min = ess_autocorr(chains)
-    rhat_max = rhat_split(chains)
+    # Keep diagnostics light; no ESS/Rhat to avoid stalls
+    ess_min, rhat_max = float("nan"), float("nan")
     diag = {
         "n_draws": int(n_samp),
         "ess_min": float(ess_min),
@@ -886,61 +994,11 @@ def bayesian_ci(
         "band_source": None,
     }
 
-    band = None
-    if return_band and predict_full is not None and x_all is not None and n_samp >= BAYES_BAND_MIN_DRAWS:
-        max_use = min(n_samp, 4096)
-        sel = np.linspace(0, n_samp-1, max_use, dtype=int)
-        T_sel = T[sel]
-        sig_sel = sigma_draws[sel]
-
-        def _eval_one(idx: int) -> np.ndarray:
-            t_i = T_sel[idx]
-            s_i = float(sig_sel[idx])
-            mu = pred(t_i)
-            try:
-                import cupy as cp  # type: ignore
-                if isinstance(mu, cp.ndarray):
-                    mu = cp.asnumpy(mu)
-            except Exception:
-                pass
-            mu = np.asarray(mu, float)
-            eps = rng.normal(0.0, s_i, size=mu.shape)
-            return mu + eps
-
-        Y_list: List[np.ndarray] = []
-        # Thread predictive draws; cap workers
-        workers_req = 0
-        try:
-            workers_req = int((fit_ctx or {}).get("unc_workers", 0))
-        except Exception:
-            workers_req = 0
-        w = max(0, min(workers_req, (os.cpu_count() or 1)))
-        if w > 0:
-            with ThreadPoolExecutor(max_workers=w) as ex:
-                futs = {ex.submit(_eval_one, int(i)): int(i) for i in range(len(sel))}
-                for f in as_completed(futs):
-                    Y_list.append(f.result())
-        else:
-            for i in range(len(sel)):
-                Y_list.append(_eval_one(int(i)))
-
-        Y = np.vstack(Y_list)
-        lo = np.quantile(Y, 0.025, axis=0)
-        hi = np.quantile(Y, 0.975, axis=0)
-        band = (np.asarray(x_all, float), lo, hi)
-        diag["band_source"] = "bayes-posterior-predictive"
-        diag["band_backend"] = "numpy"
-        diag["workers_used"] = int(w)
-        try:
-            import cupy as cp  # type: ignore
-            cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            pass
-
+    # Never compute bands for Bayesian (too heavy / not helpful here)
     return UncertaintyResult(
         method="bayesian",
         label="Bayesian (MCMC)",
         stats=stats,
         diagnostics=diag,
-        band=band,
+        band=None,
     )
