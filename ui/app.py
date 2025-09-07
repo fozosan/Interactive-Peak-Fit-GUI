@@ -1398,6 +1398,23 @@ class PeakFitApp:
         ttk.Label(unc_frame, text="Jitter %").grid(row=r, column=0, sticky="e")
         self._jitter_entry = ttk.Entry(unc_frame, textvariable=self.bootstrap_jitter_var, width=6)
         self._jitter_entry.grid(row=r, column=1, sticky="w")
+        # Clamp jitter% on blur to [0, 50]
+        def _clamp_jitter(_e=None):
+            try:
+                v = float(self.bootstrap_jitter_var.get())
+            except Exception:
+                v = 0.0
+            v = min(50.0, max(0.0, v))
+            self.bootstrap_jitter_var.set(v)
+            # keep cfg in sync as fraction
+            try:
+                self._cfg_set("bootstrap_jitter", v / 100.0)
+            except Exception:
+                pass
+        try:
+            self._jitter_entry.bind("<FocusOut>", _clamp_jitter)
+        except Exception:
+            pass
         r += 1
         # Bootstrap refit solver override
         ttk.Label(unc_frame, text="Refit solver").grid(row=r, column=0, sticky="e")
@@ -1418,6 +1435,13 @@ class PeakFitApp:
             values=_available_solvers(),
         )
         self._boot_solver_cb.grid(row=r, column=1, columnspan=2, sticky="w")
+        # If persisted override isn't available here, fall back to base solver
+        try:
+            if self.boot_solver_choice.get() not in self._boot_solver_cb.cget("values"):
+                self.boot_solver_choice.set(self.solver_choice.get())
+                self._cfg_set("unc_boot_solver", self.boot_solver_choice.get())
+        except Exception:
+            pass
         self._boot_solver_cb.bind(
             "<<ComboboxSelected>>",
             lambda _e: (
