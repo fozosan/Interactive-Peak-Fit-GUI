@@ -923,8 +923,6 @@ class PeakFitApp:
         # UI
         self._build_ui()
         self._new_figure()
-        # attach after axes are created to avoid early refresh calls
-        self.show_ci_band.trace_add("write", self._toggle_ci_band)
         self._update_template_info()
         self.apply_performance()
 
@@ -1390,6 +1388,22 @@ class PeakFitApp:
         self.chk_ci_band.pack(anchor="w", padx=4)
         self.ci_toggle = self.chk_ci_band
         self._set_ci_toggle_state(False)
+        # Guard so forcing off for Bayesian won't persist/override user's saved pref
+        self._suspend_ci_trace = False
+        def _ci_trace_guard(*_e):
+            if getattr(self, "_suspend_ci_trace", False):
+                return
+            try:
+                self._toggle_ci_band()
+            except Exception:
+                pass
+        try:
+            for t in list(self.show_ci_band.trace_info() or []):
+                if t and t[0] == "write":
+                    self.show_ci_band.trace_remove("write", t[1])
+        except Exception:
+            pass
+        self.show_ci_band.trace_add("write", _ci_trace_guard)
 
         # Extra uncertainty controls
         unc_frame = ttk.Frame(unc_box)
@@ -1437,7 +1451,10 @@ class PeakFitApp:
         self._boot_solver_cb.grid(row=r, column=1, columnspan=2, sticky="w")
         # If persisted override isn't available here, fall back to base solver
         try:
-            if self.boot_solver_choice.get() not in self._boot_solver_cb.cget("values"):
+            _vals = self._boot_solver_cb.cget("values")
+            if not isinstance(_vals, (list, tuple)):
+                _vals = tuple(_vals) if _vals else tuple()
+            if self.boot_solver_choice.get() not in _vals:
                 self.boot_solver_choice.set(self.solver_choice.get())
                 self._cfg_set("unc_boot_solver", self.boot_solver_choice.get())
         except Exception:
@@ -1803,8 +1820,12 @@ class PeakFitApp:
                 except Exception:
                     pass
         if is_bayes:
-            # hard-disable for Bayesian
-            self.show_ci_band_var.set(False)
+            # hard-disable for Bayesian without persisting a new preference
+            try:
+                self._suspend_ci_trace = True
+                self.show_ci_band_var.set(False)
+            finally:
+                self._suspend_ci_trace = False
             self.ci_band = None
             self.refresh_plot()
         # refresh Bootstrap tie widgets (enable only for Bootstrap + LMFIT refit solver)
