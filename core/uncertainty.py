@@ -518,9 +518,12 @@ def bootstrap_ci(
     if locked_mask is not None:
         free_mask = ~np.asarray(locked_mask, bool)
     Jf = J[:, free_mask] if J.ndim == 2 else None
+    allow_linear = bool((fit_ctx or {}).get("allow_linear_fallback", True))
     # If LMFIT ties parameters across peaks, linear fallback is unsafe
     if bool((fit_ctx or {}).get("lmfit_share_fwhm")) or bool((fit_ctx or {}).get("lmfit_share_eta")):
         Jf = None  # disable linear fallback under sharing
+    if not allow_linear:
+        Jf = None  # globally disable if requested
     linear_fallbacks = 0
     # mild LM damping used for linear fallback
     linear_lambda = None

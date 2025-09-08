@@ -838,8 +838,6 @@ class PeakFitApp:
             self.solver_choice.set("modern_vp")
             self.cfg["solver_choice"] = "modern_vp"
             save_config(self.cfg)
-        self.bootstrap_solver_choice = tk.StringVar(value=self.solver_choice.get())
-        self.bootstrap_solver_label = tk.StringVar(value=SOLVER_LABELS[self.solver_choice.get()])
         self.solver_title = tk.StringVar(value=SOLVER_LABELS[self.solver_choice.get()])
         self.classic_maxfev = tk.IntVar(value=20000)
         self.classic_centers_window = tk.BooleanVar(value=True)
@@ -857,8 +855,18 @@ class PeakFitApp:
         self.modern_min_fwhm = tk.BooleanVar(value=True)
         self.lmfit_algo = tk.StringVar(value="least_squares")
         self.lmfit_maxfev = tk.IntVar(value=20000)
-        self.lmfit_share_fwhm = tk.BooleanVar(value=False)
-        self.lmfit_share_eta = tk.BooleanVar(value=False)
+        self.cfg.setdefault("lmfit_share_fwhm", False)
+        self.cfg.setdefault("lmfit_share_eta", False)
+        self.lmfit_share_fwhm = tk.BooleanVar(value=bool(self.cfg.get("lmfit_share_fwhm", False)))
+        self.lmfit_share_eta = tk.BooleanVar(value=bool(self.cfg.get("lmfit_share_eta", False)))
+        self.lmfit_share_fwhm.trace_add(
+            "write",
+            lambda *_: self._cfg_set("lmfit_share_fwhm", bool(self.lmfit_share_fwhm.get())),
+        )
+        self.lmfit_share_eta.trace_add(
+            "write",
+            lambda *_: self._cfg_set("lmfit_share_eta", bool(self.lmfit_share_eta.get())),
+        )
         self.snr_text = tk.StringVar(value="S/N: --")
 
         self.ci_band = None
@@ -913,8 +921,6 @@ class PeakFitApp:
         # UI
         self._build_ui()
         self._new_figure()
-        # attach after axes are created to avoid early refresh calls
-        self.show_ci_band.trace_add("write", self._toggle_ci_band)
         self._update_template_info()
         self.apply_performance()
 
@@ -1306,20 +1312,6 @@ class PeakFitApp:
         self.unc_method_combo.pack(side=tk.LEFT, padx=4)
         self.unc_method_combo.bind("<<ComboboxSelected>>", self._on_unc_method_change)
 
-        solver_labels = [SOLVER_LABELS[k] for k in ["classic", "modern_vp", "modern_trf"]]
-        if self.has_lmfit:
-            solver_labels.append(SOLVER_LABELS["lmfit_vp"])
-        self.bootstrap_solver_combo = ttk.Combobox(
-            unc_box,
-            textvariable=self.bootstrap_solver_label,
-            state="readonly",
-            values=solver_labels,
-            width=24,
-        )
-        self.bootstrap_solver_combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _e: self._on_bootstrap_solver_change(),
-        )
         self.unc_workers_frame = ttk.Frame(unc_box)
         self.unc_workers_label = ttk.Label(self.unc_workers_frame, text="Bootstrap workers:")
         self.unc_workers_label.pack(side=tk.LEFT)
@@ -1363,7 +1355,11 @@ class PeakFitApp:
                 pass
         _toggle_boot_row()
         try:
-            self.unc_method_combo.bind("<<ComboboxSelected>>", lambda _e: _toggle_boot_row())
+            self.unc_method_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _e: _toggle_boot_row(),
+                add="+",
+            )
         except Exception:
             pass
 
@@ -1376,6 +1372,29 @@ class PeakFitApp:
         self.chk_ci_band.pack(anchor="w", padx=4)
         self.ci_toggle = self.chk_ci_band
         self._set_ci_toggle_state(False)
+        # Guard so forcing off for Bayesian won't persist/override user's saved pref
+        self._suspend_ci_trace = False
+        def _ci_trace_guard(*_e):
+            if getattr(self, "_suspend_ci_trace", False):
+                return
+            try:
+                self._toggle_ci_band()
+            except Exception:
+                pass
+        try:
+            for info in list(self.show_ci_band.trace_info() or []):
+                # Tk may return ('write', cb) or ('w', cb) and sometimes include more items
+                mode = info[0] if len(info) > 0 else None
+                cbname = info[1] if len(info) > 1 else None
+                if mode in ("write", "w") and cbname:
+                    # trace_remove expects the exact mode token it gave you
+                    self.show_ci_band.trace_remove(
+                        mode if mode in ("write", "read", "unset", "w", "r", "u") else "write",
+                        cbname,
+                    )
+        except Exception:
+            pass
+        self.show_ci_band.trace_add("write", _ci_trace_guard)
 
         # Extra uncertainty controls
         unc_frame = ttk.Frame(unc_box)
@@ -1384,9 +1403,71 @@ class PeakFitApp:
         ttk.Label(unc_frame, text="Jitter %").grid(row=r, column=0, sticky="e")
         self._jitter_entry = ttk.Entry(unc_frame, textvariable=self.bootstrap_jitter_var, width=6)
         self._jitter_entry.grid(row=r, column=1, sticky="w")
+        # Clamp jitter% on blur to [0, 50]
+        def _clamp_jitter(_e=None):
+            self._safe_jitter_pct()
+        try:
+            self._jitter_entry.bind("<FocusOut>", _clamp_jitter)
+        except Exception:
+            pass
+        r += 1
+        # Bootstrap refit solver override
+        ttk.Label(unc_frame, text="Refit solver").grid(row=r, column=0, sticky="e")
+        self.boot_solver_choice = tk.StringVar(
+            value=str(self.cfg.get("unc_boot_solver", self.solver_choice.get()))
+        )
+        # Only offer LMFIT if actually available
+        def _available_solvers():
+            keys = list(SOLVER_LABELS.keys())
+            if not getattr(self, "has_lmfit", False):
+                keys = [k for k in keys if not str(k).lower().startswith("lmfit")]
+            return tuple(keys)
+
+        def _as_seq(v):
+            if isinstance(v, (list, tuple)):
+                return tuple(v)
+            if isinstance(v, str):
+                return tuple(s for s in v.split() if s)
+            try:
+                return tuple(v)
+            except TypeError:
+                return tuple()
+        self._boot_solver_cb = ttk.Combobox(
+            unc_frame,
+            textvariable=self.boot_solver_choice,
+            width=22,
+            state="readonly",
+            values=_available_solvers(),
+        )
+        self._boot_solver_cb.grid(row=r, column=1, columnspan=2, sticky="w")
+        # If persisted override isn't available here, fall back to base solver
+        try:
+            _vals = _as_seq(self._boot_solver_cb.cget("values"))
+            if self.boot_solver_choice.get() not in _vals:
+                self.boot_solver_choice.set(self.solver_choice.get())
+                self._cfg_set("unc_boot_solver", self.boot_solver_choice.get())
+        except Exception:
+            pass
+        self._boot_solver_cb.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: (
+                self._cfg_set("unc_boot_solver", self.boot_solver_choice.get()),
+                self._update_bootstrap_tie_widgets(),
+            ),
+        )
         r += 1
         ttk.Label(unc_frame, text="CI α").grid(row=r, column=0, sticky="e")
-        ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6).grid(row=r, column=1, sticky="w")
+        _alpha_entry = ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6)
+        _alpha_entry.grid(row=r, column=1, sticky="w")
+
+        def _clamp_alpha(_e=None):
+            self._safe_alpha()
+
+        try:
+            _alpha_entry.bind("<FocusOut>", _clamp_alpha)
+        except Exception:
+            pass
+
         ttk.Checkbutton(unc_frame, text="Center residuals", variable=self.center_resid_var).grid(row=r, column=2, sticky="w")
         r += 1
 
@@ -1403,6 +1484,20 @@ class PeakFitApp:
         ttk.Label(bay, text="σ prior").grid(row=2, column=0, sticky="e")
         ttk.Combobox(bay, textvariable=self.bayes_prior_var, width=12,
                      values=("half_cauchy", "half_normal"), state="readonly").grid(row=2, column=1, sticky="w")
+        r += 1
+
+        # --- Bootstrap ties (visible + enabled only when Bootstrap + LMFIT refit solver) ---
+        ties = ttk.LabelFrame(unc_frame, text="Bootstrap ties (LMFIT only)")
+        ties.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 0))
+        self.chk_share_fwhm = ttk.Checkbutton(
+            ties, text="Share FWHM across peaks", variable=self.lmfit_share_fwhm
+        )
+        self.chk_share_fwhm.grid(row=0, column=0, sticky="w", padx=2, pady=1)
+        self.chk_share_eta = ttk.Checkbutton(
+            ties, text="Share η across peaks", variable=self.lmfit_share_eta
+        )
+        self.chk_share_eta.grid(row=0, column=1, sticky="w", padx=2, pady=1)
+
         self._update_unc_widgets()
         self._on_uncertainty_method_changed()
 
@@ -1534,19 +1629,20 @@ class PeakFitApp:
         self.cfg["solver_choice"] = choice
         save_config(self.cfg)
         # sync bootstrap default
-        self.bootstrap_solver_choice.set(choice)
-        self.bootstrap_solver_label.set(SOLVER_LABELS[choice])
+        if hasattr(self, "boot_solver_choice"):
+            try:
+                self.boot_solver_choice.set(choice)
+                self._cfg_set("unc_boot_solver", choice)
+            except Exception:
+                pass
         self._show_solver_opts()
         self._update_unc_widgets()
 
-    def _on_bootstrap_solver_change(self):
-        label = self.bootstrap_solver_label.get()
-        choice = SOLVER_LABELS_INV.get(label, "classic")
-        self.bootstrap_solver_choice.set(choice)
-        self._update_unc_widgets()
-
     def _update_unc_widgets(self):
-        label = SOLVER_LABELS[self.bootstrap_solver_choice.get()]
+        label = SOLVER_LABELS.get(
+            self.boot_solver_choice.get(),
+            SOLVER_LABELS[self.solver_choice.get()],
+        )
         self.unc_method_combo["values"] = [
             "Asymptotic",
             f"Bootstrap (base solver = {label})",
@@ -1557,11 +1653,21 @@ class PeakFitApp:
         if current.startswith("Bootstrap"):
             self.unc_method.set(f"Bootstrap (base solver = {label})")
         if self.unc_method.get().startswith("Bootstrap"):
-            self.bootstrap_solver_combo.pack(side=tk.LEFT, padx=4)
-            self.unc_workers_frame.pack(side=tk.LEFT, padx=4)
+            if hasattr(self, "_boot_solver_cb"):
+                try:
+                    self._boot_solver_cb.grid()
+                except Exception:
+                    pass
+            if hasattr(self, "unc_workers_frame"):
+                self.unc_workers_frame.pack(side=tk.LEFT, padx=4)
         else:
-            self.bootstrap_solver_combo.pack_forget()
-            self.unc_workers_frame.pack_forget()
+            if hasattr(self, "_boot_solver_cb"):
+                try:
+                    self._boot_solver_cb.grid_remove()
+                except Exception:
+                    pass
+            if hasattr(self, "unc_workers_frame"):
+                self.unc_workers_frame.pack_forget()
 
     def _on_unc_method_change(self, _e=None):
         label = self.unc_method.get()
@@ -1597,6 +1703,32 @@ class PeakFitApp:
             if w <= 0:
                 w = os.cpu_count() or 1
         return w
+
+    def _safe_alpha(self):
+        try:
+            a = float(self.alpha_var.get())
+        except Exception:
+            a = 0.05
+        a = min(0.49, max(1e-6, a))
+        self.alpha_var.set(a)
+        try:
+            self._cfg_set("unc_alpha", a)
+        except Exception:
+            pass
+        return a
+
+    def _safe_jitter_pct(self):
+        try:
+            v = float(self.bootstrap_jitter_var.get())
+        except Exception:
+            v = 0.0
+        v = min(50.0, max(0.0, v))
+        self.bootstrap_jitter_var.set(v)
+        try:
+            self._cfg_set("bootstrap_jitter", v / 100.0)
+        except Exception:
+            pass
+        return v
 
 
     def _suspend_clicks(self):
@@ -1713,21 +1845,49 @@ class PeakFitApp:
     def _on_uncertainty_method_changed(self, *_):
         sel = str(self.unc_method_var.get()).lower()
         is_bayes = ("bayes" in sel)
-        # toggle availability
+        # toggle availability of band checkbox
         self._set_ci_toggle_state(not is_bayes)
-        try:
-            state = ("normal" if "bootstrap" in sel else "disabled")
-            for w in (self._jitter_entry,):
-                w.configure(state=state)
-        except Exception:
-            pass
+        # enable/disable jitter & bootstrap-only controls
+        state = ("normal" if "bootstrap" in sel else "disabled")
+        for w in (getattr(self, "_jitter_entry", None), getattr(self, "_boot_solver_cb", None)):
+            if w is not None:
+                try:
+                    w.configure(state=state)
+                except Exception:
+                    pass
         if is_bayes:
-            # hard-disable for Bayesian
-            self.show_ci_band_var.set(False)
+            # hard-disable for Bayesian without persisting a new preference
+            try:
+                self._suspend_ci_trace = True
+                self.show_ci_band_var.set(False)
+            finally:
+                self._suspend_ci_trace = False
             self.ci_band = None
             self.refresh_plot()
+        # refresh Bootstrap tie widgets (enable only for Bootstrap + LMFIT refit solver)
+        self._update_bootstrap_tie_widgets()
         # for asymptotic/bootstrap the checkbox remains user-controlled
 
+
+    def _update_bootstrap_tie_widgets(self):
+        try:
+            sel = str(self.unc_method_var.get()).lower()
+            is_boot = ("bootstrap" in sel)
+            solver = (
+                self.boot_solver_choice.get()
+                if hasattr(self, "boot_solver_choice")
+                else self.solver_choice.get()
+            )
+            is_lmfit = str(solver).lower().startswith("lmfit") and bool(getattr(self, "has_lmfit", False))
+            state = "normal" if (is_boot and is_lmfit) else "disabled"
+            for w in (
+                getattr(self, "chk_share_fwhm", None),
+                getattr(self, "chk_share_eta", None),
+            ):
+                if w is not None:
+                    w.configure(state=state)
+        except Exception:
+            pass
 
     def on_abort_clicked(self):
         try:
@@ -3423,19 +3583,16 @@ class PeakFitApp:
                 if bool(getattr(pk, "lock_width", False)):
                     locked_mask[4 * i + 2] = True
 
-            alpha = min(max(float(self.alpha_var.get()), 1e-6), 0.5)
-            jitter_pct = max(0.0, min(float(self.bootstrap_jitter_var.get()), 50.0))
+            alpha = self._safe_alpha()
+            jitter_pct = self._safe_jitter_pct()
             walkers = max(0, int(self.bayes_walkers_var.get() or 0))
             burn = max(0, int(self.bayes_burn_var.get()))
             steps = max(1, int(self.bayes_steps_var.get()))
             thin = max(1, int(self.bayes_thin_var.get()))
-            self.alpha_var.set(alpha); self.bootstrap_jitter_var.set(jitter_pct)
             self.bayes_walkers_var.set(walkers); self.bayes_burn_var.set(burn)
             self.bayes_steps_var.set(steps); self.bayes_thin_var.set(thin)
 
-            self._cfg_set("unc_alpha", alpha)
             self._cfg_set("unc_center_resid", bool(self.center_resid_var.get()))
-            self._cfg_set("bootstrap_jitter", jitter_pct / 100.0)
             self._cfg_set("bayes_walkers", walkers)
             self._cfg_set("bayes_burn", burn)
             self._cfg_set("bayes_steps", steps)
@@ -3493,6 +3650,16 @@ class PeakFitApp:
                         total = total + base_fit
                     return total
 
+                # choose refit solver: override if user selected one for bootstrap
+                boot_solver = self.cfg.get("unc_boot_solver", self.solver_choice.get())
+                # Guard: if LMFIT not installed but override points to it, fall back
+                if not getattr(self, "has_lmfit", False) and str(boot_solver).lower().startswith("lmfit"):
+                    boot_solver = self.solver_choice.get()
+                    try:
+                        # keep UI in sync
+                        self.boot_solver_choice.set(boot_solver)
+                    except Exception:
+                        pass
                 fit_ctx = {
                     "x": x_fit,
                     "y": y_fit,
@@ -3502,7 +3669,7 @@ class PeakFitApp:
                     "predict_full": predict_full,
                     "x_all": x_fit,
                     "y_all": y_fit,
-                    "solver": self.solver_choice.get(),
+                    "solver": boot_solver,
                     # propagate sharing flags for LMFIT VP
                     "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
                     "lmfit_share_eta":  bool(self.lmfit_share_eta.get()),
@@ -3512,6 +3679,8 @@ class PeakFitApp:
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
                     "bootstrap_jitter": jitter_pct / 100.0,
+                    # important: turn off linear JᵀJ fallback to avoid unrealistically tight spreads
+                    "allow_linear_fallback": False,
                 }
 
                 out = core_uncertainty.bootstrap_ci(
@@ -3561,6 +3730,23 @@ class PeakFitApp:
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
                 }
+                # sensible bounds for MCMC to prevent runaway widths/etas
+                n_pk = len(self.peaks)
+                P = 4 * n_pk
+                lo = np.full(P, -np.inf, float); hi = np.full(P, np.inf, float)
+                xlo, xhi = float(np.min(x_fit)), float(np.max(x_fit))
+                lo[0::4] = xlo;  hi[0::4] = xhi                     # centers
+                lo[1::4] = 0.0;                                     # heights >= 0
+                # use corrected y without ambiguous array truthiness
+                y_corr = y_fit if add_mode or base_fit is None else (y_fit - base_fit)
+                yscale = float(np.nanmax(y_corr))
+                if not np.isfinite(yscale):
+                    yscale = 1.0
+                hi[1::4] = max(1.0, 1.5 * yscale)                   # height cap
+                lo[2::4] = max(1e-3, float(self.classic_fwhm_min.get() if hasattr(self, "classic_fwhm_min") else 1e-2))
+                hi[2::4] = max(1.0, xhi - xlo)                      # width ≤ window
+                lo[3::4] = 0.0;  hi[3::4] = 1.0                     # 0 ≤ eta ≤ 1
+
                 out = core_uncertainty.bayesian_ci(
                     theta_hat=theta,
                     model=predict_full,
@@ -3577,6 +3763,7 @@ class PeakFitApp:
                     n_steps=steps,
                     thin=thin,
                     prior_sigma=str(self.bayes_prior_var.get()),
+                    bounds=(lo, hi),
                 )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
@@ -4087,19 +4274,27 @@ class PeakFitApp:
                 )
                 saved_unc.append(str(txt_path))
 
-                # Band, if present (asymptotic and any method that provides it)
-                band = unc_norm.get("band")
-                if band is not None:
-                    xb, lob, hib = band
+                # also export prediction band for any method if present (asymptotic & bootstrap)
+                band_tup = self._band_tuple_from(unc_norm)
+                if band_tup is not None:
+                    bx, blo, bhi = band_tup
                     band_csv = export_base.with_name(export_base.name + "_uncertainty_band.csv")
-                    with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                        w = csv.writer(fh, lineterminator="\n")
-                        w.writerow(["x", "y_lo95", "y_hi95"])
-                        for xi, lo, hi in zip(xb, lob, hib):
-                            if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
-                                continue
-                            w.writerow([float(xi), float(lo), float(hi)])
-                    saved_unc.append(str(band_csv))
+                    try:
+                        import csv, math
+                        # dynamic header reflects chosen alpha
+                        try:
+                            ci_pct = int(round(100 * (1.0 - self._safe_alpha())))
+                        except Exception:
+                            ci_pct = 95
+                        with band_csv.open("w", newline="", encoding="utf-8") as fh:
+                            w = csv.writer(fh, lineterminator="\n")
+                            w.writerow(["x", f"y_lo{ci_pct}", f"y_hi{ci_pct}"])
+                            for xi, lo, hi in zip(bx, blo, bhi):
+                                if math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi)):
+                                    w.writerow([float(xi), float(lo), float(hi)])
+                        saved_unc.append(str(band_csv))
+                    except Exception:
+                        pass
 
                 self.log(f"Exported uncertainty ({label}).")
                 for pth in saved_unc:
