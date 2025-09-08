@@ -1357,7 +1357,7 @@ class PeakFitApp:
         try:
             self.unc_method_combo.bind(
                 "<<ComboboxSelected>>",
-                lambda _e: (self._on_uncertainty_method_changed(), _toggle_boot_row()),
+                lambda _e: _toggle_boot_row(),
                 add="+",
             )
         except Exception:
@@ -1405,17 +1405,7 @@ class PeakFitApp:
         self._jitter_entry.grid(row=r, column=1, sticky="w")
         # Clamp jitter% on blur to [0, 50]
         def _clamp_jitter(_e=None):
-            try:
-                v = float(self.bootstrap_jitter_var.get())
-            except Exception:
-                v = 0.0
-            v = min(50.0, max(0.0, v))
-            self.bootstrap_jitter_var.set(v)
-            # keep cfg in sync as fraction
-            try:
-                self._cfg_set("bootstrap_jitter", v / 100.0)
-            except Exception:
-                pass
+            self._safe_jitter_pct()
         try:
             self._jitter_entry.bind("<FocusOut>", _clamp_jitter)
         except Exception:
@@ -1432,6 +1422,16 @@ class PeakFitApp:
             if not getattr(self, "has_lmfit", False):
                 keys = [k for k in keys if not str(k).lower().startswith("lmfit")]
             return tuple(keys)
+
+        def _as_seq(v):
+            if isinstance(v, (list, tuple)):
+                return tuple(v)
+            if isinstance(v, str):
+                return tuple(s for s in v.split() if s)
+            try:
+                return tuple(v)
+            except TypeError:
+                return tuple()
         self._boot_solver_cb = ttk.Combobox(
             unc_frame,
             textvariable=self.boot_solver_choice,
@@ -1442,9 +1442,7 @@ class PeakFitApp:
         self._boot_solver_cb.grid(row=r, column=1, columnspan=2, sticky="w")
         # If persisted override isn't available here, fall back to base solver
         try:
-            _vals = self._boot_solver_cb.cget("values")
-            if not isinstance(_vals, (list, tuple)):
-                _vals = tuple(_vals) if _vals else tuple()
+            _vals = _as_seq(self._boot_solver_cb.cget("values"))
             if self.boot_solver_choice.get() not in _vals:
                 self.boot_solver_choice.set(self.solver_choice.get())
                 self._cfg_set("unc_boot_solver", self.boot_solver_choice.get())
@@ -1463,17 +1461,7 @@ class PeakFitApp:
         _alpha_entry.grid(row=r, column=1, sticky="w")
 
         def _clamp_alpha(_e=None):
-            try:
-                a = float(self.alpha_var.get())
-            except Exception:
-                a = 0.05
-            # Keep alpha sensible: (0, 0.5). Avoid 0 or >=0.5 which make bands degenerate or too wide.
-            a = min(0.49, max(1e-6, a))
-            self.alpha_var.set(a)
-            try:
-                self._cfg_set("unc_alpha", a)
-            except Exception:
-                pass
+            self._safe_alpha()
 
         try:
             _alpha_entry.bind("<FocusOut>", _clamp_alpha)
@@ -1651,7 +1639,10 @@ class PeakFitApp:
         self._update_unc_widgets()
 
     def _update_unc_widgets(self):
-        label = SOLVER_LABELS[self.boot_solver_choice.get()]
+        label = SOLVER_LABELS.get(
+            self.boot_solver_choice.get(),
+            SOLVER_LABELS[self.solver_choice.get()],
+        )
         self.unc_method_combo["values"] = [
             "Asymptotic",
             f"Bootstrap (base solver = {label})",
@@ -1664,7 +1655,7 @@ class PeakFitApp:
         if self.unc_method.get().startswith("Bootstrap"):
             if hasattr(self, "_boot_solver_cb"):
                 try:
-                    self._boot_solver_cb.pack(side=tk.LEFT, padx=4)
+                    self._boot_solver_cb.grid()
                 except Exception:
                     pass
             if hasattr(self, "unc_workers_frame"):
@@ -1672,7 +1663,7 @@ class PeakFitApp:
         else:
             if hasattr(self, "_boot_solver_cb"):
                 try:
-                    self._boot_solver_cb.pack_forget()
+                    self._boot_solver_cb.grid_remove()
                 except Exception:
                     pass
             if hasattr(self, "unc_workers_frame"):
@@ -1712,6 +1703,32 @@ class PeakFitApp:
             if w <= 0:
                 w = os.cpu_count() or 1
         return w
+
+    def _safe_alpha(self):
+        try:
+            a = float(self.alpha_var.get())
+        except Exception:
+            a = 0.05
+        a = min(0.49, max(1e-6, a))
+        self.alpha_var.set(a)
+        try:
+            self._cfg_set("unc_alpha", a)
+        except Exception:
+            pass
+        return a
+
+    def _safe_jitter_pct(self):
+        try:
+            v = float(self.bootstrap_jitter_var.get())
+        except Exception:
+            v = 0.0
+        v = min(50.0, max(0.0, v))
+        self.bootstrap_jitter_var.set(v)
+        try:
+            self._cfg_set("bootstrap_jitter", v / 100.0)
+        except Exception:
+            pass
+        return v
 
 
     def _suspend_clicks(self):
@@ -3566,19 +3583,16 @@ class PeakFitApp:
                 if bool(getattr(pk, "lock_width", False)):
                     locked_mask[4 * i + 2] = True
 
-            alpha = min(max(float(self.alpha_var.get()), 1e-6), 0.5)
-            jitter_pct = max(0.0, min(float(self.bootstrap_jitter_var.get()), 50.0))
+            alpha = self._safe_alpha()
+            jitter_pct = self._safe_jitter_pct()
             walkers = max(0, int(self.bayes_walkers_var.get() or 0))
             burn = max(0, int(self.bayes_burn_var.get()))
             steps = max(1, int(self.bayes_steps_var.get()))
             thin = max(1, int(self.bayes_thin_var.get()))
-            self.alpha_var.set(alpha); self.bootstrap_jitter_var.set(jitter_pct)
             self.bayes_walkers_var.set(walkers); self.bayes_burn_var.set(burn)
             self.bayes_steps_var.set(steps); self.bayes_thin_var.set(thin)
 
-            self._cfg_set("unc_alpha", alpha)
             self._cfg_set("unc_center_resid", bool(self.center_resid_var.get()))
-            self._cfg_set("bootstrap_jitter", jitter_pct / 100.0)
             self._cfg_set("bayes_walkers", walkers)
             self._cfg_set("bayes_burn", burn)
             self._cfg_set("bayes_steps", steps)
@@ -4269,7 +4283,7 @@ class PeakFitApp:
                         import csv, math
                         # dynamic header reflects chosen alpha
                         try:
-                            ci_pct = int(round(100 * (1.0 - float(self.alpha_var.get()))))
+                            ci_pct = int(round(100 * (1.0 - self._safe_alpha())))
                         except Exception:
                             ci_pct = 95
                         with band_csv.open("w", newline="", encoding="utf-8") as fh:
