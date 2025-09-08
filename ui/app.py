@@ -838,8 +838,6 @@ class PeakFitApp:
             self.solver_choice.set("modern_vp")
             self.cfg["solver_choice"] = "modern_vp"
             save_config(self.cfg)
-        self.bootstrap_solver_choice = tk.StringVar(value=self.solver_choice.get())
-        self.bootstrap_solver_label = tk.StringVar(value=SOLVER_LABELS[self.solver_choice.get()])
         self.solver_title = tk.StringVar(value=SOLVER_LABELS[self.solver_choice.get()])
         self.classic_maxfev = tk.IntVar(value=20000)
         self.classic_centers_window = tk.BooleanVar(value=True)
@@ -1314,20 +1312,6 @@ class PeakFitApp:
         self.unc_method_combo.pack(side=tk.LEFT, padx=4)
         self.unc_method_combo.bind("<<ComboboxSelected>>", self._on_unc_method_change)
 
-        solver_labels = [SOLVER_LABELS[k] for k in ["classic", "modern_vp", "modern_trf"]]
-        if self.has_lmfit:
-            solver_labels.append(SOLVER_LABELS["lmfit_vp"])
-        self.bootstrap_solver_combo = ttk.Combobox(
-            unc_box,
-            textvariable=self.bootstrap_solver_label,
-            state="readonly",
-            values=solver_labels,
-            width=24,
-        )
-        self.bootstrap_solver_combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _e: self._on_bootstrap_solver_change(),
-        )
         self.unc_workers_frame = ttk.Frame(unc_box)
         self.unc_workers_label = ttk.Label(self.unc_workers_frame, text="Bootstrap workers:")
         self.unc_workers_label.pack(side=tk.LEFT)
@@ -1398,9 +1382,16 @@ class PeakFitApp:
             except Exception:
                 pass
         try:
-            for t in list(self.show_ci_band.trace_info() or []):
-                if t and t[0] == "write":
-                    self.show_ci_band.trace_remove("write", t[1])
+            for info in list(self.show_ci_band.trace_info() or []):
+                # Tk may return ('write', cb) or ('w', cb) and sometimes include more items
+                mode = info[0] if len(info) > 0 else None
+                cbname = info[1] if len(info) > 1 else None
+                if mode in ("write", "w") and cbname:
+                    # trace_remove expects the exact mode token it gave you
+                    self.show_ci_band.trace_remove(
+                        mode if mode in ("write", "read", "unset", "w", "r", "u") else "write",
+                        cbname,
+                    )
         except Exception:
             pass
         self.show_ci_band.trace_add("write", _ci_trace_guard)
@@ -1468,7 +1459,27 @@ class PeakFitApp:
         )
         r += 1
         ttk.Label(unc_frame, text="CI α").grid(row=r, column=0, sticky="e")
-        ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6).grid(row=r, column=1, sticky="w")
+        _alpha_entry = ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6)
+        _alpha_entry.grid(row=r, column=1, sticky="w")
+
+        def _clamp_alpha(_e=None):
+            try:
+                a = float(self.alpha_var.get())
+            except Exception:
+                a = 0.05
+            # Keep alpha sensible: (0, 0.5). Avoid 0 or >=0.5 which make bands degenerate or too wide.
+            a = min(0.49, max(1e-6, a))
+            self.alpha_var.set(a)
+            try:
+                self._cfg_set("unc_alpha", a)
+            except Exception:
+                pass
+
+        try:
+            _alpha_entry.bind("<FocusOut>", _clamp_alpha)
+        except Exception:
+            pass
+
         ttk.Checkbutton(unc_frame, text="Center residuals", variable=self.center_resid_var).grid(row=r, column=2, sticky="w")
         r += 1
 
@@ -1630,19 +1641,17 @@ class PeakFitApp:
         self.cfg["solver_choice"] = choice
         save_config(self.cfg)
         # sync bootstrap default
-        self.bootstrap_solver_choice.set(choice)
-        self.bootstrap_solver_label.set(SOLVER_LABELS[choice])
+        if hasattr(self, "boot_solver_choice"):
+            try:
+                self.boot_solver_choice.set(choice)
+                self._cfg_set("unc_boot_solver", choice)
+            except Exception:
+                pass
         self._show_solver_opts()
         self._update_unc_widgets()
 
-    def _on_bootstrap_solver_change(self):
-        label = self.bootstrap_solver_label.get()
-        choice = SOLVER_LABELS_INV.get(label, "classic")
-        self.bootstrap_solver_choice.set(choice)
-        self._update_unc_widgets()
-
     def _update_unc_widgets(self):
-        label = SOLVER_LABELS[self.bootstrap_solver_choice.get()]
+        label = SOLVER_LABELS[self.boot_solver_choice.get()]
         self.unc_method_combo["values"] = [
             "Asymptotic",
             f"Bootstrap (base solver = {label})",
@@ -1653,11 +1662,21 @@ class PeakFitApp:
         if current.startswith("Bootstrap"):
             self.unc_method.set(f"Bootstrap (base solver = {label})")
         if self.unc_method.get().startswith("Bootstrap"):
-            self.bootstrap_solver_combo.pack(side=tk.LEFT, padx=4)
-            self.unc_workers_frame.pack(side=tk.LEFT, padx=4)
+            if hasattr(self, "_boot_solver_cb"):
+                try:
+                    self._boot_solver_cb.pack(side=tk.LEFT, padx=4)
+                except Exception:
+                    pass
+            if hasattr(self, "unc_workers_frame"):
+                self.unc_workers_frame.pack(side=tk.LEFT, padx=4)
         else:
-            self.bootstrap_solver_combo.pack_forget()
-            self.unc_workers_frame.pack_forget()
+            if hasattr(self, "_boot_solver_cb"):
+                try:
+                    self._boot_solver_cb.pack_forget()
+                except Exception:
+                    pass
+            if hasattr(self, "unc_workers_frame"):
+                self.unc_workers_frame.pack_forget()
 
     def _on_unc_method_change(self, _e=None):
         label = self.unc_method.get()
@@ -3707,6 +3726,8 @@ class PeakFitApp:
                 # use corrected y without ambiguous array truthiness
                 y_corr = y_fit if add_mode or base_fit is None else (y_fit - base_fit)
                 yscale = float(np.nanmax(y_corr))
+                if not np.isfinite(yscale):
+                    yscale = 1.0
                 hi[1::4] = max(1.0, 1.5 * yscale)                   # height cap
                 lo[2::4] = max(1e-3, float(self.classic_fwhm_min.get() if hasattr(self, "classic_fwhm_min") else 1e-2))
                 hi[2::4] = max(1.0, xhi - xlo)                      # width ≤ window
