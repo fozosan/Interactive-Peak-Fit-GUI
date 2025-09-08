@@ -838,7 +838,8 @@ class PeakFitApp:
             self.solver_choice.set("modern_vp")
             self.cfg["solver_choice"] = "modern_vp"
             save_config(self.cfg)
-        self.solver_title = tk.StringVar(value=SOLVER_LABELS[self.solver_choice.get()])
+        _base_key = self.solver_choice.get()
+        self.solver_title = tk.StringVar(value=SOLVER_LABELS.get(_base_key, _base_key))
         self.classic_maxfev = tk.IntVar(value=20000)
         self.classic_centers_window = tk.BooleanVar(value=True)
         self.classic_margin = tk.DoubleVar(value=0.0)
@@ -882,7 +883,9 @@ class PeakFitApp:
         # Uncertainty and performance controls
         unc_cfg = self.cfg.get("unc_method", "asymptotic")
         if unc_cfg == "bootstrap":
-            unc_label = f"Bootstrap (base solver = {SOLVER_LABELS[self.solver_choice.get()]})"
+            _base_key = self.solver_choice.get()
+            _base_label = SOLVER_LABELS.get(_base_key, _base_key)
+            unc_label = f"Bootstrap (base solver = {_base_label})"
         elif unc_cfg == "bayesian":
             unc_label = "Bayesian"
         else:
@@ -1418,10 +1421,10 @@ class PeakFitApp:
         )
         # Only offer LMFIT if actually available
         def _available_solvers():
-            keys = list(SOLVER_LABELS.keys())
-            if not getattr(self, "has_lmfit", False):
-                keys = [k for k in keys if not str(k).lower().startswith("lmfit")]
-            return tuple(keys)
+            ordered = ["classic", "modern_vp", "modern_trf"]
+            if getattr(self, "has_lmfit", False):
+                ordered.append("lmfit_vp")
+            return tuple(ordered)
 
         def _as_seq(v):
             if isinstance(v, (list, tuple)):
@@ -3658,6 +3661,10 @@ class PeakFitApp:
                     try:
                         # keep UI in sync
                         self.boot_solver_choice.set(boot_solver)
+                    except Exception:
+                        pass
+                    try:
+                        self._cfg_set("unc_boot_solver", boot_solver)
                     except Exception:
                         pass
                 fit_ctx = {
