@@ -1217,7 +1217,7 @@ class PeakFitApp:
         for key in ["classic", "modern_vp", "modern_trf", "lmfit_vp"]:
             rb = ttk.Radiobutton(
                 solver_box,
-                text=SOLVER_LABELS[key],
+                text=SOLVER_LABELS.get(key, key),
                 variable=self.solver_choice,
                 value=key,
                 command=self._on_solver_change,
@@ -1407,34 +1407,25 @@ class PeakFitApp:
         self._jitter_entry = ttk.Entry(unc_frame, textvariable=self.bootstrap_jitter_var, width=6)
         self._jitter_entry.grid(row=r, column=1, sticky="w")
         # Clamp jitter% on blur to [0, 50]
-        def _clamp_jitter(_e=None):
-            self._safe_jitter_pct()
         try:
-            self._jitter_entry.bind("<FocusOut>", _clamp_jitter)
+            self._jitter_entry.bind("<FocusOut>", lambda _e: self._safe_jitter_pct())
         except Exception:
             pass
         r += 1
         # Bootstrap refit solver override
         ttk.Label(unc_frame, text="Refit solver").grid(row=r, column=0, sticky="e")
-        self.boot_solver_choice = tk.StringVar(
-            value=str(self.cfg.get("unc_boot_solver", self.solver_choice.get()))
-        )
+        boot_solver = self.cfg.get("unc_boot_solver", self.solver_choice.get())
+        if not getattr(self, "has_lmfit", False) and str(boot_solver).lower().startswith("lmfit"):
+            boot_solver = self.solver_choice.get()
+            self.cfg["unc_boot_solver"] = boot_solver
+            save_config(self.cfg)
+        self.boot_solver_choice = tk.StringVar(value=str(boot_solver))
         # Only offer LMFIT if actually available
         def _available_solvers():
             ordered = ["classic", "modern_vp", "modern_trf"]
             if getattr(self, "has_lmfit", False):
                 ordered.append("lmfit_vp")
             return tuple(ordered)
-
-        def _as_seq(v):
-            if isinstance(v, (list, tuple)):
-                return tuple(v)
-            if isinstance(v, str):
-                return tuple(s for s in v.split() if s)
-            try:
-                return tuple(v)
-            except TypeError:
-                return tuple()
         self._boot_solver_cb = ttk.Combobox(
             unc_frame,
             textvariable=self.boot_solver_choice,
@@ -1445,7 +1436,7 @@ class PeakFitApp:
         self._boot_solver_cb.grid(row=r, column=1, columnspan=2, sticky="w")
         # If persisted override isn't available here, fall back to base solver
         try:
-            _vals = _as_seq(self._boot_solver_cb.cget("values"))
+            _vals = self._as_seq(self._boot_solver_cb.cget("values"))
             if self.boot_solver_choice.get() not in _vals:
                 self.boot_solver_choice.set(self.solver_choice.get())
                 self._cfg_set("unc_boot_solver", self.boot_solver_choice.get())
@@ -1463,11 +1454,8 @@ class PeakFitApp:
         _alpha_entry = ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6)
         _alpha_entry.grid(row=r, column=1, sticky="w")
 
-        def _clamp_alpha(_e=None):
-            self._safe_alpha()
-
         try:
-            _alpha_entry.bind("<FocusOut>", _clamp_alpha)
+            _alpha_entry.bind("<FocusOut>", lambda _e: self._safe_alpha())
         except Exception:
             pass
 
@@ -1628,7 +1616,7 @@ class PeakFitApp:
 
     def _on_solver_change(self):
         choice = self.solver_choice.get()
-        self.solver_title.set(SOLVER_LABELS[choice])
+        self.solver_title.set(SOLVER_LABELS.get(choice, choice))
         self.cfg["solver_choice"] = choice
         save_config(self.cfg)
         # sync bootstrap default
@@ -1644,7 +1632,7 @@ class PeakFitApp:
     def _update_unc_widgets(self):
         label = SOLVER_LABELS.get(
             self.boot_solver_choice.get(),
-            SOLVER_LABELS[self.solver_choice.get()],
+            SOLVER_LABELS.get(self.solver_choice.get(), self.solver_choice.get()),
         )
         self.unc_method_combo["values"] = [
             "Asymptotic",
@@ -1706,6 +1694,16 @@ class PeakFitApp:
             if w <= 0:
                 w = os.cpu_count() or 1
         return w
+
+    def _as_seq(self, v):
+        if isinstance(v, (list, tuple)):
+            return tuple(v)
+        if isinstance(v, str):
+            return tuple(s for s in v.split() if s)
+        try:
+            return tuple(v)
+        except TypeError:
+            return tuple()
 
     def _safe_alpha(self):
         try:
@@ -3526,7 +3524,11 @@ class PeakFitApp:
             import csv as _csv
             with band_csv.open("w", newline="", encoding="utf-8") as fh:
                 w = _csv.writer(fh, lineterminator="\n")
-                w.writerow(["x", "y_lo95", "y_hi95"])
+                try:
+                    ci_pct = int(round(100 * (1.0 - self._safe_alpha())))
+                except Exception:
+                    ci_pct = 95
+                w.writerow(["x", f"y_lo{ci_pct}", f"y_hi{ci_pct}"])
                 for xi, lo, hi in zip(xb, lob, hib):
                     if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
                         continue
@@ -3686,8 +3688,6 @@ class PeakFitApp:
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
                     "bootstrap_jitter": jitter_pct / 100.0,
-                    # important: turn off linear JᵀJ fallback to avoid unrealistically tight spreads
-                    "allow_linear_fallback": False,
                 }
 
                 out = core_uncertainty.bootstrap_ci(
@@ -3804,6 +3804,9 @@ class PeakFitApp:
                     nf = diag.get("n_fail")
                     if ns is not None or nf is not None:
                         msg = f"{msg} (success={ns}, fail={nf})"
+                    errs = diag.get("refit_errors")
+                    if errs:
+                        msg = f"{msg} | {' | '.join(errs)}"
                 self.status_error(f"Uncertainty failed: {msg}")
                 return
 
