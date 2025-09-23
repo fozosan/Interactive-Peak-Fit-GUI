@@ -482,14 +482,25 @@ def run_batch(
                 xb, lob, hib = band
                 band_csv = out_dir / f"{stem}_uncertainty_band.csv"
                 with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                    bw = csv.writer(fh, lineterminator="\n")
-                    bw.writerow(["x", "y_lo95", "y_hi95"])
+                    writer = csv.writer(fh, lineterminator="\n")
+                    ci_pct = 95
+                    try:
+                        alpha = float(
+                            unc_norm.get(
+                                "alpha",
+                                unc_norm.get("diagnostics", {}).get("alpha", 0.05),
+                            )
+                        )
+                        ci_pct = int(round(100 * (1.0 - alpha)))
+                    except Exception:
+                        pass
+                    writer.writerow(["x", f"y_lo{ci_pct}", f"y_hi{ci_pct}"])
                     for xi, lo, hi in zip(xb, lob, hib):
                         if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
                             return {"aborted": True, "records": [], "reason": "user-abort"}
                         if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
                             continue
-                        bw.writerow([float(xi), float(lo), float(hi)])
+                        writer.writerow([float(xi), float(lo), float(hi)])
 
             for row in data_io.iter_uncertainty_rows(path, unc_norm):
                 if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
