@@ -404,7 +404,7 @@ def bootstrap_ci(
     fit_ctx: Optional[Dict[str, Any]] = None,
     n_boot: int = 1000,
     seed: Optional[int] = None,
-    workers: int = 0,
+    workers: Optional[int] = 0,
     alpha: float = 0.05,
     center_residuals: bool = True,
     return_band: bool = False,
@@ -430,15 +430,22 @@ def bootstrap_ci(
 
     # Inputs
     theta = np.asarray(theta, float)
-    residual_in = np.asarray(residual, float)
+    residual = np.asarray(residual, float)
+    n = int(residual.size)
     J = np.asarray(jacobian, float)
-    x_all = np.asarray(fit.get("x_all", x_all), float)
-    y_all = np.asarray(fit.get("y_all", y_all), float)
-    if x_all is None or y_all is None:
+
+    x_src = fit.get("x_all", x_all)
+    y_src = fit.get("y_all", y_all)
+    if x_src is None or y_src is None:
         raise ValueError("x_all and y_all required for residual bootstrap")
+    x_all = np.atleast_1d(np.asarray(x_src, float))[:n]
+    y_arr = np.atleast_1d(np.asarray(y_src, float))
+    if y_arr.size != n:
+        y_arr = y_arr[:n]
+    y_all = y_arr if y_arr.size == n else None
 
     # Center residuals if requested
-    r = residual_in - residual_in.mean() if center_residuals else residual_in.copy()
+    r = residual - residual.mean() if center_residuals else residual.copy()
 
     # Baseline model prediction (prefer predict_full to avoid loss-mode mismatch)
     diag_notes: List[str] = []
@@ -447,14 +454,24 @@ def bootstrap_ci(
             y_hat = np.asarray(predict_full(theta), float)
         except Exception as e:
             diag_notes.append(repr(e))
-            y_hat = np.asarray(y_all, float) - residual_in
+            base = y_all if y_all is not None else np.zeros_like(residual)
+            y_hat = base - residual
     else:
-        y_hat = np.asarray(y_all, float) - residual_in
+        base = y_all if y_all is not None else np.zeros_like(residual)
+        y_hat = base - residual
+    if y_hat.size != n:
+        y_hat = y_hat[:n]
+    if y_all is None:
+        y_all = (y_hat + residual)[:n]
+    else:
+        y_all = np.atleast_1d(np.asarray(y_all, float))
+        if y_all.size != n:
+            y_all = (y_hat + residual)[:n]
 
     # If we have no peaks, fall back to asymptotic CI to avoid crashy path
     if not peaks_obj:
         ymodel = predict_full if callable(predict_full) else (lambda _th: np.asarray(y_all, float))
-        res_asym = asymptotic_ci(theta, residual_in, J, ymodel, alpha=alpha)
+        res_asym = asymptotic_ci(theta, residual, J, ymodel, alpha=alpha)
 
         band = res_asym.band if (return_band and predict_full is not None) else None
 
@@ -568,7 +585,6 @@ def bootstrap_ci(
     if n_boot <= 0:
         raise ValueError("n_boot must be > 0")
 
-    n = int(x_all.size)
     rng = np.random.default_rng(seed)
     T_list: List[np.ndarray] = []
     n_success = 0
@@ -597,8 +613,8 @@ def bootstrap_ci(
 
         # Residual resample
         idx = rng.integers(0, n, size=n)
-        r_star = r[idx]
-        y_star = y_hat + r_star
+        r_b = r[idx]
+        y_b = (y_hat + r_b)
 
         # Jitter start near theta0 on free dims
         theta_init = theta0.copy()
@@ -610,7 +626,7 @@ def bootstrap_ci(
         ok = False
         th_new = theta_init
         try:
-            th_new, ok = refit(theta_init, x_all, y_star)
+            th_new, ok = refit(theta_init, x_all, y_b)
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             if msg not in refit_errors and len(refit_errors) < 5:
@@ -620,7 +636,7 @@ def bootstrap_ci(
         if not ok and (Jf is None or not Jf.size or np.sum(free_mask) == 0):
             try:
                 th_try = theta_init + 1e-6 * (theta0 - theta_init)
-                th_new, ok = refit(th_try, x_all, y_star)
+                th_new, ok = refit(th_try, x_all, y_b)
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if msg not in refit_errors and len(refit_errors) < 5:
@@ -636,7 +652,7 @@ def bootstrap_ci(
         if Jf is not None and Jf.size and np.sum(free_mask) > 0:
             try:
                 AtA = Jf.T @ Jf
-                rhs = Jf.T @ r_star
+                rhs = Jf.T @ r_b
                 lam = 5e-2 * (np.trace(AtA) / max(1, AtA.shape[0]))
                 if not np.isfinite(lam) or lam <= 0: lam = 1e-3
                 linear_lambda = float(lam)
@@ -700,7 +716,18 @@ def bootstrap_ci(
                 return np.asarray(yhat)
 
             Y_list: List[np.ndarray] = []
-            w = max(0, min(int(workers), (os.cpu_count() or 1)))
+            w_req = 0
+            val_workers = workers
+            if val_workers in (None, False):
+                val_workers = fit.get("unc_workers", 0)
+            if val_workers not in (None, False):
+                try:
+                    w_req = int(val_workers)
+                except Exception as e:
+                    diag_notes.append(repr(e))
+                    w_req = 0
+            w = max(0, min(w_req, (os.cpu_count() or 1)))
+            w_norm: Optional[int] = int(w) if w > 0 else None
             if w > 0:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 with ThreadPoolExecutor(max_workers=w) as ex:
@@ -718,7 +745,7 @@ def bootstrap_ci(
             lo = np.quantile(Y, alpha/2, axis=0)
             hi = np.quantile(Y, 1 - alpha/2, axis=0)
             band = (x_all, lo, hi)
-            diagnostics["workers_used"] = int(w)
+            diagnostics["workers_used"] = w_norm
             diagnostics["band_backend"] = "numpy"
             try:
                 import cupy as cp  # type: ignore
@@ -742,6 +769,7 @@ def bootstrap_ci(
         "band_source": "bootstrap-percentile" if band is not None else None,
         "band_reason": band_reason,
         "refit_errors": refit_errors,
+        "alpha": float(alpha),
     }
     if diag_notes:
         diag["notes"] = diag_notes
@@ -776,7 +804,7 @@ def bayesian_ci(
     model=None, predict_full=None, x_all=None, y_all=None,
     residual_fn=None, bounds=None, param_names=None, locked_mask=None,
     fit_ctx=None, n_walkers=None, n_burn=2000, n_steps=8000, thin=1,
-    seed=None, return_band=True, prior_sigma="half_cauchy"
+    seed=None, workers: Optional[int] = None, return_band=True, prior_sigma="half_cauchy"
 ) -> UncertaintyResult:
     """
     Sample posterior of free θ and σ with emcee. Deterministic with seed.
@@ -913,11 +941,16 @@ def bayesian_ci(
 
     # Optional parallel pool for emcee log_prob; cap workers
     workers_req = 0
-    try:
-        workers_req = int((fit_ctx or {}).get("unc_workers", 0))
-    except Exception as e:
-        diag_notes.append(repr(e))
-        workers_req = 0
+    if workers not in (None, False):
+        val_workers = workers
+    else:
+        val_workers = (fit_ctx or {}).get("unc_workers", 0)
+    if val_workers not in (None, False):
+        try:
+            workers_req = int(val_workers)
+        except Exception as e:
+            diag_notes.append(repr(e))
+            workers_req = 0
     w = max(0, min(workers_req, (os.cpu_count() or 1)))
     pool = ThreadPoolExecutor(max_workers=w) if w > 0 else None
     try:

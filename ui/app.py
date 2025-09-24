@@ -3350,6 +3350,51 @@ class PeakFitApp:
         elif method_key.startswith("bayes"):
             method_key = "bayesian"
 
+        # Build locked mask (center/fwhm locks) for bootstrap/Bayesian refits
+        locked_mask = np.zeros(theta.size, dtype=bool)
+        for i, pk in enumerate(self.peaks):
+            if bool(getattr(pk, "lock_center", False)):
+                locked_mask[4 * i + 0] = True
+            if bool(getattr(pk, "lock_width", False)):
+                locked_mask[4 * i + 2] = True
+            if bool(getattr(pk, "lock_height", False)):
+                locked_mask[4 * i + 1] = True
+            if bool(getattr(pk, "lock_eta", False)):
+                locked_mask[4 * i + 3] = True
+
+        # Shared bounds mirroring interactive uncertainty path
+        n_pk = len(self.peaks)
+        P = 4 * n_pk
+        lo = np.full(P, -np.inf, float)
+        hi = np.full(P, np.inf, float)
+        xlo, xhi = float(np.min(x_fit)), float(np.max(x_fit))
+        lo[0::4] = xlo
+        hi[0::4] = xhi
+        lo[1::4] = 0.0
+        y_corr = y_fit if add_mode or base_fit is None else (y_fit - base_fit)
+        try:
+            yscale = float(np.nanmax(y_corr))
+        except Exception:
+            yscale = 1.0
+        if not np.isfinite(yscale) or yscale <= 0:
+            yscale = 1.0
+        hi[1::4] = max(1.0, 1.5 * yscale)
+        lo[2::4] = max(
+            1e-3,
+            float(self.classic_fwhm_min.get() if hasattr(self, "classic_fwhm_min") else 1e-2),
+        )
+        hi[2::4] = max(1.0, xhi - xlo)
+        lo[3::4] = 0.0
+        hi[3::4] = 1.0
+
+        import os
+
+        workers_req = int(self.cfg.get("unc_workers", 0))
+        workers = max(0, min(workers_req, (os.cpu_count() or 1)))
+        workers = None if workers <= 0 else workers
+        alpha = self._safe_alpha()
+        center_res = bool(self.center_resid_var.get())
+
         if method_key == "asymptotic":
             res = self._run_asymptotic_uncertainty()
             if res is None:
@@ -3386,17 +3431,21 @@ class PeakFitApp:
                 "y": y_fit,
                 "baseline": base_fit,
                 "mode": mode,
+                "lmfit_share_fwhm": bool(
+                    getattr(self, "share_fwhm_var", None) and self.share_fwhm_var.get()
+                ),
+                "lmfit_share_eta": bool(
+                    getattr(self, "share_eta_var", None) and self.share_eta_var.get()
+                ),
                 "residual_fn": (lambda th: resid_fn(th)),
                 "predict_full": predict_full,
                 "x_all": x_fit,
                 "y_all": y_fit,
-                "unc_workers": int(self.cfg.get("unc_workers", 0)),
+                "unc_workers": workers,
             }
 
             n_boot = self._get_int("bootstrap_n", 200)
             seed_val = self._get_int("bootstrap_seed", 0) or None
-            workers = int(self.cfg.get("unc_workers", 0))
-
             res = core_uncertainty.bootstrap_ci(
                 theta=theta,
                 residual=r0,
@@ -3405,9 +3454,14 @@ class PeakFitApp:
                 x_all=x_fit,
                 y_all=y_fit,
                 fit_ctx=fit_ctx,
+                locked_mask=locked_mask,
+                bounds=(lo, hi),
+                return_band=True,
+                alpha=alpha,
+                center_residuals=center_res,
+                workers=workers,
                 n_boot=n_boot,
                 seed=seed_val,
-                workers=workers,
             )
             out = res
         elif method_key == "bayesian":
@@ -3425,11 +3479,17 @@ class PeakFitApp:
                 "y": y_fit,
                 "baseline": base_fit,
                 "mode": mode,
+                "lmfit_share_fwhm": bool(
+                    getattr(self, "share_fwhm_var", None) and self.share_fwhm_var.get()
+                ),
+                "lmfit_share_eta": bool(
+                    getattr(self, "share_eta_var", None) and self.share_eta_var.get()
+                ),
                 "residual_fn": (lambda th: resid_fn(th)),
                 "predict_full": predict_full,
                 "x_all": x_fit,
                 "y_all": y_fit,
-                "unc_workers": int(self.cfg.get("unc_workers", 0)),
+                "unc_workers": workers,
             }
             out = core_uncertainty.bayesian_ci(
                 theta_hat=theta,
@@ -3439,6 +3499,10 @@ class PeakFitApp:
                 y_all=y_fit,
                 residual_fn=(lambda th: resid_fn(th)),
                 fit_ctx=fit_ctx,
+                locked_mask=locked_mask,
+                bounds=(lo, hi),
+                return_band=False,
+                workers=workers,
             )
         else:
             return {"label": "unknown", "stats": []}
