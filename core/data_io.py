@@ -19,6 +19,133 @@ import pandas as pd
 
 from .uncertainty import UncertaintyResult
 
+
+def _get_pct(d: Mapping[str, Any] | None, key_new: str, key_old: str):
+    if not isinstance(d, Mapping):
+        return None
+    if key_new in d and d[key_new] is not None:
+        return d[key_new]
+    return d.get(key_old, None)
+
+
+def _normalize_param_stats(stats: dict | Sequence[dict]) -> tuple[list[dict], dict]:
+    """
+    Returns (rows, wide) suitable for per-peak and wide CSV.
+    rows: per-peak dicts with center/height/fwhm/eta keys (est/sd/p2_5/p97_5).
+    wide: flat dict (e.g., sigma_* and any extra flat params).
+    """
+    rows: list[dict] = []
+    wide: dict = {}
+
+    def _to_series(val: Any) -> list[Any]:
+        if hasattr(val, "ndim"):
+            arr = np.asarray(val)
+            return arr.reshape(-1).tolist()
+        if isinstance(val, (list, tuple)):
+            return list(val)
+        if val is None:
+            return []
+        return [val]
+
+    def _opt_float(val: Any) -> float | None:
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except Exception:
+            try:
+                arr = np.asarray(val)
+                if arr.size:
+                    return float(arr.reshape(-1)[0])
+            except Exception:
+                pass
+        return None
+
+    stats_seq: list[Any] = []
+    if isinstance(stats, Mapping):
+        maybe_rows = stats.get("rows")
+        if isinstance(maybe_rows, Sequence) and not isinstance(maybe_rows, (str, bytes)):
+            stats_seq = list(maybe_rows)
+        elif any(isinstance(stats.get(k), Mapping) for k in ("center", "height", "fwhm", "eta")):
+            for name in ("center", "height", "fwhm", "eta"):
+                blk = stats.get(name)
+                if not isinstance(blk, Mapping):
+                    continue
+                est = _to_series(blk.get("est"))
+                sd = _to_series(blk.get("sd"))
+                lo = (
+                    _to_series(blk.get("p2_5"))
+                    or _to_series(blk.get("p2.5"))
+                    or _to_series(blk.get("ci_lo"))
+                )
+                hi = (
+                    _to_series(blk.get("p97_5"))
+                    or _to_series(blk.get("p97.5"))
+                    or _to_series(blk.get("ci_hi"))
+                )
+                n = max(len(rows), len(est), len(sd), len(lo), len(hi))
+                while len(rows) < n:
+                    rows.append({})
+                for idx in range(n):
+                    rec = rows[idx]
+                    rec[f"{name}_est"] = _opt_float(est[idx]) if idx < len(est) else rec.get(f"{name}_est")
+                    rec[f"{name}_sd"] = _opt_float(sd[idx]) if idx < len(sd) else rec.get(f"{name}_sd")
+                    rec[f"{name}_p2_5"] = (
+                        _opt_float(lo[idx]) if idx < len(lo) else rec.get(f"{name}_p2_5")
+                    )
+                    rec[f"{name}_p97_5"] = (
+                        _opt_float(hi[idx]) if idx < len(hi) else rec.get(f"{name}_p97_5")
+                    )
+            stats_seq = []
+        else:
+            stats_seq = []
+    elif isinstance(stats, Sequence) and not isinstance(stats, (str, bytes)):
+        stats_seq = list(stats)
+
+    if stats_seq:
+        for entry in stats_seq:
+            row_map = _as_mapping(entry)
+            rec: dict[str, Any] = {}
+            for name in ("center", "height", "fwhm", "eta"):
+                blk = _as_mapping(row_map.get(name))
+                est = blk.get("est")
+                sd = blk.get("sd")
+                lo = _get_pct(blk, "p2_5", "p2.5")
+                if lo is None:
+                    lo = blk.get("ci_lo")
+                hi = _get_pct(blk, "p97_5", "p97.5")
+                if hi is None:
+                    hi = blk.get("ci_hi")
+                rec[f"{name}_est"] = _opt_float(est)
+                rec[f"{name}_sd"] = _opt_float(sd)
+                rec[f"{name}_p2_5"] = _opt_float(lo)
+                rec[f"{name}_p97_5"] = _opt_float(hi)
+            rows.append(rec)
+
+    if isinstance(stats, Mapping):
+        sig = stats.get("sigma")
+        if isinstance(sig, Mapping):
+            lo = _get_pct(sig, "p2_5", "p2.5")
+            hi = _get_pct(sig, "p97_5", "p97.5")
+            wide["sigma_est"] = float(sig.get("est")) if sig.get("est") is not None else None
+            wide["sigma_sd"] = float(sig.get("sd")) if sig.get("sd") is not None else None
+            wide["sigma_p2_5"] = float(lo) if lo is not None else None
+            wide["sigma_p97_5"] = float(hi) if hi is not None else None
+
+        for name, d in stats.items():
+            if name in ("center", "height", "fwhm", "eta", "sigma", "rows"):
+                continue
+            if not isinstance(d, Mapping):
+                continue
+            est = d.get("est")
+            sd = d.get("sd")
+            lo = _get_pct(d, "p2_5", "p2.5")
+            hi = _get_pct(d, "p97_5", "p97.5")
+            for key, val in (("est", est), ("sd", sd), ("p2_5", lo), ("p97_5", hi)):
+                wide[f"{name}_{key}"] = float(val) if val is not None else None
+
+    return rows, wide
+
 # 95% normal quantile used when p2_5/p97_5 are absent but stderr exists
 _Z = 1.96
 # Conversion from Gaussian sigma to FWHM
@@ -1207,15 +1334,37 @@ def _format_unc_text(
 
     lines = [f"Uncertainty method: {canon_label}"]
 
-    stats = unc_norm.get("stats", [])
-    for i, row in enumerate(stats, start=1):
+    stats_source = (
+        unc_norm.get("param_stats")
+        or unc_norm.get("stats")
+        or []
+    )
+    norm_rows, _ = _normalize_param_stats(stats_source)
+    use_norm = bool(norm_rows)
+    stats_rows = norm_rows if use_norm else list(unc_norm.get("stats") or [])
+
+    for i, row in enumerate(stats_rows, start=1):
+
+        def _values(name: str) -> tuple[Any, Any, Any, Any]:
+            if use_norm:
+                est = row.get(f"{name}_est")
+                sd = row.get(f"{name}_sd")
+                lo = row.get(f"{name}_p2_5")
+                hi = row.get(f"{name}_p97_5")
+            else:
+                blk = _as_mapping(row.get(name))
+                est = blk.get("est")
+                sd = blk.get("sd")
+                lo = _get_pct(blk, "p2_5", "p2.5")
+                if lo is None:
+                    lo = blk.get("ci_lo")
+                hi = _get_pct(blk, "p97_5", "p97.5")
+                if hi is None:
+                    hi = blk.get("ci_hi")
+            return est, sd, lo, hi
 
         def fmt_param(name: str, locked: bool):
-            p = _as_mapping(row.get(name))
-            est = p.get("est")
-            sd = p.get("sd")
-            lo = p.get("ci_lo")
-            hi = p.get("ci_hi")
+            est, sd, lo, hi = _values(name)
             # If SD missing but we have CI, estimate SD from CI width for display so we can emit ±
             if (sd is None or np.isnan(_to_float(sd))) and not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
                 try:
@@ -1245,11 +1394,7 @@ def _format_unc_text(
         # --- NEW: p-indexed legacy summary lines (satisfies tests looking for "p0:", ... and "±") ---
         # p0->center, p1->height, p2->fwhm, p3->eta
         def pick_est_sd(name: str) -> Tuple[str, str]:
-            p = _as_mapping(row.get(name))
-            est = p.get("est")
-            sd = p.get("sd")
-            lo = p.get("ci_lo")
-            hi = p.get("ci_hi")
+            est, sd, lo, hi = _values(name)
             if (sd is None or np.isnan(_to_float(sd))) and not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
                 try:
                     sd = float(hi - lo) / (2.0 * _Z)
@@ -1367,14 +1512,24 @@ def iter_uncertainty_rows(
     dof = unc_norm.get("dof", float("nan"))
 
     rows: List[dict] = []
-    stats = unc_norm.get("stats") or []
-    for i, row in enumerate(stats, start=1):
+    stats_source = (
+        unc_norm.get("param_stats")
+        or unc_norm.get("stats")
+        or []
+    )
+    norm_rows, _ = _normalize_param_stats(stats_source)
+    if not norm_rows and isinstance(unc_norm.get("stats"), Sequence):
+        norm_rows, _ = _normalize_param_stats(unc_norm.get("stats"))
+
+    if not norm_rows:
+        norm_rows = []
+
+    for i, rec in enumerate(norm_rows, start=1):
         for param in ("center", "height", "fwhm", "eta"):
-            blk = (row or {}).get(param) or {}
-            est = _to_float(blk.get("est"))
-            sd = _to_float(blk.get("sd"))
-            qlo = _to_float(blk.get("p2_5"))
-            qhi = _to_float(blk.get("p97_5"))
+            est = _to_float(rec.get(f"{param}_est"))
+            sd = _to_float(rec.get(f"{param}_sd"))
+            qlo = _to_float(rec.get(f"{param}_p2_5"))
+            qhi = _to_float(rec.get(f"{param}_p97_5"))
             if (isnan(qlo) or isnan(qhi)) and not isnan(est) and not isnan(sd):
                 try:
                     qlo, qhi = est - _Z * sd, est + _Z * sd
@@ -1462,50 +1617,67 @@ def write_uncertainty_csvs(
     base_path = Path(base_path).with_suffix("")
     long_written = write_uncertainty_csv_legacy(base_path, file_path, unc_norm)
 
+    method_name = str(unc_norm.get("label") or unc_norm.get("method") or "unknown")
+    rmse_val = _finite(unc_norm.get("rmse"), 0.0)
+    dof_val = max(1, int(_finite(unc_norm.get("dof"), 1.0)))
+
     wide_written = None
     if write_wide:
-        rows = iter_uncertainty_rows(file_path, unc_norm)
-        wide_path = base_path.with_name(base_path.name + "_uncertainty_wide.csv")
-        header = [
-            "file","peak","method","rmse","dof",
-            "center","center_stderr","center_ci_lo","center_ci_hi",
-            "height","height_stderr","height_ci_lo","height_ci_hi",
-            "fwhm","fwhm_stderr","fwhm_ci_lo","fwhm_ci_hi",
-            "eta","eta_stderr","eta_ci_lo","eta_ci_hi",
-        ]
-        by_peak: dict[int, dict[str, Any]] = {}
-        for r in rows:
-            pk = r["peak"]
-            d = by_peak.setdefault(
-                pk,
-                {
-                    "file": r["file"],
-                    "peak": pk,
-                    "method": r["method"],
-                    "rmse": _finite(r["rmse"], 0.0),
-                    "dof": max(1, int(_finite(r["dof"], 1.0))),
-                },
-            )
-            p = r["param"]
-            e = _finite(d.get(p, r.get("value")), 0.0)
-            s = _finite(r.get("stderr"), 0.0)
-            qlo = r.get("p2_5"); qhi = r.get("p97_5")
-            if not (isinstance(qlo, (int, float)) and math.isfinite(float(qlo))) or \
-               not (isinstance(qhi, (int, float)) and math.isfinite(float(qhi))):
-                qlo, qhi = _synth_q(e, s)
-            else:
-                qlo = _finite(qlo, e); qhi = _finite(qhi, e)
-            d[p] = e
-            d[f"{p}_stderr"] = s
-            d[f"{p}_ci_lo"] = qlo
-            d[f"{p}_ci_hi"] = qhi
+        stats_source = (
+            unc_norm.get("param_stats")
+            or unc_norm.get("stats")
+            or []
+        )
+        norm_rows, wide_map = _normalize_param_stats(stats_source)
+        if not norm_rows and isinstance(unc_norm.get("stats"), Sequence):
+            norm_rows, wide_fallback = _normalize_param_stats(unc_norm.get("stats"))
+            if not wide_map:
+                wide_map = wide_fallback
 
-        with wide_path.open("w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
-            w.writeheader()
-            for pk in sorted(by_peak):
-                w.writerow(by_peak[pk])
-        wide_written = wide_path
+        if norm_rows:
+            wide_path = base_path.with_name(base_path.name + "_uncertainty_wide.csv")
+            header = [
+                "file","peak","method","rmse","dof",
+                "center","center_stderr","center_ci_lo","center_ci_hi",
+                "height","height_stderr","height_ci_lo","height_ci_hi",
+                "fwhm","fwhm_stderr","fwhm_ci_lo","fwhm_ci_hi",
+                "eta","eta_stderr","eta_ci_lo","eta_ci_hi",
+            ]
+            extra_cols = [k for k in wide_map.keys() if k not in header]
+            extra_cols.sort()
+            header.extend(extra_cols)
+
+            with wide_path.open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
+                w.writeheader()
+                for idx, rec in enumerate(norm_rows, start=1):
+                    row_out: dict[str, Any] = {
+                        "file": str(file_path),
+                        "peak": idx,
+                        "method": method_name,
+                        "rmse": rmse_val,
+                        "dof": dof_val,
+                    }
+                    for param in ("center", "height", "fwhm", "eta"):
+                        val = _finite(rec.get(f"{param}_est"), 0.0)
+                        sd = _finite(rec.get(f"{param}_sd"), 0.0)
+                        qlo_raw = rec.get(f"{param}_p2_5")
+                        qhi_raw = rec.get(f"{param}_p97_5")
+                        qlo_val = _to_float(qlo_raw)
+                        qhi_val = _to_float(qhi_raw)
+                        if not (math.isfinite(qlo_val) and math.isfinite(qhi_val)):
+                            qlo_val, qhi_val = _synth_q(val, sd)
+                        else:
+                            qlo_val = _finite(qlo_val, val)
+                            qhi_val = _finite(qhi_val, val)
+                        row_out[param] = val
+                        row_out[f"{param}_stderr"] = sd
+                        row_out[f"{param}_ci_lo"] = qlo_val
+                        row_out[f"{param}_ci_hi"] = qhi_val
+                    for col in extra_cols:
+                        row_out[col] = wide_map.get(col)
+                    w.writerow(row_out)
+            wide_written = wide_path
 
     return str(long_written), (str(wide_written) if wide_written else None)
 
@@ -1655,14 +1827,16 @@ def write_uncertainty_csv(
     stats_map = _as_mapping(getattr(res_obj, "stats", {}))
     for i, (name, st) in enumerate(stats_map.items()):
         p = _as_mapping(st)
+        lo_pct = _get_pct(p, "p2_5", "p2.5")
+        hi_pct = _get_pct(p, "p97_5", "p97.5")
         row.update(
             {
                 name: _to_float(p.get("est") or p.get("mean") or p.get("value")),
                 f"{name}_sd": _to_float(p.get("sd") or p.get("stderr") or p.get("sigma")),
-                f"{name}_ci_lo": _to_float(p.get("p2.5") or p.get("ci_lo")),
-                f"{name}_ci_hi": _to_float(p.get("p97.5") or p.get("ci_hi")),
-                f"{name}_p2_5": _to_float(p.get("p2_5")),
-                f"{name}_p97_5": _to_float(p.get("p97_5")),
+                f"{name}_ci_lo": _to_float(lo_pct if lo_pct is not None else p.get("ci_lo")),
+                f"{name}_ci_hi": _to_float(hi_pct if hi_pct is not None else p.get("ci_hi")),
+                f"{name}_p2_5": _to_float(lo_pct),
+                f"{name}_p97_5": _to_float(hi_pct),
             }
         )
         header.extend(
