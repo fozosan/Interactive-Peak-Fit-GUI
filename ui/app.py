@@ -713,6 +713,66 @@ class PeakFitApp:
         except Exception:
             pass
 
+    def _boot_follow_enabled(self) -> bool:
+        return bool(self.cfg.get("unc_boot_solver_follow", True))
+
+    def _set_boot_follow(self, val: bool) -> None:
+        follow = bool(val)
+        try:
+            self.cfg["unc_boot_solver_follow"] = follow
+            save_config(self.cfg)
+        except Exception:
+            pass
+        if hasattr(self, "boot_solver_follow_var"):
+            try:
+                self.boot_solver_follow_var.set(follow)
+            except Exception:
+                pass
+        if follow and hasattr(self, "boot_solver_choice") and hasattr(self, "solver_choice"):
+            try:
+                choice = self.solver_choice.get()
+                self.boot_solver_choice.set(choice)
+                self._cfg_set("unc_boot_solver", choice)
+            except Exception:
+                pass
+        try:
+            self._update_bootstrap_tie_widgets()
+        except Exception:
+            pass
+
+    def _select_bootstrap_solver(self) -> str:
+        main = (
+            self.solver_choice.get()
+            if hasattr(self, "solver_choice")
+            else "modern_trf"
+        )
+        ui_pick: Optional[str]
+        if hasattr(self, "boot_solver_choice"):
+            try:
+                ui_pick = self.boot_solver_choice.get()
+            except Exception:
+                ui_pick = None
+        else:
+            ui_pick = self.cfg.get("unc_boot_solver")
+        boot = main if self._boot_follow_enabled() or not ui_pick else ui_pick
+        try:
+            if str(boot).lower().startswith("lmfit") and not bool(
+                getattr(self, "has_lmfit", False)
+            ):
+                boot = "modern_trf"
+                if hasattr(self, "boot_solver_choice"):
+                    try:
+                        self.boot_solver_choice.set(boot)
+                    except Exception:
+                        pass
+                try:
+                    self._cfg_set("unc_boot_solver", boot)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return str(boot)
+
     def __init__(self, root, cfg=None):
         self.root = root
         self.cfg = cfg if cfg is not None else load_config()
@@ -728,6 +788,7 @@ class PeakFitApp:
         self.cfg.setdefault("export_unc_wide", False)
         self.cfg.setdefault("unc_alpha", 0.05)
         self.cfg.setdefault("unc_center_resid", True)
+        self.cfg.setdefault("unc_boot_solver_follow", True)
         self.cfg.setdefault("bootstrap_jitter", 0.02)
         self.cfg.setdefault("bayes_walkers", 0)
         self.cfg.setdefault("bayes_burn", 1000)
@@ -1444,10 +1505,7 @@ class PeakFitApp:
             pass
         self._boot_solver_cb.bind(
             "<<ComboboxSelected>>",
-            lambda _e: (
-                self._cfg_set("unc_boot_solver", self.boot_solver_choice.get()),
-                self._update_bootstrap_tie_widgets(),
-            ),
+            lambda _e: self._on_boot_solver_choice(),
         )
         r += 1
         ttk.Label(unc_frame, text="CI α").grid(row=r, column=0, sticky="e")
@@ -1614,13 +1672,28 @@ class PeakFitApp:
             "height_factor": float(self.classic_height_factor.get()),
         }
 
+    def _on_boot_solver_choice(self, *_):
+        if hasattr(self, "boot_solver_choice"):
+            try:
+                self._cfg_set("unc_boot_solver", self.boot_solver_choice.get())
+            except Exception:
+                pass
+        # user touched it -> stop following main solver
+        self._set_boot_follow(False)
+        # immediate visual/state feedback
+        try:
+            self._update_unc_widgets()
+            self._update_bootstrap_tie_widgets()
+        except Exception:
+            pass
+
     def _on_solver_change(self):
         choice = self.solver_choice.get()
         self.solver_title.set(SOLVER_LABELS.get(choice, choice))
         self.cfg["solver_choice"] = choice
         save_config(self.cfg)
-        # sync bootstrap default
-        if hasattr(self, "boot_solver_choice"):
+        # sync bootstrap default if following main solver
+        if hasattr(self, "boot_solver_choice") and self._boot_follow_enabled():
             try:
                 self.boot_solver_choice.set(choice)
                 self._cfg_set("unc_boot_solver", choice)
@@ -1630,10 +1703,9 @@ class PeakFitApp:
         self._update_unc_widgets()
 
     def _update_unc_widgets(self):
-        label = SOLVER_LABELS.get(
-            self.boot_solver_choice.get(),
-            SOLVER_LABELS.get(self.solver_choice.get(), self.solver_choice.get()),
-        )
+        # Keep the Bootstrap label in sync with the actual solver selection
+        chosen = self._select_bootstrap_solver()
+        label = SOLVER_LABELS.get(chosen, chosen)
         self.unc_method_combo["values"] = [
             "Asymptotic",
             f"Bootstrap (base solver = {label})",
@@ -1874,11 +1946,7 @@ class PeakFitApp:
         try:
             sel = str(self.unc_method_var.get()).lower()
             is_boot = ("bootstrap" in sel)
-            solver = (
-                self.boot_solver_choice.get()
-                if hasattr(self, "boot_solver_choice")
-                else self.solver_choice.get()
-            )
+            solver = self._select_bootstrap_solver()
             is_lmfit = str(solver).lower().startswith("lmfit") and bool(getattr(self, "has_lmfit", False))
             state = "normal" if (is_boot and is_lmfit) else "disabled"
             for w in (
@@ -3426,6 +3494,8 @@ class PeakFitApp:
                     total = total + base_fit
                 return total
 
+            boot_solver = self._select_bootstrap_solver()
+
             fit_ctx = {
                 "x": x_fit,
                 "y": y_fit,
@@ -3442,6 +3512,7 @@ class PeakFitApp:
                 "x_all": x_fit,
                 "y_all": y_fit,
                 "unc_workers": workers,
+                "solver": boot_solver,
             }
 
             n_boot = self._get_int("bootstrap_n", 200)
@@ -3719,20 +3790,7 @@ class PeakFitApp:
                         total = total + base_fit
                     return total
 
-                # choose refit solver: override if user selected one for bootstrap
-                boot_solver = self.cfg.get("unc_boot_solver", self.solver_choice.get())
-                # Guard: if LMFIT not installed but override points to it, fall back
-                if not getattr(self, "has_lmfit", False) and str(boot_solver).lower().startswith("lmfit"):
-                    boot_solver = self.solver_choice.get()
-                    try:
-                        # keep UI in sync
-                        self.boot_solver_choice.set(boot_solver)
-                    except Exception:
-                        pass
-                    try:
-                        self._cfg_set("unc_boot_solver", boot_solver)
-                    except Exception:
-                        pass
+                boot_solver = self._select_bootstrap_solver()
                 fit_ctx = {
                     "x": x_fit,
                     "y": y_fit,

@@ -995,7 +995,10 @@ def bayesian_ci(
                     pass
     finally:
         if pool is not None:
-            pool.shutdown(wait=True, cancel_futures=True)
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
 
     # Early abort/minimal mode: skip heavy post-processing
     if abort_evt is not None and getattr(abort_evt, "is_set", lambda: False)():
@@ -1039,12 +1042,12 @@ def bayesian_ci(
     log_sigma_draws = flat[:, -1]
     sigma_draws = np.exp(log_sigma_draws)
 
-    T = np.tile(theta_hat, (th_draws.shape[0], 1))
+    T_full = np.tile(theta_hat, (th_draws.shape[0], 1))
     if P_free:
-        T[:, free_idx] = th_draws
-    # Apply ties on all draws
+        T_full[:, free_idx] = th_draws
+    # Apply ties on all draws so the full parameter order is preserved
     for leader, group in tie_groups:
-        T[:, group] = T[:, [leader]]
+        T_full[:, group] = T_full[:, [leader]]
 
     def _finite(a):
         return np.isfinite(a)
@@ -1062,7 +1065,7 @@ def bayesian_ci(
     stats = {}
     alpha = 0.05
     for i, name in enumerate(names):
-        samp = T[:, i]
+        samp = T_full[:, i]
         finite = _finite(samp)
         if finite.any():
             est = float(np.nanmedian(samp[finite]))
