@@ -2324,6 +2324,16 @@ class PeakFitApp:
             return
         try:
             x, y = load_xy_any(path)
+        except ValueError as e:
+            self.status_warn(str(e))
+            try:
+                messagebox.showwarning(
+                    "Unsupported File",
+                    f"{e}\n\nTip: Use a two-column (x y) text file."
+                )
+            except Exception:
+                pass
+            return
         except Exception as e:
             messagebox.showerror("Open data", f"Failed to read file:\n{e}")
             return

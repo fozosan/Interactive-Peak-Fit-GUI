@@ -35,6 +35,7 @@ def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
     """
 
     xs, ys = [], []
+    more_than_two = False
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
         for line in fh:
             line = line.strip()
@@ -50,6 +51,18 @@ def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
             if not line:
                 continue
             parts = re.split(r"[,\s;]+", line)
+            if len(parts) >= 3:
+                for token in parts[2:]:
+                    if not token:
+                        continue
+                    try:
+                        float(token)
+                        more_than_two = True
+                        break
+                    except ValueError:
+                        continue
+                if more_than_two:
+                    break
             try:
                 x_val = float(parts[0])
                 y_val = float(parts[1])
@@ -57,6 +70,12 @@ def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
                 continue
             xs.append(x_val)
             ys.append(y_val)
+
+    if more_than_two:
+        raise ValueError(
+            "Unsupported data file: detected more than two numeric columns.\n"
+            "This app expects exactly two columns (x y)."
+        )
 
     if len(xs) < 2:
         raise ValueError("Could not parse a two-column numeric dataset from the file.")
