@@ -85,23 +85,115 @@ class UncertaintyResult:
         stds: list[float] = []
         q05: list[float] = []
         q95: list[float] = []
+
+        def _to_float(x: Any) -> float:
+            if x is None:
+                return float("nan")
+            try:
+                return float(x)
+            except Exception:
+                return float("nan")
+
+        def _seq_len(val: Any) -> int:
+            if isinstance(val, np.ndarray):
+                return int(val.size) if val.ndim > 0 else 0
+            if isinstance(val, (list, tuple)):
+                return len(val)
+            return 0
+
+        def _values_for(st: Dict[str, Any], key: str, n: int) -> list[float]:
+            val = st.get(key)
+            if isinstance(val, np.ndarray):
+                if val.ndim == 0:
+                    seq = [val.item()] * n
+                else:
+                    seq = val.reshape(-1).tolist()
+            elif isinstance(val, (list, tuple)):
+                seq = list(val)
+            elif val is None:
+                seq = []
+            else:
+                seq = [val] * n
+            out: list[float] = []
+            for i in range(n):
+                out.append(_to_float(seq[i] if i < len(seq) else float("nan")))
+            return out
+
+        block_keys = ("center", "height", "fwhm", "eta")
+        max_len = 0
+        for key in block_keys:
+            st = self.stats.get(key)
+            if not isinstance(st, dict):
+                continue
+            max_len = max(
+                max_len,
+                _seq_len(st.get("est")),
+                _seq_len(st.get("sd")),
+                _seq_len(st.get("p2_5")),
+                _seq_len(st.get("p97_5")),
+            )
+
+        processed: set[str] = set()
+        if max_len > 0:
+            for key in block_keys:
+                st = self.stats.get(key)
+                if not isinstance(st, dict):
+                    continue
+                processed.add(key)
+                est_vals = _values_for(st, "est", max_len)
+                sd_vals = _values_for(st, "sd", max_len)
+                lo_vals = _values_for(st, "p2_5", max_len)
+                hi_vals = _values_for(st, "p97_5", max_len)
+                for idx in range(max_len):
+                    pname = f"{key}{idx + 1}"
+                    est = est_vals[idx]
+                    sd = sd_vals[idx]
+                    lo = lo_vals[idx]
+                    hi = hi_vals[idx]
+                    params[pname] = {
+                        "mean": est,
+                        "std": sd,
+                        "q05": lo,
+                        "q50": est,
+                        "q95": hi,
+                    }
+                    names.append(pname)
+                    means.append(est)
+                    stds.append(sd)
+                    q05.append(lo)
+                    q95.append(hi)
+
         for name, st in self.stats.items():
-            est = float(st.get("est", np.nan))
-            sd = float(st.get("sd", np.nan))
-            lo = st.get("p2.5")
-            hi = st.get("p97.5")
+            if name in processed:
+                continue
+            # Skip flat p-indexed aliases if grouped blocks were detected to avoid duplicates
+            if max_len > 0 and isinstance(name, str) and name.startswith("p") and name[1:].isdigit():
+                continue
+            est = _to_float(st.get("est", np.nan)) if isinstance(st, dict) else float("nan")
+            sd = _to_float(st.get("sd", np.nan)) if isinstance(st, dict) else float("nan")
+            lo = None
+            hi = None
+            if isinstance(st, dict):
+                lo = st.get("p2_5")
+                if lo is None:
+                    lo = st.get("p2.5")
+                hi = st.get("p97_5")
+                if hi is None:
+                    hi = st.get("p97.5")
+            lo_f = _to_float(lo)
+            hi_f = _to_float(hi)
             params[name] = {
                 "mean": est,
                 "std": sd,
-                "q05": lo,
+                "q05": lo_f,
                 "q50": est,
-                "q95": hi,
+                "q95": hi_f,
             }
             names.append(name)
             means.append(est)
             stds.append(sd)
-            q05.append(lo if lo is not None else np.nan)
-            q95.append(hi if hi is not None else np.nan)
+            q05.append(lo_f)
+            q95.append(hi_f)
 
         band_dict = None
         if self.band is not None:
@@ -1049,48 +1141,87 @@ def bayesian_ci(
     for leader, group in tie_groups:
         T_full[:, group] = T_full[:, [leader]]
 
-    def _finite(a):
-        return np.isfinite(a)
-
-    def _q(a, p):
-        return np.nanpercentile(a, p)
-
     def _nanstd_safe(a: np.ndarray) -> float:
         a = a[np.isfinite(a)]
         if a.size < 2:
             return float(np.nanstd(a, ddof=0))
         return float(np.nanstd(a, ddof=1))
 
-    names = param_names or [f"p{i}" for i in range(theta_hat.size)]
-    stats = {}
     alpha = 0.05
-    for i, name in enumerate(names):
-        samp = T_full[:, i]
-        finite = _finite(samp)
-        if finite.any():
-            est = float(np.nanmedian(samp[finite]))
-            sd = _nanstd_safe(samp[finite])
-            lo = float(_q(samp[finite], 100.0 * (alpha / 2)))
-            hi = float(_q(samp[finite], 100.0 * (1.0 - alpha / 2)))
-        else:
-            est = sd = lo = hi = float("nan")
-        stats[name] = {"est": est, "sd": sd, "p2.5": lo, "p97.5": hi}
+    P = int(T_full.shape[1])
+    n_pk = P // 4 if P >= 4 else 0
 
-    finite = _finite(sigma_draws)
+    def _col(col: int) -> np.ndarray:
+        return T_full[:, col]
+
+    def _stat_vec(offset: int) -> Dict[str, List[float]]:
+        vals: List[float] = []
+        sds: List[float] = []
+        lo2: List[float] = []
+        hi97: List[float] = []
+        for i in range(n_pk):
+            samp = _col(4 * i + offset)
+            finite = np.isfinite(samp)
+            if finite.any():
+                sf = samp[finite]
+                vals.append(float(np.nanmedian(sf)))
+                sds.append(float(_nanstd_safe(sf)))
+                lo2.append(float(np.nanpercentile(sf, 100.0 * (alpha / 2))))
+                hi97.append(float(np.nanpercentile(sf, 100.0 * (1.0 - alpha / 2))))
+            else:
+                nan = float("nan")
+                vals.append(nan)
+                sds.append(nan)
+                lo2.append(nan)
+                hi97.append(nan)
+        return {"est": vals, "sd": sds, "p2_5": lo2, "p97_5": hi97}
+
+    param_stats: Dict[str, Dict[str, Any]] = {
+        "center": _stat_vec(0),
+        "height": _stat_vec(1),
+        "fwhm": _stat_vec(2),
+        "eta": _stat_vec(3),
+    }
+
+    finite = np.isfinite(sigma_draws)
     if finite.any():
-        stats["sigma"] = {
-            "est": float(np.nanmedian(sigma_draws[finite])),
-            "sd": _nanstd_safe(sigma_draws[finite]),
-            "p2.5": float(_q(sigma_draws[finite], 100.0 * (alpha / 2))),
-            "p97.5": float(_q(sigma_draws[finite], 100.0 * (1.0 - alpha / 2))),
+        sigma_fin = sigma_draws[finite]
+        param_stats["sigma"] = {
+            "est": float(np.nanmedian(sigma_fin)),
+            "sd": _nanstd_safe(sigma_fin),
+            "p2_5": float(np.nanpercentile(sigma_fin, 100.0 * (alpha / 2))),
+            "p97_5": float(np.nanpercentile(sigma_fin, 100.0 * (1.0 - alpha / 2))),
         }
     else:
-        stats["sigma"] = {
+        param_stats["sigma"] = {
             "est": float("nan"),
             "sd": float("nan"),
-            "p2.5": float("nan"),
-            "p97.5": float("nan"),
+            "p2_5": float("nan"),
+            "p97_5": float("nan"),
         }
+
+    def _scalar_stats_for(samples: np.ndarray) -> Dict[str, float]:
+        finite = np.isfinite(samples)
+        if finite.any():
+            sf = samples[finite]
+            return {
+                "est": float(np.nanmedian(sf)),
+                "sd": float(_nanstd_safe(sf)),
+                "p2_5": float(np.nanpercentile(sf, 100.0 * (alpha / 2))),
+                "p97_5": float(np.nanpercentile(sf, 100.0 * (1.0 - alpha / 2))),
+            }
+        nan = float("nan")
+        return {"est": nan, "sd": nan, "p2_5": nan, "p97_5": nan}
+
+    default_names = [f"p{i}" for i in range(P)]
+    custom_names = list(param_names) if param_names is not None else []
+    for idx in range(P):
+        stats_flat = _scalar_stats_for(T_full[:, idx])
+        param_stats[default_names[idx]] = stats_flat
+        if idx < len(custom_names):
+            key = str(custom_names[idx])
+            if key and key not in param_stats:
+                param_stats[key] = dict(stats_flat)
 
     # Keep diagnostics light; no ESS/Rhat to avoid stalls
     ess_min, rhat_max = float("nan"), float("nan")
@@ -1110,7 +1241,7 @@ def bayesian_ci(
     return UncertaintyResult(
         method="bayesian",
         label="Bayesian (MCMC)",
-        stats=stats,
+        stats=param_stats,
         diagnostics=diag,
         band=None,
     )
