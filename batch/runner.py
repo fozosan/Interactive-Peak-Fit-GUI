@@ -23,8 +23,18 @@ if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safegu
 
 from core import data_io, models, peaks, signals, fit_api
 from core.residuals import build_residual
-from core.uncertainty import finite_diff_jacobian
+from core.uncertainty import finite_diff_jacobian, bootstrap_ci, UncertaintyResult
 from core.uncertainty_router import route_uncertainty
+
+
+def _norm_jitter(v, default=0.02):
+    """Normalize bootstrap jitter to a fractional value."""
+
+    try:
+        f = float(v)
+        return f / 100.0 if f > 1.0 else f
+    except Exception:
+        return float(default)
 
 
 def _auto_seed(
@@ -157,7 +167,21 @@ def run_batch(
             return {"aborted": True, "records": [], "reason": "user-abort"}
         if progress:
             progress(i, total, path)
-        x, y = data_io.load_xy(path)
+        try:
+            x, y = data_io.load_xy(path)
+        except ValueError as exc:
+            emsg = str(exc).lower()
+            if (
+                "more than 2" in emsg
+                or "more than two" in emsg
+                or "unsupported column" in emsg
+            ):
+                if log:
+                    log(
+                        f"{Path(path).name}: skipped (has >2 columns; mapping files not supported)"
+                    )
+                continue
+            raise
         xmin = config.get("fit_xmin")
         xmax = config.get("fit_xmax")
         if xmin is not None and xmax is not None:
@@ -339,10 +363,14 @@ def run_batch(
         unc_res = None
         if res["fit_ok"] and fitted and compute_uncertainty:
             try:
-                theta_hat = res["theta"]
+                theta_hat = np.asarray(res["theta"], float)
                 x_fit = np.asarray(res.get("x_fit") or res.get("x"), float)
                 y_fit = np.asarray(res.get("y_fit") or res.get("y"), float)
-                peaks_obj = res.get("peaks", [])
+                peaks_obj = (
+                    res.get("peaks_out")
+                    or res.get("peaks")
+                    or []
+                )
                 base_fit = res.get("baseline")
                 mode = res.get("mode", "add")
 
@@ -361,19 +389,55 @@ def run_batch(
                 if jac is None:
                     jac = finite_diff_jacobian(residual_fn, theta_hat)
 
-                model_eval = res.get("predict_full")
-                if model_eval is None:
-                    model_eval = lambda th, x=x_fit: predict_full(
-                        x, peaks_obj, base_fit, mode, th
-                    )
+                residual_vec = res.get("residual")
+                if residual_vec is None:
+                    residual_vec = residual_fn(theta_hat)
+                residual_vec = np.asarray(residual_vec, float)
 
-                fit_ctx = dict(res)
+                model_eval = res.get("predict_full")
+                def _predict_full_from_peaks(th, *, _x=x_fit, _peaks=peaks_obj, _base=base_fit, _mode=mode):
+                    total = np.zeros_like(_x, float)
+                    for idx in range(len(_peaks)):
+                        c, h, fw, eta = th[4 * idx : 4 * (idx + 1)]
+                        total += models.pseudo_voigt(_x, h, c, fw, eta)
+                    if _mode == "add" and _base is not None:
+                        total = total + _base
+                    return total
+                if model_eval is None:
+                    model_eval = _predict_full_from_peaks
+
+                fit_ctx = dict(res.get("fit_ctx") or {})
+                solver_choice = str(
+                    config.get("solver_choice", res.get("solver", "modern_trf"))
+                )
+                boot_solver = str(config.get("unc_boot_solver", solver_choice))
+                has_lmfit = bool(res.get("has_lmfit", config.get("has_lmfit", False)))
+                if boot_solver.lower().startswith("lmfit") and not has_lmfit:
+                    boot_solver = solver_choice
+
                 fit_ctx.update(
                     {
                         "residual_fn": residual_fn,
                         "predict_full": model_eval,
                         "x_all": x_fit,
                         "y_all": y_fit,
+                        "baseline": base_fit,
+                        "mode": mode,
+                        "peaks": peaks_obj,
+                        "peaks_out": peaks_obj,
+                        "unc_workers": unc_workers,
+                        "solver": boot_solver,
+                        "bootstrap_jitter": _norm_jitter(
+                            config.get("bootstrap_jitter", 0.02)
+                        ),
+                        "lmfit_share_fwhm": bool(config.get("lmfit_share_fwhm", False)),
+                        "lmfit_share_eta": bool(config.get("lmfit_share_eta", False)),
+                        "theta0": np.asarray(
+                            res.get("theta0")
+                            if res.get("theta0") is not None
+                            else (res.get("p0") if res.get("p0") is not None else theta_hat),
+                            float,
+                        ),
                     }
                 )
 
@@ -423,19 +487,68 @@ def run_batch(
 
                 fit_ctx.update({"refit": _refit_wrapper})
 
-                unc_res = route_uncertainty(
-                    unc_method_canon,
-                    theta_hat=theta_hat,
-                    residual_fn=residual_fn,
-                    jacobian=jac,
-                    model_eval=model_eval,
-                    fit_ctx=fit_ctx,
-                    x_all=x_fit,
-                    y_all=y_fit,
-                    workers=unc_workers,
-                    seed=None,
-                    n_boot=100,
-                )
+                if str(unc_method_canon).lower() == "bootstrap":
+                    bounds = res.get("bounds")
+                    locked_mask = res.get("locked_mask")
+                    alpha = float(config.get("unc_alpha", 0.05))
+                    center_res = bool(config.get("unc_center_resid", True))
+                    try:
+                        n_boot = int(config.get("bootstrap_n", 200))
+                    except Exception:
+                        n_boot = 200
+                    try:
+                        seed_val = config.get("bootstrap_seed", 0)
+                        seed_int = int(seed_val)
+                    except Exception:
+                        seed_int = 0
+                    seed_val = None if seed_int == 0 else seed_int
+
+                    jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
+                    jac_mat = np.atleast_2d(np.asarray(jac_mat, float))
+
+                    unc_res = bootstrap_ci(
+                        theta=theta_hat,
+                        residual=residual_vec,
+                        jacobian=jac_mat,
+                        predict_full=model_eval,
+                        x_all=x_fit,
+                        y_all=y_fit,
+                        fit_ctx=fit_ctx,
+                        bounds=bounds,
+                        param_names=res.get("param_names"),
+                        locked_mask=locked_mask,
+                        n_boot=n_boot,
+                        seed=seed_val,
+                        workers=unc_workers,
+                        alpha=alpha,
+                        center_residuals=center_res,
+                        return_band=True,
+                    )
+                    if isinstance(unc_res, UncertaintyResult):
+                        diag = dict(unc_res.diagnostics)
+                        unc_res = {
+                            "method": unc_res.method,
+                            "label": unc_res.label,
+                            "method_label": unc_res.label,
+                            "param_stats": unc_res.stats,
+                            "diagnostics": diag,
+                            "band": unc_res.band,
+                            "alpha": diag.get("alpha", alpha),
+                        }
+                else:
+                    unc_res = route_uncertainty(
+                        unc_method_canon,
+                        theta_hat=theta_hat,
+                        residual_fn=residual_fn,
+                        jacobian=jac,
+                        model_eval=model_eval,
+                        fit_ctx=fit_ctx,
+                        x_all=x_fit,
+                        y_all=y_fit,
+                        workers=unc_workers,
+                        seed=None,
+                        n_boot=100,
+                    )
             except Exception as exc:
                 msg = str(exc)
                 if "Unknown uncertainty method" in msg:
