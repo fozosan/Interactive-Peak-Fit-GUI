@@ -88,8 +88,12 @@ class UncertaintyResult:
         for name, st in self.stats.items():
             est = float(st.get("est", np.nan))
             sd = float(st.get("sd", np.nan))
-            lo = st.get("p2.5")
-            hi = st.get("p97.5")
+            lo = st.get("p2_5")
+            if lo is None:
+                lo = st.get("p2.5")
+            hi = st.get("p97_5")
+            if hi is None:
+                hi = st.get("p97.5")
             params[name] = {
                 "mean": est,
                 "std": sd,
@@ -1049,12 +1053,6 @@ def bayesian_ci(
     for leader, group in tie_groups:
         T_full[:, group] = T_full[:, [leader]]
 
-    def _finite(a):
-        return np.isfinite(a)
-
-    def _q(a, p):
-        return np.nanpercentile(a, p)
-
     def _nanstd_safe(a: np.ndarray) -> float:
         a = a[np.isfinite(a)]
         if a.size < 2:
@@ -1066,30 +1064,32 @@ def bayesian_ci(
     alpha = 0.05
     for i, name in enumerate(names):
         samp = T_full[:, i]
-        finite = _finite(samp)
+        finite = np.isfinite(samp)
         if finite.any():
-            est = float(np.nanmedian(samp[finite]))
-            sd = _nanstd_safe(samp[finite])
-            lo = float(_q(samp[finite], 100.0 * (alpha / 2)))
-            hi = float(_q(samp[finite], 100.0 * (1.0 - alpha / 2)))
+            samp_fin = samp[finite]
+            est = float(np.nanmedian(samp_fin))
+            sd = _nanstd_safe(samp_fin)
+            lo = float(np.nanpercentile(samp_fin, 100.0 * (alpha / 2)))
+            hi = float(np.nanpercentile(samp_fin, 100.0 * (1.0 - alpha / 2)))
         else:
             est = sd = lo = hi = float("nan")
-        stats[name] = {"est": est, "sd": sd, "p2.5": lo, "p97.5": hi}
+        stats[name] = {"est": est, "sd": sd, "p2_5": lo, "p97_5": hi}
 
-    finite = _finite(sigma_draws)
+    finite = np.isfinite(sigma_draws)
     if finite.any():
+        sigma_fin = sigma_draws[finite]
         stats["sigma"] = {
-            "est": float(np.nanmedian(sigma_draws[finite])),
-            "sd": _nanstd_safe(sigma_draws[finite]),
-            "p2.5": float(_q(sigma_draws[finite], 100.0 * (alpha / 2))),
-            "p97.5": float(_q(sigma_draws[finite], 100.0 * (1.0 - alpha / 2))),
+            "est": float(np.nanmedian(sigma_fin)),
+            "sd": _nanstd_safe(sigma_fin),
+            "p2_5": float(np.nanpercentile(sigma_fin, 100.0 * (alpha / 2))),
+            "p97_5": float(np.nanpercentile(sigma_fin, 100.0 * (1.0 - alpha / 2))),
         }
     else:
         stats["sigma"] = {
             "est": float("nan"),
             "sd": float("nan"),
-            "p2.5": float("nan"),
-            "p97.5": float("nan"),
+            "p2_5": float("nan"),
+            "p97_5": float("nan"),
         }
 
     # Keep diagnostics light; no ESS/Rhat to avoid stalls
