@@ -1,9 +1,23 @@
 from __future__ import annotations
+
 from typing import Any, Callable, Dict, Optional
 import numpy as np
 
 from .data_io import canonical_unc_label
 from . import uncertainty as unc
+
+
+def _infer_alpha(ctx: Optional[Dict[str, Any]]) -> float:
+    """Pull a CI alpha from a fit context if present; default 0.05 (95%)."""
+    if not isinstance(ctx, dict):
+        return 0.05
+    for k in ("alpha", "unc_alpha", "ci_alpha"):
+        try:
+            if k in ctx and ctx[k] is not None:
+                return float(ctx[k])
+        except Exception:
+            pass
+    return 0.05
 
 
 def route_uncertainty(
@@ -12,61 +26,122 @@ def route_uncertainty(
     theta_hat: np.ndarray,
     residual_fn: Callable[[np.ndarray], np.ndarray],
     jacobian: Any,
-    model_eval: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
+    model_eval: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     fit_ctx: Optional[Dict[str, Any]] = None,
     x_all: Optional[np.ndarray] = None,
     y_all: Optional[np.ndarray] = None,
-    workers: int = 0,
+    workers: Optional[int] = None,
     seed: Optional[int] = None,
-    n_boot: int = 100,
-    bayes_steps: int = 8000,
-    bayes_burn: int = 2000,
+    n_boot: int = 200,
 ) -> Any:
-    """Dispatch to asymptotic, bootstrap, or bayesian. No fallback."""
+    """
+    Route to the appropriate uncertainty engine and return an UncertaintyResult-like
+    payload (dataclass from core.uncertainty or a mapping normalizable by data_io).
+
+    Parameters
+    ----------
+    method
+        User-facing label or alias; will be canonicalized.
+    theta_hat
+        Current parameter vector (length 4*N).
+    residual_fn
+        Callable that returns residuals for a given theta.
+    jacobian
+        Either a callable J(theta) or an already evaluated array.
+    model_eval
+        Callable yhat(theta) on the *fit window* for band construction (if supported).
+    fit_ctx
+        Optional context dict (x_all, y_all, baseline/mode, sharing flags, etc.).
+    x_all, y_all
+        Fit-window x and target y (if not carried inside fit_ctx).
+    workers, seed
+        Parallelism and RNG seed hints where applicable.
+    n_boot
+        Bootstrap draw count (only used if method resolves to Bootstrap and the caller
+        chooses to route it here).
+    """
     canon = canonical_unc_label(method)
-    s = canon.lower()
+    m = canon.lower()
+    ctx = dict(fit_ctx or {})
+    alpha = _infer_alpha(ctx)
 
-    # Materialize J or wrap callable for asymptotic
-    if callable(jacobian):
-        J_fn = jacobian
-        J_mat = None
-    else:
-        J_mat = np.asarray(jacobian, float)
-        J_fn = lambda _th: J_mat  # type: ignore
+    # Ensure we have a model evaluator on the fit window when bands are requested.
+    # For Asymptotic and Bayesian, bands use predict_full/ymodel_fn(theta).
+    if model_eval is None:
+        # Fall back to any predictor the caller stashed in the context.
+        maybe_pred = ctx.get("predict_full") or ctx.get("model")
+        if callable(maybe_pred):
+            model_eval = maybe_pred  # type: ignore[assignment]
 
-    if s.startswith("asymptotic"):
-        return unc.asymptotic_ci(theta_hat, residual_fn, J_fn, model_eval)
-
-    if s.startswith("bootstrap"):
-        if J_mat is None:
-            J_mat = np.asarray(J_fn(theta_hat), float)
-        r0 = residual_fn(theta_hat)
-        return unc.bootstrap_ci(
-            theta=theta_hat,
-            residual=r0,
-            jacobian=J_mat,
-            predict_full=model_eval,
-            x_all=x_all,
-            y_all=y_all,
-            fit_ctx=fit_ctx or {},
-            n_boot=int(n_boot),
-            workers=int(workers),
-            seed=seed,
+    # --- ASYMPTOTIC ---------------------------------------------------------
+    if "asymptotic" in m or "jᵀj" in m or "jtj" in m or "gauss" in m or "hessian" in m:
+        if not callable(model_eval):
+            # No predictor available — still return param stats without a band.
+            ymodel = lambda th: residual_fn(th) * 0.0  # dummy; band will be ignored
+        else:
+            ymodel = model_eval
+        return unc.asymptotic_ci(
+            theta_hat=theta_hat,
+            residual=residual_fn,
+            jacobian=jacobian,
+            ymodel_fn=ymodel,
+            alpha=alpha,
         )
 
-    if s.startswith("bayesian"):
+    # --- BOOTSTRAP ----------------------------------------------------------
+    if "bootstrap" in m:
+        # This path is *usually* handled directly in batch.runner for better control
+        # over seeds and worker pools. We still support it here so GUI callers or
+        # tests can route bootstrap through this function if they want.
+        r0 = residual_fn(theta_hat)
+        J = jacobian(theta_hat) if callable(jacobian) else np.asarray(jacobian, float)
+        return unc.bootstrap_ci(
+            theta=theta_hat,
+            residual=np.asarray(r0, float),
+            jacobian=np.asarray(J, float),
+            predict_full=model_eval,
+            x_all=x_all if x_all is not None else ctx.get("x_all"),
+            y_all=y_all if y_all is not None else ctx.get("y_all"),
+            bounds=ctx.get("bounds"),
+            param_names=ctx.get("param_names"),
+            locked_mask=ctx.get("locked_mask"),
+            fit_ctx=ctx,
+            n_boot=int(n_boot),
+            seed=seed,
+            workers=workers if workers not in (False,) else None,
+            alpha=alpha,
+            center_residuals=bool(ctx.get("unc_center_resid", True)),
+            return_band=True,
+        )
+
+    # --- BAYESIAN -----------------------------------------------------------
+    if "bayes" in m or "mcmc" in m:
+        # Pull common MCMC settings (provide safe fallbacks).
+        n_walkers = ctx.get("bayes_walkers", None)
+        n_burn = int(ctx.get("bayes_burn", 2000))
+        n_steps = int(ctx.get("bayes_steps", 8000))
+        thin = int(ctx.get("bayes_thin", 1))
+        prior_sigma = str(ctx.get("bayes_prior_sigma", "half_cauchy"))
+
         return unc.bayesian_ci(
             theta_hat=theta_hat,
             model=model_eval,
             predict_full=model_eval,
-            x_all=fit_ctx.get("x_all") if fit_ctx else x_all,
-            y_all=fit_ctx.get("y_all") if fit_ctx else y_all,
+            x_all=x_all if x_all is not None else ctx.get("x_all"),
+            y_all=y_all if y_all is not None else ctx.get("y_all"),
             residual_fn=residual_fn,
-            fit_ctx=fit_ctx or {},
-            n_steps=int(bayes_steps),
-            n_burn=int(bayes_burn),
+            bounds=ctx.get("bounds"),
+            param_names=ctx.get("param_names"),
+            locked_mask=ctx.get("locked_mask"),
+            fit_ctx=ctx,
+            n_walkers=n_walkers,
+            n_burn=n_burn,
+            n_steps=n_steps,
+            thin=thin,
             seed=seed,
+            workers=workers,
             return_band=True,
+            prior_sigma=prior_sigma,
         )
 
     raise ValueError(f"Unknown uncertainty method: '{method}' -> '{canon}'")
