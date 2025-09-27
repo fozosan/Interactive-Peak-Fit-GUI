@@ -191,8 +191,6 @@ from types import SimpleNamespace  # ensure this import exists
 from core.data_io import (
     write_uncertainty_csvs,
     write_uncertainty_txt,
-    normalize_unc_result as _normalize_unc_result,
-    canonical_unc_label as _canonical_unc_label,
 )
 
 import numpy as np
@@ -221,6 +219,9 @@ from scipy.signal import find_peaks
 
 from core import signals
 import core.data_io as _dio
+# aliases used in export-parity logic
+from core.data_io import canonical_unc_label as _canonical_unc_label
+from core.data_io import normalize_unc_result as _normalize_unc_result
 import core.uncertainty as core_uncertainty
 try:
     from core.uncertainty import UncertaintyResult, NotAvailable
