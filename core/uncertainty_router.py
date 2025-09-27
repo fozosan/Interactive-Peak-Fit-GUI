@@ -21,6 +21,24 @@ def _infer_alpha(ctx: Optional[Dict[str, Any]]) -> float:
     return 0.05
 
 
+def _norm_jitter(val: Any) -> float:
+    """
+    Accept jitter as either a fraction (0..1) or percent (0..100).
+    If > 1.5, treat as percent and divide by 100. Clamp to [0, 1].
+    """
+    try:
+        f = float(val)
+    except Exception:
+        return 0.0
+    if f < 0:
+        f = 0.0
+    if f > 1.5:
+        f = f / 100.0
+    if f > 1.0:
+        f = 1.0
+    return f
+
+
 def _normalize_model_eval(
     model_eval: Optional[Callable[..., np.ndarray]],
     ctx: Dict[str, Any],
@@ -139,6 +157,8 @@ def route_uncertainty(
         # tests can route bootstrap through this function if they want.
         r0 = residual_fn(theta_hat)
         J = jacobian(theta_hat) if callable(jacobian) else np.asarray(jacobian, float)
+        jitter = _norm_jitter(ctx.get("bootstrap_jitter", ctx.get("jitter", 0.0)))
+        ctx["bootstrap_jitter"] = jitter
         return unc.bootstrap_ci(
             theta=theta_hat,
             residual=np.asarray(r0, float),

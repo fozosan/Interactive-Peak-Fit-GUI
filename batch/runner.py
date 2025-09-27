@@ -32,9 +32,15 @@ def _norm_jitter(v, default=0.02):
 
     try:
         f = float(v)
-        return f / 100.0 if f > 1.0 else f
     except Exception:
         return float(default)
+    if f < 0:
+        f = 0.0
+    if f > 1.5:
+        f = f / 100.0
+    if f > 1.0:
+        f = 1.0
+    return f
 
 
 def _auto_seed(
