@@ -1847,6 +1847,9 @@ class PeakFitApp:
             "center_resid": bool(_pick("unc_center_resid", True)),
             # store normalized jitter so cache invalidates when the effective value changes
             "jitter": self._norm_jitter_val(_pick("bootstrap_jitter", 0.0)),
+            # include bootstrap solver + workers so cache respects engine changes
+            "boot_solver": getattr(self, "_select_bootstrap_solver", lambda: "")(),
+            "workers": int(cfg.get("unc_workers", 0) or 0),
         }
 
 
@@ -3573,6 +3576,13 @@ class PeakFitApp:
                 "solver": boot_solver,
                 "bootstrap_jitter": jitter_val,
             }
+            # helpful breadcrumb in logs for parity/debugging
+            try:
+                self.status_info(
+                    f"Bootstrap: jitter={jitter_val:.3f} (fraction), solver={boot_solver}, workers={workers or 0}"
+                )
+            except Exception:
+                pass
 
             n_boot = self._get_int("bootstrap_n", 200)
             seed_val = self._get_int("bootstrap_seed", 0) or None
