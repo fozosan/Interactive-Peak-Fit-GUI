@@ -1824,15 +1824,31 @@ def write_uncertainty_csv(
         "rhat",
     ]
 
+    def _is_seq(x) -> bool:
+        if isinstance(x, (str, bytes)):
+            return False
+        try:
+            arr = np.asarray(x)
+        except Exception:
+            return False
+        # Only treat multi-dimensional arrays as sequences to skip; 1-D lists
+        # of scalars are converted by ``_to_float`` for backwards compatibility.
+        return arr.ndim > 1
+
     stats_map = _as_mapping(getattr(res_obj, "stats", {}))
     for i, (name, st) in enumerate(stats_map.items()):
         p = _as_mapping(st)
+        est_raw = p.get("est")
+        sd_raw = p.get("sd") or p.get("stderr") or p.get("sigma")
         lo_pct = _get_pct(p, "p2_5", "p2.5")
         hi_pct = _get_pct(p, "p97_5", "p97.5")
+        # Skip nested arrays (e.g. covariance matrices) that cannot be coerced to scalars.
+        if _is_seq(est_raw) or _is_seq(sd_raw) or _is_seq(lo_pct) or _is_seq(hi_pct):
+            continue
         row.update(
             {
-                name: _to_float(p.get("est") or p.get("mean") or p.get("value")),
-                f"{name}_sd": _to_float(p.get("sd") or p.get("stderr") or p.get("sigma")),
+                name: _to_float(est_raw or p.get("mean") or p.get("value")),
+                f"{name}_sd": _to_float(sd_raw),
                 f"{name}_ci_lo": _to_float(lo_pct if lo_pct is not None else p.get("ci_lo")),
                 f"{name}_ci_hi": _to_float(hi_pct if hi_pct is not None else p.get("ci_hi")),
                 f"{name}_p2_5": _to_float(lo_pct),
