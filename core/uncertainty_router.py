@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any, Callable, Dict, Optional
 import numpy as np
 
@@ -18,6 +19,43 @@ def _infer_alpha(ctx: Optional[Dict[str, Any]]) -> float:
         except Exception:
             pass
     return 0.05
+
+
+def _normalize_model_eval(
+    model_eval: Optional[Callable[..., np.ndarray]],
+    ctx: Dict[str, Any],
+) -> Optional[Callable[[np.ndarray], np.ndarray]]:
+    """Convert flexible predictors to the single-argument flavour our engines expect."""
+
+    if not callable(model_eval):
+        return None
+
+    # Some legacy pathways still provide predict(theta, x) callables.  Bind x if we
+    # can so the downstream uncertainty APIs see a predict(theta) interface.
+    try:
+        sig = inspect.signature(model_eval)
+    except (TypeError, ValueError):  # pragma: no cover - very unusual callables
+        return model_eval  # type: ignore[return-value]
+
+    pos_args = [
+        p
+        for p in sig.parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+
+    if len(pos_args) >= 2:
+        x_full = ctx.get("x_all")
+        if x_full is None:
+            return model_eval  # type: ignore[return-value]
+
+        x_full = np.asarray(x_full, float)
+
+        def _wrapped(theta: np.ndarray, _model=model_eval, _x=x_full):
+            return _model(theta, _x)
+
+        return _wrapped
+
+    return model_eval  # type: ignore[return-value]
 
 
 def route_uncertainty(
@@ -63,6 +101,10 @@ def route_uncertainty(
     canon = canonical_unc_label(method)
     m = canon.lower()
     ctx = dict(fit_ctx or {})
+    if x_all is not None:
+        ctx.setdefault("x_all", x_all)
+    if y_all is not None:
+        ctx.setdefault("y_all", y_all)
     alpha = _infer_alpha(ctx)
 
     # Ensure we have a model evaluator on the fit window when bands are requested.
@@ -72,6 +114,8 @@ def route_uncertainty(
         maybe_pred = ctx.get("predict_full") or ctx.get("model")
         if callable(maybe_pred):
             model_eval = maybe_pred  # type: ignore[assignment]
+
+    model_eval = _normalize_model_eval(model_eval, ctx)
 
     # --- ASYMPTOTIC ---------------------------------------------------------
     if "asymptotic" in m or "jᵀj" in m or "jtj" in m or "gauss" in m or "hessian" in m:
