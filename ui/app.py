@@ -4007,6 +4007,22 @@ class PeakFitApp:
                 pass
 
             self.status_info(f"Computed {label} uncertainty.")
+            # --- cache signature for export parity ---
+            try:
+                theta_sig = []
+                for _p in self.peaks:
+                    theta_sig.extend([_p.center, _p.height, _p.fwhm, _p.eta])
+                self._last_unc_theta = np.asarray(theta_sig, float)
+                # capture fit-window signature (range + count) for a light staleness check
+                self._last_unc_fitwin = (
+                    float(x_fit[0]) if x_fit.size else float("nan"),
+                    float(x_fit[-1]) if x_fit.size else float("nan"),
+                    int(x_fit.size),
+                )
+                self._last_unc_method = label  # canonical label we just computed
+            except Exception:
+                # best-effort cache; export will still fall back to recompute if missing
+                pass
 
             try:
                 for i, row in enumerate(self.last_uncertainty.get("stats", []), start=1):
@@ -4323,7 +4339,9 @@ class PeakFitApp:
             export_base = Path(out_csv).with_suffix("")
             write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
 
-            # Single export: always compute uncertainty regardless of GUI history or batch toggle
+            # Single export: **prefer the GUI-cached uncertainty** for parity.
+            # Only recompute if cache is clearly stale (method/theta/fit-window changed or cache missing).
+            saved_unc = []
             if self.peaks:
                 method_key = self._unc_selected_method_key()
                 add_mode = (self.baseline_mode.get() == "add")
@@ -4341,37 +4359,106 @@ class PeakFitApp:
                     else None
                 )
 
-                # recompute uncertainty on export regardless of what the user did before
-                unc = self._compute_uncertainty_sync(
-                    method_key,
-                    x_fit=x_fit,
-                    y_fit=y_fit_target,
-                    base_fit=base_for_unc,
-                    add_mode=add_mode,
-                )
+                # build current theta snapshot
+                theta_now = []
+                for _p in self.peaks:
+                    theta_now.extend([_p.center, _p.height, _p.fwhm, _p.eta])
+                theta_now = np.asarray(theta_now, float)
 
-                # Build model on full x to compute RMSE/DOF using the current fit window
-                total_peaks = np.zeros_like(self.x, float)
-                for p in self.peaks:
-                    total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
+                # check if we can reuse the last GUI result
+                use_cache = False
+                try:
+                    # canonicalize both labels for comparison
+                    cached = getattr(self, "last_uncertainty", None)
+                    cached_label = _canonical_unc_label(
+                        (cached or {}).get("label") or (cached or {}).get("method") or ""
+                    ) if isinstance(cached, dict) else ""
+                    selected_label = _canonical_unc_label(method_key)
 
-                base_array = (
-                    self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
-                )
-                model = base_array + total_peaks if add_mode else total_peaks
+                    same_method = (cached_label == selected_label and bool(cached))
+                    same_theta = np.allclose(
+                        theta_now,
+                        getattr(self, "_last_unc_theta", np.asarray([], float)),
+                        rtol=0,
+                        atol=0,
+                    )
+                    fw = getattr(self, "_last_unc_fitwin", (float("nan"), float("nan"), 0))
+                    same_fitwin = (
+                        x_fit.size == int(fw[2])
+                        and (
+                            x_fit.size == 0
+                            or (
+                                float(x_fit[0]) == float(fw[0])
+                                and float(x_fit[-1]) == float(fw[1])
+                            )
+                        )
+                    )
+                    use_cache = bool(same_method and same_theta and same_fitwin)
+                except Exception:
+                    use_cache = False
 
-                rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float(np.sqrt(np.mean((y_target - model) ** 2)))
-                dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
+                if use_cache:
+                    # Export exactly what the GUI computed
+                    unc_norm = _normalize_unc_result(self.last_uncertainty)
+                else:
+                    # Fallback: compute once through the same pipeline
+                    unc = self._compute_uncertainty_sync(
+                        method_key,
+                        x_fit=x_fit,
+                        y_fit=y_fit_target,
+                        base_fit=base_for_unc,
+                        add_mode=add_mode,
+                    )
 
-                # Normalize + canonicalize label, then attach RMSE/DOF from current export context
-                unc_norm = _normalize_unc_result(unc)
-                raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_key)
-                label = _canonical_unc_label(raw_lbl)
-                unc_norm["label"] = label
-                unc_norm["rmse"] = rmse
-                unc_norm["dof"] = dof
-                if not unc_norm.get("stats"):
-                    raise RuntimeError("Export uncertainty normalization produced no stats")
+                    # Build model on full x to compute RMSE/DOF using the current fit window
+                    total_peaks = np.zeros_like(self.x, float)
+                    for p in self.peaks:
+                        total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
+
+                    base_array = (
+                        self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
+                    )
+                    model = base_array + total_peaks if add_mode else total_peaks
+
+                    rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float(
+                        np.sqrt(np.mean((y_target - model) ** 2))
+                    )
+                    dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
+
+                    # Normalize + canonicalize label, then attach RMSE/DOF from current export context
+                    unc_norm = _normalize_unc_result(unc)
+                    raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_key)
+                    label = _canonical_unc_label(raw_lbl)
+                    unc_norm["label"] = label
+                    unc_norm["rmse"] = rmse
+                    unc_norm["dof"] = dof
+                    if not unc_norm.get("stats"):
+                        raise RuntimeError("Export uncertainty normalization produced no stats")
+
+                # If the cached result needs RMSE/DOF normalization, attach it lazily here.
+                if use_cache:
+                    # Build model on full x to compute RMSE/DOF using the current fit window
+                    total_peaks = np.zeros_like(self.x, float)
+                    for p in self.peaks:
+                        total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
+
+                    base_array = (
+                        self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
+                    )
+                    model = base_array + total_peaks if add_mode else total_peaks
+
+                    rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float(
+                        np.sqrt(np.mean((y_target - model) ** 2))
+                    )
+                    dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
+
+                    raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_key)
+                    label = _canonical_unc_label(raw_lbl)
+                    unc_norm["label"] = label
+                    unc_norm["rmse"] = rmse
+                    unc_norm["dof"] = dof
+                    if not unc_norm.get("stats"):
+                        raise RuntimeError("Export uncertainty normalization produced no stats")
 
                 # CSVs (long + optional wide)
                 long_csv, wide_csv = write_uncertainty_csvs(
