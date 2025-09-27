@@ -1393,19 +1393,23 @@ def _format_unc_text(
 
         # --- NEW: p-indexed legacy summary lines (satisfies tests looking for "p0:", ... and "±") ---
         # p0->center, p1->height, p2->fwhm, p3->eta
-        def pick_est_sd(name: str) -> Tuple[str, str]:
+        def pick_est_sd(name: str, locked_flag: bool) -> Tuple[str, str]:
             est, sd, lo, hi = _values(name)
             if (sd is None or np.isnan(_to_float(sd))) and not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
-                try:
-                    sd = float(hi - lo) / (2.0 * _Z)
-                except Exception:
-                    pass
+                # don't synthesize SD from CI when the parameter is locked
+                if not locked_flag:
+                    try:
+                        sd = float(hi - lo) / (2.0 * _Z)
+                    except Exception:
+                        pass
+            if locked_flag:
+                sd = 0.0
             return fmt(est), fmt(sd, 3)
 
-        c_est, c_sd = pick_est_sd("center")
-        h_est, h_sd = pick_est_sd("height")
-        w_est, w_sd = pick_est_sd("fwhm")
-        e_est, e_sd = pick_est_sd("eta")
+        c_est, c_sd = pick_est_sd("center", bool(lock_row.get("center", False)))
+        h_est, h_sd = pick_est_sd("height", False)
+        w_est, w_sd = pick_est_sd("fwhm", bool(lock_row.get("fwhm", False)))
+        e_est, e_sd = pick_est_sd("eta",  bool(lock_row.get("eta", False)))
         lines.append(f"  p0: {c_est} ± {c_sd}")
         lines.append(f"  p1: {h_est} ± {h_sd}")
         lines.append(f"  p2: {w_est} ± {w_sd}")
