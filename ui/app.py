@@ -3592,6 +3592,7 @@ class PeakFitApp:
                 workers=workers,
                 n_boot=n_boot,
                 seed=seed_val,
+                jitter=jitter_val,
             )
             out = res
         elif method_key == "bayesian":
@@ -3886,6 +3887,7 @@ class PeakFitApp:
                     return_band=bool(self.show_ci_band_var.get()),
                     alpha=alpha,
                     center_residuals=bool(self.center_resid_var.get()),
+                    jitter=jitter_pct / 100.0,
                 )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}

@@ -175,6 +175,7 @@ def route_uncertainty(
             workers=workers if workers not in (False,) else None,
             alpha=alpha,
             center_residuals=bool(ctx.get("unc_center_resid", True)),
+            jitter=jitter,
             return_band=True,
         )
 
