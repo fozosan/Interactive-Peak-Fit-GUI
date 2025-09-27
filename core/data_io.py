@@ -20,6 +20,61 @@ import pandas as pd
 from .uncertainty import UncertaintyResult
 
 
+# --- helpers for robust export (Bayesian-safe) -------------------------------
+def _as_scalar_or_none(x: Any) -> float | None:
+    """Return float(x) if x is a scalar or 1-element array/list; otherwise None."""
+    if x is None:
+        return None
+    try:
+        arr = np.asarray(x)
+        if arr.ndim == 0:
+            return float(arr)
+        if arr.size == 1:
+            return float(arr.reshape(()))
+        return None
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+
+def _normalize_band(band_obj: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """
+    Accept (x, ylo, yhi), or dict-like {'x':..., 'lo'/'lower':..., 'hi'/'upper':...}.
+    Always return (np.array x, lo, hi) or None.
+    """
+    if band_obj is None:
+        return None
+    if isinstance(band_obj, (tuple, list)) and len(band_obj) == 3:
+        x, lo, hi = band_obj
+        try:
+            return (np.asarray(x, float), np.asarray(lo, float), np.asarray(hi, float))
+        except Exception:
+            return None
+    try:
+        mapping = band_obj if isinstance(band_obj, Mapping) else {}
+        if mapping:
+            x = mapping.get("x") or mapping.get("xb") or mapping.get("xs")
+            lo = (
+                mapping.get("lo")
+                or mapping.get("lower")
+                or mapping.get("y_lo")
+                or mapping.get("ylo")
+            )
+            hi = (
+                mapping.get("hi")
+                or mapping.get("upper")
+                or mapping.get("y_hi")
+                or mapping.get("yhi")
+            )
+            if x is not None and lo is not None and hi is not None:
+                return (np.asarray(x, float), np.asarray(lo, float), np.asarray(hi, float))
+    except Exception:
+        pass
+    return None
+
+
 def _get_pct(d: Mapping[str, Any] | None, key_new: str, key_old: str):
     if not isinstance(d, Mapping):
         return None
@@ -1073,11 +1128,9 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
     # Pull band in a tolerant way
     band = None
     for key in ("band", "prediction_band", "ci_band", "curve_band"):
-        if key in m and m[key] is not None:
-            b = m[key]
-            if isinstance(b, (list, tuple)) and len(b) >= 3:
-                x, lo, hi = b[0], b[1], b[2]
-                band = (np.asarray(x, float), np.asarray(lo, float), np.asarray(hi, float))
+        cand = m.get(key)
+        band = _normalize_band(cand)
+        if band is not None:
             break
 
     diag = _as_mapping(m.get("diagnostics"))
@@ -1393,19 +1446,23 @@ def _format_unc_text(
 
         # --- NEW: p-indexed legacy summary lines (satisfies tests looking for "p0:", ... and "±") ---
         # p0->center, p1->height, p2->fwhm, p3->eta
-        def pick_est_sd(name: str) -> Tuple[str, str]:
+        def pick_est_sd(name: str, locked_flag: bool) -> Tuple[str, str]:
             est, sd, lo, hi = _values(name)
             if (sd is None or np.isnan(_to_float(sd))) and not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
-                try:
-                    sd = float(hi - lo) / (2.0 * _Z)
-                except Exception:
-                    pass
+                # don't synthesize SD from CI when the parameter is locked
+                if not locked_flag:
+                    try:
+                        sd = float(hi - lo) / (2.0 * _Z)
+                    except Exception:
+                        pass
+            if locked_flag:
+                sd = 0.0
             return fmt(est), fmt(sd, 3)
 
-        c_est, c_sd = pick_est_sd("center")
-        h_est, h_sd = pick_est_sd("height")
-        w_est, w_sd = pick_est_sd("fwhm")
-        e_est, e_sd = pick_est_sd("eta")
+        c_est, c_sd = pick_est_sd("center", bool(lock_row.get("center", False)))
+        h_est, h_sd = pick_est_sd("height", False)
+        w_est, w_sd = pick_est_sd("fwhm", bool(lock_row.get("fwhm", False)))
+        e_est, e_sd = pick_est_sd("eta",  bool(lock_row.get("eta", False)))
         lines.append(f"  p0: {c_est} ± {c_sd}")
         lines.append(f"  p1: {h_est} ± {h_sd}")
         lines.append(f"  p2: {w_est} ± {w_sd}")
@@ -1675,7 +1732,13 @@ def write_uncertainty_csvs(
                         row_out[f"{param}_ci_lo"] = qlo_val
                         row_out[f"{param}_ci_hi"] = qhi_val
                     for col in extra_cols:
-                        row_out[col] = wide_map.get(col)
+                        val = wide_map.get(col)
+                        if isinstance(val, str):
+                            row_out[col] = val
+                            continue
+                        scalar = _as_scalar_or_none(val)
+                        if scalar is not None:
+                            row_out[col] = scalar
                     w.writerow(row_out)
             wide_written = wide_path
 
@@ -1781,7 +1844,7 @@ def _ensure_result(unc: Any) -> UncertaintyResult:
     label = _canonical_unc_label(m.get("label") or m.get("method_label") or m.get("method") or method)
     stats = _as_mapping(m.get("param_stats") or m.get("parameters") or m.get("params") or m.get("stats"))
     diag = _as_mapping(m.get("diagnostics"))
-    band = m.get("band")
+    band = _normalize_band(m.get("band"))
     return UncertaintyResult(method=method, label=label, stats=stats, diagnostics=diag, band=band)
 
 
