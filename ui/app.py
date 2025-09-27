@@ -4020,7 +4020,7 @@ class PeakFitApp:
                     float(x_fit[-1]) if x_fit.size else float("nan"),
                     int(x_fit.size),
                 )
-                self._last_unc_method = label  # canonical label we just computed
+                self._last_unc_method = _canonical_unc_label(label)
             except Exception:
                 # best-effort cache; export will still fall back to recompute if missing
                 pass
@@ -4460,6 +4460,12 @@ class PeakFitApp:
                     unc_norm["dof"] = dof
                     if not unc_norm.get("stats"):
                         raise RuntimeError("Export uncertainty normalization produced no stats")
+
+                # Note whether we reused cached GUI result or recomputed
+                if use_cache:
+                    self.status_info("Exporting uncertainty: reusing cached GUI result.")
+                else:
+                    self.status_info("Exporting uncertainty: recomputed (cache stale/missing).")
 
                 # CSVs (long + optional wide)
                 long_csv, wide_csv = write_uncertainty_csvs(
