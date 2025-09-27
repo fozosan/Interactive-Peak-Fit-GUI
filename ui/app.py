@@ -706,6 +706,20 @@ def _format_unc_row(i: int, row: Dict[str, Any]) -> str:
 
 # ---------- Main GUI ----------
 class PeakFitApp:
+    # Local copy to normalize GUI jitter slider (percent → fraction)
+    @staticmethod
+    def _norm_jitter_val(val) -> float:
+        try:
+            f = float(val)
+        except Exception:
+            return 0.0
+        if f < 0:
+            f = 0.0
+        if f > 1.5:  # treat as percent
+            f = f / 100.0
+        if f > 1.0:
+            f = 1.0
+        return f
     # --- small config helper used by Bootstrap controls ---
     def _cfg_set(self, key, value):
         try:
@@ -1803,6 +1817,37 @@ class PeakFitApp:
         except Exception:
             pass
         return v
+
+
+    def _current_uncertainty_signature(self) -> dict:
+        cfg = getattr(self, "cfg", {})
+        attr_map = {
+            "unc_alpha": "alpha_var",
+            "bootstrap_n": "boot_n_var",
+            "bootstrap_seed": "boot_seed_var",
+            "unc_center_resid": "center_resid_var",
+            "bootstrap_jitter": "bootstrap_jitter_var",
+        }
+
+        def _pick(key: str, default: Any):
+            attr_name = attr_map.get(key)
+            if attr_name and hasattr(self, attr_name):
+                var = getattr(self, attr_name)
+                try:
+                    return var.get()
+                except Exception:
+                    pass
+            return cfg.get(key, default)
+
+        return {
+            "method": _canonical_unc_label(self._unc_selected_method_key()),
+            "alpha": float(_pick("unc_alpha", 0.05)),
+            "n_boot": int(_pick("bootstrap_n", 200)),
+            "seed": int(_pick("bootstrap_seed", 0)),
+            "center_resid": bool(_pick("unc_center_resid", True)),
+            # store normalized jitter so cache invalidates when the effective value changes
+            "jitter": self._norm_jitter_val(_pick("bootstrap_jitter", 0.0)),
+        }
 
 
     def _suspend_clicks(self):
@@ -3472,6 +3517,8 @@ class PeakFitApp:
         workers = max(0, min(workers_req, (os.cpu_count() or 1)))
         workers = None if workers <= 0 else workers
         alpha = self._safe_alpha()
+        unc_sig = self._current_uncertainty_signature()
+        jitter_val = float(unc_sig.get("jitter", 0.0) or 0.0)
         center_res = bool(self.center_resid_var.get())
 
         if method_key == "asymptotic":
@@ -3524,6 +3571,7 @@ class PeakFitApp:
                 "y_all": y_fit,
                 "unc_workers": workers,
                 "solver": boot_solver,
+                "bootstrap_jitter": jitter_val,
             }
 
             n_boot = self._get_int("bootstrap_n", 200)
@@ -4021,6 +4069,7 @@ class PeakFitApp:
                     int(x_fit.size),
                 )
                 self._last_unc_method = _canonical_unc_label(label)
+                self._last_unc_signature = self._current_uncertainty_signature()
             except Exception:
                 # best-effort cache; export will still fall back to recompute if missing
                 pass
@@ -4394,7 +4443,10 @@ class PeakFitApp:
                             )
                         )
                     )
-                    use_cache = bool(same_method and same_theta and same_fitwin)
+                    sig_cached = getattr(self, "_last_unc_signature", None)
+                    sig_current = self._current_uncertainty_signature()
+                    same_sig = bool(sig_cached == sig_current)
+                    use_cache = bool(same_method and same_theta and same_fitwin and same_sig)
                 except Exception:
                     use_cache = False
 
