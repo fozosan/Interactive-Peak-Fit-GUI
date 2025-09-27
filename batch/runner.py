@@ -506,6 +506,9 @@ def run_batch(
                     jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
                     jac_mat = np.atleast_2d(np.asarray(jac_mat, float))
 
+                    # Make Bootstrap deterministic when a seed is provided by running single-threaded.
+                    workers_eff = None if (seed_val is not None) else unc_workers
+                    fit_ctx["unc_workers"] = workers_eff
                     unc_res = bootstrap_ci(
                         theta=theta_hat,
                         residual=residual_vec,
@@ -519,7 +522,7 @@ def run_batch(
                         locked_mask=locked_mask,
                         n_boot=n_boot,
                         seed=seed_val,
-                        workers=unc_workers,
+                        workers=workers_eff,
                         alpha=alpha,
                         center_residuals=center_res,
                         return_band=True,
