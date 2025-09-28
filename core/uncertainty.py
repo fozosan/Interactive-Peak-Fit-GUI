@@ -809,7 +809,7 @@ def bootstrap_ci(
             bounds=bounds, baseline=baseline
         )
         th = np.asarray(res.get("theta", theta_arr), float)
-        ok = True
+        ok = np.all(np.isfinite(th))
         return th, ok
 
     # --- Optional user-supplied refit from fit_ctx (batch path) ---
