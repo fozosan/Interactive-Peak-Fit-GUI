@@ -994,7 +994,11 @@ class PeakFitApp:
         self.bayes_steps_var = tk.IntVar(value=int(self.cfg.get("bayes_steps", 4000)))
         self.bayes_thin_var = tk.IntVar(value=int(self.cfg.get("bayes_thin", 1)))
         self.bayes_prior_var = tk.StringVar(value=str(self.cfg.get("bayes_prior_sigma", "half_cauchy")))
-        self.bayes_diag_var = tk.BooleanVar(value=bool(self.cfg.get("bayes_diag", True)))
+        self.bayes_diag_var = tk.BooleanVar(
+            value=bool(
+                self.cfg.get("bayes_diagnostics", self.cfg.get("bayes_diag", False))
+            )
+        )
         self.seed_var = tk.StringVar(value="")
         self.gpu_chunk_var = tk.IntVar(value=262144)
 
@@ -3653,7 +3657,7 @@ class PeakFitApp:
                 "unc_workers": workers,
                 "unc_band_workers": workers,
                 "unc_use_gpu": bool(getattr(self, "use_gpu_var", None) and self.use_gpu_var.get()),
-                "bayes_diag": bool(self.bayes_diag_var.get()),
+                "bayes_diagnostics": bool(self.bayes_diag_var.get()),
             }
             out = core_uncertainty.bayesian_ci(
                 theta_hat=theta,
@@ -3838,7 +3842,7 @@ class PeakFitApp:
             self._cfg_set("bayes_steps", steps)
             self._cfg_set("bayes_thin", thin)
             self._cfg_set("bayes_prior_sigma", str(self.bayes_prior_var.get()))
-            self._cfg_set("bayes_diag", bool(self.bayes_diag_var.get()))
+            self._cfg_set("bayes_diagnostics", bool(self.bayes_diag_var.get()))
             if method == "asymptotic":
                 res = self._run_asymptotic_uncertainty()
                 if abort_evt.is_set():
@@ -3968,7 +3972,7 @@ class PeakFitApp:
                     "unc_workers": workers,
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
-                    "bayes_diag": bool(self.bayes_diag_var.get()),
+                    "bayes_diagnostics": bool(self.bayes_diag_var.get()),
                 }
                 # sensible bounds for MCMC to prevent runaway widths/etas
                 n_pk = len(self.peaks)
@@ -4109,22 +4113,28 @@ class PeakFitApp:
 
             self.status_info(f"Computed {label} uncertainty.")
             if isinstance(label, str) and label.startswith("Bayesian"):
-                if bool(self.bayes_diag_var.get()):
-                    try:
-                        out = res
-                        d = out.get("diagnostics", {}) if isinstance(out, dict) else getattr(out, "diagnostics", {}) or {}
-                        ess_min = d.get("ess_min"); rhat_max = d.get("rhat_max")
-                        mcse = d.get("mcse") or {}
-                        q16 = mcse.get("q16"); q50 = mcse.get("q50"); q84 = mcse.get("q84")
+                try:
+                    out = res
+                    d = (
+                        out.get("diagnostics", {})
+                        if isinstance(out, dict)
+                        else getattr(out, "diagnostics", {})
+                        or {}
+                    )
+                    if bool(d.get("diagnostics_enabled")):
+                        # NOTE(surgical): emitted after sampling progress (e.g., "1000/1000") finishes.
+                        # Tell the user we're now computing ESS/R̂/MCSE summaries.
+                        self.log_threadsafe("Computing Bayesian diagnostics (ESS/R̂/MCSE)…")
+                        ess_min = d.get("ess_min")
+                        rhat_max = d.get("rhat_max")
+                        mcse_mean = d.get("mcse_mean")
                         self.log_threadsafe(
-                            f"Posterior health: ess_min={ess_min if ess_min is not None else 'nan'}, "
-                            f"rhat_max={rhat_max if rhat_max is not None else 'nan'}, "
-                            f"MCSE[q16/q50/q84]={q16 if q16 is not None else 'nan'}/"
-                            f"{q50 if q50 is not None else 'nan'}/"
-                            f"{q84 if q84 is not None else 'nan'}"
+                            f"Posterior health: ess_min={ess_min if np.isfinite(ess_min) else 'nan'}, "
+                            f"rhat_max={rhat_max if np.isfinite(rhat_max) else 'nan'}, "
+                            f"MCSE_mean={mcse_mean if np.isfinite(mcse_mean) else 'nan'}"
                         )
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
             # --- cache signature for export parity ---
             try:
                 theta_sig = []

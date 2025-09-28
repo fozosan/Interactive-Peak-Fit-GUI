@@ -140,9 +140,23 @@ def run_batch(
     source = config.get("source", "template")
     reheight = bool(config.get("reheight", False))
     auto_max = int(config.get("auto_max", 5))
-    unc_workers = int(config.get("unc_workers", 0))
-    if unc_workers < 0:
+    try:
+        _unc_req = int(config.get("unc_workers", 0))
+    except Exception:
+        _unc_req = 0
+    maxcpu = max(1, (os.cpu_count() or 1))
+    if _unc_req <= 1:
         unc_workers = 0
+    else:
+        unc_workers = min(_unc_req, maxcpu)
+    try:
+        _band_req = int(config.get("unc_band_workers", _unc_req))
+    except Exception:
+        _band_req = _unc_req
+    if _band_req <= 1:
+        unc_band_workers = 0
+    else:
+        unc_band_workers = min(_band_req, maxcpu)
 
     out_dir = Path(
         config.get("output_dir", Path(config.get("peak_output", "peaks.csv")).parent)
@@ -456,7 +470,7 @@ def run_batch(
                 )
                 fit_ctx.update({
                     "unc_workers": unc_workers if unc_workers > 0 else None,
-                    "unc_band_workers": int(config.get("unc_band_workers", unc_workers)) if unc_workers > 0 else None,
+                    "unc_band_workers": unc_band_workers if unc_band_workers > 0 else None,
                     "unc_use_gpu": bool(config.get("unc_use_gpu", False)),
                 })
 
@@ -506,7 +520,7 @@ def run_batch(
                             bounds=bounds,
                         )
                     except TypeError:
-                        # Retry without optional kwargs or fit_mask for older signatures
+                        # Retry without optional kwargs for older signatures
                         try:
                             out = _fit_api.run_fit_consistent(
                                 x,
@@ -515,6 +529,7 @@ def run_batch(
                                 cfg,
                                 baseline=res.get("baseline"),
                                 mode=res.get("mode", "add"),
+                                fit_mask=fit_mask,
                             )
                         except TypeError:
                             # Final minimal fallback for very old signatures
@@ -595,8 +610,11 @@ def run_batch(
                         }
                 else:
                     fit_ctx.update({
-                        "bayes_diag": bool(config.get("bayes_diag", True)),
+                        "bayes_diagnostics": bool(
+                            config.get("bayes_diagnostics", config.get("bayes_diag", False))
+                        ),
                     })
+                    workers_eff = unc_workers if unc_workers > 0 else None
                     unc_res = route_uncertainty(
                         unc_method_canon,
                         theta_hat=theta_hat,
@@ -606,7 +624,7 @@ def run_batch(
                         fit_ctx=fit_ctx,
                         x_all=x_fit,
                         y_all=y_fit,
-                        workers=unc_workers,
+                        workers=workers_eff,
                         seed=None,
                         n_boot=100,
                     )

@@ -751,6 +751,12 @@ def bootstrap_ci(
                 "locked_mask": locked_mask,
                 "bounds": bounds,
             }
+            # NOTE(surgical): Respect user-provided fit range. Prefer fit_mask, fall back to legacy mask.
+            _m = fit.get("fit_mask", fit.get("mask", None))
+            if _m is not None:
+                _m_arr = np.asarray(_m, dtype=bool)
+                if _m_arr.shape == x.shape:
+                    optional["fit_mask"] = _m_arr
             for k, v in optional.items():
                 if k in params:
                     call_base[k] = v
@@ -845,10 +851,10 @@ def bootstrap_ci(
             if isinstance(out, tuple) and len(out) == 2:
                 th_new, ok = out
                 th_new = np.asarray(th_new, float)
-                return th_new, bool(ok)
-            # Explicit contract: a bare array return is NOT success
+                return th_new, bool(ok) and np.all(np.isfinite(th_new))
+            # Bare array return: allow only when strict_refit is disabled and values are finite
             th_new = np.asarray(out, float)
-            return th_new, False
+            return th_new, (not strict_refit) and np.all(np.isfinite(th_new))
     else:
         refit = _robust_refit
 
@@ -1175,8 +1181,11 @@ def bayesian_ci(
     # Optional tying (LMFIT "share FWHM/eta"): collapse tied params to one free scalar
     share_fwhm = bool((fit_ctx or {}).get("lmfit_share_fwhm", False))
     share_eta = bool((fit_ctx or {}).get("lmfit_share_eta", False))
-    # Toggle diagnostics (ESS/R̂/MCSE); default True for backward compat
-    diag_enable = bool((fit_ctx or {}).get("bayes_diag", True))
+    # Toggle diagnostics (ESS/R̂/MCSE); default off; honor legacy key for compatibility
+    _diag_flag = (fit_ctx or {}).get("bayes_diagnostics", None)
+    if _diag_flag is None:
+        _diag_flag = (fit_ctx or {}).get("bayes_diag", False)
+    diagnostics_enabled = bool(_diag_flag)
     # Pull bounds/locks from fit_ctx when not explicitly provided
     if bounds is None and fit_ctx and "bounds" in fit_ctx:
         bounds = fit_ctx.get("bounds")
@@ -1238,10 +1247,10 @@ def bayesian_ci(
         lp = -0.5*np.sum(((th_f - th_loc)/th_scale)**2)
         sigma = np.exp(log_sigma)
         if prior_sigma == "half_normal":
-            lp += -0.5*(sigma/rmse)**2 + math.log(2.0) + math.log(1.0/max(sigma,1e-300))
+            lp += -0.5*(sigma/rmse)**2 + math.log(2.0) - math.log(max(sigma, 1e-300))
         else:
             s = rmse
-            lp += math.log(2.0/ math.pi) - math.log(s*(1.0 + (sigma/s)**2)) + math.log(1.0/max(sigma,1e-300))
+            lp += math.log(2.0/ math.pi) - math.log(s*(1.0 + (sigma/s)**2)) - math.log(max(sigma, 1e-300))
         return lp
 
     def _project_full(th_f):
@@ -1487,16 +1496,17 @@ def bayesian_ci(
             if key and key not in param_stats:
                 param_stats[key] = dict(stats_flat)
 
-    # Build post-burn/thinned chain view only if diagnostics enabled
+    # Diagnostics: only compute heavy metrics when enabled
     ess_min = float("nan")
     rhat_max = float("nan")
-    mcse16 = mcse50 = mcse84 = float("nan")
+    mcse_mean = float("nan")
 
     post = None
-    if diag_enable:
+    post_swapped = None
+    if diagnostics_enabled:
         try:
-            chain_full = sampler.get_chain(flat=False)     # (total_steps, n_walkers, dim)
-            post = chain_full[-int(n_steps):, :, :]        # keep steps after burn
+            chain_full = sampler.get_chain(flat=False)
+            post = chain_full[-int(n_steps):, :, :]
             if int(thin) > 1:
                 post = post[::int(thin), :, :]
         except Exception as e:
@@ -1505,47 +1515,40 @@ def bayesian_ci(
 
         if post is not None and post.size:
             try:
-                ess = ess_autocorr(post)                   # (steps, chains, dim)
-                ess_min = float(np.nanmin(np.asarray(ess)))
+                post_swapped = np.swapaxes(post, 0, 1)
+                ess_val = ess_autocorr(post_swapped)
+                ess_arr = np.asarray(ess_val, dtype=float)
+                if ess_arr.size:
+                    ess_min = float(np.nanmin(ess_arr))
             except Exception as e:
                 diag_notes.append(repr(e))
             try:
-                rhat = rhat_split(post)                    # (steps, chains, dim)
-                rhat_max = float(np.nanmax(np.asarray(rhat)))
+                post_for_rhat = post_swapped if post_swapped is not None else np.swapaxes(post, 0, 1)
+                rhat_val = rhat_split(post_for_rhat)
+                rhat_arr = np.asarray(rhat_val, dtype=float)
+                if rhat_arr.size:
+                    rhat_max = float(np.nanmax(rhat_arr))
             except Exception as e:
                 diag_notes.append(repr(e))
-            # Conservative MCSE for q16/50/84 via per-walker quantile spread
             try:
-                W = post.shape[1]
-
-                def _mcse_q(q):
-                    q_w = np.nanquantile(post, q, axis=0)  # (walkers, dim)
-                    return float(
-                        np.nanmax(
-                            np.nanstd(q_w, axis=0, ddof=1) / max(np.sqrt(W), 1.0)
-                        )
-                    )
-
-                mcse16 = _mcse_q(0.16)
-                mcse50 = _mcse_q(0.50)
-                mcse84 = _mcse_q(0.84)
+                if np.isfinite(ess_min) and ess_min > 0 and T_full.size:
+                    sd_vals = np.nanstd(T_full, axis=0, ddof=1)
+                    mcse_vals = np.asarray(sd_vals, float) / np.sqrt(max(ess_min, 1.0))
+                    if mcse_vals.size:
+                        mcse_mean = float(np.nanmax(mcse_vals))
             except Exception as e:
                 diag_notes.append(repr(e))
 
     diag = {
         "n_draws": int(n_samp),
+        "ess_min": ess_min,
+        "rhat_max": rhat_max,
+        "mcse_mean": mcse_mean,
         "accept_frac_mean": acc_frac,
         "seed": seed,
         "aborted": bool(aborted),
         "band_source": None,
-        "ess_min": float(ess_min) if diag_enable else None,
-        "rhat_max": float(rhat_max) if diag_enable else None,
-        "mcse": (
-            {"q16": float(mcse16), "q50": float(mcse50), "q84": float(mcse84)}
-            if diag_enable
-            else None
-        ),
-        "diagnostics_enabled": bool(diag_enable),
+        "diagnostics_enabled": bool(diagnostics_enabled),
     }
     if diag_notes:
         diag["notes"] = diag_notes
