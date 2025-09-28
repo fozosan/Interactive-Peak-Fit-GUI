@@ -435,6 +435,8 @@ def run_batch(
                         "peaks_out": peaks_obj,
                         "solver": boot_solver,
                         "bootstrap_jitter": jitter_frac,
+                        "bounds": res.get("bounds"),
+                        "locked_mask": res.get("locked_mask"),
                         "lmfit_share_fwhm": bool(config.get("lmfit_share_fwhm", False)),
                         "lmfit_share_eta": bool(config.get("lmfit_share_eta", False)),
                         "theta0": np.asarray(
@@ -443,7 +445,7 @@ def run_batch(
                             else (res.get("p0") if res.get("p0") is not None else theta_hat),
                             float,
                         ),
-                        "strict_refit": bool(config.get("bootstrap_strict_refit", False)),
+                        "strict_refit": True,
                         "centers_ref": centers_ref,
                         "relabel_by_center": True,
                     }
@@ -477,7 +479,9 @@ def run_batch(
                             locked_mask=locked_mask,
                             bounds=bounds,
                         )
-                        return np.asarray(out.get("theta", theta_init), float)
+                        th = np.asarray(out.get("theta", theta_init), float)
+                        ok = bool(out.get("fit_ok", out.get("ok", True)))
+                        return th, ok
                     except Exception:
                         # Legacy fallback: (x, y, cfg_with_peaks_dicts, ...)
                         from core.data_io import peaks_to_dicts
@@ -494,9 +498,11 @@ def run_batch(
                                 bounds=bounds,
                                 baseline=res.get("baseline"),
                             )
-                            return np.asarray(out.get("theta", theta_init), float)
+                            th = np.asarray(out.get("theta", theta_init), float)
+                            ok = bool(out.get("fit_ok", out.get("ok", True)))
+                            return th, ok
                         except Exception:
-                            return np.asarray(theta_init, float)
+                            return np.asarray(theta_init, float), False
 
                 fit_ctx.update({"refit": _refit_wrapper})
 

@@ -3574,6 +3574,7 @@ class PeakFitApp:
                 "y_all": y_fit,
                 "unc_workers": workers,
                 "solver": boot_solver,
+                "strict_refit": True,
                 "bootstrap_jitter": jitter_val,
             }
             # helpful breadcrumb in logs for parity/debugging
@@ -3879,6 +3880,7 @@ class PeakFitApp:
                     "unc_workers": workers,
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
+                    "strict_refit": True,
                     "bootstrap_jitter": jitter_pct / 100.0,
                 }
 
