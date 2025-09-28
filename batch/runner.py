@@ -450,6 +450,11 @@ def run_batch(
                         "relabel_by_center": True,
                     }
                 )
+                fit_ctx.update({
+                    "unc_workers": unc_workers if unc_workers > 0 else None,
+                    "unc_band_workers": int(config.get("unc_band_workers", unc_workers)) if unc_workers > 0 else None,
+                    "unc_use_gpu": bool(config.get("unc_use_gpu", False)),
+                })
 
                 from core import fit_api as _fit_api
 

@@ -15,6 +15,7 @@ import warnings
 import time
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -288,6 +289,18 @@ def _param_df(theta: np.ndarray, std: np.ndarray, lo: np.ndarray, hi: np.ndarray
     return pd.DataFrame({"name": list(names), "value": theta, "std": std, "ci_lo": lo, "ci_hi": hi})
 
 
+def _spawn_rng_streams(seed: Optional[int], n: int):
+    """
+    Deterministic per-draw RNGs independent of worker count/scheduling.
+    """
+    if seed is None:
+        ss = np.random.SeedSequence()
+    else:
+        ss = np.random.SeedSequence(int(seed))
+    children = ss.spawn(int(n))
+    return [np.random.Generator(np.random.PCG64(s)) for s in children]
+
+
 # ---------------------------------------------------------------------------
 # Prediction band helper
 # ---------------------------------------------------------------------------
@@ -537,6 +550,30 @@ def bootstrap_ci(
     jitter_scale = float(fit.get("bootstrap_jitter", 0.0))
     allow_linear = bool(fit.get("allow_linear_fallback", True))
 
+    # Resolve worker count for DRAW phase
+    if workers not in (None, False):
+        _workers_req = workers
+    else:
+        _workers_req = fit.get("unc_workers", None)
+    try:
+        draw_workers = max(0, min(int(_workers_req or 0), os.cpu_count() or 1))
+    except Exception:
+        draw_workers = 0
+
+    # Resolve worker count for BAND predict_full (optional separate knob)
+    _band_req = fit.get("unc_band_workers", fit.get("unc_workers", None))
+    try:
+        band_workers = max(0, min(int(_band_req or 0), os.cpu_count() or 1))
+    except Exception:
+        band_workers = 0
+
+    # GPU toggle: fit_ctx flag OR env var PEAKFIT_USE_GPU=1/true/yes
+    def _env_true(s: str) -> bool:
+        s = (s or "").strip().lower()
+        return s in ("1", "true", "yes", "on")
+
+    use_gpu = bool(fit.get("unc_use_gpu", False)) or _env_true(os.getenv("PEAKFIT_USE_GPU", "0"))
+
     if strict_refit and not (callable(fit.get("refit")) or fit.get("solver") is not None):
         raise RuntimeError(
             "bootstrap_ci(strict_refit=True) requires fit_ctx['solver'] or fit_ctx['refit']."
@@ -719,93 +756,99 @@ def bootstrap_ci(
     if n_boot <= 0:
         raise ValueError("n_boot must be > 0")
 
-    rng = np.random.default_rng(seed)
+    rng_streams = _spawn_rng_streams(seed, int(n_boot))
     T_list: List[np.ndarray] = []
     n_success = 0
     n_fail = 0
     linear_fallbacks = 0
     linear_lambda = None
     refit_errors: List[str] = []
-
     pulse_step = max(1, int(n_boot // 20))
     next_pulse_at = 0
     last_pulse_t = time.monotonic()
-    for b in range(int(n_boot)):
-        # Abort?
-        if abort_evt is not None:
-            try:
-                if abort_evt.is_set(): break
-            except Exception:
-                pass
+    aborted = False
 
-        # Throttled progress pulses
-        if progress_cb is not None and (b >= next_pulse_at or (time.monotonic() - last_pulse_t) > 0.5):
-            try: progress_cb(f"Bootstrap: {b}/{int(n_boot)}")
-            except Exception: pass
-            last_pulse_t = time.monotonic()
-            next_pulse_at = b + pulse_step
-
-        # Residual resample
-        idx = rng.integers(0, n, size=n)
+    def _one_draw(b: int):
+        rng_local = rng_streams[b]
+        # resample residuals
+        idx = rng_local.integers(0, n, size=n)
         r_b = r[idx]
         y_b = (y_hat + r_b)
 
-        # Jitter start near theta0 on free dims
+        # jitter start (free params only)
         theta_init = theta0.copy()
         if jitter_scale > 0 and np.any(free_mask):
             step = jitter_scale * np.maximum(np.abs(theta_init), 1.0)
-            theta_init[free_mask] += rng.normal(0.0, step[free_mask])
+            theta_init[free_mask] += rng_local.normal(0.0, step[free_mask])
 
-        # Try refit
         ok = False
         th_new = theta_init
+        err_msg = None
         try:
             th_new, ok = refit(theta_init, x_all, y_b)
         except Exception as e:
-            msg = f"{type(e).__name__}: {e}"
-            if msg not in refit_errors and len(refit_errors) < 5:
-                refit_errors.append(msg)
+            err_msg = f"{type(e).__name__}: {e}"
 
-        # Tiny re-seed towards theta0 if we failed without linear path
         if not ok and (Jf is None or not Jf.size or np.sum(free_mask) == 0):
             try:
                 th_try = theta_init + 1e-6 * (theta0 - theta_init)
                 th_new, ok = refit(th_try, x_all, y_b)
             except Exception as e:
-                msg = f"{type(e).__name__}: {e}"
-                if msg not in refit_errors and len(refit_errors) < 5:
-                    refit_errors.append(msg)
+                if err_msg is None:
+                    err_msg = f"{type(e).__name__}: {e}"
 
-        if ok and np.all(np.isfinite(th_new)):
-            T_list.append(th_new)
-            n_success += 1
-            continue
+        return b, np.asarray(th_new, float), bool(ok), err_msg
 
-        # Safe linearized fallback (when allowed): (JᵀJ + λI)Δ = Jᵀ r*
-        used = False
-        if Jf is not None and Jf.size and np.sum(free_mask) > 0:
+    def _pulse(done_i: int):
+        nonlocal next_pulse_at, last_pulse_t
+        if progress_cb is not None and (done_i >= next_pulse_at or (time.monotonic() - last_pulse_t) > 0.5):
             try:
-                AtA = Jf.T @ Jf
-                rhs = Jf.T @ r_b
-                lam = 5e-2 * (np.trace(AtA) / max(1, AtA.shape[0]))
-                if not np.isfinite(lam) or lam <= 0: lam = 1e-3
-                linear_lambda = float(lam)
-                th_lin = theta0.copy()
-                delta_f = np.linalg.solve(AtA + lam*np.eye(AtA.shape[0]), rhs)
-                th_lin[free_mask] += delta_f
-                if bounds is not None:
-                    lo, hi = bounds
-                    if lo is not None: th_lin = np.maximum(th_lin, lo)
-                    if hi is not None: th_lin = np.minimum(th_lin, hi)
-                if np.all(np.isfinite(th_lin)):
-                    T_list.append(th_lin)
+                progress_cb(f"Bootstrap: {done_i}/{int(n_boot)}")
+            except Exception:
+                pass
+            last_pulse_t = time.monotonic()
+            next_pulse_at = done_i + pulse_step
+
+    if draw_workers > 0:
+        with ThreadPoolExecutor(max_workers=draw_workers) as ex:
+            futs = {ex.submit(_one_draw, int(b)): int(b) for b in range(int(n_boot))}
+            done_cnt = 0
+            for f in as_completed(futs):
+                if abort_evt is not None:
+                    try:
+                        if abort_evt.is_set():
+                            aborted = True
+                            break
+                    except Exception:
+                        pass
+                _, th_new, ok, err_msg = f.result()
+                done_cnt += 1
+                _pulse(done_cnt)
+                if ok and np.all(np.isfinite(th_new)):
+                    T_list.append(th_new)
                     n_success += 1
-                    linear_fallbacks += 1
-                    used = True
-            except Exception as e:
-                diag_notes.append(repr(e))
-        if not used:
-            n_fail += 1
+                else:
+                    n_fail += 1
+                    if err_msg and err_msg not in refit_errors and len(refit_errors) < 5:
+                        refit_errors.append(err_msg)
+    else:
+        for b in range(int(n_boot)):
+            if abort_evt is not None:
+                try:
+                    if abort_evt.is_set():
+                        aborted = True
+                        break
+                except Exception:
+                    pass
+            _, th_new, ok, err_msg = _one_draw(int(b))
+            if ok and np.all(np.isfinite(th_new)):
+                T_list.append(th_new)
+                n_success += 1
+            else:
+                n_fail += 1
+                if err_msg and err_msg not in refit_errors and len(refit_errors) < 5:
+                    refit_errors.append(err_msg)
+            _pulse(b + 1)
 
     if not T_list or len(T_list) < 2:
         raise RuntimeError(f"Insufficient successful bootstrap refits (success={n_success}, fail={n_fail})")
@@ -834,36 +877,70 @@ def bootstrap_ci(
     band_reason = None
     diagnostics: Dict[str, object] = {}
     if return_band:
-        if predict_full is None or T.shape[0] < BOOT_BAND_MIN_SAMPLES:
+        if predict_full is None or len(T_list) < BOOT_BAND_MIN_SAMPLES:
             band_reason = "missing model or insufficient samples"
         else:
+            T = np.vstack(T_list)
             max_use = min(T.shape[0], 4096)
             sel = np.linspace(0, T.shape[0]-1, max_use, dtype=int)
-            def _eval_one(i: int) -> np.ndarray:
+
+            def _eval_one(i: int):
                 yhat = predict_full(T[i])
                 try:
-                    import cupy as cp  # type: ignore
-                    if isinstance(yhat, cp.ndarray):
-                        return cp.asnumpy(yhat)
-                except Exception as e:
-                    diag_notes.append(repr(e))
+                    import cupy as cp  # optional
+                    if "cupy" in str(type(yhat)).lower():
+                        return yhat  # keep CuPy on GPU
+                except Exception:
+                    pass
                 return np.asarray(yhat)
 
             Y_list: List[np.ndarray] = []
-            for i in sel:
-                Y_list.append(_eval_one(int(i)))
+            if band_workers > 0:
+                with ThreadPoolExecutor(max_workers=band_workers) as ex:
+                    futs = {ex.submit(_eval_one, int(i)): int(i) for i in sel}
+                    for f in as_completed(futs):
+                        try:
+                            Y_list.append(f.result())
+                        except Exception as e:
+                            diag_notes.append(repr(e))
+            else:
+                for i in sel:
+                    try:
+                        Y_list.append(_eval_one(int(i)))
+                    except Exception as e:
+                        diag_notes.append(repr(e))
 
-            Y = np.vstack(Y_list)
-            lo = np.quantile(Y, alpha/2, axis=0)
-            hi = np.quantile(Y, 1 - alpha/2, axis=0)
-            band = (x_all, lo, hi)
-            diagnostics["workers_used"] = None
-            diagnostics["band_backend"] = "numpy"
+            band_backend = "numpy"
             try:
-                import cupy as cp  # type: ignore
+                import cupy as cp  # optional
+                if use_gpu:
+                    # If any element already on GPU, keep it; else copy to GPU
+                    if any("cupy" in str(type(y)).lower() for y in Y_list):
+                        Y = cp.stack([y if isinstance(y, cp.ndarray) else cp.asarray(y) for y in Y_list], axis=0)
+                    else:
+                        Y = cp.asarray(np.stack(Y_list, axis=0))
+                    lo = cp.quantile(Y, float(alpha/2), axis=0)
+                    hi = cp.quantile(Y, float(1 - alpha/2), axis=0)
+                    lo = cp.asnumpy(lo); hi = cp.asnumpy(hi)
+                    band_backend = "cupy"
+                else:
+                    Y = np.stack(Y_list, axis=0)
+                    lo = np.quantile(Y, alpha/2, axis=0)
+                    hi = np.quantile(Y, 1 - alpha/2, axis=0)
+            except Exception:
+                Y = np.stack(Y_list, axis=0)
+                lo = np.quantile(Y, alpha/2, axis=0)
+                hi = np.quantile(Y, 1 - alpha/2, axis=0)
+                band_backend = "numpy"
+
+            band = (x_all, lo, hi)
+            diagnostics["band_backend"] = band_backend
+            diagnostics["band_workers_used"] = int(band_workers) if band_workers > 0 else None
+            try:
+                import cupy as cp  # optional
                 cp.get_default_memory_pool().free_all_blocks()
-            except Exception as e:
-                diag_notes.append(repr(e))
+            except Exception:
+                pass
 
     diag = {
         "B": int(n_boot),
@@ -875,7 +952,7 @@ def bootstrap_ci(
         "seed": seed,
         "pct_at_bounds": pct_at_bounds,
         "pct_at_bounds_units": "percent",
-        "aborted": bool(abort_evt.is_set()) if abort_evt is not None else False,
+        "aborted": bool(aborted or ((abort_evt.is_set()) if abort_evt is not None else False)),
         "runtime_s": float(time.time() - t0),
         "theta_jitter_scale": float(jitter_scale),
         "band_source": "bootstrap-percentile" if band is not None else None,
@@ -888,6 +965,7 @@ def bootstrap_ci(
     # Merge any per-band diagnostics (e.g. workers_used, band_backend)
     diag.update(diagnostics)
     diag["bootstrap_mode"] = "linearized" if use_linearized_fast_path else "refit"
+    diag["draw_workers_used"] = int(draw_workers) if draw_workers > 0 else None
 
     return UncertaintyResult(method="bootstrap", label="Bootstrap", stats=stats, diagnostics=diag, band=band)
 # ---------------------------------------------------------------------------
@@ -1058,19 +1136,15 @@ def bayesian_ci(
         p0[k, -1] = math.log(max(rmse*abs(rng.normal(loc=1.0, scale=0.1)), 1e-6))
 
     # Optional parallel pool for emcee log_prob; cap workers
-    workers_req = 0
     if workers not in (None, False):
         val_workers = workers
     else:
         val_workers = (fit_ctx or {}).get("unc_workers", 0)
-    if val_workers not in (None, False):
-        try:
-            workers_req = int(val_workers)
-        except Exception as e:
-            diag_notes.append(repr(e))
-            workers_req = 0
-    w = max(0, min(workers_req, (os.cpu_count() or 1)))
-    pool = None
+    try:
+        w = max(0, min(int(val_workers or 0), os.cpu_count() or 1))
+    except Exception:
+        w = 0
+    pool = ThreadPoolExecutor(max_workers=w) if w > 0 else None
     try:
         sampler = emcee.EnsembleSampler(
             n_walkers, dim, lambda z: log_prob(z), pool=pool

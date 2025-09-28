@@ -3573,6 +3573,8 @@ class PeakFitApp:
                 "x_all": x_fit,
                 "y_all": y_fit,
                 "unc_workers": workers,
+                "unc_band_workers": workers,
+                "unc_use_gpu": bool(getattr(self, "use_gpu_var", None) and self.use_gpu_var.get()),
                 "solver": boot_solver,
                 "strict_refit": True,
                 "bootstrap_jitter": jitter_val,
@@ -3632,6 +3634,8 @@ class PeakFitApp:
                 "x_all": x_fit,
                 "y_all": y_fit,
                 "unc_workers": workers,
+                "unc_band_workers": workers,
+                "unc_use_gpu": bool(getattr(self, "use_gpu_var", None) and self.use_gpu_var.get()),
             }
             out = core_uncertainty.bayesian_ci(
                 theta_hat=theta,

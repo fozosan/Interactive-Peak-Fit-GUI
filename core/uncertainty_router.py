@@ -160,6 +160,7 @@ def route_uncertainty(
         jitter = _norm_jitter(ctx.get("bootstrap_jitter", ctx.get("jitter", 0.0)))
         ctx["bootstrap_jitter"] = jitter
         ctx["strict_refit"] = True
+        ctx["unc_use_gpu"] = bool(ctx.get("unc_use_gpu", False))
         # Jitter travels through fit_ctx so the engine can normalize/inspect it.
         return unc.bootstrap_ci(
             theta=theta_hat,
