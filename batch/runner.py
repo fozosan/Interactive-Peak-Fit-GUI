@@ -515,7 +515,9 @@ def run_batch(
                             mode=res.get("mode", "add"),
                             fit_mask=fit_mask,
                         )
-                    return np.asarray(out.get("theta", theta_init), float), True
+                    theta_out = np.asarray(out.get("theta", theta_init), float)
+                    ok = bool(out.get("fit_ok", out.get("ok", True))) and np.all(np.isfinite(theta_out))
+                    return theta_out, ok
 
                 fit_ctx.update({"refit": _refit_wrapper})
 
