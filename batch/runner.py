@@ -433,7 +433,6 @@ def run_batch(
                         "mode": mode,
                         "peaks": peaks_obj,
                         "peaks_out": peaks_obj,
-                        "unc_workers": unc_workers,
                         "solver": boot_solver,
                         "bootstrap_jitter": jitter_frac,
                         "lmfit_share_fwhm": bool(config.get("lmfit_share_fwhm", False)),
@@ -444,7 +443,7 @@ def run_batch(
                             else (res.get("p0") if res.get("p0") is not None else theta_hat),
                             float,
                         ),
-                        "strict_refit": True,
+                        "strict_refit": bool(config.get("bootstrap_strict_refit", False)),
                         "centers_ref": centers_ref,
                         "relabel_by_center": True,
                     }
@@ -502,9 +501,9 @@ def run_batch(
                     alpha = float(config.get("unc_alpha", 0.05))
                     center_res = bool(config.get("unc_center_resid", True))
                     try:
-                        n_boot = int(config.get("bootstrap_n", 200))
+                        n_boot = int(config.get("bootstrap_n", 250))
                     except Exception:
-                        n_boot = 200
+                        n_boot = 250
                     try:
                         seed_val = config.get("bootstrap_seed", 0)
                         seed_int = int(seed_val)
