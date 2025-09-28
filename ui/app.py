@@ -728,6 +728,26 @@ class PeakFitApp:
         except Exception:
             pass
 
+    def _perf_seed_value(self) -> Optional[int]:
+        seed_cfg = self.cfg.get("perf_seed", "")
+        seed_var = getattr(self, "seed_var", None)
+        if seed_var is not None:
+            try:
+                seed_str = str(seed_var.get()).strip()
+            except Exception:
+                seed_str = ""
+        else:
+            try:
+                seed_str = str(seed_cfg).strip()
+            except Exception:
+                seed_str = ""
+        if seed_str in ("", "None"):
+            return None
+        try:
+            return int(seed_str)
+        except Exception:
+            return None
+
     def _boot_follow_enabled(self) -> bool:
         return bool(self.cfg.get("unc_boot_solver_follow", True))
 
@@ -797,6 +817,7 @@ class PeakFitApp:
         self.cfg.setdefault("perf_gpu", False)
         self.cfg.setdefault("perf_cache_baseline", True)
         self.cfg.setdefault("perf_seed_all", False)
+        self.cfg.setdefault("perf_seed", "")
         self.cfg.setdefault("perf_max_workers", 0)
         self.cfg.setdefault("unc_workers", 0)
         self.cfg.setdefault("last_template_name", self.cfg.get("auto_apply_template_name", ""))
@@ -973,8 +994,9 @@ class PeakFitApp:
             self._on_uncertainty_method_changed()
         except Exception:
             pass
-        self.unc_workers_var = tk.IntVar(value=int(self.cfg.get("unc_workers", 0)))
-        self.unc_workers_var.trace_add("write", lambda *_: self._on_unc_workers_change())
+        # NOTE(surgical): uncertainty workers now come from Performance.max_workers only
+        # (keep any existing cfg key intact but unused to avoid migrations)
+        self.unc_workers_var = tk.IntVar(value=int(self.cfg.get("perf_max_workers", 0)))
         self.perf_numba = tk.BooleanVar(value=bool(self.cfg.get("perf_numba", False)))
         self.perf_gpu = tk.BooleanVar(value=bool(self.cfg.get("perf_gpu", False)))
         self.perf_cache_baseline = tk.BooleanVar(value=bool(self.cfg.get("perf_cache_baseline", True)))
@@ -999,7 +1021,8 @@ class PeakFitApp:
                 self.cfg.get("bayes_diagnostics", self.cfg.get("bayes_diag", False))
             )
         )
-        self.seed_var = tk.StringVar(value="")
+        self.seed_var = tk.StringVar(value=str(self.cfg.get("perf_seed", "")))
+        self.seed_var.trace_add("write", lambda *_: self.apply_performance())
         self.gpu_chunk_var = tk.IntVar(value=262144)
 
         # UI
@@ -1769,10 +1792,6 @@ class PeakFitApp:
         self._update_unc_widgets()
         self._on_uncertainty_method_changed()
 
-    def _on_unc_workers_change(self, *_):
-        self.cfg["unc_workers"] = int(self.unc_workers_var.get())
-        save_config(self.cfg)
-
     def _get_int(self, name: str, default: int) -> int:
         try:
             v = getattr(self, name)
@@ -1785,12 +1804,15 @@ class PeakFitApp:
                 return default
 
     def _resolve_unc_workers(self) -> int:
-        w = int(self.unc_workers_var.get())
-        if w <= 0:
-            w = int(self.perf_max_workers.get())
-            if w <= 0:
-                w = os.cpu_count() or 1
-        return w
+        """Return the configured uncertainty worker count from Performance controls."""
+
+        try:
+            return int(self.perf_max_workers.get())
+        except Exception:
+            try:
+                return int(self.cfg.get("perf_max_workers", 0))
+            except Exception:
+                return 0
 
     def _as_seq(self, v):
         if isinstance(v, (list, tuple)):
@@ -1834,7 +1856,6 @@ class PeakFitApp:
         attr_map = {
             "unc_alpha": "alpha_var",
             "bootstrap_n": "boot_n_var",
-            "bootstrap_seed": "boot_seed_var",
             "unc_center_resid": "center_resid_var",
             "bootstrap_jitter": "bootstrap_jitter_var",
         }
@@ -1849,17 +1870,20 @@ class PeakFitApp:
                     pass
             return cfg.get(key, default)
 
+        seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
+
         return {
             "method": _canonical_unc_label(self._unc_selected_method_key()),
             "alpha": float(_pick("unc_alpha", 0.05)),
             "n_boot": int(_pick("bootstrap_n", 200)),
-            "seed": int(_pick("bootstrap_seed", 0)),
+            "seed": seed_val,
             "center_resid": bool(_pick("unc_center_resid", True)),
             # store normalized jitter so cache invalidates when the effective value changes
             "jitter": self._norm_jitter_val(_pick("bootstrap_jitter", 0.0)),
             # include bootstrap solver + workers so cache respects engine changes
             "boot_solver": getattr(self, "_select_bootstrap_solver", lambda: "")(),
-            "workers": int(cfg.get("unc_workers", 0) or 0),
+            "workers": int(cfg.get("perf_max_workers", 0) or 0),
+            "seed_all": bool(self.perf_seed_all.get()),
         }
 
 
@@ -3254,7 +3278,8 @@ class PeakFitApp:
             "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
             "perf_seed_all": bool(self.perf_seed_all.get()),
             "perf_max_workers": int(self.perf_max_workers.get()),
-            "unc_workers": int(self.cfg.get("unc_workers", 0)),
+            "unc_workers": int(self.cfg.get("perf_max_workers", 0)),
+            "perf_seed": self.cfg.get("perf_seed", ""),
             "output_dir": str(output_dir),
             "output_base": output_base,
         }
@@ -3535,7 +3560,7 @@ class PeakFitApp:
             workers = int(self._resolve_unc_workers())
         except Exception:
             try:
-                workers = int(self.cfg.get("unc_workers", 0) or 0)
+                workers = int(self.cfg.get("perf_max_workers", 0) or 0)
             except Exception:
                 workers = 0
         workers = workers if workers and workers > 0 else None
@@ -3610,7 +3635,7 @@ class PeakFitApp:
                 pass
 
             n_boot = self._get_int("bootstrap_n", 200)
-            seed_val = self._get_int("bootstrap_seed", 0) or None
+            seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
             res = core_uncertainty.bootstrap_ci(
                 theta=theta,
                 residual=r0,
@@ -3659,6 +3684,7 @@ class PeakFitApp:
                 "unc_use_gpu": bool(getattr(self, "use_gpu_var", None) and self.use_gpu_var.get()),
                 "bayes_diagnostics": bool(self.bayes_diag_var.get()),
             }
+            seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
             out = core_uncertainty.bayesian_ci(
                 theta_hat=theta,
                 model=predict_full,
@@ -3666,6 +3692,7 @@ class PeakFitApp:
                 x_all=x_fit,
                 y_all=y_fit,
                 residual_fn=(lambda th: resid_fn(th)),
+                seed=seed_val,
                 fit_ctx=fit_ctx,
                 locked_mask=locked_mask,
                 bounds=(lo, hi),
@@ -3812,7 +3839,7 @@ class PeakFitApp:
                 workers_val = int(self._resolve_unc_workers())
             except Exception:
                 try:
-                    workers_val = int(self.cfg.get("unc_workers", 0) or 0)
+                    workers_val = int(self.cfg.get("perf_max_workers", 0) or 0)
                 except Exception:
                     workers_val = 0
             workers = workers_val if workers_val > 0 else None
@@ -3878,10 +3905,8 @@ class PeakFitApp:
             if method == "bootstrap":
                 # Prefer live widget values; persist to cfg
                 n_boot = int(getattr(self, "boot_n_var", None).get() if hasattr(self, "boot_n_var") else self._get_int("bootstrap_n", 200))
-                seed_val = int(getattr(self, "boot_seed_var", None).get() if hasattr(self, "boot_seed_var") else self._get_int("bootstrap_seed", 0))
                 self._cfg_set("bootstrap_n", n_boot)
-                self._cfg_set("bootstrap_seed", seed_val)
-                seed_val = seed_val or None
+                seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
 
                 r0 = resid_fn(theta)
                 J = jacobian_fd(resid_fn, theta)
@@ -3966,7 +3991,7 @@ class PeakFitApp:
                     "y_all": y_fit,
                     "solver": self.solver_choice.get(),
                     "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
-                    "lmfit_share_eta":  bool(self.lmfit_share_eta.get()),
+                    "lmfit_share_eta": bool(self.lmfit_share_eta.get()),
                     "peaks": self.peaks,
                     "locked_mask": locked_mask,
                     "unc_workers": workers,
@@ -3977,20 +4002,24 @@ class PeakFitApp:
                 # sensible bounds for MCMC to prevent runaway widths/etas
                 n_pk = len(self.peaks)
                 P = 4 * n_pk
-                lo = np.full(P, -np.inf, float); hi = np.full(P, np.inf, float)
+                lo = np.full(P, -np.inf, float)
+                hi = np.full(P, np.inf, float)
                 xlo, xhi = float(np.min(x_fit)), float(np.max(x_fit))
-                lo[0::4] = xlo;  hi[0::4] = xhi                     # centers
-                lo[1::4] = 0.0;                                     # heights >= 0
+                lo[0::4] = xlo
+                hi[0::4] = xhi                     # centers
+                lo[1::4] = 0.0                     # heights >= 0
                 # use corrected y without ambiguous array truthiness
                 y_corr = y_fit if add_mode or base_fit is None else (y_fit - base_fit)
                 yscale = float(np.nanmax(y_corr))
                 if not np.isfinite(yscale):
                     yscale = 1.0
-                hi[1::4] = max(1.0, 1.5 * yscale)                   # height cap
+                hi[1::4] = max(1.0, 1.5 * yscale)  # height cap
                 lo[2::4] = max(1e-3, float(self.classic_fwhm_min.get() if hasattr(self, "classic_fwhm_min") else 1e-2))
-                hi[2::4] = max(1.0, xhi - xlo)                      # width ≤ window
-                lo[3::4] = 0.0;  hi[3::4] = 1.0                     # 0 ≤ eta ≤ 1
+                hi[2::4] = max(1.0, xhi - xlo)     # width ≤ window
+                lo[3::4] = 0.0
+                hi[3::4] = 1.0                     # 0 ≤ eta ≤ 1
 
+                seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
                 out = core_uncertainty.bayesian_ci(
                     theta_hat=theta,
                     model=predict_full,
@@ -3998,6 +4027,7 @@ class PeakFitApp:
                     x_all=x_fit,
                     y_all=y_fit,
                     residual_fn=(lambda th: resid_fn(th)),
+                    seed=seed_val,
                     fit_ctx=fit_ctx,
                     locked_mask=locked_mask,
                     # Force off: bands for MCMC are disabled
@@ -4191,19 +4221,30 @@ class PeakFitApp:
         performance.set_numba(bool(self.perf_numba.get()))
         performance.set_gpu(bool(self.perf_gpu.get()))
         performance.set_cache_baseline(bool(self.perf_cache_baseline.get()))
-        seed_txt = self.seed_var.get().strip()
-        seed = int(seed_txt) if seed_txt else None
-        if self.perf_seed_all.get():
-            performance.set_seed(seed)
-        else:
-            performance.set_seed(None)
+        try:
+            seed_txt = str(self.seed_var.get()).strip()
+        except Exception:
+            seed_txt = ""
+        seed = None
+        if seed_txt:
+            try:
+                seed = int(seed_txt)
+            except Exception:
+                seed = None
+        effective_seed = seed if bool(self.perf_seed_all.get()) else None
+        performance.set_seed(effective_seed)
         performance.set_max_workers(int(self.perf_max_workers.get()))
         performance.set_gpu_chunk(self.gpu_chunk_var.get())
         self.cfg["perf_numba"] = bool(self.perf_numba.get())
         self.cfg["perf_gpu"] = bool(self.perf_gpu.get())
         self.cfg["perf_cache_baseline"] = bool(self.perf_cache_baseline.get())
         self.cfg["perf_seed_all"] = bool(self.perf_seed_all.get())
+        self.cfg["perf_seed"] = seed if seed is not None else ""
         self.cfg["perf_max_workers"] = int(self.perf_max_workers.get())
+        try:
+            self.unc_workers_var.set(int(self.perf_max_workers.get()))
+        except Exception:
+            pass
         save_config(self.cfg)
         self.log(f"Backend: {performance.which_backend()} | workers={performance.get_max_workers()}")
         self.status_var.set("Performance options applied.")
@@ -4473,6 +4514,8 @@ class PeakFitApp:
             saved_unc = []
             if self.peaks:
                 method_key = self._unc_selected_method_key()
+                last_method_label = getattr(self, "_last_unc_method", None)
+                method_for_export = last_method_label or method_key
                 add_mode = (self.baseline_mode.get() == "add")
 
                 mask = self.current_fit_mask()
@@ -4494,6 +4537,93 @@ class PeakFitApp:
                     theta_now.extend([_p.center, _p.height, _p.fwhm, _p.eta])
                 theta_now = np.asarray(theta_now, float)
 
+                # Guard: if the cached GUI result is stale (method/fit window/signature),
+                # recompute it with the same method used in the GUI so the export matches.
+                last_unc = getattr(self, "last_uncertainty", None)
+                guard_recompute = False
+                try:
+                    if isinstance(last_unc, dict) and last_unc:
+                        last_sig = getattr(self, "_last_unc_signature", None)
+                        sig_now = self._current_uncertainty_signature()
+                        if sig_now != last_sig:
+                            guard_recompute = True
+                        else:
+                            cached_label = _canonical_unc_label(
+                                last_unc.get("label") or last_unc.get("method") or ""
+                            )
+                            last_method_canon = _canonical_unc_label(last_method_label or "")
+                            selected_label = _canonical_unc_label(method_key)
+                            if last_method_canon and selected_label != last_method_canon:
+                                guard_recompute = True
+                            if not guard_recompute:
+                                fw = getattr(self, "_last_unc_fitwin", (float("nan"), float("nan"), 0))
+                                guard_recompute = not (
+                                    x_fit.size == int(fw[2])
+                                    and (
+                                        x_fit.size == 0
+                                        or (
+                                            float(x_fit[0]) == float(fw[0])
+                                            and float(x_fit[-1]) == float(fw[1])
+                                        )
+                                    )
+                                )
+                except Exception:
+                    guard_recompute = False
+
+                if guard_recompute:
+                    try:
+                        self.log_threadsafe("Uncertainty cache stale; recomputing with current settings…")
+                    except Exception:
+                        pass
+                    try:
+                        recompute_method = last_method_label or method_key
+                        refreshed = self._compute_uncertainty_sync(
+                            recompute_method,
+                            x_fit=x_fit,
+                            y_fit=y_fit_target,
+                            base_fit=base_for_unc,
+                            add_mode=add_mode,
+                        )
+                        if isinstance(refreshed, dict):
+                            refreshed = _normalize_unc_result(refreshed)
+                            self.last_uncertainty = refreshed
+                            method_for_export = recompute_method
+                            canon_label = _canonical_unc_label(
+                                refreshed.get("label") or refreshed.get("method") or recompute_method
+                            )
+                            self._last_unc_method = canon_label
+                            self._last_unc_theta = np.asarray(theta_now, float)
+                            self._last_unc_fitwin = (
+                                float(x_fit[0]) if x_fit.size else float("nan"),
+                                float(x_fit[-1]) if x_fit.size else float("nan"),
+                                int(x_fit.size),
+                            )
+                            self._last_unc_signature = self._current_uncertainty_signature()
+                            locks = []
+                            for pk in self.peaks:
+                                locks.append(
+                                    {
+                                        "center": bool(getattr(pk, "lock_center", False)),
+                                        "fwhm": bool(getattr(pk, "lock_width", False)),
+                                        "eta": False,
+                                    }
+                                )
+                            self._last_unc_locks = locks
+                            band_tup = self._band_tuple_from(refreshed)
+                            if band_tup is not None and self.show_ci_band_var.get():
+                                bx, blo, bhi = band_tup
+                                self.ci_band = (
+                                    np.asarray(bx, float),
+                                    np.asarray(blo, float),
+                                    np.asarray(bhi, float),
+                                )
+                            elif band_tup is None:
+                                self.ci_band = None
+                    except Exception:
+                        pass
+
+                method_for_export = getattr(self, "_last_unc_method", None) or method_for_export
+
                 # check if we can reuse the last GUI result
                 use_cache = False
                 try:
@@ -4502,9 +4632,9 @@ class PeakFitApp:
                     cached_label = _canonical_unc_label(
                         (cached or {}).get("label") or (cached or {}).get("method") or ""
                     ) if isinstance(cached, dict) else ""
-                    selected_label = _canonical_unc_label(method_key)
+                    export_label = _canonical_unc_label(method_for_export)
 
-                    same_method = (cached_label == selected_label and bool(cached))
+                    same_method = (cached_label == export_label and bool(cached))
                     same_theta = np.allclose(
                         theta_now,
                         getattr(self, "_last_unc_theta", np.asarray([], float)),
@@ -4535,7 +4665,7 @@ class PeakFitApp:
                 else:
                     # Fallback: compute once through the same pipeline
                     unc = self._compute_uncertainty_sync(
-                        method_key,
+                        method_for_export,
                         x_fit=x_fit,
                         y_fit=y_fit_target,
                         base_fit=base_for_unc,
@@ -4559,7 +4689,7 @@ class PeakFitApp:
 
                     # Normalize + canonicalize label, then attach RMSE/DOF from current export context
                     unc_norm = _normalize_unc_result(unc)
-                    raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_key)
+                    raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_for_export)
                     label = _canonical_unc_label(raw_lbl)
                     unc_norm["label"] = label
                     unc_norm["rmse"] = rmse
@@ -4584,7 +4714,7 @@ class PeakFitApp:
                     )
                     dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
 
-                    raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_key)
+                    raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_for_export)
                     label = _canonical_unc_label(raw_lbl)
                     unc_norm["label"] = label
                     unc_norm["rmse"] = rmse
