@@ -4122,6 +4122,9 @@ class PeakFitApp:
                         or {}
                     )
                     if bool(d.get("diagnostics_enabled")):
+                        # NOTE(surgical): emitted after sampling progress (e.g., "1000/1000") finishes.
+                        # Tell the user we're now computing ESS/R̂/MCSE summaries.
+                        self.log_threadsafe("Computing Bayesian diagnostics (ESS/R̂/MCSE)…")
                         ess_min = d.get("ess_min")
                         rhat_max = d.get("rhat_max")
                         mcse_mean = d.get("mcse_mean")
