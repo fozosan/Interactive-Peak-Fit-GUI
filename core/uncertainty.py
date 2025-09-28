@@ -500,6 +500,7 @@ def bootstrap_ci(
     alpha: float = 0.05,
     center_residuals: bool = True,
     return_band: bool = False,
+    jitter: Optional[float] = None,
 ) -> UncertaintyResult:
     """
     Residual bootstrap with robust refitting and clear diagnostics.
@@ -518,6 +519,12 @@ def bootstrap_ci(
     """
     t0 = time.time()
     fit_ctx = dict(fit_ctx or {})
+    # allow callers to pass normalized jitter explicitly
+    if jitter is not None:
+        try:
+            fit_ctx["bootstrap_jitter"] = float(jitter)
+        except Exception:
+            pass
     fit = fit_ctx
     strict_refit = bool(fit.get("strict_refit", False))
     progress_cb = fit.get("progress_cb")
