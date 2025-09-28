@@ -533,15 +533,7 @@ def run_batch(
                             )
                         except TypeError:
                             # Final minimal fallback for very old signatures
-                            out = _fit_api.run_fit_consistent(
-                                x,
-                                y,
-                                peaks_start,
-                                cfg,
-                                res.get("baseline"),
-                                res.get("mode", "add"),
-                                fit_mask,
-                            )
+                            out = _fit_api.run_fit_consistent(x, y, peaks_start, cfg)
 
                     # Normalize fitter output: accept dict or array-like
                     if isinstance(out, dict):

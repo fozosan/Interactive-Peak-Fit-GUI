@@ -1517,15 +1517,17 @@ def bayesian_ci(
             try:
                 post_swapped = np.swapaxes(post, 0, 1)
                 ess_val = ess_autocorr(post_swapped)
-                if np.isfinite(ess_val):
-                    ess_min = float(ess_val)
+                ess_arr = np.asarray(ess_val, dtype=float)
+                if ess_arr.size:
+                    ess_min = float(np.nanmin(ess_arr))
             except Exception as e:
                 diag_notes.append(repr(e))
             try:
                 post_for_rhat = post_swapped if post_swapped is not None else np.swapaxes(post, 0, 1)
                 rhat_val = rhat_split(post_for_rhat)
-                if np.isfinite(rhat_val):
-                    rhat_max = float(rhat_val)
+                rhat_arr = np.asarray(rhat_val, dtype=float)
+                if rhat_arr.size:
+                    rhat_max = float(np.nanmax(rhat_arr))
             except Exception as e:
                 diag_notes.append(repr(e))
             try:
