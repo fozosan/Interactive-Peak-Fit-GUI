@@ -1008,6 +1008,8 @@ def bayesian_ci(
 
     theta_hat = np.asarray(theta_hat, float)
     diag_notes: List[str] = []
+    # Significance level for credible intervals (used in per-parameter quantiles)
+    alpha = float((fit_ctx or {}).get("alpha", 0.05))
     # Optional tying (LMFIT "share FWHM/eta"): collapse tied params to one free scalar
     share_fwhm = bool((fit_ctx or {}).get("lmfit_share_fwhm", False))
     share_eta = bool((fit_ctx or {}).get("lmfit_share_eta", False))
@@ -1202,12 +1204,11 @@ def bayesian_ci(
             band=None,
         )
 
-    chain_post = sampler.get_chain(discard=n_burn, thin=thin)
+    chain_post = sampler.get_chain(discard=n_burn, thin=thin, flat=False)  # (steps, walkers, dim)
     acc_frac = float(np.mean(sampler.acceptance_fraction))
     if chain_post.ndim != 3:
-        chain_post = np.asarray(chain_post)
-        chain_post = chain_post.reshape((n_walkers, -1, dim))
-    n_post = chain_post.shape[1]
+        chain_post = np.asarray(chain_post).reshape((-1, n_walkers, dim))
+    n_post = chain_post.shape[0]  # number of post-burn/thinned steps per walker
     if n_post <= 0:
         # Avoid "index -1" crashes when burn==total or abort mid-burn
         return UncertaintyResult(
@@ -1247,7 +1248,6 @@ def bayesian_ci(
             return float(np.nanstd(a, ddof=0))
         return float(np.nanstd(a, ddof=1))
 
-    alpha = 0.05
     P = int(T_full.shape[1])
     n_pk = P // 4 if P >= 4 else 0
 
