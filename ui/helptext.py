@@ -161,6 +161,7 @@ def build_help(opts: dict) -> str:
           – R̂ (“R-hat”): should be ≈1.00; >1.05 suggests non-convergence.
           – MCSE: Monte Carlo standard error of reported quantiles (q16/q50/q84); smaller is better.
           You can toggle diagnostics via “Compute diagnostics (ESS/R̂/MCSE)” to reduce overhead on large runs.
+          The Performance → Uncertainty pane exposes a Bayesian diagnostics toggle; when off, ESS/R̂/MCSE are skipped and the log stays quiet.
           (If emcee is not installed, the app reports “NotAvailable”.)
 
         Batch processing

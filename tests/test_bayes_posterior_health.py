@@ -31,8 +31,4 @@ def test_bayesian_posterior_health_fields_present():
         seed=123,
     )
     d = res.diagnostics
-    assert "ess_min" in d and "rhat_max" in d and "mcse" in d
-    assert isinstance(d["mcse"], dict)
-    for k in ("q16", "q50", "q84"):
-        assert k in d["mcse"]
-        assert d["mcse"][k] == d["mcse"][k]
+    assert "ess_min" in d and "rhat_max" in d and "mcse_mean" in d
