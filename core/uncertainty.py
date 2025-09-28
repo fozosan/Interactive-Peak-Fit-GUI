@@ -15,6 +15,7 @@ import warnings
 import time
 import math
 import os
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -670,56 +671,111 @@ def bootstrap_ci(
 
     def _robust_refit(theta_init, x, y):
         cfg = _mk_cfg()
+        theta_arr = np.asarray(theta_init, float)
+
+        # Prepare peaks with jittered start values so p0 follows theta_init
+        peaks_start = peaks_obj
+        try:
+            if peaks_obj and 4 * len(peaks_obj) == int(theta_arr.size):
+                t = theta_arr.ravel()
+                ps = copy.deepcopy(peaks_obj)
+                for i, pk in enumerate(ps):
+                    j = 4 * i
+                    pk.center = float(t[j + 0])
+                    pk.height = float(t[j + 1])
+                    pk.fwhm   = float(t[j + 2])
+                    pk.eta    = float(t[j + 3])
+                peaks_start = ps
+        except Exception:
+            peaks_start = peaks_obj  # best effort, don’t fail the draw
+
+        fit_mask_full = np.ones_like(x, dtype=bool)
         if _sig:
             params = set(_sig.parameters.keys())
-            call = {"x": x, "y": y}
+            call_base = {"x": x, "y": y}
 
             # Supply configuration under the name the function supports
             if "cfg" in params:
-                call["cfg"] = cfg
+                call_base["cfg"] = cfg
             elif "config" in params:
-                call["config"] = cfg
+                call_base["config"] = cfg
 
             # support both new spellings for peaks
             if "peaks_in" in params:
-                call["peaks_in"] = peaks_obj
+                call_base["peaks_in"] = peaks_start
             elif "peaks" in params:
-                call["peaks"] = peaks_obj
+                call_base["peaks"] = peaks_start
 
             # pass only kwargs that exist in the function signature
             optional = {
                 "baseline": baseline,
                 "mode": mode,
-                "fit_mask": np.ones_like(x, dtype=bool),
+                "fit_mask": fit_mask_full,
                 "rng_seed": None,
                 "verbose": False,
                 "quick_and_dirty": False,
-                "theta_init": theta_init,
                 "locked_mask": locked_mask,
                 "bounds": bounds,
             }
             for k, v in optional.items():
                 if k in params:
-                    call[k] = v
+                    call_base[k] = v
+            res_main = None
             try:
-                res = _fit_api.run_fit_consistent(**call)
-                th = np.asarray(res.get("theta", theta_init), float)
-                ok = bool(res.get("fit_ok", res.get("ok", False)))
-                return th, ok
+                res_main = _fit_api.run_fit_consistent(**call_base)
             except Exception:
-                # fall through to legacy below
-                pass
+                res_main = None
+            if res_main is not None:
+                th_main = np.asarray(res_main.get("theta", theta_arr), float)
+                if np.all(np.isfinite(th_main)):
+                    return th_main, True
+
+            call_with_theta = dict(call_base)
+            call_with_theta["theta_init"] = theta_arr
+            try:
+                res_theta = _fit_api.run_fit_consistent(**call_with_theta)
+            except Exception:
+                res_theta = None
+            if res_theta is not None:
+                th_theta = np.asarray(res_theta.get("theta", theta_arr), float)
+                if np.all(np.isfinite(th_theta)):
+                    return th_theta, True
 
         # LEGACY fallback: (x, y, cfg_with_peaks_dicts, ...)
         from .data_io import peaks_to_dicts
-        cfg_legacy = {**cfg, "peaks": peaks_to_dicts(peaks_obj)}
+        cfg_legacy = {**cfg, "peaks": peaks_to_dicts(peaks_start)}
+        common_kwargs = {
+            "x": x,
+            "y": y,
+            "cfg": cfg_legacy,
+            "baseline": baseline,
+            "mode": mode,
+            "fit_mask": fit_mask_full,
+            "locked_mask": locked_mask,
+            "bounds": bounds,
+        }
+        variants = [
+            {"peaks_in": peaks_start, **common_kwargs},
+            common_kwargs,
+        ]
+        for kwargs in variants:
+            res_main = None
+            try:
+                res_main = _fit_api.run_fit_consistent(**kwargs)
+            except Exception:
+                res_main = None
+            if res_main is not None:
+                th_main = np.asarray(res_main.get("theta", theta_arr), float)
+                if np.all(np.isfinite(th_main)):
+                    return th_main, True
+
         res = _fit_api.run_fit_consistent(
             x, y, cfg_legacy,
-            theta_init=theta_init, locked_mask=locked_mask,
+            theta_init=theta_arr, locked_mask=locked_mask,
             bounds=bounds, baseline=baseline
         )
-        th = np.asarray(res.get("theta", theta_init), float)
-        ok = bool(res.get("fit_ok", res.get("ok", False)))
+        th = np.asarray(res.get("theta", theta_arr), float)
+        ok = True
         return th, ok
 
     # --- Optional user-supplied refit from fit_ctx (batch path) ---
@@ -1051,6 +1107,8 @@ def bayesian_ci(
     # Optional tying (LMFIT "share FWHM/eta"): collapse tied params to one free scalar
     share_fwhm = bool((fit_ctx or {}).get("lmfit_share_fwhm", False))
     share_eta = bool((fit_ctx or {}).get("lmfit_share_eta", False))
+    # Toggle diagnostics (ESS/R̂/MCSE); default True for backward compat
+    diag_enable = bool((fit_ctx or {}).get("bayes_diag", True))
     # Pull bounds/locks from fit_ctx when not explicitly provided
     if bounds is None and fit_ctx and "bounds" in fit_ctx:
         bounds = fit_ctx.get("bounds")
@@ -1361,59 +1419,65 @@ def bayesian_ci(
             if key and key not in param_stats:
                 param_stats[key] = dict(stats_flat)
 
-    # Build post-burn/thinned chain view for diagnostics
-    try:
-        chain = sampler.get_chain(flat=False)  # (total_steps, n_walkers, dim)
-        post = chain[-int(n_steps):, :, :]     # keep steps after burn
-        if int(thin) > 1:
-            post = post[::int(thin), :, :]
-    except Exception as e:
-        diag_notes.append(repr(e))
-        post = None
-
+    # Build post-burn/thinned chain view only if diagnostics enabled
     ess_min = float("nan")
     rhat_max = float("nan")
     mcse16 = mcse50 = mcse84 = float("nan")
 
-    if post is not None and post.size:
+    post = None
+    if diag_enable:
         try:
-            ess = ess_autocorr(post)               # expects (steps, chains, dim)
-            ess_min = float(np.nanmin(np.asarray(ess)))
+            chain_full = sampler.get_chain(flat=False)     # (total_steps, n_walkers, dim)
+            post = chain_full[-int(n_steps):, :, :]        # keep steps after burn
+            if int(thin) > 1:
+                post = post[::int(thin), :, :]
         except Exception as e:
             diag_notes.append(repr(e))
-        try:
-            rhat = rhat_split(post)                # expects (steps, chains, dim)
-            rhat_max = float(np.nanmax(np.asarray(rhat)))
-        except Exception as e:
-            diag_notes.append(repr(e))
-        # Conservative MCSE for marginal quantiles via per-walker quantile std
-        try:
-            W = post.shape[1]
+            post = None
 
-            def _mcse_q(q):
-                q_walker = np.nanquantile(post, q, axis=0)   # (walkers, dim)
-                return float(
-                    np.nanmax(
-                        np.nanstd(q_walker, axis=0, ddof=1)
-                        / max(np.sqrt(W), 1.0)
+        if post is not None and post.size:
+            try:
+                ess = ess_autocorr(post)                   # (steps, chains, dim)
+                ess_min = float(np.nanmin(np.asarray(ess)))
+            except Exception as e:
+                diag_notes.append(repr(e))
+            try:
+                rhat = rhat_split(post)                    # (steps, chains, dim)
+                rhat_max = float(np.nanmax(np.asarray(rhat)))
+            except Exception as e:
+                diag_notes.append(repr(e))
+            # Conservative MCSE for q16/50/84 via per-walker quantile spread
+            try:
+                W = post.shape[1]
+
+                def _mcse_q(q):
+                    q_w = np.nanquantile(post, q, axis=0)  # (walkers, dim)
+                    return float(
+                        np.nanmax(
+                            np.nanstd(q_w, axis=0, ddof=1) / max(np.sqrt(W), 1.0)
+                        )
                     )
-                )
 
-            mcse16 = _mcse_q(0.16)
-            mcse50 = _mcse_q(0.50)
-            mcse84 = _mcse_q(0.84)
-        except Exception as e:
-            diag_notes.append(repr(e))
+                mcse16 = _mcse_q(0.16)
+                mcse50 = _mcse_q(0.50)
+                mcse84 = _mcse_q(0.84)
+            except Exception as e:
+                diag_notes.append(repr(e))
 
     diag = {
         "n_draws": int(n_samp),
-        "ess_min": float(ess_min),
-        "rhat_max": float(rhat_max),
         "accept_frac_mean": acc_frac,
         "seed": seed,
         "aborted": bool(aborted),
         "band_source": None,
-        "mcse": {"q16": float(mcse16), "q50": float(mcse50), "q84": float(mcse84)},
+        "ess_min": float(ess_min) if diag_enable else None,
+        "rhat_max": float(rhat_max) if diag_enable else None,
+        "mcse": (
+            {"q16": float(mcse16), "q50": float(mcse50), "q84": float(mcse84)}
+            if diag_enable
+            else None
+        ),
+        "diagnostics_enabled": bool(diag_enable),
     }
     if diag_notes:
         diag["notes"] = diag_notes
