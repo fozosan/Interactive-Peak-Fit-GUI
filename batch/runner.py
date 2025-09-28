@@ -140,9 +140,8 @@ def run_batch(
     source = config.get("source", "template")
     reheight = bool(config.get("reheight", False))
     auto_max = int(config.get("auto_max", 5))
-    # NOTE(surgical): prefer Performance.max_workers if present
     try:
-        _unc_req = int(config.get("perf_max_workers", config.get("unc_workers", 0)))
+        _unc_req = int(config.get("unc_workers", 0))
     except Exception:
         _unc_req = 0
     maxcpu = max(1, (os.cpu_count() or 1))
@@ -178,12 +177,6 @@ def run_batch(
         or "asymptotic"
     )
     unc_method_canon = data_io.canonical_unc_label(unc_choice)
-    perf_seed_all = bool(config.get("perf_seed_all", False))
-    _perf_seed_cfg = config.get("perf_seed", "")
-    try:
-        perf_seed = int(_perf_seed_cfg) if str(_perf_seed_cfg) not in ("", "None") else None
-    except Exception:
-        perf_seed = None
     if log:
         log(f"batch uncertainty method={unc_method_canon}")
         log(f"batch compute_uncertainty={bool(compute_uncertainty)}")
@@ -194,7 +187,6 @@ def run_batch(
     processed = 0
 
     for i, path in enumerate(files, 1):
-        file_index = i - 1
         if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
             return {"aborted": True, "records": [], "reason": "user-abort"}
         if progress:
@@ -565,7 +557,12 @@ def run_batch(
                         n_boot = int(config.get("bootstrap_n", 250))
                     except Exception:
                         n_boot = 250
-                    seed_val = (perf_seed + file_index) if (perf_seed_all and perf_seed is not None) else None
+                    try:
+                        seed_val = config.get("bootstrap_seed", 0)
+                        seed_int = int(seed_val)
+                    except Exception:
+                        seed_int = 0
+                    seed_val = None if seed_int == 0 else seed_int
 
                     jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
                     jac_mat = np.atleast_2d(np.asarray(jac_mat, float))
@@ -617,7 +614,6 @@ def run_batch(
                             config.get("bayes_diagnostics", config.get("bayes_diag", False))
                         ),
                     })
-                    seed_val = (perf_seed + file_index) if (perf_seed_all and perf_seed is not None) else None
                     workers_eff = unc_workers if unc_workers > 0 else None
                     unc_res = route_uncertainty(
                         unc_method_canon,
@@ -629,7 +625,7 @@ def run_batch(
                         x_all=x_fit,
                         y_all=y_fit,
                         workers=workers_eff,
-                        seed=seed_val,
+                        seed=None,
                         n_boot=100,
                     )
             except Exception as exc:
