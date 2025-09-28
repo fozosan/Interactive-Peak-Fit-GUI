@@ -506,16 +506,30 @@ def run_batch(
                             bounds=bounds,
                         )
                     except TypeError:
-                        out = _fit_api.run_fit_consistent(
-                            x,
-                            y,
-                            peaks_start,
-                            cfg,
-                            baseline=res.get("baseline"),
-                            mode=res.get("mode", "add"),
-                            fit_mask=fit_mask,
-                        )
-                    return np.asarray(out.get("theta", theta_init), float), True
+                        # Retry without optional kwargs or fit_mask for older signatures
+                        try:
+                            out = _fit_api.run_fit_consistent(
+                                x,
+                                y,
+                                peaks_start,
+                                cfg,
+                                baseline=res.get("baseline"),
+                                mode=res.get("mode", "add"),
+                            )
+                        except TypeError:
+                            # Final minimal fallback for very old signatures
+                            out = _fit_api.run_fit_consistent(x, y, peaks_start, cfg)
+
+                    # Normalize fitter output: accept dict or array-like
+                    if isinstance(out, dict):
+                        theta_out = np.asarray(out.get("theta", theta_init), float)
+                        ok_flag = out.get("fit_ok", out.get("ok", True))
+                    else:
+                        theta_out = np.asarray(out, float)
+                        ok_flag = True  # no flags provided; rely on finite check below
+
+                    ok = bool(ok_flag) and np.all(np.isfinite(theta_out))
+                    return theta_out, ok
 
                 fit_ctx.update({"refit": _refit_wrapper})
 

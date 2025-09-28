@@ -596,6 +596,9 @@ def bootstrap_ci(
         y_arr = y_arr[:n]
     y_all = y_arr if y_arr.size == n else None
 
+    # Canonical starting point for jitter (allow caller override via theta0)
+    theta0 = np.asarray(fit.get("theta0", theta), float)
+
     # Center residuals if requested
     r = residual - residual.mean() if center_residuals else residual.copy()
 
@@ -622,6 +625,37 @@ def bootstrap_ci(
 
     # If we have no peaks, fall back to asymptotic CI to avoid crashy path
     if not peaks_obj:
+        def _peaks_from_theta(th_like: np.ndarray):
+            try:
+                from . import peaks as _peaks_mod
+            except Exception:
+                return []
+
+            arr = np.asarray(th_like, float).ravel()
+            if arr.size % 4 != 0 or arr.size == 0:
+                return []
+
+            out: list[_peaks_mod.Peak] = []
+            for i in range(arr.size // 4):
+                j = 4 * i
+                try:
+                    out.append(
+                        _peaks_mod.Peak(
+                            center=float(arr[j + 0]),
+                            height=float(arr[j + 1]),
+                            fwhm=float(arr[j + 2]),
+                            eta=float(arr[j + 3]),
+                        )
+                    )
+                except Exception:
+                    return []
+            return out
+
+        peaks_obj = _peaks_from_theta(theta0)
+
+    user_refit = fit.get("refit", None)
+
+    if not peaks_obj and not callable(user_refit):
         ymodel = predict_full if callable(predict_full) else (lambda _th: np.asarray(y_all, float))
         res_asym = asymptotic_ci(theta, residual, J, ymodel, alpha=alpha)
 
@@ -775,14 +809,39 @@ def bootstrap_ci(
             bounds=bounds, baseline=baseline
         )
         th = np.asarray(res.get("theta", theta_arr), float)
-        ok = True
+        ok = np.all(np.isfinite(th))
         return th, ok
 
     # --- Optional user-supplied refit from fit_ctx (batch path) ---
-    user_refit = fit.get("refit", None)
     if callable(user_refit):
+        from inspect import signature as _inspect_signature
+
+        try:
+            _user_sig = _inspect_signature(user_refit)
+        except Exception:
+            _user_sig = None
+
         def refit(theta_init, x, y):
-            out = user_refit(theta_init, locked_mask, bounds, x, y)
+            if _user_sig is not None:
+                for args in (
+                    (theta_init, locked_mask, bounds, x, y),
+                    (theta_init, x, y),
+                ):
+                    try:
+                        _user_sig.bind_partial(*args)
+                    except TypeError:
+                        continue
+                    out_local = user_refit(*args)
+                    break
+                else:
+                    out_local = user_refit(theta_init, locked_mask, bounds, x, y)
+            else:
+                try:
+                    out_local = user_refit(theta_init, locked_mask, bounds, x, y)
+                except TypeError:
+                    out_local = user_refit(theta_init, x, y)
+
+            out = out_local
             if isinstance(out, tuple) and len(out) == 2:
                 th_new, ok = out
                 th_new = np.asarray(th_new, float)
@@ -805,7 +864,6 @@ def bootstrap_ci(
         return None
 
     # Free-parameter mask for optional linear fallback
-    theta0 = np.asarray(fit.get("theta0", theta), float)
     P = theta.size
 
     locked_arr = _canon_locked_mask(locked_mask, P)
@@ -904,7 +962,17 @@ def bootstrap_ci(
                             break
                     except Exception:
                         pass
-                _, th_new, ok, err_msg, jit_info = f.result()
+                try:
+                    _, th_new, ok, err_msg, jit_info = f.result()
+                except Exception as e:
+                    # Count as failed draw; capture first few error messages
+                    n_fail += 1
+                    if len(refit_errors) < 5:
+                        refit_errors.append(f"{type(e).__name__}: {e}")
+                    done_cnt += 1
+                    _pulse(done_cnt)
+                    continue
+
                 jitter_applied_last, jitter_reason_last, jitter_rms_last = jit_info
                 done_cnt += 1
                 _pulse(done_cnt)
