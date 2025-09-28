@@ -14,11 +14,10 @@ import logging
 import warnings
 import time
 import math
+import os
 
 import numpy as np
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
 
 try:
     from scipy.optimize import nnls as _nnls
@@ -507,9 +506,8 @@ def bootstrap_ci(
 
     Notes
     -----
-    * Determinism: when ``seed`` is provided, each draw consumes a dedicated RNG
-      stream derived from ``seed``. This keeps results stable irrespective of
-      the worker count or execution order.
+    * Determinism: when ``seed`` is provided, a single RNG stream is used.
+      Reproducibility is guaranteed only for single-threaded execution.
     * Strict refit: callers can set ``fit_ctx['strict_refit'] = True`` to forbid
       the linearized/fast fallback path, ensuring every successful draw results
       from a full non-linear refit.
@@ -536,7 +534,7 @@ def bootstrap_ci(
     mode = fit.get("mode", "add") or "add"
     share_fwhm = bool(fit.get("lmfit_share_fwhm", False))
     share_eta = bool(fit.get("lmfit_share_eta", False))
-    jitter_scale = float(fit.get("bootstrap_jitter", 0.02))  # ~2% default
+    jitter_scale = float(fit.get("bootstrap_jitter", 0.0))
     allow_linear = bool(fit.get("allow_linear_fallback", True))
 
     if strict_refit and not (callable(fit.get("refit")) or fit.get("solver") is not None):
@@ -698,16 +696,15 @@ def bootstrap_ci(
     if share_fwhm or share_eta or not allow_linear:
         Jf = None
     use_linearized_fast_path = bool(Jf is not None and Jf.size and np.sum(free_mask) > 0)
-    if strict_refit:
-        Jf = None
+    if strict_refit or jitter_scale > 0:
         use_linearized_fast_path = False
+        Jf = None
 
     # Bootstrap loop
     if n_boot <= 0:
         raise ValueError("n_boot must be > 0")
 
-    rng_streams = _rng_streams(int(seed), int(n_boot)) if seed is not None else None
-    rng = None if rng_streams is not None else np.random.default_rng()
+    rng = np.random.default_rng(seed)
     T_list: List[np.ndarray] = []
     n_success = 0
     n_fail = 0
@@ -734,8 +731,7 @@ def bootstrap_ci(
             next_pulse_at = b + pulse_step
 
         # Residual resample
-        rng_local = rng_streams[b] if rng_streams is not None else rng
-        idx = rng_local.integers(0, n, size=n)
+        idx = rng.integers(0, n, size=n)
         r_b = r[idx]
         y_b = (y_hat + r_b)
 
@@ -743,7 +739,7 @@ def bootstrap_ci(
         theta_init = theta0.copy()
         if jitter_scale > 0 and np.any(free_mask):
             step = jitter_scale * np.maximum(np.abs(theta_init), 1.0)
-            theta_init[free_mask] += rng_local.normal(0.0, step[free_mask])
+            theta_init[free_mask] += rng.normal(0.0, step[free_mask])
 
         # Try refit
         ok = False
@@ -839,36 +835,14 @@ def bootstrap_ci(
                 return np.asarray(yhat)
 
             Y_list: List[np.ndarray] = []
-            w_req = 0
-            val_workers = workers
-            if val_workers in (None, False):
-                val_workers = fit.get("unc_workers", 0)
-            if val_workers not in (None, False):
-                try:
-                    w_req = int(val_workers)
-                except Exception as e:
-                    diag_notes.append(repr(e))
-                    w_req = 0
-            w = max(0, min(w_req, (os.cpu_count() or 1)))
-            w_norm: Optional[int] = int(w) if w > 0 else None
-            if w > 0:
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                with ThreadPoolExecutor(max_workers=w) as ex:
-                    futs = {ex.submit(_eval_one, int(i)): int(i) for i in sel}
-                    for f in as_completed(futs):
-                        try:
-                            Y_list.append(f.result())
-                        except Exception as e:
-                            diag_notes.append(repr(e))
-            else:
-                for i in sel:
-                    Y_list.append(_eval_one(int(i)))
+            for i in sel:
+                Y_list.append(_eval_one(int(i)))
 
             Y = np.vstack(Y_list)
             lo = np.quantile(Y, alpha/2, axis=0)
             hi = np.quantile(Y, 1 - alpha/2, axis=0)
             band = (x_all, lo, hi)
-            diagnostics["workers_used"] = w_norm
+            diagnostics["workers_used"] = None
             diagnostics["band_backend"] = "numpy"
             try:
                 import cupy as cp  # type: ignore
@@ -898,7 +872,7 @@ def bootstrap_ci(
         diag["notes"] = diag_notes
     # Merge any per-band diagnostics (e.g. workers_used, band_backend)
     diag.update(diagnostics)
-    diag["bootstrap_mode"] = "linearized" if (not strict_refit and linear_fallbacks > 0 and use_linearized_fast_path) else "refit"
+    diag["bootstrap_mode"] = "linearized" if use_linearized_fast_path else "refit"
 
     return UncertaintyResult(method="bootstrap", label="Bootstrap", stats=stats, diagnostics=diag, band=band)
 # ---------------------------------------------------------------------------
@@ -1277,14 +1251,3 @@ def bayesian_ci(
         diagnostics=diag,
         band=None,
     )
-
-
-def _rng_streams(seed: int, n: int):
-    """
-    Return ``n`` independent RNG generators derived deterministically from ``seed``.
-    This keeps bootstrap results stable regardless of the worker count or scheduling.
-    """
-    ss = np.random.SeedSequence(int(seed))
-    children = ss.spawn(int(n))
-    return [np.random.Generator(np.random.PCG64(s)) for s in children]
-
