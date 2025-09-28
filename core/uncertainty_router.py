@@ -160,6 +160,10 @@ def route_uncertainty(
         jitter = _norm_jitter(ctx.get("bootstrap_jitter", ctx.get("jitter", 0.0)))
         ctx["bootstrap_jitter"] = jitter
         ctx["strict_refit"] = True
+        if "unc_workers" not in ctx and "workers" in locals():
+            ctx["unc_workers"] = workers
+        if "unc_band_workers" not in ctx:
+            ctx["unc_band_workers"] = ctx.get("unc_workers", None)
         ctx["unc_use_gpu"] = bool(ctx.get("unc_use_gpu", False))
         # Jitter travels through fit_ctx so the engine can normalize/inspect it.
         return unc.bootstrap_ci(

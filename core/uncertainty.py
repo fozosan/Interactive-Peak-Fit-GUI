@@ -530,7 +530,7 @@ def bootstrap_ci(
     """
     t0 = time.time()
     fit_ctx = dict(fit_ctx or {})
-    # allow callers to pass normalized jitter explicitly
+    # Accept explicit jitter kw (normalized fraction) for GUI/batch calls
     if jitter is not None:
         try:
             fit_ctx["bootstrap_jitter"] = float(jitter)
@@ -737,12 +737,25 @@ def bootstrap_ci(
     else:
         refit = _robust_refit
 
+    # --- helper: canonicalize locked mask to parameter-length ---
+    def _canon_locked_mask(mask, P):
+        if mask is None:
+            return None
+        lm = np.asarray(mask, bool).ravel()
+        if lm.size == P:
+            return lm
+        if P % 4 == 0 and lm.size == (P // 4):
+            return np.repeat(lm, 4)
+        return None
+
     # Free-parameter mask for optional linear fallback
     theta0 = np.asarray(fit.get("theta0", theta), float)
     P = theta.size
-    free_mask = np.ones(P, bool)
-    if locked_mask is not None:
-        free_mask = ~np.asarray(locked_mask, bool)
+
+    locked_arr = _canon_locked_mask(locked_mask, P)
+    locked_mask = locked_arr if locked_arr is not None else None
+    free_mask = np.ones(P, bool) if locked_arr is None else ~locked_arr
+
     Jf = J[:, free_mask] if (J.ndim == 2) else None
     # Disable linear fallback when parameters are tied (LMFIT) or globally disabled
     if share_fwhm or share_eta or not allow_linear:
@@ -777,9 +790,19 @@ def bootstrap_ci(
 
         # jitter start (free params only)
         theta_init = theta0.copy()
-        if jitter_scale > 0 and np.any(free_mask):
-            step = jitter_scale * np.maximum(np.abs(theta_init), 1.0)
-            theta_init[free_mask] += rng_local.normal(0.0, step[free_mask])
+        jitter_applied = False
+        jitter_rms_local = 0.0
+        jitter_reason = None
+        if jitter_scale > 0:
+            if np.any(free_mask):
+                step = jitter_scale * np.maximum(np.abs(theta_init), 1.0)
+                jit = rng_local.normal(0.0, step[free_mask])
+                theta_init[free_mask] += jit
+                jitter_applied = bool(jit.size and np.any(np.abs(jit) > 0))
+                if jit.size:
+                    jitter_rms_local = float(np.sqrt(np.mean(np.square(jit))))
+            else:
+                jitter_reason = "no-free-params"
 
         ok = False
         th_new = theta_init
@@ -797,7 +820,7 @@ def bootstrap_ci(
                 if err_msg is None:
                     err_msg = f"{type(e).__name__}: {e}"
 
-        return b, np.asarray(th_new, float), bool(ok), err_msg
+        return b, np.asarray(th_new, float), bool(ok), err_msg, (jitter_applied, jitter_reason, jitter_rms_local)
 
     def _pulse(done_i: int):
         nonlocal next_pulse_at, last_pulse_t
@@ -808,6 +831,10 @@ def bootstrap_ci(
                 pass
             last_pulse_t = time.monotonic()
             next_pulse_at = done_i + pulse_step
+
+    jitter_applied_last = False
+    jitter_reason_last = None
+    jitter_rms_last = 0.0
 
     if draw_workers > 0:
         with ThreadPoolExecutor(max_workers=draw_workers) as ex:
@@ -821,7 +848,8 @@ def bootstrap_ci(
                             break
                     except Exception:
                         pass
-                _, th_new, ok, err_msg = f.result()
+                _, th_new, ok, err_msg, jit_info = f.result()
+                jitter_applied_last, jitter_reason_last, jitter_rms_last = jit_info
                 done_cnt += 1
                 _pulse(done_cnt)
                 if ok and np.all(np.isfinite(th_new)):
@@ -840,7 +868,8 @@ def bootstrap_ci(
                         break
                 except Exception:
                     pass
-            _, th_new, ok, err_msg = _one_draw(int(b))
+            _, th_new, ok, err_msg, jit_info = _one_draw(int(b))
+            jitter_applied_last, jitter_reason_last, jitter_rms_last = jit_info
             if ok and np.all(np.isfinite(th_new)):
                 T_list.append(th_new)
                 n_success += 1
@@ -851,7 +880,9 @@ def bootstrap_ci(
             _pulse(b + 1)
 
     if not T_list or len(T_list) < 2:
-        raise RuntimeError(f"Insufficient successful bootstrap refits (success={n_success}, fail={n_fail})")
+        raise RuntimeError(
+            f"Insufficient successful bootstrap refits (success={n_success}, fail={n_fail})"
+        )
 
     T = np.vstack(T_list)
     mean = T.mean(axis=0)
@@ -954,7 +985,6 @@ def bootstrap_ci(
         "pct_at_bounds_units": "percent",
         "aborted": bool(aborted or ((abort_evt.is_set()) if abort_evt is not None else False)),
         "runtime_s": float(time.time() - t0),
-        "theta_jitter_scale": float(jitter_scale),
         "band_source": "bootstrap-percentile" if band is not None else None,
         "band_reason": band_reason,
         "refit_errors": refit_errors,
@@ -966,6 +996,14 @@ def bootstrap_ci(
     diag.update(diagnostics)
     diag["bootstrap_mode"] = "linearized" if use_linearized_fast_path else "refit"
     diag["draw_workers_used"] = int(draw_workers) if draw_workers > 0 else None
+    diag["band_workers_used"] = int(band_workers) if band_workers > 0 else None
+    diag["theta_jitter_scale"] = float(jitter_scale)
+    diag["jitter_applied_any"] = bool(jitter_scale > 0)
+    diag["jitter_free_params"] = int(np.sum(free_mask))
+    diag["jitter_last_rms"] = float(jitter_rms_last)
+    diag["jitter_last_applied"] = bool(jitter_applied_last)
+    if jitter_reason_last:
+        diag["jitter_reason"] = jitter_reason_last
 
     return UncertaintyResult(method="bootstrap", label="Bootstrap", stats=stats, diagnostics=diag, band=band)
 # ---------------------------------------------------------------------------

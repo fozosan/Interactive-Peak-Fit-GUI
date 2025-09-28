@@ -3520,14 +3520,20 @@ class PeakFitApp:
         lo[3::4] = 0.0
         hi[3::4] = 1.0
 
-        import os
-
-        workers_req = int(self.cfg.get("unc_workers", 0))
-        workers = max(0, min(workers_req, (os.cpu_count() or 1)))
-        workers = None if workers <= 0 else workers
+        workers = None
+        try:
+            workers = int(self._resolve_unc_workers())
+        except Exception:
+            try:
+                workers = int(self.cfg.get("unc_workers", 0) or 0)
+            except Exception:
+                workers = 0
+        workers = workers if workers and workers > 0 else None
+        band_workers = workers
         alpha = self._safe_alpha()
         unc_sig = self._current_uncertainty_signature()
         jitter_val = float(unc_sig.get("jitter", 0.0) or 0.0)
+        jitter_frac = (jitter_val / 100.0) if "jitter_pct" in locals() else float(jitter_val)
         center_res = bool(self.center_resid_var.get())
 
         if method_key == "asymptotic":
@@ -3579,16 +3585,16 @@ class PeakFitApp:
                 "x_all": x_fit,
                 "y_all": y_fit,
                 "unc_workers": workers,
-                "unc_band_workers": workers,
+                "unc_band_workers": band_workers,
                 "unc_use_gpu": bool(getattr(self, "use_gpu_var", None) and self.use_gpu_var.get()),
                 "solver": boot_solver,
                 "strict_refit": True,
-                "bootstrap_jitter": jitter_val,
+                "bootstrap_jitter": jitter_frac,
             }
             # helpful breadcrumb in logs for parity/debugging
             try:
                 self.status_info(
-                    f"Bootstrap: jitter={jitter_val:.3f} (fraction), solver={boot_solver}, workers={workers or 0}"
+                    f"Bootstrap: jitter={jitter_frac:.3f}, workers={workers or 0}, band_workers={band_workers or 0}, solver={boot_solver}"
                 )
             except Exception:
                 pass
@@ -3611,7 +3617,6 @@ class PeakFitApp:
                 workers=workers,
                 n_boot=n_boot,
                 seed=seed_val,
-                jitter=jitter_val,
             )
             out = res
         elif method_key == "bayesian":
@@ -3791,10 +3796,16 @@ class PeakFitApp:
                 pass
             if abort_evt.is_set():
                 return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
-            # Cap workers
-            import os
-            workers_req = int(self.cfg.get("unc_workers", 0))
-            workers = max(0, min(workers_req, (os.cpu_count() or 1)))
+            workers_val = 0
+            try:
+                workers_val = int(self._resolve_unc_workers())
+            except Exception:
+                try:
+                    workers_val = int(self.cfg.get("unc_workers", 0) or 0)
+                except Exception:
+                    workers_val = 0
+            workers = workers_val if workers_val > 0 else None
+            band_workers = workers
 
             # Build locked mask (center/fwhm locks) for bootstrap/Bayesian refits
             locked_mask = np.zeros(theta.size, dtype=bool)
@@ -3806,6 +3817,7 @@ class PeakFitApp:
 
             alpha = self._safe_alpha()
             jitter_pct = self._safe_jitter_pct()
+            jitter_frac = jitter_pct / 100.0
             walkers = max(0, int(self.bayes_walkers_var.get() or 0))
             burn = max(0, int(self.bayes_burn_var.get()))
             steps = max(1, int(self.bayes_steps_var.get()))
@@ -3891,8 +3903,16 @@ class PeakFitApp:
                     "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
                     "abort_event": abort_evt,
                     "strict_refit": True,
-                    "bootstrap_jitter": jitter_pct / 100.0,
+                    "bootstrap_jitter": jitter_frac,
+                    "unc_band_workers": band_workers,
                 }
+
+                try:
+                    self.status_info(
+                        f"Bootstrap: jitter={jitter_frac:.3f}, workers={workers or 0}, band_workers={band_workers or 0}, solver={boot_solver}"
+                    )
+                except Exception:
+                    pass
 
                 out = core_uncertainty.bootstrap_ci(
                     theta=theta,
@@ -3909,7 +3929,6 @@ class PeakFitApp:
                     return_band=bool(self.show_ci_band_var.get()),
                     alpha=alpha,
                     center_residuals=bool(self.center_resid_var.get()),
-                    jitter=jitter_pct / 100.0,
                 )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
