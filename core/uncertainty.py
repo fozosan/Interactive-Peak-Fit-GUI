@@ -1202,12 +1202,12 @@ def bayesian_ci(
             band=None,
         )
 
-    chain = sampler.get_chain(discard=n_burn, thin=thin)
+    chain_post = sampler.get_chain(discard=n_burn, thin=thin)
     acc_frac = float(np.mean(sampler.acceptance_fraction))
-    if chain.ndim != 3:
-        chain = np.asarray(chain)
-        chain = chain.reshape((n_walkers, -1, dim))
-    n_post = chain.shape[1]
+    if chain_post.ndim != 3:
+        chain_post = np.asarray(chain_post)
+        chain_post = chain_post.reshape((n_walkers, -1, dim))
+    n_post = chain_post.shape[1]
     if n_post <= 0:
         # Avoid "index -1" crashes when burn==total or abort mid-burn
         return UncertaintyResult(
@@ -1219,7 +1219,7 @@ def bayesian_ci(
         )
     n_samp = n_post * n_walkers
 
-    flat = chain.reshape(-1, dim)
+    flat = chain_post.reshape(-1, dim)
     flat = flat[np.all(np.isfinite(flat), axis=1)]
     n_samp = flat.shape[0]
     if n_samp < 2:
@@ -1323,8 +1323,50 @@ def bayesian_ci(
             if key and key not in param_stats:
                 param_stats[key] = dict(stats_flat)
 
-    # Keep diagnostics light; no ESS/Rhat to avoid stalls
-    ess_min, rhat_max = float("nan"), float("nan")
+    # Build post-burn/thinned chain view for diagnostics
+    try:
+        chain = sampler.get_chain(flat=False)  # (total_steps, n_walkers, dim)
+        post = chain[-int(n_steps):, :, :]     # keep steps after burn
+        if int(thin) > 1:
+            post = post[::int(thin), :, :]
+    except Exception as e:
+        diag_notes.append(repr(e))
+        post = None
+
+    ess_min = float("nan")
+    rhat_max = float("nan")
+    mcse16 = mcse50 = mcse84 = float("nan")
+
+    if post is not None and post.size:
+        try:
+            ess = ess_autocorr(post)               # expects (steps, chains, dim)
+            ess_min = float(np.nanmin(np.asarray(ess)))
+        except Exception as e:
+            diag_notes.append(repr(e))
+        try:
+            rhat = rhat_split(post)                # expects (steps, chains, dim)
+            rhat_max = float(np.nanmax(np.asarray(rhat)))
+        except Exception as e:
+            diag_notes.append(repr(e))
+        # Conservative MCSE for marginal quantiles via per-walker quantile std
+        try:
+            W = post.shape[1]
+
+            def _mcse_q(q):
+                q_walker = np.nanquantile(post, q, axis=0)   # (walkers, dim)
+                return float(
+                    np.nanmax(
+                        np.nanstd(q_walker, axis=0, ddof=1)
+                        / max(np.sqrt(W), 1.0)
+                    )
+                )
+
+            mcse16 = _mcse_q(0.16)
+            mcse50 = _mcse_q(0.50)
+            mcse84 = _mcse_q(0.84)
+        except Exception as e:
+            diag_notes.append(repr(e))
+
     diag = {
         "n_draws": int(n_samp),
         "ess_min": float(ess_min),
@@ -1333,6 +1375,7 @@ def bayesian_ci(
         "seed": seed,
         "aborted": bool(aborted),
         "band_source": None,
+        "mcse": {"q16": float(mcse16), "q50": float(mcse50), "q84": float(mcse84)},
     }
     if diag_notes:
         diag["notes"] = diag_notes

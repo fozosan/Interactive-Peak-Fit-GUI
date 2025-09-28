@@ -3438,13 +3438,19 @@ class PeakFitApp:
     def _unc_method_label(self, info: dict) -> str:
         """Return a stable canonical label for an uncertainty method key."""
         m = str((info or {}).get("method", "")).strip().lower()
+        label = "unknown"
         if m.startswith("asymptotic"):
-            return "Asymptotic (JᵀJ)"
-        if m.startswith("bootstrap"):
-            return "Bootstrap"
-        if m.startswith("bayes"):
-            return "Bayesian (MCMC)"
-        return "unknown"
+            label = "Asymptotic (JᵀJ)"
+        elif m.startswith("bootstrap"):
+            label = "Bootstrap"
+        elif m.startswith("bayes"):
+            label = "Bayesian (MCMC)"
+        try:
+            if isinstance(label, str) and label.lower().startswith("bayes"):
+                label += "\n(ESS↑ and R̂→1 indicate better mixing; MCSE shows Monte Carlo error of reported quantiles.)"
+        except Exception:
+            pass
+        return label
     # --- END: local helper ---
 
     # --- BEGIN: batch uncertainty helpers ---
@@ -4074,6 +4080,22 @@ class PeakFitApp:
                 pass
 
             self.status_info(f"Computed {label} uncertainty.")
+            if isinstance(label, str) and label.startswith("Bayesian"):
+                try:
+                    out = res
+                    d = out.get("diagnostics", {}) if isinstance(out, dict) else getattr(out, "diagnostics", {}) or {}
+                    ess_min = d.get("ess_min"); rhat_max = d.get("rhat_max")
+                    mcse = d.get("mcse") or {}
+                    q16 = mcse.get("q16"); q50 = mcse.get("q50"); q84 = mcse.get("q84")
+                    self.log_threadsafe(
+                        f"Posterior health: ess_min={ess_min if ess_min is not None else 'nan'}, "
+                        f"rhat_max={rhat_max if rhat_max is not None else 'nan'}, "
+                        f"MCSE[q16/q50/q84]={q16 if q16 is not None else 'nan'}/"
+                        f"{q50 if q50 is not None else 'nan'}/"
+                        f"{q84 if q84 is not None else 'nan'}"
+                    )
+                except Exception:
+                    pass
             # --- cache signature for export parity ---
             try:
                 theta_sig = []
