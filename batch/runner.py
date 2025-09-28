@@ -32,9 +32,15 @@ def _norm_jitter(v, default=0.02):
 
     try:
         f = float(v)
-        return f / 100.0 if f > 1.0 else f
     except Exception:
         return float(default)
+    if f < 0:
+        f = 0.0
+    if f > 1.5:
+        f = f / 100.0
+    if f > 1.0:
+        f = 1.0
+    return f
 
 
 def _auto_seed(
@@ -415,6 +421,8 @@ def run_batch(
                 if boot_solver.lower().startswith("lmfit") and not has_lmfit:
                     boot_solver = solver_choice
 
+                jitter_frac = _norm_jitter(config.get("bootstrap_jitter", 0.02))
+                centers_ref = [float(p.center) for p in peaks_obj] if peaks_obj else []
                 fit_ctx.update(
                     {
                         "residual_fn": residual_fn,
@@ -427,9 +435,7 @@ def run_batch(
                         "peaks_out": peaks_obj,
                         "unc_workers": unc_workers,
                         "solver": boot_solver,
-                        "bootstrap_jitter": _norm_jitter(
-                            config.get("bootstrap_jitter", 0.02)
-                        ),
+                        "bootstrap_jitter": jitter_frac,
                         "lmfit_share_fwhm": bool(config.get("lmfit_share_fwhm", False)),
                         "lmfit_share_eta": bool(config.get("lmfit_share_eta", False)),
                         "theta0": np.asarray(
@@ -438,6 +444,9 @@ def run_batch(
                             else (res.get("p0") if res.get("p0") is not None else theta_hat),
                             float,
                         ),
+                        "strict_refit": True,
+                        "centers_ref": centers_ref,
+                        "relabel_by_center": True,
                     }
                 )
 
@@ -506,8 +515,7 @@ def run_batch(
                     jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
                     jac_mat = np.atleast_2d(np.asarray(jac_mat, float))
 
-                    # Make Bootstrap deterministic when a seed is provided by running single-threaded.
-                    workers_eff = None if (seed_val is not None) else unc_workers
+                    workers_eff = unc_workers if unc_workers > 0 else None
                     fit_ctx["unc_workers"] = workers_eff
                     unc_res = bootstrap_ci(
                         theta=theta_hat,

@@ -500,25 +500,49 @@ def bootstrap_ci(
     alpha: float = 0.05,
     center_residuals: bool = True,
     return_band: bool = False,
+    jitter: Optional[float] = None,
 ) -> UncertaintyResult:
     """
     Residual bootstrap with robust refitting and clear diagnostics.
-    - Works with both new and legacy run_fit_consistent signatures.
-    - Records up to 5 unique refit errors.
-    - Tiny re-seed retry before safe linearized fallback (when allowed).
+
+    Notes
+    -----
+    * Determinism: when ``seed`` is provided, each draw consumes a dedicated RNG
+      stream derived from ``seed``. This keeps results stable irrespective of
+      the worker count or execution order.
+    * Strict refit: callers can set ``fit_ctx['strict_refit'] = True`` to forbid
+      the linearized/fast fallback path, ensuring every successful draw results
+      from a full non-linear refit.
+    * Diagnostics: the returned diagnostics map contains a ``bootstrap_mode``
+      key (``"refit"`` or ``"linearized"``) describing which pathway produced
+      the accepted draws.
     """
     t0 = time.time()
-    fit = fit_ctx or {}
+    fit_ctx = dict(fit_ctx or {})
+    # allow callers to pass normalized jitter explicitly
+    if jitter is not None:
+        try:
+            fit_ctx["bootstrap_jitter"] = float(jitter)
+        except Exception:
+            pass
+    fit = fit_ctx
+    strict_refit = bool(fit.get("strict_refit", False))
     progress_cb = fit.get("progress_cb")
     abort_evt = fit.get("abort_event")
     peaks_obj = fit.get("peaks") or fit.get("peaks_out") or fit.get("peaks_in")
     solver = fit.get("solver", "classic")
+    fit.setdefault("solver", solver)
     baseline = fit.get("baseline", None)
     mode = fit.get("mode", "add") or "add"
     share_fwhm = bool(fit.get("lmfit_share_fwhm", False))
     share_eta = bool(fit.get("lmfit_share_eta", False))
     jitter_scale = float(fit.get("bootstrap_jitter", 0.02))  # ~2% default
     allow_linear = bool(fit.get("allow_linear_fallback", True))
+
+    if strict_refit and not (callable(fit.get("refit")) or fit.get("solver") is not None):
+        raise RuntimeError(
+            "bootstrap_ci(strict_refit=True) requires fit_ctx['solver'] or fit_ctx['refit']."
+        )
 
     # Inputs
     theta = np.asarray(theta, float)
@@ -582,6 +606,7 @@ def bootstrap_ci(
         diag.setdefault("n_linear_fallback", 0)
         diag.setdefault("linear_lambda", None)
         diag.setdefault("refit_errors", [])
+        diag["bootstrap_mode"] = "refit"
 
         return UncertaintyResult(
             method="bootstrap",
@@ -672,12 +697,17 @@ def bootstrap_ci(
     # Disable linear fallback when parameters are tied (LMFIT) or globally disabled
     if share_fwhm or share_eta or not allow_linear:
         Jf = None
+    use_linearized_fast_path = bool(Jf is not None and Jf.size and np.sum(free_mask) > 0)
+    if strict_refit:
+        Jf = None
+        use_linearized_fast_path = False
 
     # Bootstrap loop
     if n_boot <= 0:
         raise ValueError("n_boot must be > 0")
 
-    rng = np.random.default_rng(seed)
+    rng_streams = _rng_streams(int(seed), int(n_boot)) if seed is not None else None
+    rng = None if rng_streams is not None else np.random.default_rng()
     T_list: List[np.ndarray] = []
     n_success = 0
     n_fail = 0
@@ -704,7 +734,8 @@ def bootstrap_ci(
             next_pulse_at = b + pulse_step
 
         # Residual resample
-        idx = rng.integers(0, n, size=n)
+        rng_local = rng_streams[b] if rng_streams is not None else rng
+        idx = rng_local.integers(0, n, size=n)
         r_b = r[idx]
         y_b = (y_hat + r_b)
 
@@ -712,7 +743,7 @@ def bootstrap_ci(
         theta_init = theta0.copy()
         if jitter_scale > 0 and np.any(free_mask):
             step = jitter_scale * np.maximum(np.abs(theta_init), 1.0)
-            theta_init[free_mask] += rng.normal(0.0, step[free_mask])
+            theta_init[free_mask] += rng_local.normal(0.0, step[free_mask])
 
         # Try refit
         ok = False
@@ -867,6 +898,7 @@ def bootstrap_ci(
         diag["notes"] = diag_notes
     # Merge any per-band diagnostics (e.g. workers_used, band_backend)
     diag.update(diagnostics)
+    diag["bootstrap_mode"] = "linearized" if (not strict_refit and linear_fallbacks > 0 and use_linearized_fast_path) else "refit"
 
     return UncertaintyResult(method="bootstrap", label="Bootstrap", stats=stats, diagnostics=diag, band=band)
 # ---------------------------------------------------------------------------
@@ -1245,3 +1277,14 @@ def bayesian_ci(
         diagnostics=diag,
         band=None,
     )
+
+
+def _rng_streams(seed: int, n: int):
+    """
+    Return ``n`` independent RNG generators derived deterministically from ``seed``.
+    This keeps bootstrap results stable regardless of the worker count or scheduling.
+    """
+    ss = np.random.SeedSequence(int(seed))
+    children = ss.spawn(int(n))
+    return [np.random.Generator(np.random.PCG64(s)) for s in children]
+

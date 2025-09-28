@@ -1287,6 +1287,21 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
     }
 
     if stats_tbl:
+        if str(canon).lower().startswith("bayes"):
+            try:
+                def _center_key(rec: Mapping[str, Any]) -> float:
+                    blk = _as_mapping(rec.get("center"))
+                    val = _to_float(blk.get("est"))
+                    try:
+                        if math.isfinite(val):
+                            return float(val)
+                    except Exception:
+                        pass
+                    return float("inf")
+
+                stats_tbl.sort(key=_center_key)
+            except Exception:
+                pass
         # Build canonical param blocks and a row-oriented table
         param_blocks = _stats_to_param_blocks(stats_tbl)
         out.setdefault("param_stats", param_blocks)
