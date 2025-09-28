@@ -473,45 +473,49 @@ def run_batch(
                 ):
                     peaks_in = res.get("peaks_out") or res.get("peaks") or []
                     cfg = copy.deepcopy(config)
-                    mask = np.ones_like(x, bool)
-                    # Try modern signature first
+                    fit_mask = np.ones_like(x, bool)
+
+                    # Inject jittered theta into a copy of peaks so run_fit_consistent uses it as p0
+                    peaks_start = copy.deepcopy(peaks_in)
+                    try:
+                        if peaks_start and 4 * len(peaks_start) == int(np.asarray(theta_init).size):
+                            t = np.asarray(theta_init, float).ravel()
+                            for i, pk in enumerate(peaks_start):
+                                j = 4 * i
+                                pk.center = float(t[j + 0])
+                                pk.height = float(t[j + 1])
+                                pk.fwhm   = float(t[j + 2])
+                                pk.eta    = float(t[j + 3])
+                    except Exception:
+                        # Fall back to original peaks_in if anything goes sideways
+                        peaks_start = peaks_in
+
+                    # Single modern call; success if it returns without error
                     try:
                         out = _fit_api.run_fit_consistent(
                             x,
                             y,
-                            peaks_in,
+                            peaks_start,
                             cfg,
                             baseline=res.get("baseline"),
                             mode=res.get("mode", "add"),
-                            mask=mask,
+                            fit_mask=fit_mask,
+                            # kwargs below are harmless if not used by the fitter
                             theta_init=np.asarray(theta_init, float),
                             locked_mask=locked_mask,
                             bounds=bounds,
                         )
-                        th = np.asarray(out.get("theta", theta_init), float)
-                        ok = bool(out.get("fit_ok", out.get("ok", True)))
-                        return th, ok
-                    except Exception:
-                        # Legacy fallback: (x, y, cfg_with_peaks_dicts, ...)
-                        from core.data_io import peaks_to_dicts
-
-                        cfg_legacy = copy.deepcopy(cfg)
-                        cfg_legacy["peaks"] = peaks_to_dicts(peaks_in)
-                        try:
-                            out = _fit_api.run_fit_consistent(
-                                x,
-                                y,
-                                cfg_legacy,
-                                theta_init=np.asarray(theta_init, float),
-                                locked_mask=locked_mask,
-                                bounds=bounds,
-                                baseline=res.get("baseline"),
-                            )
-                            th = np.asarray(out.get("theta", theta_init), float)
-                            ok = bool(out.get("fit_ok", out.get("ok", True)))
-                            return th, ok
-                        except Exception:
-                            return np.asarray(theta_init, float), False
+                    except TypeError:
+                        out = _fit_api.run_fit_consistent(
+                            x,
+                            y,
+                            peaks_start,
+                            cfg,
+                            baseline=res.get("baseline"),
+                            mode=res.get("mode", "add"),
+                            fit_mask=fit_mask,
+                        )
+                    return np.asarray(out.get("theta", theta_init), float), True
 
                 fit_ctx.update({"refit": _refit_wrapper})
 
@@ -576,6 +580,9 @@ def run_batch(
                             "alpha": diag.get("alpha", alpha),
                         }
                 else:
+                    fit_ctx.update({
+                        "bayes_diag": bool(config.get("bayes_diag", True)),
+                    })
                     unc_res = route_uncertainty(
                         unc_method_canon,
                         theta_hat=theta_hat,

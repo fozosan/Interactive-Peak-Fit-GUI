@@ -156,7 +156,11 @@ def build_help(opts: dict) -> str:
         ---------------------------
         • Asymptotic (default band ON): fast covariance-based CIs using JᵀJ; prediction band via delta method; lightly smoothed.
         • Bootstrap: residual resampling → refit → parameter distributions; seeded for reproducibility; respects locks/bounds.
-        • Bayesian (emcee): posterior mean/SD and 95% credible intervals; ESS/R-hat diagnostics; band from posterior predictive.
+        • Bayesian (emcee): posterior mean/SD and 95% credible intervals; optional diagnostics (ESS, R̂, MCSE) and posterior-predictive band.
+          – ESS (effective sample size): higher is better; <200 suggests more steps/chains.
+          – R̂ (“R-hat”): should be ≈1.00; >1.05 suggests non-convergence.
+          – MCSE: Monte Carlo standard error of reported quantiles (q16/q50/q84); smaller is better.
+          You can toggle diagnostics via “Compute diagnostics (ESS/R̂/MCSE)” to reduce overhead on large runs.
           (If emcee is not installed, the app reports “NotAvailable”.)
 
         Batch processing
