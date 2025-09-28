@@ -17,6 +17,7 @@ import os
 import copy
 import numpy as np
 import math
+import logging
 
 if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safeguard
     os.environ.setdefault("MPLBACKEND", "Agg")
@@ -25,6 +26,9 @@ from core import data_io, models, peaks, signals, fit_api
 from core.residuals import build_residual
 from core.uncertainty import finite_diff_jacobian, bootstrap_ci, UncertaintyResult
 from core.uncertainty_router import route_uncertainty
+
+
+logger = logging.getLogger(__name__)
 
 
 def _norm_jitter(v, default=0.02):
@@ -550,6 +554,16 @@ def run_batch(
                         center_residuals=center_res,
                         return_band=True,
                     )
+                    if isinstance(unc_res, dict):
+                        diag = (unc_res.get("diagnostics") or {})
+                    else:
+                        diag = getattr(unc_res, "diagnostics", {}) or {}
+                    errs = (diag.get("refit_errors") or [])[:5]
+                    if errs:
+                        msg = "; ".join(map(str, errs))
+                        logger.info("bootstrap refit errors (first few): %s", msg)
+                        if log:
+                            log(f"bootstrap refit errors (first few): {msg}")
                     if isinstance(unc_res, UncertaintyResult):
                         diag = dict(unc_res.diagnostics)
                         unc_res = {
