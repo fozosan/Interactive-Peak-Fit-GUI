@@ -1050,7 +1050,7 @@ def bayesian_ci(
             diag_notes.append(repr(e))
             workers_req = 0
     w = max(0, min(workers_req, (os.cpu_count() or 1)))
-    pool = ThreadPoolExecutor(max_workers=w) if w > 0 else None
+    pool = None
     try:
         sampler = emcee.EnsembleSampler(
             n_walkers, dim, lambda z: log_prob(z), pool=pool

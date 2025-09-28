@@ -159,6 +159,7 @@ def route_uncertainty(
         J = jacobian(theta_hat) if callable(jacobian) else np.asarray(jacobian, float)
         jitter = _norm_jitter(ctx.get("bootstrap_jitter", ctx.get("jitter", 0.0)))
         ctx["bootstrap_jitter"] = jitter
+        # Jitter travels through fit_ctx so the engine can normalize/inspect it.
         return unc.bootstrap_ci(
             theta=theta_hat,
             residual=np.asarray(r0, float),

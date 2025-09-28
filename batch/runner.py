@@ -463,33 +463,38 @@ def run_batch(
                     peaks_in = res.get("peaks_out") or res.get("peaks") or []
                     cfg = copy.deepcopy(config)
                     mask = np.ones_like(x, bool)
+                    # Try modern signature first
                     try:
                         out = _fit_api.run_fit_consistent(
                             x,
                             y,
                             peaks_in,
                             cfg,
-                            res.get("baseline"),
-                            res.get("mode", "add"),
-                            mask,
-                            theta_init=theta_init,
+                            baseline=res.get("baseline"),
+                            mode=res.get("mode", "add"),
+                            mask=mask,
+                            theta_init=np.asarray(theta_init, float),
                             locked_mask=locked_mask,
                             bounds=bounds,
-                            baseline=res.get("baseline"),
                         )
-                        return out["theta"]
+                        return np.asarray(out.get("theta", theta_init), float)
                     except Exception:
+                        # Legacy fallback: (x, y, cfg_with_peaks_dicts, ...)
+                        from core.data_io import peaks_to_dicts
+
+                        cfg_legacy = copy.deepcopy(cfg)
+                        cfg_legacy["peaks"] = peaks_to_dicts(peaks_in)
                         try:
                             out = _fit_api.run_fit_consistent(
                                 x,
                                 y,
-                                peaks_in,
-                                cfg,
-                                res.get("baseline"),
-                                res.get("mode", "add"),
-                                mask,
+                                cfg_legacy,
+                                theta_init=np.asarray(theta_init, float),
+                                locked_mask=locked_mask,
+                                bounds=bounds,
+                                baseline=res.get("baseline"),
                             )
-                            return out["theta"]
+                            return np.asarray(out.get("theta", theta_init), float)
                         except Exception:
                             return np.asarray(theta_init, float)
 
