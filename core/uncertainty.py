@@ -962,7 +962,17 @@ def bootstrap_ci(
                             break
                     except Exception:
                         pass
-                _, th_new, ok, err_msg, jit_info = f.result()
+                try:
+                    _, th_new, ok, err_msg, jit_info = f.result()
+                except Exception as e:
+                    # Count as failed draw; capture first few error messages
+                    n_fail += 1
+                    if len(refit_errors) < 5:
+                        refit_errors.append(f"{type(e).__name__}: {e}")
+                    done_cnt += 1
+                    _pulse(done_cnt)
+                    continue
+
                 jitter_applied_last, jitter_reason_last, jitter_rms_last = jit_info
                 done_cnt += 1
                 _pulse(done_cnt)
