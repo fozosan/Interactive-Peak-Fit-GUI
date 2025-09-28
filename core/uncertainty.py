@@ -631,7 +631,7 @@ def bootstrap_ci(
             cfg["lmfit_share_eta"] = share_eta
         return cfg
 
-    def refit(theta_init, x, y):
+    def _robust_refit(theta_init, x, y):
         cfg = _mk_cfg()
         if _sig:
             params = set(_sig.parameters.keys())
@@ -684,6 +684,21 @@ def bootstrap_ci(
         th = np.asarray(res.get("theta", theta_init), float)
         ok = bool(res.get("fit_ok", res.get("ok", False)))
         return th, ok
+
+    # --- Optional user-supplied refit from fit_ctx (batch path) ---
+    user_refit = fit.get("refit", None)
+    if callable(user_refit):
+        def refit(theta_init, x, y):
+            out = user_refit(theta_init, locked_mask, bounds, x, y)
+            if isinstance(out, tuple) and len(out) == 2:
+                th_new, ok = out
+                th_new = np.asarray(th_new, float)
+                return th_new, bool(ok)
+            # Explicit contract: a bare array return is NOT success
+            th_new = np.asarray(out, float)
+            return th_new, False
+    else:
+        refit = _robust_refit
 
     # Free-parameter mask for optional linear fallback
     theta0 = np.asarray(fit.get("theta0", theta), float)
@@ -918,6 +933,11 @@ def bayesian_ci(
     # Optional tying (LMFIT "share FWHM/eta"): collapse tied params to one free scalar
     share_fwhm = bool((fit_ctx or {}).get("lmfit_share_fwhm", False))
     share_eta = bool((fit_ctx or {}).get("lmfit_share_eta", False))
+    # Pull bounds/locks from fit_ctx when not explicitly provided
+    if bounds is None and fit_ctx and "bounds" in fit_ctx:
+        bounds = fit_ctx.get("bounds")
+    if locked_mask is None and fit_ctx and "locked_mask" in fit_ctx:
+        locked_mask = fit_ctx.get("locked_mask")
     locked_eff = locked_mask.copy() if locked_mask is not None else np.zeros(theta_hat.size, bool)
     tie_groups: list[tuple[int, list[int]]] = []
     if share_fwhm:
