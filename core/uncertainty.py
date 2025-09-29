@@ -35,12 +35,26 @@ __all__ = [
     "bayesian_ci",
     "UncertaintyResult",
     "finite_diff_jacobian",
+    "BAND_SKIP_DIAG_DISABLED",
+    "BAND_SKIP_DIAG_UNHEALTHY",
+    "BAND_SKIP_INSUFF_DRAWS",
+    "BAND_SKIP_HARD_FAILURE",
+    "BAND_SKIP_ABORTED",
 ]
 
 log = logging.getLogger(__name__)
 
 BOOT_BAND_MIN_SAMPLES = 16
-BAYES_BAND_MIN_DRAWS = 50
+# Minimum number of total MCMC draws required before attempting a tiny band
+# (kept small to stay "tiny" and fast). Adjust if needed.
+BAYES_BAND_MIN_DRAWS = 32
+
+# Common skip reasons (keep strings stable across GUI/Batch/Tests)
+BAND_SKIP_DIAG_DISABLED = "diagnostics_disabled"
+BAND_SKIP_DIAG_UNHEALTHY = "diagnostics_unhealthy"
+BAND_SKIP_INSUFF_DRAWS = "insufficient_draws"
+BAND_SKIP_HARD_FAILURE = "hard_failure"
+BAND_SKIP_ABORTED = "aborted"
 
 
 @dataclass
@@ -104,6 +118,11 @@ class UncertaintyResult:
 
         def _values_for(st: Dict[str, Any], key: str, n: int) -> list[float]:
             val = st.get(key)
+            if val is None:
+                if key == "p2_5":
+                    val = st.get("p2.5")
+                elif key == "p97_5":
+                    val = st.get("p97.5")
             if isinstance(val, np.ndarray):
                 if val.ndim == 0:
                     seq = [val.item()] * n
@@ -1036,10 +1055,13 @@ def bootstrap_ci(
     # Optional percentile band (subsample to control memory)
     band = None
     band_reason = None
+    band_skip_reason = None
+    band_gated = False
     diagnostics: Dict[str, object] = {}
     if return_band:
         if predict_full is None or len(T_list) < BOOT_BAND_MIN_SAMPLES:
             band_reason = "missing model or insufficient samples"
+            band_gated = True
         else:
             T = np.vstack(T_list)
             max_use = min(T.shape[0], 4096)
@@ -1055,53 +1077,81 @@ def bootstrap_ci(
                     pass
                 return np.asarray(yhat)
 
-            Y_list: List[np.ndarray] = []
-            if band_workers > 0:
-                with ThreadPoolExecutor(max_workers=band_workers) as ex:
-                    futs = {ex.submit(_eval_one, int(i)): int(i) for i in sel}
-                    for f in as_completed(futs):
-                        try:
-                            Y_list.append(f.result())
-                        except Exception as e:
-                            diag_notes.append(repr(e))
-            else:
-                for i in sel:
-                    try:
-                        Y_list.append(_eval_one(int(i)))
-                    except Exception as e:
-                        diag_notes.append(repr(e))
+            n_used = int(sel.size)
+            if progress_cb:
+                try:
+                    progress_cb(
+                        f"Bootstrap band: using {n_used} resamples, workers={band_workers or 0}"
+                    )
+                except Exception:
+                    pass
 
-            band_backend = "numpy"
+            def _abort_requested() -> bool:
+                return bool(abort_evt is not None and getattr(abort_evt, "is_set", lambda: False)())
+
+            Y_list: List[np.ndarray] = []
             try:
-                import cupy as cp  # optional
-                if use_gpu:
-                    # If any element already on GPU, keep it; else copy to GPU
-                    if any("cupy" in str(type(y)).lower() for y in Y_list):
-                        Y = cp.stack([y if isinstance(y, cp.ndarray) else cp.asarray(y) for y in Y_list], axis=0)
-                    else:
-                        Y = cp.asarray(np.stack(Y_list, axis=0))
-                    lo = cp.quantile(Y, float(alpha/2), axis=0)
-                    hi = cp.quantile(Y, float(1 - alpha/2), axis=0)
-                    lo = cp.asnumpy(lo); hi = cp.asnumpy(hi)
-                    band_backend = "cupy"
+                if band_workers > 0:
+                    with ThreadPoolExecutor(max_workers=band_workers) as ex:
+                        for row_idx, pred_row in enumerate(ex.map(lambda idx: _eval_one(int(idx)), sel)):
+                            if _abort_requested():
+                                raise RuntimeError("aborted")
+                            Y_list.append(pred_row)
                 else:
+                    for idx_val in sel:
+                        if _abort_requested():
+                            raise RuntimeError("aborted")
+                        Y_list.append(_eval_one(int(idx_val)))
+            except Exception as exc:
+                aborted_eval = isinstance(exc, RuntimeError) and str(exc).lower() == "aborted"
+                if progress_cb:
+                    try:
+                        progress_cb(
+                            "Bootstrap band aborted." if aborted_eval else "Bootstrap band evaluation error."
+                        )
+                    except Exception:
+                        pass
+                diag_notes.append(repr(exc))
+                band_gated = True
+                band_skip_reason = BAND_SKIP_ABORTED if aborted_eval else "evaluation_error"
+                band_reason = "aborted" if aborted_eval else "evaluation_error"
+                Y_list = []
+            else:
+                band_backend = "numpy"
+                try:
+                    import cupy as cp  # optional
+                    if use_gpu:
+                        # If any element already on GPU, keep it; else copy to GPU
+                        if any("cupy" in str(type(y)).lower() for y in Y_list):
+                            Y = cp.stack([y if isinstance(y, cp.ndarray) else cp.asarray(y) for y in Y_list], axis=0)
+                        else:
+                            Y = cp.asarray(np.stack(Y_list, axis=0))
+                        lo = cp.quantile(Y, float(alpha/2), axis=0)
+                        hi = cp.quantile(Y, float(1 - alpha/2), axis=0)
+                        lo = cp.asnumpy(lo); hi = cp.asnumpy(hi)
+                        band_backend = "cupy"
+                    else:
+                        Y = np.stack(Y_list, axis=0)
+                        lo = np.quantile(Y, alpha/2, axis=0)
+                        hi = np.quantile(Y, 1 - alpha/2, axis=0)
+                except Exception:
+                    if not Y_list:
+                        raise RuntimeError("bootstrap_band_empty")
                     Y = np.stack(Y_list, axis=0)
                     lo = np.quantile(Y, alpha/2, axis=0)
                     hi = np.quantile(Y, 1 - alpha/2, axis=0)
-            except Exception:
-                Y = np.stack(Y_list, axis=0)
-                lo = np.quantile(Y, alpha/2, axis=0)
-                hi = np.quantile(Y, 1 - alpha/2, axis=0)
-                band_backend = "numpy"
+                    band_backend = "numpy"
 
-            band = (x_all, lo, hi)
-            diagnostics["band_backend"] = band_backend
-            diagnostics["band_workers_used"] = int(band_workers) if band_workers > 0 else None
-            try:
-                import cupy as cp  # optional
-                cp.get_default_memory_pool().free_all_blocks()
-            except Exception:
-                pass
+                band = (x_all, lo, hi)
+                band_gated = False
+                band_skip_reason = None
+                diagnostics["band_backend"] = band_backend
+                diagnostics["band_workers_used"] = int(band_workers) if band_workers > 0 else None
+                try:
+                    import cupy as cp  # optional
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
 
     diag = {
         "B": int(n_boot),
@@ -1120,6 +1170,9 @@ def bootstrap_ci(
         "refit_errors": refit_errors,
         "alpha": float(alpha),
     }
+    diag["band_gated"] = bool(band_gated)
+    if band_skip_reason is not None:
+        diag["band_skip_reason"] = band_skip_reason
     if diag_notes:
         diag["notes"] = diag_notes
     # Merge any per-band diagnostics (e.g. workers_used, band_backend)
@@ -1186,6 +1239,22 @@ def bayesian_ci(
     if _diag_flag is None:
         _diag_flag = (fit_ctx or {}).get("bayes_diag", False)
     diagnostics_enabled = bool(_diag_flag)
+    fc = dict(fit_ctx or {})
+    bayes_band_enabled: bool = bool(fc.get("bayes_band_enabled", False))
+    bayes_band_force: bool = bool(fc.get("bayes_band_force", False))
+    bayes_band_max_draws: int = int(fc.get("bayes_band_max_draws", 512) or 512)
+    thr_ess_min = float(fc.get("bayes_diag_ess_min", 200.0))
+    thr_rhat_max = float(fc.get("bayes_diag_rhat_max", 1.05))
+    thr_mcse_mean = float(fc.get("bayes_diag_mcse_mean", float("inf")))
+    band_workers = fc.get("unc_band_workers") if fc else None
+    try:
+        band_workers = int(band_workers) if band_workers is not None else None
+        if band_workers is not None and band_workers <= 0:
+            band_workers = None
+    except Exception:
+        band_workers = None
+    progress_cb = fc.get("progress_cb") if fc else None
+    abort_evt = fc.get("abort_event") if fc else None
     # Pull bounds/locks from fit_ctx when not explicitly provided
     if bounds is None and fit_ctx and "bounds" in fit_ctx:
         bounds = fit_ctx.get("bounds")
@@ -1297,11 +1366,6 @@ def bayesian_ci(
         n_walkers = max(4 * dim, 16)
     rng = np.random.default_rng(seed)
     # Optional progress + abort
-    abort_evt = None
-    progress_cb = None
-    if fit_ctx:
-        abort_evt, progress_cb = fit_ctx.get("abort_event"), fit_ctx.get("progress_cb")
-    np.random.seed(seed)
     p0 = np.empty((n_walkers, dim), float)
     for k in range(n_walkers):
         jitter = rng.normal(scale=0.01, size=P_free)
@@ -1321,9 +1385,26 @@ def bayesian_ci(
         w = 0
     pool = ThreadPoolExecutor(max_workers=w) if w > 0 else None
     try:
-        sampler = emcee.EnsembleSampler(
-            n_walkers, dim, lambda z: log_prob(z), pool=pool
-        )
+        try:
+            sampler = emcee.EnsembleSampler(
+                n_walkers,
+                dim,
+                lambda z: log_prob(z),
+                pool=pool,
+                random_state=int(seed) if seed is not None else None,
+            )
+        except TypeError:
+            sampler = emcee.EnsembleSampler(
+                n_walkers,
+                dim,
+                lambda z: log_prob(z),
+                pool=pool,
+            )
+            if seed is not None:
+                try:
+                    sampler.random_state = np.random.RandomState(int(seed))
+                except Exception:
+                    pass
         # Guardrails before sampling for very high dimension
         if dim > 40:
             n_burn = min(int(n_burn), 1000)
@@ -1447,7 +1528,7 @@ def bayesian_ci(
                 sds.append(nan)
                 lo2.append(nan)
                 hi97.append(nan)
-        return {"est": vals, "sd": sds, "p2_5": lo2, "p97_5": hi97}
+        return {"est": vals, "sd": sds, "p2.5": lo2, "p97.5": hi97}
 
     param_stats: Dict[str, Dict[str, Any]] = {
         "center": _stat_vec(0),
@@ -1462,15 +1543,15 @@ def bayesian_ci(
         param_stats["sigma"] = {
             "est": float(np.nanmedian(sigma_fin)),
             "sd": _nanstd_safe(sigma_fin),
-            "p2_5": float(np.nanpercentile(sigma_fin, 100.0 * (alpha / 2))),
-            "p97_5": float(np.nanpercentile(sigma_fin, 100.0 * (1.0 - alpha / 2))),
+            "p2.5": float(np.nanpercentile(sigma_fin, 100.0 * (alpha / 2))),
+            "p97.5": float(np.nanpercentile(sigma_fin, 100.0 * (1.0 - alpha / 2))),
         }
     else:
         param_stats["sigma"] = {
             "est": float("nan"),
             "sd": float("nan"),
-            "p2_5": float("nan"),
-            "p97_5": float("nan"),
+            "p2.5": float("nan"),
+            "p97.5": float("nan"),
         }
 
     def _scalar_stats_for(samples: np.ndarray) -> Dict[str, float]:
@@ -1480,11 +1561,11 @@ def bayesian_ci(
             return {
                 "est": float(np.nanmedian(sf)),
                 "sd": float(_nanstd_safe(sf)),
-                "p2_5": float(np.nanpercentile(sf, 100.0 * (alpha / 2))),
-                "p97_5": float(np.nanpercentile(sf, 100.0 * (1.0 - alpha / 2))),
+                "p2.5": float(np.nanpercentile(sf, 100.0 * (alpha / 2))),
+                "p97.5": float(np.nanpercentile(sf, 100.0 * (1.0 - alpha / 2))),
             }
         nan = float("nan")
-        return {"est": nan, "sd": nan, "p2_5": nan, "p97_5": nan}
+        return {"est": nan, "sd": nan, "p2.5": nan, "p97.5": nan}
 
     default_names = [f"p{i}" for i in range(P)]
     custom_names = list(param_names) if param_names is not None else []
@@ -1496,48 +1577,57 @@ def bayesian_ci(
             if key and key not in param_stats:
                 param_stats[key] = dict(stats_flat)
 
-    # Diagnostics: only compute heavy metrics when enabled
     ess_min = float("nan")
     rhat_max = float("nan")
     mcse_mean = float("nan")
 
     post = None
     post_swapped = None
-    if diagnostics_enabled:
+    try:
+        chain_full = sampler.get_chain(flat=False)
+        post = chain_full[-int(n_steps):, :, :]
+        if int(thin) > 1:
+            post = post[::int(thin), :, :]
+    except Exception as e:
+        diag_notes.append(repr(e))
+        post = None
+
+    if (
+        diagnostics_enabled
+        and post is not None
+        and post.size
+        and callable(progress_cb)
+    ):
         try:
-            chain_full = sampler.get_chain(flat=False)
-            post = chain_full[-int(n_steps):, :, :]
-            if int(thin) > 1:
-                post = post[::int(thin), :, :]
+            progress_cb("Computing Bayesian diagnostics (ESS/R̂/MCSE)…")
+        except Exception:
+            pass
+
+    if diagnostics_enabled and post is not None and post.size:
+        try:
+            post_swapped = np.swapaxes(post, 0, 1)
+            ess_val = ess_autocorr(post_swapped)
+            ess_arr = np.asarray(ess_val, dtype=float)
+            if ess_arr.size:
+                ess_min = float(np.nanmin(ess_arr))
         except Exception as e:
             diag_notes.append(repr(e))
-            post = None
-
-        if post is not None and post.size:
-            try:
-                post_swapped = np.swapaxes(post, 0, 1)
-                ess_val = ess_autocorr(post_swapped)
-                ess_arr = np.asarray(ess_val, dtype=float)
-                if ess_arr.size:
-                    ess_min = float(np.nanmin(ess_arr))
-            except Exception as e:
-                diag_notes.append(repr(e))
-            try:
-                post_for_rhat = post_swapped if post_swapped is not None else np.swapaxes(post, 0, 1)
-                rhat_val = rhat_split(post_for_rhat)
-                rhat_arr = np.asarray(rhat_val, dtype=float)
-                if rhat_arr.size:
-                    rhat_max = float(np.nanmax(rhat_arr))
-            except Exception as e:
-                diag_notes.append(repr(e))
-            try:
-                if np.isfinite(ess_min) and ess_min > 0 and T_full.size:
-                    sd_vals = np.nanstd(T_full, axis=0, ddof=1)
-                    mcse_vals = np.asarray(sd_vals, float) / np.sqrt(max(ess_min, 1.0))
-                    if mcse_vals.size:
-                        mcse_mean = float(np.nanmax(mcse_vals))
-            except Exception as e:
-                diag_notes.append(repr(e))
+        try:
+            post_for_rhat = post_swapped if post_swapped is not None else np.swapaxes(post, 0, 1)
+            rhat_val = rhat_split(post_for_rhat)
+            rhat_arr = np.asarray(rhat_val, dtype=float)
+            if rhat_arr.size:
+                rhat_max = float(np.nanmax(rhat_arr))
+        except Exception as e:
+            diag_notes.append(repr(e))
+        try:
+            if np.isfinite(ess_min) and ess_min > 0 and T_full.size:
+                sd_vals = np.nanstd(T_full, axis=0, ddof=1)
+                mcse_vals = np.asarray(sd_vals, float) / np.sqrt(max(ess_min, 1.0))
+                if mcse_vals.size:
+                    mcse_mean = float(np.nanmax(mcse_vals))
+        except Exception as e:
+            diag_notes.append(repr(e))
 
     diag = {
         "n_draws": int(n_samp),
@@ -1548,16 +1638,152 @@ def bayesian_ci(
         "seed": seed,
         "aborted": bool(aborted),
         "band_source": None,
+        "band_gated": False,
+        "band_forced": False,
         "diagnostics_enabled": bool(diagnostics_enabled),
     }
     if diag_notes:
         diag["notes"] = diag_notes
 
-    # Never compute bands for Bayesian (disabled)
+    band_tuple: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+    should_attempt_band = bool(bayes_band_enabled) and bool(post is not None and post.size) and callable(predict_full)
+    if should_attempt_band and not (diagnostics_enabled or bayes_band_force):
+        if callable(progress_cb):
+            try:
+                progress_cb(
+                    "Bayesian band skipped: diagnostics are OFF (turn on diagnostics or toggle 'Force band')."
+                )
+            except Exception:
+                pass
+        diag["band_gated"] = True
+        diag["band_forced"] = False
+        diag["band_skip_reason"] = BAND_SKIP_DIAG_DISABLED
+        should_attempt_band = False
+
+    if should_attempt_band:
+        n_total = int(n_samp)
+        max_draws = max(1, int(bayes_band_max_draws))
+        min_required = min(BAYES_BAND_MIN_DRAWS, max_draws)
+        if n_total < min_required:
+            diag["band_gated"] = True
+            diag["band_forced"] = bool(bayes_band_force)
+            diag["band_draws_used"] = int(n_total)
+            diag["band_skip_reason"] = BAND_SKIP_INSUFF_DRAWS
+            if callable(progress_cb):
+                try:
+                    progress_cb(
+                        f"Bayesian band skipped: draws={n_total} < required {min_required}"
+                    )
+                except Exception:
+                    pass
+        else:
+            stride = 1 if n_total <= max_draws else int(np.ceil(n_total / max_draws))
+            idx = np.arange(0, n_total, stride, dtype=int)
+            if idx.size > max_draws:
+                idx = idx[:max_draws]
+            n_used = int(idx.size)
+
+            if callable(progress_cb):
+                try:
+                    progress_cb(
+                        f"Bayesian band: draws={n_total}, using {n_used} (stride={stride}), "
+                        f"workers={band_workers or 0}"
+                    )
+                except Exception:
+                    pass
+
+            hard_failure = bool(aborted) or n_used <= 0
+            gate_bad = False
+            if diagnostics_enabled and not bayes_band_force:
+                cond_ess = (not np.isfinite(thr_ess_min)) or (np.isfinite(ess_min) and ess_min >= thr_ess_min)
+                cond_rhat = (not np.isfinite(thr_rhat_max)) or (np.isfinite(rhat_max) and rhat_max <= thr_rhat_max)
+                cond_mcse = (not np.isfinite(thr_mcse_mean)) or (np.isfinite(mcse_mean) and mcse_mean <= thr_mcse_mean)
+                gate_bad = (not cond_ess) or (not cond_rhat) or (not cond_mcse) or bool(aborted)
+
+            if hard_failure:
+                diag["band_gated"] = True
+                diag["band_forced"] = bool(bayes_band_force)
+                diag["band_draws_used"] = n_used
+                diag["band_skip_reason"] = BAND_SKIP_HARD_FAILURE
+            elif gate_bad and not bayes_band_force:
+                diag["band_gated"] = True
+                diag["band_forced"] = False
+                diag["band_draws_used"] = n_used
+                diag["band_skip_reason"] = BAND_SKIP_DIAG_UNHEALTHY
+                diag["band_gating_thresholds"] = {
+                    "ess_min_req": thr_ess_min,
+                    "ess_min": ess_min,
+                    "rhat_max_req": thr_rhat_max,
+                    "rhat_max": rhat_max,
+                    "mcse_mean_req": thr_mcse_mean,
+                    "mcse_mean": mcse_mean,
+                }
+                if callable(progress_cb):
+                    try:
+                        progress_cb(
+                            f"Bayesian band gated: ESS_min={ess_min:.3g} (≥{thr_ess_min}), "
+                            f"R̂_max={rhat_max:.3g} (≤{thr_rhat_max}), MCSE_mean={mcse_mean:.3g} (≤{thr_mcse_mean})."
+                        )
+                    except Exception:
+                        pass
+            else:
+                diag["band_gated"] = False
+                diag["band_forced"] = bool(bayes_band_force)
+                diag["band_draws_used"] = n_used
+                diag["band_stride"] = int(stride)
+                diag.pop("band_skip_reason", None)
+                diag.pop("band_gating_thresholds", None)
+                theta_sel = T_full[idx, :]
+
+                def _evaluate(theta_vec: np.ndarray) -> np.ndarray:
+                    return np.asarray(predict_full(theta_vec), float)
+
+                xb = np.asarray(x_all, float)
+                Y = np.empty((n_used, xb.size), float)
+                try:
+                    if band_workers and band_workers > 1:
+                        with ThreadPoolExecutor(max_workers=band_workers) as pool:
+                            for row_idx, pred_row in enumerate(pool.map(_evaluate, theta_sel)):
+                                if abort_evt is not None and getattr(abort_evt, "is_set", lambda: False)():
+                                    raise RuntimeError("aborted")
+                                Y[row_idx, :] = np.asarray(pred_row, float)
+                    else:
+                        for row_idx in range(n_used):
+                            if abort_evt is not None and getattr(abort_evt, "is_set", lambda: False)():
+                                raise RuntimeError("aborted")
+                            Y[row_idx, :] = np.asarray(_evaluate(theta_sel[row_idx, :]), float)
+                except Exception as exc:
+                    diag_notes.append(repr(exc))
+                    diag["band_gated"] = True
+                    diag["band_forced"] = bool(bayes_band_force)
+                    diag["band_skip_reason"] = (
+                        BAND_SKIP_ABORTED
+                        if isinstance(exc, RuntimeError) and str(exc).lower() == "aborted"
+                        else "evaluation_error"
+                    )
+                else:
+                    qlo = 100.0 * (alpha / 2.0)
+                    qhi = 100.0 * (1.0 - alpha / 2.0)
+                    lo = np.nanpercentile(Y, qlo, axis=0)
+                    hi = np.nanpercentile(Y, qhi, axis=0)
+                    band_tuple = (xb, lo, hi)
+                    diag["band_source"] = "posterior_predictive_subset"
+                    if callable(progress_cb):
+                        try:
+                            if diag["band_forced"]:
+                                progress_cb("Bayesian band computed (FORCED despite diagnostics).")
+                            else:
+                                progress_cb("Bayesian band computed.")
+                        except Exception:
+                            pass
+
+    if diag_notes and "notes" not in diag:
+        diag["notes"] = diag_notes
+
     return UncertaintyResult(
         method="bayesian",
         label="Bayesian (MCMC)",
         stats=param_stats,
         diagnostics=diag,
-        band=None,
+        band=band_tuple,
     )

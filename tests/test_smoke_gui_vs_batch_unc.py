@@ -94,6 +94,14 @@ def _fit_once_gui_style(x, y, *, config):
         "bootstrap_jitter": float(config.get("bootstrap_jitter", 0.02)) if float(config.get("bootstrap_jitter", 0.02)) <= 1.0 else float(config.get("bootstrap_jitter", 0.02))/100.0,
     }
 
+    seed_cfg = config.get("perf_seed", "")
+    try:
+        seed_val = int(seed_cfg) if str(seed_cfg) not in ("", "None") else None
+    except Exception:
+        seed_val = None
+    if not bool(config.get("perf_seed_all", False)):
+        seed_val = None
+
     unc_res = bootstrap_ci(
         theta=theta_hat,
         residual=np.asarray(residual_vec, float),
@@ -106,7 +114,7 @@ def _fit_once_gui_style(x, y, *, config):
         param_names=out.get("param_names"),
         locked_mask=out.get("locked_mask"),
         n_boot=int(config.get("bootstrap_n", 60)),
-        seed=int(config.get("bootstrap_seed", 1234)) or None,
+        seed=seed_val,
         workers=None,
         alpha=float(config.get("unc_alpha", 0.05)),
         center_residuals=bool(config.get("unc_center_resid", True)),
@@ -127,7 +135,8 @@ def test_bootstrap_gui_vs_batch_match(tmp_path):
         "unc_boot_solver": "modern_trf",
         "unc_center_resid": True,
         "bootstrap_n": 60,
-        "bootstrap_seed": 1234,
+        "perf_seed_all": True,
+        "perf_seed": 1234,
         "bootstrap_jitter": 0.02,
         "export_unc_wide": True,
         "unc_alpha": 0.05,
