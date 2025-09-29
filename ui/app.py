@@ -2236,19 +2236,17 @@ class PeakFitApp:
 
     def _on_uncertainty_method_changed(self, *_):
         method_key = self._unc_selected_method_key()
-        if method_key in ("asymptotic", "bootstrap"):
-            band_should_enable = True
-        elif method_key == "bayesian":
+
+        # Always keep the checkbox enabled; when switching to Bayesian, untick it.
+        if method_key == "bayesian":
             try:
-                band_should_enable = bool(
-                    self.bayes_band_enabled_var.get()
-                    and (self.bayes_diag_var.get() or self.bayes_band_force_var.get())
-                )
-            except Exception:
-                band_should_enable = False
-        else:
-            band_should_enable = False
-        self._set_ci_toggle_state(band_should_enable)
+                self._suspend_ci_trace = True
+                self.show_ci_band_var.set(False)  # untick but DO NOT disable
+            finally:
+                self._suspend_ci_trace = False
+
+        # Checkbox remains enabled regardless of method; actual rendering depends on band availability.
+        self._set_ci_toggle_state(True)
 
         is_boot = (method_key == "bootstrap")
         jitter = getattr(self, "_jitter_entry", None)
@@ -3939,7 +3937,12 @@ class PeakFitApp:
             )
             out = res
         elif method_key == "bayesian":
-            # Pre-run user notice (only if the user intends to see a band)
+            # Pre-run user notices (only if the user intends to see a band)
+            try:
+                if self.show_ci_band_var.get() and not self.bayes_band_enabled_var.get():
+                    self.status_warn("Bayesian band is disabled. Turn on 'Enable posterior band' to plot the band.")
+            except Exception:
+                pass
             try:
                 if self.show_ci_band_var.get() and self.bayes_band_enabled_var.get():
                     if (not self.bayes_diag_var.get()) and (not self.bayes_band_force_var.get()):
@@ -4015,7 +4018,6 @@ class PeakFitApp:
                 fit_ctx=fit_ctx,
                 locked_mask=locked_mask,
                 bounds=(lo, hi),
-                return_band=False,
                 workers=workers,
                 n_walkers=(walkers or None),
                 n_burn=burn,
@@ -4181,6 +4183,10 @@ class PeakFitApp:
             burn = self._safe_bayes_burn()
             steps = self._safe_bayes_steps()
             thin = self._safe_bayes_thin()
+            prior_sigma = str(
+                self.bayes_prior_var.get()
+                or self.cfg.get("bayes_prior_sigma", "half_cauchy")
+            )
 
             self._cfg_set("unc_center_resid", bool(self.center_resid_var.get()))
             self._cfg_set("bayes_walkers", walkers)
@@ -4289,6 +4295,20 @@ class PeakFitApp:
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
                 return out
             if method == "bayesian":
+                # Pre-run user notices (only if the user intends to see a band)
+                try:
+                    if self.show_ci_band_var.get() and not self.bayes_band_enabled_var.get():
+                        self.status_warn("Bayesian band is disabled. Turn on 'Enable posterior band' to plot the band.")
+                except Exception:
+                    pass
+                try:
+                    if self.show_ci_band_var.get() and self.bayes_band_enabled_var.get():
+                        if (not self.bayes_diag_var.get()) and (not self.bayes_band_force_var.get()):
+                            self.status_warn(
+                                "Bayesian band will NOT be computed: diagnostics are OFF. Enable diagnostics or toggle 'Force band'."
+                            )
+                except Exception:
+                    pass
                 def predict_full(th):
                     total = np.zeros_like(x_fit, float)
                     for i in range(len(self.peaks)):
@@ -4364,8 +4384,6 @@ class PeakFitApp:
                     seed=seed_val,
                     fit_ctx=fit_ctx,
                     locked_mask=locked_mask,
-                    # Force off: bands for MCMC are disabled
-                    return_band=False,
                     n_walkers=(walkers or None),
                     n_burn=burn,
                     n_steps=steps,
