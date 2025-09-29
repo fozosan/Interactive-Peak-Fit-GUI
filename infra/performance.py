@@ -123,16 +123,17 @@ def cache_baseline_enabled() -> bool:
 
 
 def set_seed(seed: Optional[int]) -> None:
+    """Record a preferred seed for deterministic ops without globally seeding NumPy."""
+
     global _SEED
     _SEED = int(seed) if seed is not None else None
-    if _SEED is None:
-        return
-    np.random.seed(_SEED)
-    if _CUPY_OK:  # pragma: no cover - optional
-        try:
-            _cp.random.seed(_SEED)
-        except Exception:
-            pass
+    # Do NOT call np.random.seed() here; callers (bootstrap/emcee/etc.) pass explicit seeds for reproducibility.
+    try:
+        import cupy as _cp  # type: ignore
+        _ = _cp.random  # ensure module loads
+        # Avoid global CuPy seeding here as well
+    except Exception:
+        pass
 
 
 def set_max_workers(n: int) -> None:

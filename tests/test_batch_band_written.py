@@ -28,10 +28,9 @@ def test_batch_band_written(tmp_path):
         "perf_gpu": False,
         "perf_cache_baseline": True,
         "perf_seed_all": False,
-        "perf_max_workers": 0,
+        "perf_max_workers": 1,
         "output_dir": str(tmp_path),
         "output_base": "batch",
-        "unc_workers": 0,
     }
 
     ok, total = runner.run_batch([str(p)], cfg, compute_uncertainty=True, unc_method="Asymptotic")

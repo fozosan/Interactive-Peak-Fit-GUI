@@ -23,10 +23,9 @@ def test_batch_toggle_respected(tmp_path):
         "auto_max":5,
         "classic":{},
         "baseline_uses_fit_range":True,
-        "perf_numba":False,"perf_gpu":False,"perf_cache_baseline":True,"perf_seed_all":False,"perf_max_workers":0,
+        "perf_numba":False,"perf_gpu":False,"perf_cache_baseline":True,"perf_seed_all":False,"perf_max_workers":1,
         "output_dir":str(tmp_path),
         "output_base":"batch",
-        "unc_workers":0,
     }
 
     # OFF: no per-file unc files, no batch uncertainty
