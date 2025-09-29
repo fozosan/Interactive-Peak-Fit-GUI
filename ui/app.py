@@ -828,7 +828,6 @@ class PeakFitApp:
         self.cfg.setdefault("perf_seed_all", False)
         self.cfg.setdefault("perf_seed", "")
         self.cfg.setdefault("perf_max_workers", 0)
-        self.cfg.setdefault("unc_workers", 0)
         self.cfg.setdefault("last_template_name", self.cfg.get("auto_apply_template_name", ""))
         self.cfg.setdefault("export_unc_wide", False)
         self.cfg.setdefault("unc_alpha", 0.05)
@@ -1016,9 +1015,6 @@ class PeakFitApp:
             self._on_uncertainty_method_changed()
         except Exception:
             pass
-        # NOTE(surgical): uncertainty workers now come from Performance.max_workers only
-        # (keep any existing cfg key intact but unused to avoid migrations)
-        self.unc_workers_var = tk.IntVar(value=int(self.cfg.get("perf_max_workers", 0)))
         self.perf_numba = tk.BooleanVar(value=bool(self.cfg.get("perf_numba", False)))
         self.perf_gpu = tk.BooleanVar(value=bool(self.cfg.get("perf_gpu", False)))
         self.perf_cache_baseline = tk.BooleanVar(value=bool(self.cfg.get("perf_cache_baseline", True)))
@@ -1038,10 +1034,30 @@ class PeakFitApp:
         self.bayes_steps_var = tk.IntVar(value=int(self.cfg.get("bayes_steps", 4000)))
         self.bayes_thin_var = tk.IntVar(value=int(self.cfg.get("bayes_thin", 1)))
         self.bayes_prior_var = tk.StringVar(value=str(self.cfg.get("bayes_prior_sigma", "half_cauchy")))
+        def _on_prior_change(*_e):
+            try:
+                self._cfg_set("bayes_prior_sigma", str(self.bayes_prior_var.get()))
+            except Exception:
+                pass
+
+        try:
+            self.bayes_prior_var.trace_add("write", _on_prior_change)
+        except Exception:
+            pass
         self.bayes_diag_var = tk.BooleanVar(
             value=bool(
                 self.cfg.get("bayes_diagnostics", self.cfg.get("bayes_diag", False))
             )
+        )
+        # --- Bayesian band + diagnostics GUI state ---
+        self.bayes_band_enabled_var = tk.BooleanVar(value=bool(self.cfg.get("bayes_band_enabled", False)))
+        self.bayes_band_force_var = tk.BooleanVar(value=bool(self.cfg.get("bayes_band_force", False)))
+        self.bayes_band_max_draws_var = tk.IntVar(value=int(self.cfg.get("bayes_band_max_draws", 512)))
+        self.bayes_thresh_ess_min_var = tk.DoubleVar(value=float(self.cfg.get("bayes_diag_ess_min", 200.0)))
+        self.bayes_thresh_rhat_max_var = tk.DoubleVar(value=float(self.cfg.get("bayes_diag_rhat_max", 1.05)))
+        _mcse_cfg = self.cfg.get("bayes_diag_mcse_mean", float("inf"))
+        self.bayes_thresh_mcse_mean_str = tk.StringVar(
+            value=("" if not np.isfinite(_mcse_cfg) else str(_mcse_cfg))
         )
         self.seed_var = tk.StringVar(value=str(self.cfg.get("perf_seed", "")))
         self.seed_var.trace_add("write", lambda *_: self.apply_performance())
@@ -1431,78 +1447,66 @@ class PeakFitApp:
 
         # Uncertainty panel
         unc_box = ttk.Labelframe(right, text="Uncertainty"); unc_box.pack(fill=tk.X, pady=4)
-        self.unc_method_combo = ttk.Combobox(
-            unc_box,
-            textvariable=self.unc_method,
-            state="readonly",
-            values=["Asymptotic", "Bootstrap", "Bayesian"],
-            width=14,
+        unc_method_frame = ttk.Labelframe(unc_box, text="Method")
+        unc_method_frame.pack(fill=tk.X, padx=4, pady=4)
+        self._unc_method_frame = unc_method_frame
+        boot_solver_label = SOLVER_LABELS.get(self._select_bootstrap_solver(), self._select_bootstrap_solver())
+        boot_label = f"Bootstrap (base solver = {boot_solver_label})"
+        self._unc_asym_radio = ttk.Radiobutton(
+            unc_method_frame,
+            text="Asymptotic",
+            value="Asymptotic",
+            variable=self.unc_method,
+            command=self._on_unc_method_change,
         )
-        self.unc_method_combo.pack(side=tk.LEFT, padx=4)
-        self.unc_method_combo.bind("<<ComboboxSelected>>", self._on_unc_method_change)
-
-        self.unc_workers_frame = ttk.Frame(unc_box)
-        self.unc_workers_label = ttk.Label(self.unc_workers_frame, text="Bootstrap workers:")
-        self.unc_workers_label.pack(side=tk.LEFT)
-        self.unc_workers_spin = ttk.Spinbox(
-            self.unc_workers_frame,
-            from_=0,
-            to=64,
-            textvariable=self.unc_workers_var,
-            width=5,
+        self._unc_asym_radio.grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        self._unc_boot_radio = ttk.Radiobutton(
+            unc_method_frame,
+            text=boot_label,
+            value=boot_label,
+            variable=self.unc_method,
+            command=self._on_unc_method_change,
         )
-        self.unc_workers_spin.pack(side=tk.LEFT, padx=2)
+        self._unc_boot_radio.grid(row=0, column=1, sticky="w", padx=4, pady=2)
+        self._unc_bayes_radio = ttk.Radiobutton(
+            unc_method_frame,
+            text="Bayesian",
+            value="Bayesian",
+            variable=self.unc_method,
+            command=self._on_unc_method_change,
+        )
+        self._unc_bayes_radio.grid(row=0, column=2, sticky="w", padx=4, pady=2)
 
         # Bootstrap advanced options (visible only when method == "bootstrap")
-        boot_row = ttk.Frame(unc_box); boot_row.pack(fill=tk.X, pady=2)
-        ttk.Label(boot_row, text="Draws:").pack(side=tk.LEFT)
+        self._boot_options_row = ttk.Frame(unc_box)
+        ttk.Label(self._boot_options_row, text="Draws:").pack(side=tk.LEFT)
         self.boot_n_var = tk.IntVar(value=int(self.cfg.get("bootstrap_n", 500)))
         ttk.Spinbox(
-            boot_row,
-            from_=50, to=100000, increment=50, width=8,
+            self._boot_options_row,
+            from_=50,
+            to=100000,
+            increment=50,
+            width=8,
             textvariable=self.boot_n_var,
-            command=lambda: self._cfg_set("bootstrap_n", int(self.boot_n_var.get()))
+            command=lambda: self._cfg_set("bootstrap_n", int(self.boot_n_var.get())),
         ).pack(side=tk.LEFT, padx=4)
-        ttk.Label(boot_row, text="Seed:").pack(side=tk.LEFT)
-        self.boot_seed_var = tk.IntVar(value=int(self.cfg.get("bootstrap_seed", 0)))
-        _boot_seed_entry = ttk.Entry(boot_row, width=10, textvariable=self.boot_seed_var)
-        _boot_seed_entry.pack(side=tk.LEFT, padx=4)
-        _boot_seed_entry.bind(
-            "<FocusOut>",
-            lambda _e: self._cfg_set("bootstrap_seed", int(self.boot_seed_var.get() or 0))
-        )
-        self._boot_options_row = boot_row
 
-        def _toggle_boot_row():
-            try:
-                mkey = self._unc_selected_method_key().lower()
-                if mkey == "bootstrap":
-                    self._boot_options_row.pack(fill=tk.X, pady=2)
-                else:
-                    self._boot_options_row.forget()
-            except Exception:
-                pass
-        _toggle_boot_row()
-        try:
-            self.unc_method_combo.bind(
-                "<<ComboboxSelected>>",
-                lambda _e: _toggle_boot_row(),
-                add="+",
-            )
-        except Exception:
-            pass
-
-        ttk.Button(unc_box, text="Run", command=self.run_uncertainty).pack(side=tk.LEFT, padx=4)
+        action_row = ttk.Frame(unc_box)
+        action_row.pack(fill=tk.X, pady=(2, 2))
+        self._unc_action_row = action_row
+        ttk.Button(action_row, text="Run", command=self.run_uncertainty).pack(side=tk.LEFT, padx=4)
         self.chk_ci_band = ttk.Checkbutton(
-            unc_box,
+            action_row,
             text="Show uncertainty band",
             variable=self.show_ci_band_var,
         )
-        self.chk_ci_band.pack(anchor="w", padx=4)
+        self.chk_ci_band.pack(side=tk.LEFT, padx=4)
         self.ci_toggle = self.chk_ci_band
+        self.band_chk = self.chk_ci_band
         self._set_ci_toggle_state(False)
         # Guard so forcing off for Bayesian won't persist/override user's saved pref
         self._suspend_ci_trace = False
+
         def _ci_trace_guard(*_e):
             if getattr(self, "_suspend_ci_trace", False):
                 return
@@ -1510,6 +1514,7 @@ class PeakFitApp:
                 self._toggle_ci_band()
             except Exception:
                 pass
+
         try:
             for info in list(self.show_ci_band.trace_info() or []):
                 # Tk may return ('write', cb) or ('w', cb) and sometimes include more items
@@ -1585,24 +1590,85 @@ class PeakFitApp:
         ttk.Checkbutton(unc_frame, text="Center residuals", variable=self.center_resid_var).grid(row=r, column=2, sticky="w")
         r += 1
 
-        bay = ttk.LabelFrame(unc_frame, text="Bayesian (no band)")
+        bay = ttk.LabelFrame(unc_frame, text="Bayesian")
         bay.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 0))
         ttk.Label(bay, text="Walkers").grid(row=0, column=0, sticky="e")
-        ttk.Entry(bay, textvariable=self.bayes_walkers_var, width=6).grid(row=0, column=1, sticky="w")
+        walkers_entry = ttk.Entry(bay, textvariable=self.bayes_walkers_var, width=6)
+        walkers_entry.grid(row=0, column=1, sticky="w")
         ttk.Label(bay, text="Burn-in").grid(row=0, column=2, sticky="e")
-        ttk.Entry(bay, textvariable=self.bayes_burn_var, width=6).grid(row=0, column=3, sticky="w")
+        burn_entry = ttk.Entry(bay, textvariable=self.bayes_burn_var, width=6)
+        burn_entry.grid(row=0, column=3, sticky="w")
         ttk.Label(bay, text="Steps").grid(row=1, column=0, sticky="e")
-        ttk.Entry(bay, textvariable=self.bayes_steps_var, width=6).grid(row=1, column=1, sticky="w")
+        steps_entry = ttk.Entry(bay, textvariable=self.bayes_steps_var, width=6)
+        steps_entry.grid(row=1, column=1, sticky="w")
         ttk.Label(bay, text="Thin").grid(row=1, column=2, sticky="e")
-        ttk.Entry(bay, textvariable=self.bayes_thin_var, width=6).grid(row=1, column=3, sticky="w")
+        thin_entry = ttk.Entry(bay, textvariable=self.bayes_thin_var, width=6)
+        thin_entry.grid(row=1, column=3, sticky="w")
         ttk.Label(bay, text="σ prior").grid(row=2, column=0, sticky="e")
-        ttk.Combobox(bay, textvariable=self.bayes_prior_var, width=12,
-                     values=("half_cauchy", "half_normal"), state="readonly").grid(row=2, column=1, sticky="w")
-        ttk.Checkbutton(
+        ttk.Combobox(
             bay,
-            text="Compute diagnostics (ESS/R̂/MCSE)",
+            textvariable=self.bayes_prior_var,
+            width=12,
+            values=("half_cauchy", "half_normal"),
+            state="readonly",
+        ).grid(row=2, column=1, sticky="w")
+        try:
+            walkers_entry.bind("<FocusOut>", lambda _e: self._safe_bayes_walkers())
+            burn_entry.bind("<FocusOut>", lambda _e: self._safe_bayes_burn())
+            steps_entry.bind("<FocusOut>", lambda _e: self._safe_bayes_steps())
+            thin_entry.bind("<FocusOut>", lambda _e: self._safe_bayes_thin())
+        except Exception:
+            pass
+        r += 1
+
+        bayes_band_frame = ttk.Labelframe(unc_frame, text="Bayesian band")
+        bayes_band_frame.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 0))
+        self._bayes_band_frame = bayes_band_frame
+        ttk.Checkbutton(
+            bayes_band_frame,
+            text="Enable posterior band",
+            variable=self.bayes_band_enabled_var,
+            command=lambda: self._cfg_set("bayes_band_enabled", bool(self.bayes_band_enabled_var.get())),
+        ).grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(
+            bayes_band_frame,
+            text="Force band (ignore diagnostics)",
+            variable=self.bayes_band_force_var,
+            command=lambda: self._cfg_set("bayes_band_force", bool(self.bayes_band_force_var.get())),
+        ).grid(row=0, column=1, sticky="w", padx=4, pady=2)
+        ttk.Label(bayes_band_frame, text="Max draws (default 512):").grid(row=1, column=0, sticky="w", padx=4)
+        ttk.Entry(bayes_band_frame, width=8, textvariable=self.bayes_band_max_draws_var).grid(row=1, column=1, sticky="w")
+        self.bayes_band_max_draws_var.trace_add(
+            "write",
+            lambda *_: self._on_bayes_band_max_draws_change(),
+        )
+
+        diag_frame = ttk.Labelframe(bayes_band_frame, text="Diagnostics gates")
+        diag_frame.grid(row=2, column=0, columnspan=2, sticky="we", padx=4, pady=4)
+        ttk.Checkbutton(
+            diag_frame,
+            text="Enable diagnostics (ESS/R̂/MCSE)",
             variable=self.bayes_diag_var,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+            command=lambda: self._cfg_set("bayes_diagnostics", bool(self.bayes_diag_var.get())),
+        ).grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        ttk.Label(diag_frame, text="ESS min (default 200):").grid(row=1, column=0, sticky="w", padx=4)
+        ttk.Entry(diag_frame, width=8, textvariable=self.bayes_thresh_ess_min_var).grid(row=1, column=1, sticky="w")
+        self.bayes_thresh_ess_min_var.trace_add(
+            "write",
+            lambda *_: self._on_bayes_diag_ess_change(),
+        )
+        ttk.Label(diag_frame, text="R̂ max (default 1.05):").grid(row=2, column=0, sticky="w", padx=4)
+        ttk.Entry(diag_frame, width=8, textvariable=self.bayes_thresh_rhat_max_var).grid(row=2, column=1, sticky="w")
+        self.bayes_thresh_rhat_max_var.trace_add(
+            "write",
+            lambda *_: self._on_bayes_diag_rhat_change(),
+        )
+        ttk.Label(diag_frame, text="MCSE mean (blank = ∞):").grid(row=3, column=0, sticky="w", padx=4)
+        ttk.Entry(diag_frame, width=8, textvariable=self.bayes_thresh_mcse_mean_str).grid(row=3, column=1, sticky="w")
+        self.bayes_thresh_mcse_mean_str.trace_add(
+            "write",
+            lambda *_: self._on_bayes_diag_mcse_change(),
+        )
         r += 1
 
         # --- Bootstrap ties (visible + enabled only when Bootstrap + LMFIT refit solver) ---
@@ -1776,31 +1842,16 @@ class PeakFitApp:
         # Keep the Bootstrap label in sync with the actual solver selection
         chosen = self._select_bootstrap_solver()
         label = SOLVER_LABELS.get(chosen, chosen)
-        self.unc_method_combo["values"] = [
-            "Asymptotic",
-            f"Bootstrap (base solver = {label})",
-            "Bayesian",
-        ]
-        # Preserve current selection if possible
+        boot_label = f"Bootstrap (base solver = {label})"
         current = self.unc_method.get()
+        if hasattr(self, "_unc_boot_radio"):
+            try:
+                self._unc_boot_radio.configure(text=boot_label, value=boot_label)
+            except Exception:
+                pass
         if current.startswith("Bootstrap"):
-            self.unc_method.set(f"Bootstrap (base solver = {label})")
-        if self.unc_method.get().startswith("Bootstrap"):
-            if hasattr(self, "_boot_solver_cb"):
-                try:
-                    self._boot_solver_cb.grid()
-                except Exception:
-                    pass
-            if hasattr(self, "unc_workers_frame"):
-                self.unc_workers_frame.pack(side=tk.LEFT, padx=4)
-        else:
-            if hasattr(self, "_boot_solver_cb"):
-                try:
-                    self._boot_solver_cb.grid_remove()
-                except Exception:
-                    pass
-            if hasattr(self, "unc_workers_frame"):
-                self.unc_workers_frame.pack_forget()
+            self.unc_method.set(boot_label)
+        self._on_uncertainty_method_changed()
 
     def _on_unc_method_change(self, _e=None):
         label = self.unc_method.get()
@@ -1826,15 +1877,24 @@ class PeakFitApp:
                 return default
 
     def _resolve_unc_workers(self) -> int:
-        """Return the configured uncertainty worker count from Performance controls."""
-
+        """Return effective worker count. 0/blank ⇒ auto = os.cpu_count()."""
         try:
-            return int(self.perf_max_workers.get())
+            raw = self.perf_max_workers.get()
+        except Exception:
+            raw = self.cfg.get("perf_max_workers", 0)
+        try:
+            w = int(raw)
         except Exception:
             try:
-                return int(self.cfg.get("perf_max_workers", 0))
+                w = int(float(str(raw).strip()))
             except Exception:
-                return 0
+                w = 0
+        if w <= 0:
+            try:
+                return os.cpu_count() or 1
+            except Exception:
+                return 1
+        return w
 
     def _as_seq(self, v):
         if isinstance(v, (list, tuple)):
@@ -1858,6 +1918,125 @@ class PeakFitApp:
         except Exception:
             pass
         return a
+
+    def _safe_int_from_var(self, var: tk.Variable, default: int) -> int:
+        try:
+            raw = var.get()
+        except Exception:
+            raw = default
+        try:
+            return int(raw)
+        except Exception:
+            try:
+                return int(float(str(raw).strip()))
+            except Exception:
+                return default
+
+    def _safe_float_from_var(self, var: tk.Variable, default: float) -> float:
+        try:
+            raw = var.get()
+        except Exception:
+            raw = default
+        try:
+            return float(raw)
+        except Exception:
+            try:
+                return float(str(raw).strip())
+            except Exception:
+                return default
+
+    def _safe_bayes_walkers(self) -> int:
+        try:
+            v = int(self.bayes_walkers_var.get() or 0)
+        except Exception:
+            v = 0
+        v = max(0, v)
+        # enforce minimal requirement if user sets a too-small positive number
+        try:
+            ndim = 4 * len(self.peaks)
+            min_walkers = max(2 * max(1, ndim), 4)
+            if v and v < min_walkers:
+                v = min_walkers
+        except Exception:
+            pass
+        try:
+            self.bayes_walkers_var.set(v)
+        except Exception:
+            pass
+        return v
+
+    def _safe_bayes_burn(self) -> int:
+        try:
+            v = int(self.bayes_burn_var.get() or 0)
+        except Exception:
+            v = 0
+        v = max(0, v)
+        try:
+            self.bayes_burn_var.set(v)
+        except Exception:
+            pass
+        return v
+
+    def _safe_bayes_steps(self) -> int:
+        try:
+            v = int(self.bayes_steps_var.get() or 4000)
+        except Exception:
+            v = 4000
+        v = max(1, v)
+        try:
+            self.bayes_steps_var.set(v)
+        except Exception:
+            pass
+        return v
+
+    def _safe_bayes_thin(self) -> int:
+        try:
+            v = int(self.bayes_thin_var.get() or 1)
+        except Exception:
+            v = 1
+        v = max(1, v)
+        try:
+            self.bayes_thin_var.set(v)
+        except Exception:
+            pass
+        return v
+
+    def _bayes_band_max_draws_value(self) -> int:
+        val = self._safe_int_from_var(self.bayes_band_max_draws_var, 512)
+        return val if val > 0 else 512
+
+    def _bayes_diag_ess_min_value(self) -> float:
+        val = self._safe_float_from_var(self.bayes_thresh_ess_min_var, 200.0)
+        return val if val > 0 else 200.0
+
+    def _bayes_diag_rhat_max_value(self) -> float:
+        val = self._safe_float_from_var(self.bayes_thresh_rhat_max_var, 1.05)
+        return val if val > 0 else 1.05
+
+    def _bayes_diag_mcse_value(self) -> float:
+        try:
+            txt = str(self.bayes_thresh_mcse_mean_str.get()).strip()
+        except Exception:
+            txt = ""
+        if not txt:
+            return float("inf")
+        try:
+            val = float(txt)
+        except Exception:
+            return float("inf")
+        return val if val > 0 else float("inf")
+
+    def _on_bayes_band_max_draws_change(self):
+        self._cfg_set("bayes_band_max_draws", self._bayes_band_max_draws_value())
+
+    def _on_bayes_diag_ess_change(self):
+        self._cfg_set("bayes_diag_ess_min", self._bayes_diag_ess_min_value())
+
+    def _on_bayes_diag_rhat_change(self):
+        self._cfg_set("bayes_diag_rhat_max", self._bayes_diag_rhat_max_value())
+
+    def _on_bayes_diag_mcse_change(self):
+        self._cfg_set("bayes_diag_mcse_mean", self._bayes_diag_mcse_value())
 
     def _safe_jitter_pct(self):
         try:
@@ -1904,7 +2083,7 @@ class PeakFitApp:
             "jitter": self._norm_jitter_val(_pick("bootstrap_jitter", 0.0)),
             # include bootstrap solver + workers so cache respects engine changes
             "boot_solver": getattr(self, "_select_bootstrap_solver", lambda: "")(),
-            "workers": int(cfg.get("perf_max_workers", 0) or 0),
+            "workers": int(self._resolve_unc_workers()),
             "seed_all": bool(self.perf_seed_all.get()),
         }
         try:
@@ -1913,13 +2092,23 @@ class PeakFitApp:
                     "bayes_diagnostics": bool(self.bayes_diag_var.get()),
                     "bayes_band_enabled": bool(self.bayes_band_enabled_var.get()),
                     "bayes_band_force": bool(self.bayes_band_force_var.get()),
-                    "bayes_band_max_draws": int(self.bayes_band_max_draws_var.get() or 512),
-                    "bayes_diag_ess_min": float(self.bayes_thresh_ess_min_var.get() or 200.0),
-                    "bayes_diag_rhat_max": float(self.bayes_thresh_rhat_max_var.get() or 1.05),
+                    "bayes_band_max_draws": self._bayes_band_max_draws_value(),
+                    "bayes_diag_ess_min": self._bayes_diag_ess_min_value(),
+                    "bayes_diag_rhat_max": self._bayes_diag_rhat_max_value(),
                     "bayes_diag_mcse_mean": (
-                        float(self.bayes_thresh_mcse_mean_str.get())
-                        if str(self.bayes_thresh_mcse_mean_str.get()).strip()
-                        else float("inf")
+                        self._bayes_diag_mcse_value()
+                    ),
+                }
+            )
+            sig.update(
+                {
+                    "bayes_walkers": self._safe_bayes_walkers(),
+                    "bayes_burn": self._safe_bayes_burn(),
+                    "bayes_steps": self._safe_bayes_steps(),
+                    "bayes_thin": self._safe_bayes_thin(),
+                    "bayes_prior_sigma": str(
+                        self.bayes_prior_var.get()
+                        or self.cfg.get("bayes_prior_sigma", "half_cauchy")
                     ),
                 }
             )
@@ -1959,6 +2148,12 @@ class PeakFitApp:
         self.refresh_plot()
 
     def _set_ci_toggle_state(self, enabled: bool):
+        try:
+            widget = getattr(self, "band_chk", getattr(self, "ci_toggle", None))
+            if widget is not None:
+                widget.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+        except Exception:
+            pass
         try:
             state = ("!disabled",) if enabled else ("disabled",)
             self.ci_toggle.state(state)
@@ -2040,27 +2235,64 @@ class PeakFitApp:
         return None
 
     def _on_uncertainty_method_changed(self, *_):
-        sel = str(self.unc_method_var.get()).lower()
-        is_bayes = ("bayes" in sel)
-        # toggle availability of band checkbox
-        self._set_ci_toggle_state(not is_bayes)
-        # enable/disable jitter & bootstrap-only controls
-        state = ("normal" if "bootstrap" in sel else "disabled")
-        for w in (getattr(self, "_jitter_entry", None), getattr(self, "_boot_solver_cb", None)):
-            if w is not None:
+        method_key = self._unc_selected_method_key()
+        if method_key in ("asymptotic", "bootstrap"):
+            band_should_enable = True
+        elif method_key == "bayesian":
+            try:
+                band_should_enable = bool(
+                    self.bayes_band_enabled_var.get()
+                    and (self.bayes_diag_var.get() or self.bayes_band_force_var.get())
+                )
+            except Exception:
+                band_should_enable = False
+        else:
+            band_should_enable = False
+        self._set_ci_toggle_state(band_should_enable)
+
+        is_boot = (method_key == "bootstrap")
+        jitter = getattr(self, "_jitter_entry", None)
+        if jitter is not None:
+            try:
+                jitter.configure(state="normal" if is_boot else "disabled")
+            except Exception:
+                pass
+        boot_cb = getattr(self, "_boot_solver_cb", None)
+        if boot_cb is not None:
+            try:
+                boot_cb.configure(state="readonly" if is_boot else "disabled")
+            except Exception:
+                pass
+            try:
+                if is_boot:
+                    boot_cb.grid()
+                else:
+                    boot_cb.grid_remove()
+            except Exception:
+                pass
+        options_row = getattr(self, "_boot_options_row", None)
+        if options_row is not None:
+            if is_boot:
                 try:
-                    w.configure(state=state)
+                    options_row.pack_forget()
+                    options_row.pack(fill=tk.X, pady=2, before=self._unc_action_row)
                 except Exception:
                     pass
-        if is_bayes:
-            # hard-disable for Bayesian without persisting a new preference
+            else:
+                try:
+                    options_row.pack_forget()
+                except Exception:
+                    pass
+        bayes_frame = getattr(self, "_bayes_band_frame", None)
+        if bayes_frame is not None:
             try:
-                self._suspend_ci_trace = True
-                self.show_ci_band_var.set(False)
-            finally:
-                self._suspend_ci_trace = False
-            self.ci_band = None
-            self.refresh_plot()
+                if method_key == "bayesian":
+                    bayes_frame.grid()
+                else:
+                    bayes_frame.grid_remove()
+            except Exception:
+                pass
+
         # refresh Bootstrap tie widgets (enable only for Bootstrap + LMFIT refit solver)
         self._update_bootstrap_tie_widgets()
         # for asymptotic/bootstrap the checkbox remains user-controlled
@@ -3303,6 +3535,7 @@ class PeakFitApp:
             peaks_list = [p.__dict__ for p in self.peaks]
 
         solver = self.solver_choice.get()
+        workers_eff = self._resolve_unc_workers()
         cfg = {
             "peaks": peaks_list,
             "solver": solver,
@@ -3318,22 +3551,25 @@ class PeakFitApp:
             "perf_gpu": bool(self.perf_gpu.get()),
             "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
             "perf_seed_all": bool(self.perf_seed_all.get()),
-            "perf_max_workers": int(self.perf_max_workers.get()),
-            "unc_workers": int(self.cfg.get("perf_max_workers", 0)),
+            "perf_max_workers": int(workers_eff),
             "perf_seed": self.cfg.get("perf_seed", ""),
             "output_dir": str(output_dir),
             "output_base": output_base,
             # Bayesian band configuration
             "bayes_band_enabled": bool(self.bayes_band_enabled_var.get()),
             "bayes_band_force": bool(self.bayes_band_force_var.get()),
-            "bayes_band_max_draws": int(self.bayes_band_max_draws_var.get() or 512),
+            "bayes_band_max_draws": self._bayes_band_max_draws_value(),
             "bayes_diagnostics": bool(self.bayes_diag_var.get()),
-            "bayes_diag_ess_min": float(self.bayes_thresh_ess_min_var.get() or 200.0),
-            "bayes_diag_rhat_max": float(self.bayes_thresh_rhat_max_var.get() or 1.05),
-            "bayes_diag_mcse_mean": (
-                float(self.bayes_thresh_mcse_mean_str.get())
-                if str(self.bayes_thresh_mcse_mean_str.get()).strip()
-                else float("inf")
+            "bayes_diag_ess_min": self._bayes_diag_ess_min_value(),
+            "bayes_diag_rhat_max": self._bayes_diag_rhat_max_value(),
+            "bayes_diag_mcse_mean": self._bayes_diag_mcse_value(),
+            "bayes_walkers": int(self._safe_bayes_walkers()),
+            "bayes_burn": int(self._safe_bayes_burn()),
+            "bayes_steps": int(self._safe_bayes_steps()),
+            "bayes_thin": int(self._safe_bayes_thin()),
+            "bayes_prior_sigma": str(
+                self.bayes_prior_var.get()
+                or self.cfg.get("bayes_prior_sigma", "half_cauchy")
             ),
         }
 
@@ -3608,14 +3844,10 @@ class PeakFitApp:
         lo[3::4] = 0.0
         hi[3::4] = 1.0
 
-        workers = None
         try:
             workers = int(self._resolve_unc_workers())
         except Exception:
-            try:
-                workers = int(self.cfg.get("perf_max_workers", 0) or 0)
-            except Exception:
-                workers = 0
+            workers = 0
         workers = workers if workers and workers > 0 else None
         band_workers = workers
         alpha = self._safe_alpha()
@@ -3725,6 +3957,15 @@ class PeakFitApp:
                     total = total + base_fit
                 return total
 
+            walkers = self._safe_bayes_walkers()
+            burn = self._safe_bayes_burn()
+            steps = self._safe_bayes_steps()
+            thin = self._safe_bayes_thin()
+            prior_sigma = str(
+                self.bayes_prior_var.get()
+                or self.cfg.get("bayes_prior_sigma", "half_cauchy")
+            )
+
             fit_ctx = {
                 "x": x_fit,
                 "y": y_fit,
@@ -3747,16 +3988,21 @@ class PeakFitApp:
                 # pass band flags + thresholds + progress callback
                 "bayes_band_enabled": bool(self.bayes_band_enabled_var.get()),
                 "bayes_band_force": bool(self.bayes_band_force_var.get()),
-                "bayes_band_max_draws": int(self.bayes_band_max_draws_var.get() or 512),
-                "bayes_diag_ess_min": float(self.bayes_thresh_ess_min_var.get() or 200.0),
-                "bayes_diag_rhat_max": float(self.bayes_thresh_rhat_max_var.get() or 1.05),
-                "bayes_diag_mcse_mean": (
-                    float(self.bayes_thresh_mcse_mean_str.get())
-                    if str(self.bayes_thresh_mcse_mean_str.get()).strip()
-                    else float("inf")
-                ),
+                "bayes_band_max_draws": self._bayes_band_max_draws_value(),
+                "bayes_diag_ess_min": self._bayes_diag_ess_min_value(),
+                "bayes_diag_rhat_max": self._bayes_diag_rhat_max_value(),
+                "bayes_diag_mcse_mean": self._bayes_diag_mcse_value(),
                 "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
             }
+            fit_ctx.update(
+                {
+                    "bayes_walkers": walkers,
+                    "bayes_burn": burn,
+                    "bayes_steps": steps,
+                    "bayes_thin": thin,
+                    "bayes_prior_sigma": prior_sigma,
+                }
+            )
             seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
             out = core_uncertainty.bayesian_ci(
                 theta_hat=theta,
@@ -3771,6 +4017,11 @@ class PeakFitApp:
                 bounds=(lo, hi),
                 return_band=False,
                 workers=workers,
+                n_walkers=(walkers or None),
+                n_burn=burn,
+                n_steps=steps,
+                thin=thin,
+                prior_sigma=prior_sigma,
             )
         else:
             return {"label": "unknown", "stats": []}
@@ -3911,10 +4162,7 @@ class PeakFitApp:
             try:
                 workers_val = int(self._resolve_unc_workers())
             except Exception:
-                try:
-                    workers_val = int(self.cfg.get("perf_max_workers", 0) or 0)
-                except Exception:
-                    workers_val = 0
+                workers_val = 0
             workers = workers_val if workers_val > 0 else None
             band_workers = workers
 
@@ -3929,19 +4177,16 @@ class PeakFitApp:
             alpha = self._safe_alpha()
             jitter_pct = self._safe_jitter_pct()
             jitter_frac = jitter_pct / 100.0
-            walkers = max(0, int(self.bayes_walkers_var.get() or 0))
-            burn = max(0, int(self.bayes_burn_var.get()))
-            steps = max(1, int(self.bayes_steps_var.get()))
-            thin = max(1, int(self.bayes_thin_var.get()))
-            self.bayes_walkers_var.set(walkers); self.bayes_burn_var.set(burn)
-            self.bayes_steps_var.set(steps); self.bayes_thin_var.set(thin)
+            walkers = self._safe_bayes_walkers()
+            burn = self._safe_bayes_burn()
+            steps = self._safe_bayes_steps()
+            thin = self._safe_bayes_thin()
 
             self._cfg_set("unc_center_resid", bool(self.center_resid_var.get()))
             self._cfg_set("bayes_walkers", walkers)
             self._cfg_set("bayes_burn", burn)
             self._cfg_set("bayes_steps", steps)
             self._cfg_set("bayes_thin", thin)
-            self._cfg_set("bayes_prior_sigma", str(self.bayes_prior_var.get()))
             self._cfg_set("bayes_diagnostics", bool(self.bayes_diag_var.get()))
             if method == "asymptotic":
                 res = self._run_asymptotic_uncertainty()
@@ -4074,15 +4319,20 @@ class PeakFitApp:
                     "bayes_diagnostics": bool(self.bayes_diag_var.get()),
                     "bayes_band_enabled": bool(self.bayes_band_enabled_var.get()),
                     "bayes_band_force": bool(self.bayes_band_force_var.get()),
-                    "bayes_band_max_draws": int(self.bayes_band_max_draws_var.get() or 512),
-                    "bayes_diag_ess_min": float(self.bayes_thresh_ess_min_var.get() or 200.0),
-                    "bayes_diag_rhat_max": float(self.bayes_thresh_rhat_max_var.get() or 1.05),
-                    "bayes_diag_mcse_mean": (
-                        float(self.bayes_thresh_mcse_mean_str.get())
-                        if str(self.bayes_thresh_mcse_mean_str.get()).strip()
-                        else float("inf")
-                    ),
+                    "bayes_band_max_draws": self._bayes_band_max_draws_value(),
+                    "bayes_diag_ess_min": self._bayes_diag_ess_min_value(),
+                    "bayes_diag_rhat_max": self._bayes_diag_rhat_max_value(),
+                    "bayes_diag_mcse_mean": self._bayes_diag_mcse_value(),
                 }
+                fit_ctx.update(
+                    {
+                        "bayes_walkers": walkers,
+                        "bayes_burn": burn,
+                        "bayes_steps": steps,
+                        "bayes_thin": thin,
+                        "bayes_prior_sigma": prior_sigma,
+                    }
+                )
                 # sensible bounds for MCMC to prevent runaway widths/etas
                 n_pk = len(self.peaks)
                 P = 4 * n_pk
@@ -4120,7 +4370,7 @@ class PeakFitApp:
                     n_burn=burn,
                     n_steps=steps,
                     thin=thin,
-                    prior_sigma=str(self.bayes_prior_var.get()),
+                    prior_sigma=prior_sigma,
                     bounds=(lo, hi),
                 )
                 if abort_evt.is_set():
@@ -4366,20 +4616,26 @@ class PeakFitApp:
                 seed = None
         effective_seed = seed if bool(self.perf_seed_all.get()) else None
         performance.set_seed(effective_seed)
-        performance.set_max_workers(int(self.perf_max_workers.get()))
+        # Parse workers safely even if the Entry is blank while typing
+        try:
+            w_txt = str(self.perf_max_workers.get()).strip()
+        except Exception:
+            w_txt = ""
+        try:
+            workers = int(float(w_txt)) if w_txt else 0
+        except Exception:
+            workers = 0
+        performance.set_max_workers(workers)
         performance.set_gpu_chunk(self.gpu_chunk_var.get())
         self.cfg["perf_numba"] = bool(self.perf_numba.get())
         self.cfg["perf_gpu"] = bool(self.perf_gpu.get())
         self.cfg["perf_cache_baseline"] = bool(self.perf_cache_baseline.get())
         self.cfg["perf_seed_all"] = bool(self.perf_seed_all.get())
         self.cfg["perf_seed"] = seed if seed is not None else ""
-        self.cfg["perf_max_workers"] = int(self.perf_max_workers.get())
-        try:
-            self.unc_workers_var.set(int(self.perf_max_workers.get()))
-        except Exception:
-            pass
+        self.cfg["perf_max_workers"] = workers
         save_config(self.cfg)
-        self.log(f"Backend: {performance.which_backend()} | workers={performance.get_max_workers()}")
+        eff = self._resolve_unc_workers()
+        self.log(f"Backend: {performance.which_backend()} | workers_effective={eff}")
         self.status_var.set("Performance options applied.")
 
     # --- BEGIN: hook batch runner to compute + export uncertainty ---

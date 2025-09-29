@@ -140,11 +140,18 @@ def run_batch(
     source = config.get("source", "template")
     reheight = bool(config.get("reheight", False))
     auto_max = int(config.get("auto_max", 5))
+    try:
+        bootstrap_n = int(config.get("bootstrap_n", 500) or 500)
+    except Exception:
+        bootstrap_n = 500
     # NOTE(surgical): prefer Performance.max_workers if present
     try:
-        _unc_req = int(config.get("perf_max_workers", config.get("unc_workers", 0)))
+        raw = config.get("perf_max_workers", config.get("unc_workers", 0))
+        _unc_req = int(raw)
     except Exception:
         _unc_req = 0
+    if _unc_req <= 0:
+        _unc_req = os.cpu_count() or 1
     maxcpu = max(1, (os.cpu_count() or 1))
     if _unc_req <= 1:
         unc_workers = 0
@@ -561,10 +568,7 @@ def run_batch(
                     locked_mask = res.get("locked_mask")
                     alpha = float(config.get("unc_alpha", 0.05))
                     center_res = bool(config.get("unc_center_resid", True))
-                    try:
-                        n_boot = int(config.get("bootstrap_n", 250))
-                    except Exception:
-                        n_boot = 250
+                    n_boot = bootstrap_n
                     seed_val = (perf_seed + file_index) if (perf_seed_all and perf_seed is not None) else None
 
                     jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
@@ -616,6 +620,10 @@ def run_batch(
                             "alpha": diag.get("alpha", alpha),
                         }
                 else:
+                    w_cfg = int(config.get("bayes_walkers", 0) or 0)
+                    burn_cfg = int(config.get("bayes_burn", 1000) or 0)
+                    steps_cfg = int(config.get("bayes_steps", 4000) or 4000)
+                    thin_cfg = int(config.get("bayes_thin", 1) or 1)
                     fit_ctx.update({
                         "bayes_diagnostics": bool(
                             config.get("bayes_diagnostics", config.get("bayes_diag", False))
@@ -630,6 +638,13 @@ def run_batch(
                         "bayes_diag_rhat_max": float(config.get("bayes_diag_rhat_max", 1.05)),
                         "bayes_diag_mcse_mean": float(
                             config.get("bayes_diag_mcse_mean", float("inf"))
+                        ),
+                        "bayes_walkers": (w_cfg if w_cfg > 0 else None),
+                        "bayes_burn": max(0, burn_cfg),
+                        "bayes_steps": max(1, steps_cfg),
+                        "bayes_thin": max(1, thin_cfg),
+                        "bayes_prior_sigma": str(
+                            config.get("bayes_prior_sigma", "half_cauchy")
                         ),
                         "abort_event": abort_event,
                     })
@@ -646,7 +661,7 @@ def run_batch(
                         y_all=y_fit,
                         workers=workers_eff,
                         seed=seed_val,
-                        n_boot=100,
+                        n_boot=bootstrap_n,
                     )
             except Exception as exc:
                 msg = str(exc)
