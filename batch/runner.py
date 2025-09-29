@@ -140,8 +140,9 @@ def run_batch(
     source = config.get("source", "template")
     reheight = bool(config.get("reheight", False))
     auto_max = int(config.get("auto_max", 5))
+    # NOTE(surgical): prefer Performance.max_workers if present
     try:
-        _unc_req = int(config.get("unc_workers", 0))
+        _unc_req = int(config.get("perf_max_workers", config.get("unc_workers", 0)))
     except Exception:
         _unc_req = 0
     maxcpu = max(1, (os.cpu_count() or 1))
@@ -177,6 +178,12 @@ def run_batch(
         or "asymptotic"
     )
     unc_method_canon = data_io.canonical_unc_label(unc_choice)
+    perf_seed_all = bool(config.get("perf_seed_all", False))
+    _perf_seed_cfg = config.get("perf_seed", "")
+    try:
+        perf_seed = int(_perf_seed_cfg) if str(_perf_seed_cfg) not in ("", "None") else None
+    except Exception:
+        perf_seed = None
     if log:
         log(f"batch uncertainty method={unc_method_canon}")
         log(f"batch compute_uncertainty={bool(compute_uncertainty)}")
@@ -187,6 +194,7 @@ def run_batch(
     processed = 0
 
     for i, path in enumerate(files, 1):
+        file_index = i - 1
         if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
             return {"aborted": True, "records": [], "reason": "user-abort"}
         if progress:
@@ -557,18 +565,17 @@ def run_batch(
                         n_boot = int(config.get("bootstrap_n", 250))
                     except Exception:
                         n_boot = 250
-                    try:
-                        seed_val = config.get("bootstrap_seed", 0)
-                        seed_int = int(seed_val)
-                    except Exception:
-                        seed_int = 0
-                    seed_val = None if seed_int == 0 else seed_int
+                    seed_val = (perf_seed + file_index) if (perf_seed_all and perf_seed is not None) else None
 
                     jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
                     jac_mat = np.atleast_2d(np.asarray(jac_mat, float))
 
                     workers_eff = unc_workers if unc_workers > 0 else None
                     fit_ctx["unc_workers"] = workers_eff
+                    fit_ctx["unc_band_workers"] = (
+                        unc_band_workers if unc_band_workers > 0 else None
+                    )
+                    fit_ctx["abort_event"] = abort_event
                     unc_res = bootstrap_ci(
                         theta=theta_hat,
                         residual=residual_vec,
@@ -613,7 +620,20 @@ def run_batch(
                         "bayes_diagnostics": bool(
                             config.get("bayes_diagnostics", config.get("bayes_diag", False))
                         ),
+                        "unc_band_workers": (
+                            unc_band_workers if unc_band_workers > 0 else None
+                        ),
+                        "bayes_band_enabled": bool(config.get("bayes_band_enabled", False)),
+                        "bayes_band_force": bool(config.get("bayes_band_force", False)),
+                        "bayes_band_max_draws": int(config.get("bayes_band_max_draws", 512) or 512),
+                        "bayes_diag_ess_min": float(config.get("bayes_diag_ess_min", 200.0)),
+                        "bayes_diag_rhat_max": float(config.get("bayes_diag_rhat_max", 1.05)),
+                        "bayes_diag_mcse_mean": float(
+                            config.get("bayes_diag_mcse_mean", float("inf"))
+                        ),
+                        "abort_event": abort_event,
                     })
+                    seed_val = (perf_seed + file_index) if (perf_seed_all and perf_seed is not None) else None
                     workers_eff = unc_workers if unc_workers > 0 else None
                     unc_res = route_uncertainty(
                         unc_method_canon,
@@ -625,7 +645,7 @@ def run_batch(
                         x_all=x_fit,
                         y_all=y_fit,
                         workers=workers_eff,
-                        seed=None,
+                        seed=seed_val,
                         n_boot=100,
                     )
             except Exception as exc:
