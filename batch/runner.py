@@ -31,6 +31,33 @@ from core.uncertainty_router import route_uncertainty
 logger = logging.getLogger(__name__)
 
 
+class _NopCtx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _tp_limits_ctx_for_config(config: dict):
+    try:
+        from threadpoolctl import threadpool_limits
+    except Exception:
+        return _NopCtx()
+    strategy = str(config.get("perf_parallel_strategy", "outer"))
+    try:
+        blas_threads = int(config.get("perf_blas_threads", 0))
+    except Exception:
+        blas_threads = 0
+    limit = 1 if strategy == "outer" else (blas_threads if blas_threads > 0 else None)
+    try:
+        if limit is None:
+            return _NopCtx()
+        return threadpool_limits(limits=limit)
+    except Exception:
+        return _NopCtx()
+
+
 def _norm_jitter(v, default=0.02):
     """Normalize bootstrap jitter to a fractional value."""
 
@@ -563,6 +590,17 @@ def run_batch(
 
                 fit_ctx.update({"refit": _refit_wrapper})
 
+                workers_eff = unc_workers if unc_workers > 0 else None
+                try:
+                    unc_band_workers_cfg = int(config.get("unc_band_workers", 0) or 0)
+                except Exception:
+                    unc_band_workers_cfg = 0
+                band_workers_eff = (
+                    unc_band_workers_cfg if unc_band_workers_cfg > 0 else workers_eff
+                )
+                fit_ctx["unc_workers"] = workers_eff
+                fit_ctx["unc_band_workers"] = band_workers_eff
+
                 if str(unc_method_canon).lower() == "bootstrap":
                     bounds = res.get("bounds")
                     locked_mask = res.get("locked_mask")
@@ -574,30 +612,26 @@ def run_batch(
                     jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
                     jac_mat = np.atleast_2d(np.asarray(jac_mat, float))
 
-                    workers_eff = unc_workers if unc_workers > 0 else None
-                    fit_ctx["unc_workers"] = workers_eff
-                    fit_ctx["unc_band_workers"] = (
-                        unc_band_workers if unc_band_workers > 0 else None
-                    )
                     fit_ctx["abort_event"] = abort_event
-                    unc_res = bootstrap_ci(
-                        theta=theta_hat,
-                        residual=residual_vec,
-                        jacobian=jac_mat,
-                        predict_full=model_eval,
-                        x_all=x_fit,
-                        y_all=y_fit,
-                        fit_ctx=fit_ctx,
-                        bounds=bounds,
-                        param_names=res.get("param_names"),
-                        locked_mask=locked_mask,
-                        n_boot=n_boot,
-                        seed=seed_val,
-                        workers=workers_eff,
-                        alpha=alpha,
-                        center_residuals=center_res,
-                        return_band=True,
-                    )
+                    with _tp_limits_ctx_for_config(config):
+                        unc_res = bootstrap_ci(
+                            theta=theta_hat,
+                            residual=residual_vec,
+                            jacobian=jac_mat,
+                            predict_full=model_eval,
+                            x_all=x_fit,
+                            y_all=y_fit,
+                            fit_ctx=fit_ctx,
+                            bounds=bounds,
+                            param_names=res.get("param_names"),
+                            locked_mask=locked_mask,
+                            n_boot=n_boot,
+                            seed=seed_val,
+                            workers=workers_eff,
+                            alpha=alpha,
+                            center_residuals=center_res,
+                            return_band=True,
+                        )
                     if isinstance(unc_res, dict):
                         diag = (unc_res.get("diagnostics") or {})
                     else:
@@ -628,9 +662,7 @@ def run_batch(
                         "bayes_diagnostics": bool(
                             config.get("bayes_diagnostics", config.get("bayes_diag", False))
                         ),
-                        "unc_band_workers": (
-                            unc_band_workers if unc_band_workers > 0 else None
-                        ),
+                        "unc_band_workers": band_workers_eff,
                         "bayes_band_enabled": bool(config.get("bayes_band_enabled", False)),
                         "bayes_band_force": bool(config.get("bayes_band_force", False)),
                         "bayes_band_max_draws": int(config.get("bayes_band_max_draws", 512) or 512),
@@ -650,19 +682,20 @@ def run_batch(
                     })
                     seed_val = (perf_seed + file_index) if (perf_seed_all and perf_seed is not None) else None
                     workers_eff = unc_workers if unc_workers > 0 else None
-                    unc_res = route_uncertainty(
-                        unc_method_canon,
-                        theta_hat=theta_hat,
-                        residual_fn=residual_fn,
-                        jacobian=jac,
-                        model_eval=model_eval,
-                        fit_ctx=fit_ctx,
-                        x_all=x_fit,
-                        y_all=y_fit,
-                        workers=workers_eff,
-                        seed=seed_val,
-                        n_boot=bootstrap_n,
-                    )
+                    with _tp_limits_ctx_for_config(config):
+                        unc_res = route_uncertainty(
+                            unc_method_canon,
+                            theta_hat=theta_hat,
+                            residual_fn=residual_fn,
+                            jacobian=jac,
+                            model_eval=model_eval,
+                            fit_ctx=fit_ctx,
+                            x_all=x_fit,
+                            y_all=y_fit,
+                            workers=workers_eff,
+                            seed=seed_val,
+                            n_boot=bootstrap_n,
+                        )
             except Exception as exc:
                 msg = str(exc)
                 if "Unknown uncertainty method" in msg:

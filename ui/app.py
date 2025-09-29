@@ -185,6 +185,7 @@ import re
 import time
 import csv
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple, Optional
 from types import SimpleNamespace  # ensure this import exists
@@ -210,7 +211,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.widgets import SpanSelector
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import simpledialog
 import tkinter.font as tkfont
 import threading
 import traceback
@@ -251,6 +253,39 @@ try:  # optional
     from fit import lmfit_backend
 except Exception:  # pragma: no cover - optional dependency may be missing
     lmfit_backend = None
+
+
+def _safe_bool(v, default=False):
+    try:
+        return bool(v)
+    except Exception:
+        return default
+
+
+def log_action(fn):
+    """Decorator to emit debug log lines when debug mode is on."""
+
+    @wraps(fn)
+    def _wrap(self, *a, **k):
+        try:
+            if _safe_bool(self.debug_mode_var.get(), False):
+                def _srepr(x, n=120):
+                    try:
+                        s = repr(x)
+                    except Exception:
+                        s = object.__repr__(x)
+                    return s if len(s) <= n else s[:n] + "\u2026"
+
+                args_s = ", ".join(_srepr(v) for v in a)
+                kwargs_s = ", ".join(f"{kk}={_srepr(vv)}" for kk, vv in k.items())
+                self.log_threadsafe(
+                    f"[DEBUG] {fn.__name__}({args_s}" + (", " if kwargs_s else "") + f"{kwargs_s})"
+                )
+        except Exception:
+            pass
+        return fn(self, *a, **k)
+
+    return _wrap
 
 BACKENDS = {
     "classic": classic,
@@ -729,6 +764,48 @@ class PeakFitApp:
         if f > 1.0:
             f = 1.0
         return f
+
+    def dlog(self, msg):
+        """Instance debug logger respecting the UI toggle."""
+        try:
+            if _safe_bool(self.debug_mode_var.get(), False):
+                self.log_threadsafe(f"[DEBUG] {msg}")
+        except Exception:
+            pass
+
+    def _tp_limits_ctx(self):
+        try:
+            from threadpoolctl import threadpool_limits
+        except Exception:
+            class threadpool_limits:  # type: ignore[no-redef]
+                def __init__(self, *a, **k):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+        strategy = str(getattr(self, "perf_parallel_strategy", tk.StringVar(value="outer")).get())
+        try:
+            blas_threads = int(getattr(self, "perf_blas_threads", tk.IntVar(value=0)).get())
+        except Exception:
+            blas_threads = 0
+        limit = 1 if strategy == "outer" else (blas_threads if blas_threads > 0 else None)
+        try:
+            if limit is None:
+                raise RuntimeError("no limit -> no-op")
+            return threadpool_limits(limits=limit)
+        except Exception:
+            class _Nop:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            return _Nop()
     # --- small config helper used by Bootstrap controls ---
     def _cfg_set(self, key, value):
         try:
@@ -758,29 +835,34 @@ class PeakFitApp:
             return None
 
     def _boot_follow_enabled(self) -> bool:
-        return bool(self.cfg.get("unc_boot_solver_follow", True))
+        try:
+            return bool(self.unc_boot_follow_var.get())
+        except Exception:
+            return bool(self.cfg.get("unc_boot_solver_follow", True))
 
     def _set_boot_follow(self, val: bool) -> None:
         follow = bool(val)
         try:
-            self.cfg["unc_boot_solver_follow"] = follow
-            save_config(self.cfg)
+            self.unc_boot_follow_var.set(follow)
+            return
         except Exception:
-            pass
-        if hasattr(self, "boot_solver_follow_var"):
+            self._cfg_set("unc_boot_solver_follow", follow)
+            if follow and hasattr(self, "boot_solver_choice") and hasattr(self, "solver_choice"):
+                try:
+                    choice = self.solver_choice.get()
+                    self.boot_solver_choice.set(choice)
+                    self._cfg_set("unc_boot_solver", choice)
+                except Exception:
+                    pass
             try:
-                self.boot_solver_follow_var.set(follow)
+                self._update_bootstrap_tie_widgets()
             except Exception:
                 pass
-        if follow and hasattr(self, "boot_solver_choice") and hasattr(self, "solver_choice"):
-            try:
-                choice = self.solver_choice.get()
-                self.boot_solver_choice.set(choice)
-                self._cfg_set("unc_boot_solver", choice)
-            except Exception:
-                pass
+
+    @log_action
+    def _on_debug_toggle(self, *_):
         try:
-            self._update_bootstrap_tie_widgets()
+            self._cfg_set("log_debug_mode", bool(self.debug_mode_var.get()))
         except Exception:
             pass
 
@@ -828,12 +910,15 @@ class PeakFitApp:
         self.cfg.setdefault("perf_seed_all", False)
         self.cfg.setdefault("perf_seed", "")
         self.cfg.setdefault("perf_max_workers", 0)
+        self.cfg.setdefault("perf_parallel_strategy", "outer")
+        self.cfg.setdefault("perf_blas_threads", 0)
         self.cfg.setdefault("last_template_name", self.cfg.get("auto_apply_template_name", ""))
         self.cfg.setdefault("export_unc_wide", False)
         self.cfg.setdefault("unc_alpha", 0.05)
         self.cfg.setdefault("unc_center_resid", True)
         self.cfg.setdefault("unc_boot_solver_follow", True)
         self.cfg.setdefault("bootstrap_jitter", 0.02)
+        self.cfg.setdefault("log_debug_mode", False)
         self.cfg.setdefault("bayes_walkers", 0)
         self.cfg.setdefault("bayes_burn", 1000)
         self.cfg.setdefault("bayes_steps", 4000)
@@ -987,6 +1072,17 @@ class PeakFitApp:
             lambda *_: self._cfg_set("lmfit_share_eta", bool(self.lmfit_share_eta.get())),
         )
         self.snr_text = tk.StringVar(value="S/N: --")
+
+        self.debug_mode_var = tk.BooleanVar(value=bool(self.cfg.get("log_debug_mode", False)))
+        self.perf_parallel_strategy = tk.StringVar(
+            value=str(self.cfg.get("perf_parallel_strategy", "outer"))
+        )
+        self.perf_blas_threads = tk.IntVar(value=int(self.cfg.get("perf_blas_threads", 0)))
+        self.unc_boot_follow_var = tk.BooleanVar(
+            value=bool(self.cfg.get("unc_boot_solver_follow", True))
+        )
+        self.debug_mode_var.trace_add("write", lambda *_: self._on_debug_toggle())
+        self.unc_boot_follow_var.trace_add("write", self._on_unc_boot_follow)
 
         self.ci_band = None
         self.show_ci_band = tk.BooleanVar(value=bool(self.cfg.get("ui_show_uncertainty_band", False)))
@@ -1578,6 +1674,12 @@ class PeakFitApp:
             lambda _e: self._on_boot_solver_choice(),
         )
         r += 1
+        ttk.Checkbutton(
+            unc_frame,
+            text="Bootstrap base solver follows main solver",
+            variable=self.unc_boot_follow_var,
+        ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        r += 1
         ttk.Label(unc_frame, text="CI α").grid(row=r, column=0, sticky="e")
         _alpha_entry = ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6)
         _alpha_entry.grid(row=r, column=1, sticky="w")
@@ -1685,6 +1787,10 @@ class PeakFitApp:
 
         self._update_unc_widgets()
         self._on_uncertainty_method_changed()
+        try:
+            self._on_unc_boot_follow()
+        except Exception:
+            pass
 
         # Axes / label controls
         axes_box = ttk.Labelframe(right, text="Axes / Labels")
@@ -1709,6 +1815,33 @@ class PeakFitApp:
         ttk.Checkbutton(perf_box, text="GPU", variable=self.perf_gpu).pack(anchor="w")
         ttk.Checkbutton(perf_box, text="Cache baseline", variable=self.perf_cache_baseline).pack(anchor="w")
         ttk.Checkbutton(perf_box, text="Seed all", variable=self.perf_seed_all).pack(anchor="w")
+        par = ttk.Labelframe(perf_box, text="Parallelism")
+        par.pack(fill=tk.X, pady=4)
+        ttk.Radiobutton(
+            par,
+            text="Outer: many workers (BLAS=1)",
+            value="outer",
+            variable=self.perf_parallel_strategy,
+            command=self.apply_performance,
+        ).pack(anchor="w")
+        row = ttk.Frame(par)
+        row.pack(fill=tk.X)
+        ttk.Radiobutton(
+            row,
+            text="Inner: BLAS threads per task =",
+            value="inner",
+            variable=self.perf_parallel_strategy,
+            command=self.apply_performance,
+        ).pack(side=tk.LEFT)
+        ttk.Spinbox(
+            row,
+            from_=0,
+            to=256,
+            width=4,
+            textvariable=self.perf_blas_threads,
+            command=self.apply_performance,
+        ).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(row, text="(0 = library default)").pack(side=tk.LEFT, padx=(6, 0))
         rowp = ttk.Frame(perf_box); rowp.pack(fill=tk.X, pady=2)
         ttk.Label(rowp, text="Seed:").pack(side=tk.LEFT)
         ttk.Entry(rowp, width=8, textvariable=self.seed_var).pack(side=tk.LEFT, padx=4)
@@ -1808,6 +1941,7 @@ class PeakFitApp:
             "height_factor": float(self.classic_height_factor.get()),
         }
 
+    @log_action
     def _on_boot_solver_choice(self, *_):
         if hasattr(self, "boot_solver_choice"):
             try:
@@ -1815,7 +1949,10 @@ class PeakFitApp:
             except Exception:
                 pass
         # user touched it -> stop following main solver
-        self._set_boot_follow(False)
+        try:
+            self.unc_boot_follow_var.set(False)
+        except Exception:
+            self._set_boot_follow(False)
         # immediate visual/state feedback
         try:
             self._update_unc_widgets()
@@ -1823,6 +1960,23 @@ class PeakFitApp:
         except Exception:
             pass
 
+    @log_action
+    def _on_unc_boot_follow(self, *_):
+        self._cfg_set("unc_boot_solver_follow", bool(self.unc_boot_follow_var.get()))
+        if self._boot_follow_enabled():
+            try:
+                self.boot_solver_choice.set(self.solver_choice.get())
+                self._cfg_set("unc_boot_solver", self.solver_choice.get())
+            except Exception:
+                pass
+        # disable/enable combobox when following
+        try:
+            state = "disabled" if self._boot_follow_enabled() else "readonly"
+            self._boot_solver_cb.configure(state=state)
+        except Exception:
+            pass
+
+    @log_action
     def _on_solver_change(self):
         choice = self.solver_choice.get()
         self.solver_title.set(SOLVER_LABELS.get(choice, choice))
@@ -1837,7 +1991,13 @@ class PeakFitApp:
                 pass
         self._show_solver_opts()
         self._update_unc_widgets()
+        try:
+            if self._boot_follow_enabled():
+                self._update_unc_widgets()
+        except Exception:
+            pass
 
+    @log_action
     def _update_unc_widgets(self):
         # Keep the Bootstrap label in sync with the actual solver selection
         chosen = self._select_bootstrap_solver()
@@ -1853,6 +2013,7 @@ class PeakFitApp:
             self.unc_method.set(boot_label)
         self._on_uncertainty_method_changed()
 
+    @log_action
     def _on_unc_method_change(self, _e=None):
         label = self.unc_method.get()
         if label.startswith("Bootstrap"):
@@ -2026,15 +2187,19 @@ class PeakFitApp:
             return float("inf")
         return val if val > 0 else float("inf")
 
+    @log_action
     def _on_bayes_band_max_draws_change(self):
         self._cfg_set("bayes_band_max_draws", self._bayes_band_max_draws_value())
 
+    @log_action
     def _on_bayes_diag_ess_change(self):
         self._cfg_set("bayes_diag_ess_min", self._bayes_diag_ess_min_value())
 
+    @log_action
     def _on_bayes_diag_rhat_change(self):
         self._cfg_set("bayes_diag_rhat_max", self._bayes_diag_rhat_max_value())
 
+    @log_action
     def _on_bayes_diag_mcse_change(self):
         self._cfg_set("bayes_diag_mcse_mean", self._bayes_diag_mcse_value())
 
@@ -2234,6 +2399,7 @@ class PeakFitApp:
                 return (x, lo, hi)
         return None
 
+    @log_action
     def _on_uncertainty_method_changed(self, *_):
         method_key = self._unc_selected_method_key()
 
@@ -2258,7 +2424,10 @@ class PeakFitApp:
         boot_cb = getattr(self, "_boot_solver_cb", None)
         if boot_cb is not None:
             try:
-                boot_cb.configure(state="readonly" if is_boot else "disabled")
+                state = "disabled"
+                if is_boot:
+                    state = "disabled" if self._boot_follow_enabled() else "readonly"
+                boot_cb.configure(state=state)
             except Exception:
                 pass
             try:
@@ -2374,6 +2543,12 @@ class PeakFitApp:
             btns = ttk.Frame(self._log_frame)
             ttk.Button(btns, text="Copy log", command=self._copy_log).pack(side=tk.LEFT)
             ttk.Button(btns, text="Save log…", command=self._save_log).pack(side=tk.LEFT)
+            ttk.Checkbutton(
+                btns,
+                text="Debug",
+                variable=self.debug_mode_var,
+                command=self._on_debug_toggle,
+            ).pack(side=tk.LEFT, padx=(12, 2))
             btns.pack(fill=tk.X)
             self._log_console = scrolledtext.ScrolledText(self._log_frame, height=8, state="disabled")
             self._log_console.configure(
@@ -2388,6 +2563,12 @@ class PeakFitApp:
         self._log_frame.pack(side=tk.BOTTOM, fill=tk.X)
         self.log_btn.config(text="Hide log \u25BE")
         self._log_visible = True
+
+    def copy_log(self):  # back-compat alias
+        return self._copy_log()
+
+    def save_log(self):  # back-compat alias
+        return self._save_log()
 
     def _copy_log(self):
         try:
@@ -3551,6 +3732,8 @@ class PeakFitApp:
             "perf_seed_all": bool(self.perf_seed_all.get()),
             "perf_max_workers": int(workers_eff),
             "perf_seed": self.cfg.get("perf_seed", ""),
+            "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
+            "perf_blas_threads": int(self.perf_blas_threads.get()),
             "output_dir": str(output_dir),
             "output_base": output_base,
             # Bayesian band configuration
@@ -3569,6 +3752,8 @@ class PeakFitApp:
                 self.bayes_prior_var.get()
                 or self.cfg.get("bayes_prior_sigma", "half_cauchy")
             ),
+            "unc_boot_solver_follow": bool(self.unc_boot_follow_var.get()),
+            "log_debug_mode": bool(self.debug_mode_var.get()),
         }
 
         if self.fit_xmin is not None and self.fit_xmax is not None:
@@ -3918,23 +4103,37 @@ class PeakFitApp:
 
             n_boot = self._get_int("bootstrap_n", 200)
             seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
-            res = core_uncertainty.bootstrap_ci(
-                theta=theta,
-                residual=r0,
-                jacobian=J,
-                predict_full=predict_full,
-                x_all=x_fit,
-                y_all=y_fit,
-                fit_ctx=fit_ctx,
-                locked_mask=locked_mask,
-                bounds=(lo, hi),
-                return_band=True,
-                alpha=alpha,
-                center_residuals=center_res,
-                workers=workers,
-                n_boot=n_boot,
-                seed=seed_val,
-            )
+            try:
+                req_workers = self._resolve_unc_workers()
+            except Exception:
+                req_workers = 0
+            try:
+                show_band = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else True
+                kind = "prediction" if show_band else "resampling"
+                self.log(
+                    f"Bootstrap band ({kind}): draws={n_boot} | "
+                    f"workers_requested={req_workers} | workers_band={band_workers or 0}"
+                )
+            except Exception:
+                pass
+            with self._tp_limits_ctx():
+                res = core_uncertainty.bootstrap_ci(
+                    theta=theta,
+                    residual=r0,
+                    jacobian=J,
+                    predict_full=predict_full,
+                    x_all=x_fit,
+                    y_all=y_fit,
+                    fit_ctx=fit_ctx,
+                    locked_mask=locked_mask,
+                    bounds=(lo, hi),
+                    return_band=True,
+                    alpha=alpha,
+                    center_residuals=center_res,
+                    workers=workers,
+                    n_boot=n_boot,
+                    seed=seed_val,
+                )
             out = res
         elif method_key == "bayesian":
             # Pre-run user notices (only if the user intends to see a band)
@@ -4007,24 +4206,25 @@ class PeakFitApp:
                 }
             )
             seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
-            out = core_uncertainty.bayesian_ci(
-                theta_hat=theta,
-                model=predict_full,
-                predict_full=predict_full,
-                x_all=x_fit,
-                y_all=y_fit,
-                residual_fn=(lambda th: resid_fn(th)),
-                seed=seed_val,
-                fit_ctx=fit_ctx,
-                locked_mask=locked_mask,
-                bounds=(lo, hi),
-                workers=workers,
-                n_walkers=(walkers or None),
-                n_burn=burn,
-                n_steps=steps,
-                thin=thin,
-                prior_sigma=prior_sigma,
-            )
+            with self._tp_limits_ctx():
+                out = core_uncertainty.bayesian_ci(
+                    theta_hat=theta,
+                    model=predict_full,
+                    predict_full=predict_full,
+                    x_all=x_fit,
+                    y_all=y_fit,
+                    residual_fn=(lambda th: resid_fn(th)),
+                    seed=seed_val,
+                    fit_ctx=fit_ctx,
+                    locked_mask=locked_mask,
+                    bounds=(lo, hi),
+                    workers=workers,
+                    n_walkers=(walkers or None),
+                    n_burn=burn,
+                    n_steps=steps,
+                    thin=thin,
+                    prior_sigma=prior_sigma,
+                )
         else:
             return {"label": "unknown", "stats": []}
 
@@ -4125,6 +4325,7 @@ class PeakFitApp:
         return saved
     # --- END: batch uncertainty helpers ---
 
+    @log_action
     def run_uncertainty(self):
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Uncertainty", "Load data and perform a fit first.")
@@ -4275,22 +4476,36 @@ class PeakFitApp:
                 except Exception:
                     pass
 
-                out = core_uncertainty.bootstrap_ci(
-                    theta=theta,
-                    residual=r0,
-                    jacobian=J,
-                    predict_full=predict_full,
-                    x_all=x_fit,
-                    y_all=y_fit,
-                    locked_mask=locked_mask,
-                    fit_ctx=fit_ctx,
-                    n_boot=n_boot,
-                    seed=seed_val,
-                    workers=workers,
-                    return_band=bool(self.show_ci_band_var.get()),
-                    alpha=alpha,
-                    center_residuals=bool(self.center_resid_var.get()),
-                )
+                try:
+                    req_workers = self._resolve_unc_workers()
+                except Exception:
+                    req_workers = 0
+                try:
+                    show_band = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else True
+                    kind = "prediction" if show_band else "resampling"
+                    self.log(
+                        f"Bootstrap band ({kind}): draws={n_boot} | "
+                        f"workers_requested={req_workers} | workers_band={band_workers or 0}"
+                    )
+                except Exception:
+                    pass
+                with self._tp_limits_ctx():
+                    out = core_uncertainty.bootstrap_ci(
+                        theta=theta,
+                        residual=r0,
+                        jacobian=J,
+                        predict_full=predict_full,
+                        x_all=x_fit,
+                        y_all=y_fit,
+                        locked_mask=locked_mask,
+                        fit_ctx=fit_ctx,
+                        n_boot=n_boot,
+                        seed=seed_val,
+                        workers=workers,
+                        return_band=bool(self.show_ci_band_var.get()),
+                        alpha=alpha,
+                        center_residuals=bool(self.center_resid_var.get()),
+                    )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
                 return out
@@ -4374,23 +4589,24 @@ class PeakFitApp:
                 hi[3::4] = 1.0                     # 0 ≤ eta ≤ 1
 
                 seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
-                out = core_uncertainty.bayesian_ci(
-                    theta_hat=theta,
-                    model=predict_full,
-                    predict_full=predict_full,
-                    x_all=x_fit,
-                    y_all=y_fit,
-                    residual_fn=(lambda th: resid_fn(th)),
-                    seed=seed_val,
-                    fit_ctx=fit_ctx,
-                    locked_mask=locked_mask,
-                    n_walkers=(walkers or None),
-                    n_burn=burn,
-                    n_steps=steps,
-                    thin=thin,
-                    prior_sigma=prior_sigma,
-                    bounds=(lo, hi),
-                )
+                with self._tp_limits_ctx():
+                    out = core_uncertainty.bayesian_ci(
+                        theta_hat=theta,
+                        model=predict_full,
+                        predict_full=predict_full,
+                        x_all=x_fit,
+                        y_all=y_fit,
+                        residual_fn=(lambda th: resid_fn(th)),
+                        seed=seed_val,
+                        fit_ctx=fit_ctx,
+                        locked_mask=locked_mask,
+                        n_walkers=(walkers or None),
+                        n_burn=burn,
+                        n_steps=steps,
+                        thin=thin,
+                        prior_sigma=prior_sigma,
+                        bounds=(lo, hi),
+                    )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
                 return out
@@ -4618,6 +4834,7 @@ class PeakFitApp:
         self.status_info("Computing uncertainty…")
         self.run_in_thread(work, done)
 
+    @log_action
     def apply_performance(self):
         performance.set_numba(bool(self.perf_numba.get()))
         performance.set_gpu(bool(self.perf_gpu.get()))
@@ -4651,12 +4868,56 @@ class PeakFitApp:
         self.cfg["perf_seed_all"] = bool(self.perf_seed_all.get())
         self.cfg["perf_seed"] = seed if seed is not None else ""
         self.cfg["perf_max_workers"] = workers
+        self.cfg["perf_parallel_strategy"] = str(self.perf_parallel_strategy.get())
+        self.cfg["perf_blas_threads"] = int(self.perf_blas_threads.get())
+        self.cfg["unc_boot_solver_follow"] = bool(self.unc_boot_follow_var.get())
+        self.cfg["log_debug_mode"] = bool(self.debug_mode_var.get())
+
+        # Set env for child processes/futures
+        import os
+
+        strategy = str(self.perf_parallel_strategy.get())
+        blas_threads = int(self.perf_blas_threads.get())
+        if strategy == "outer":
+            os.environ["MKL_NUM_THREADS"] = "1"
+            os.environ["OPENBLAS_NUM_THREADS"] = "1"
+            os.environ["OMP_NUM_THREADS"] = "1"
+        else:
+            if blas_threads > 0:
+                os.environ["MKL_NUM_THREADS"] = str(blas_threads)
+                os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
+                os.environ["OMP_NUM_THREADS"] = str(blas_threads)
+            else:
+                for k in ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"):
+                    os.environ.pop(k, None)
+
+        # Log effective libs
+        try:
+            from threadpoolctl import threadpool_info
+
+            libs = threadpool_info()
+            self.dlog(f"threadpool_info={libs}")
+        except Exception:
+            libs = []
         save_config(self.cfg)
+        requested = 0
+        try:
+            requested = int(self.perf_max_workers.get())
+        except Exception:
+            pass
         eff = self._resolve_unc_workers()
-        self.log(f"Backend: {performance.which_backend()} | workers_effective={eff}")
+        self.log(
+            "Backend: "
+            f"{performance.which_backend()} | workers_requested={requested} | workers_effective={eff} | "
+            f"strategy={strategy} | "
+            f"MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS', '-')} "
+            f"OPENBLAS_NUM_THREADS={os.environ.get('OPENBLAS_NUM_THREADS', '-')} "
+            f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '-')}"
+        )
         self.status_var.set("Performance options applied.")
 
     # --- BEGIN: hook batch runner to compute + export uncertainty ---
+    @log_action
     def _batch_process_file(self, in_path: Path, out_dir: Path, unc_rows: List[dict] | None = None):
         """Process one spectrum: reset band, fit, export fit/trace, then compute and export uncertainty if enabled."""
         # reset any previous band so batch files don't leak state
