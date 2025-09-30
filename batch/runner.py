@@ -26,7 +26,6 @@ from core import data_io, models, peaks, signals, fit_api
 from core.residuals import build_residual
 from core.uncertainty import finite_diff_jacobian, bootstrap_ci, UncertaintyResult
 from core.uncertainty_router import route_uncertainty
-from infra import performance
 
 
 logger = logging.getLogger(__name__)
@@ -172,41 +171,27 @@ def run_batch(
         bootstrap_n = int(config.get("bootstrap_n", 500) or 500)
     except Exception:
         bootstrap_n = 500
-    cfg_perf = performance.get_parallel_config()
-    performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
-
+    # NOTE(surgical): prefer Performance.max_workers if present
+    try:
+        raw = config.get("perf_max_workers", config.get("unc_workers", 0))
+        _unc_req = int(raw)
+    except Exception:
+        _unc_req = 0
+    if _unc_req <= 0:
+        _unc_req = os.cpu_count() or 1
     maxcpu = max(1, (os.cpu_count() or 1))
-
-    def _parse_workers(value) -> int:
-        try:
-            return int(value)
-        except Exception:
-            try:
-                return int(float(value))
-            except Exception:
-                return 0
-
-    unc_req_cfg = _parse_workers(
-        config.get(
-            "perf_unc_workers",
-            config.get("unc_workers", config.get("perf_max_workers", 0)),
-        )
-    )
-    if unc_req_cfg <= 0:
-        unc_workers = min(maxcpu, max(1, int(cfg_perf.unc_workers)))
+    if _unc_req <= 1:
+        unc_workers = 0
     else:
-        unc_workers = max(1, min(unc_req_cfg, maxcpu))
-
-    band_req_cfg = _parse_workers(
-        config.get(
-            "unc_band_workers",
-            unc_req_cfg if unc_req_cfg > 0 else cfg_perf.unc_workers,
-        )
-    )
-    if band_req_cfg <= 0:
-        unc_band_workers = unc_workers
+        unc_workers = min(_unc_req, maxcpu)
+    try:
+        _band_req = int(config.get("unc_band_workers", _unc_req))
+    except Exception:
+        _band_req = _unc_req
+    if _band_req <= 1:
+        unc_band_workers = 0
     else:
-        unc_band_workers = max(1, min(band_req_cfg, maxcpu))
+        unc_band_workers = min(_band_req, maxcpu)
 
     out_dir = Path(
         config.get("output_dir", Path(config.get("peak_output", "peaks.csv")).parent)
@@ -227,13 +212,12 @@ def run_batch(
         or "asymptotic"
     )
     unc_method_canon = data_io.canonical_unc_label(unc_choice)
-    perf_seed_all = bool(config.get("perf_seed_all", cfg_perf.seed_all))
-    seed_default = cfg_perf.seed_value if cfg_perf.seed_value is not None else ""
-    _perf_seed_cfg = config.get("perf_seed", seed_default)
+    perf_seed_all = bool(config.get("perf_seed_all", False))
+    _perf_seed_cfg = config.get("perf_seed", "")
     try:
-        perf_seed = int(_perf_seed_cfg) if str(_perf_seed_cfg) not in ("", "None") else cfg_perf.seed_value
+        perf_seed = int(_perf_seed_cfg) if str(_perf_seed_cfg) not in ("", "None") else None
     except Exception:
-        perf_seed = cfg_perf.seed_value
+        perf_seed = None
     if log:
         log(f"batch uncertainty method={unc_method_canon}")
         log(f"batch compute_uncertainty={bool(compute_uncertainty)}")
@@ -527,8 +511,8 @@ def run_batch(
                     }
                 )
                 fit_ctx.update({
-                    "unc_workers": int(unc_workers),
-                    "unc_band_workers": int(unc_band_workers),
+                    "unc_workers": unc_workers if unc_workers > 0 else None,
+                    "unc_band_workers": unc_band_workers if unc_band_workers > 0 else None,
                     "unc_use_gpu": bool(config.get("unc_use_gpu", False)),
                 })
 
@@ -606,8 +590,14 @@ def run_batch(
 
                 fit_ctx.update({"refit": _refit_wrapper})
 
-                workers_eff = int(unc_workers)
-                band_workers_eff = int(unc_band_workers)
+                workers_eff = unc_workers if unc_workers > 0 else None
+                try:
+                    unc_band_workers_cfg = int(config.get("unc_band_workers", 0) or 0)
+                except Exception:
+                    unc_band_workers_cfg = 0
+                band_workers_eff = (
+                    unc_band_workers_cfg if unc_band_workers_cfg > 0 else workers_eff
+                )
                 fit_ctx["unc_workers"] = workers_eff
                 fit_ctx["unc_band_workers"] = band_workers_eff
 
@@ -617,47 +607,31 @@ def run_batch(
                     alpha = float(config.get("unc_alpha", 0.05))
                     center_res = bool(config.get("unc_center_resid", True))
                     n_boot = bootstrap_n
-                    if perf_seed_all and perf_seed is not None:
-                        seed_val = perf_seed + file_index
-                    elif cfg_perf.seed_all and cfg_perf.seed_value is not None:
-                        seed_val = cfg_perf.seed_value
-                    else:
-                        seed_val = None
+                    seed_val = (perf_seed + file_index) if (perf_seed_all and perf_seed is not None) else None
 
                     jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
                     jac_mat = np.atleast_2d(np.asarray(jac_mat, float))
 
                     fit_ctx["abort_event"] = abort_event
-                    perf_line = (
-                        f"[DEBUG] perf: fit_workers={cfg_perf.fit_workers} unc_workers={workers_eff} "
-                        f"blas_threads=1 seed_all={perf_seed_all or cfg_perf.seed_all} seed={seed_val}"
-                    )
-                    logger.debug(perf_line)
-                    if log:
-                        log(perf_line)
                     with _tp_limits_ctx_for_config(config):
-                        with performance.blas_single_thread_ctx():
-                            performance.apply_global_seed(
-                                seed_val, perf_seed_all or cfg_perf.seed_all
-                            )
-                            unc_res = bootstrap_ci(
-                                theta=theta_hat,
-                                residual=residual_vec,
-                                jacobian=jac_mat,
-                                predict_full=model_eval,
-                                x_all=x_fit,
-                                y_all=y_fit,
-                                fit_ctx=fit_ctx,
-                                bounds=bounds,
-                                param_names=res.get("param_names"),
-                                locked_mask=locked_mask,
-                                n_boot=n_boot,
-                                seed=seed_val,
-                                workers=workers_eff,
-                                alpha=alpha,
-                                center_residuals=center_res,
-                                return_band=True,
-                            )
+                        unc_res = bootstrap_ci(
+                            theta=theta_hat,
+                            residual=residual_vec,
+                            jacobian=jac_mat,
+                            predict_full=model_eval,
+                            x_all=x_fit,
+                            y_all=y_fit,
+                            fit_ctx=fit_ctx,
+                            bounds=bounds,
+                            param_names=res.get("param_names"),
+                            locked_mask=locked_mask,
+                            n_boot=n_boot,
+                            seed=seed_val,
+                            workers=workers_eff,
+                            alpha=alpha,
+                            center_residuals=center_res,
+                            return_band=True,
+                        )
                     if isinstance(unc_res, dict):
                         diag = (unc_res.get("diagnostics") or {})
                     else:
@@ -706,38 +680,22 @@ def run_batch(
                         ),
                         "abort_event": abort_event,
                     })
-                    if perf_seed_all and perf_seed is not None:
-                        seed_val = perf_seed + file_index
-                    elif cfg_perf.seed_all and cfg_perf.seed_value is not None:
-                        seed_val = cfg_perf.seed_value
-                    else:
-                        seed_val = None
-                    workers_eff = int(unc_workers)
-                    perf_line = (
-                        f"[DEBUG] perf: fit_workers={cfg_perf.fit_workers} unc_workers={workers_eff} "
-                        f"blas_threads=1 seed_all={perf_seed_all or cfg_perf.seed_all} seed={seed_val}"
-                    )
-                    logger.debug(perf_line)
-                    if log:
-                        log(perf_line)
+                    seed_val = (perf_seed + file_index) if (perf_seed_all and perf_seed is not None) else None
+                    workers_eff = unc_workers if unc_workers > 0 else None
                     with _tp_limits_ctx_for_config(config):
-                        with performance.blas_single_thread_ctx():
-                            performance.apply_global_seed(
-                                seed_val, perf_seed_all or cfg_perf.seed_all
-                            )
-                            unc_res = route_uncertainty(
-                                unc_method_canon,
-                                theta_hat=theta_hat,
-                                residual_fn=residual_fn,
-                                jacobian=jac,
-                                model_eval=model_eval,
-                                fit_ctx=fit_ctx,
-                                x_all=x_fit,
-                                y_all=y_fit,
-                                workers=workers_eff,
-                                seed=seed_val,
-                                n_boot=bootstrap_n,
-                            )
+                        unc_res = route_uncertainty(
+                            unc_method_canon,
+                            theta_hat=theta_hat,
+                            residual_fn=residual_fn,
+                            jacobian=jac,
+                            model_eval=model_eval,
+                            fit_ctx=fit_ctx,
+                            x_all=x_fit,
+                            y_all=y_fit,
+                            workers=workers_eff,
+                            seed=seed_val,
+                            n_boot=bootstrap_n,
+                        )
             except Exception as exc:
                 msg = str(exc)
                 if "Unknown uncertainty method" in msg:
