@@ -910,7 +910,6 @@ class PeakFitApp:
         self.cfg.setdefault("perf_seed_all", False)
         self.cfg.setdefault("perf_seed", "")
         self.cfg.setdefault("perf_max_workers", 0)
-        self.cfg.setdefault("perf_unc_workers", 0)
         self.cfg.setdefault("perf_parallel_strategy", "outer")
         self.cfg.setdefault("perf_blas_threads", 0)
         self.cfg.setdefault("last_template_name", self.cfg.get("auto_apply_template_name", ""))
@@ -1117,13 +1116,11 @@ class PeakFitApp:
         self.perf_cache_baseline = tk.BooleanVar(value=bool(self.cfg.get("perf_cache_baseline", True)))
         self.perf_seed_all = tk.BooleanVar(value=bool(self.cfg.get("perf_seed_all", False)))
         self.perf_max_workers = tk.IntVar(value=int(self.cfg.get("perf_max_workers", 0)))
-        self.perf_unc_workers = tk.IntVar(value=int(self.cfg.get("perf_unc_workers", 0)))
         self.perf_numba.trace_add("write", lambda *_: self.apply_performance())
         self.perf_gpu.trace_add("write", lambda *_: self.apply_performance())
         self.perf_cache_baseline.trace_add("write", lambda *_: self.apply_performance())
         self.perf_seed_all.trace_add("write", lambda *_: self.apply_performance())
         self.perf_max_workers.trace_add("write", lambda *_: self.apply_performance())
-        self.perf_unc_workers.trace_add("write", lambda *_: self.apply_performance())
         self.alpha_var = tk.DoubleVar(value=float(self.cfg.get("unc_alpha", 0.05)))
         self.center_resid_var = tk.BooleanVar(value=bool(self.cfg.get("unc_center_resid", True)))
         self.bootstrap_jitter_var = tk.DoubleVar(value=100.0 * float(self.cfg.get("bootstrap_jitter", 0.02)))
@@ -1850,15 +1847,6 @@ class PeakFitApp:
         ttk.Entry(rowp, width=8, textvariable=self.seed_var).pack(side=tk.LEFT, padx=4)
         ttk.Label(rowp, text="Max workers:").pack(side=tk.LEFT, padx=(8,0))
         ttk.Spinbox(rowp, from_=0, to=64, textvariable=self.perf_max_workers, width=5).pack(side=tk.LEFT)
-        ttk.Label(rowp, text="Unc. workers (0=auto):").pack(side=tk.LEFT, padx=(8,0))
-        ttk.Spinbox(
-            rowp,
-            from_=0,
-            to=256,
-            textvariable=self.perf_unc_workers,
-            width=6,
-            command=self.apply_performance,
-        ).pack(side=tk.LEFT)
         ttk.Label(rowp, text="GPU chunk:").pack(side=tk.LEFT, padx=(8,0))
         ttk.Entry(rowp, width=7, textvariable=self.gpu_chunk_var).pack(side=tk.LEFT, padx=2)
         ttk.Button(rowp, text="Apply", command=self.apply_performance).pack(side=tk.LEFT, padx=4)
@@ -2049,32 +2037,12 @@ class PeakFitApp:
             except Exception:
                 return default
 
-    def _resolve_fit_workers(self) -> int:
-        """Return effective worker count for fitting."""
+    def _resolve_unc_workers(self) -> int:
+        """Return effective worker count. 0/blank ⇒ auto = os.cpu_count()."""
         try:
             raw = self.perf_max_workers.get()
         except Exception:
             raw = self.cfg.get("perf_max_workers", 0)
-        try:
-            w = int(raw)
-        except Exception:
-            try:
-                w = int(float(str(raw).strip()))
-            except Exception:
-                w = 0
-        if w <= 0:
-            try:
-                return os.cpu_count() or 1
-            except Exception:
-                return 1
-        return w
-
-    def _resolve_unc_workers(self) -> int:
-        """Return effective worker count for uncertainty pipelines."""
-        try:
-            raw = self.perf_unc_workers.get()
-        except Exception:
-            raw = self.cfg.get("perf_unc_workers", 0)
         try:
             w = int(raw)
         except Exception:
@@ -3746,8 +3714,7 @@ class PeakFitApp:
             peaks_list = [p.__dict__ for p in self.peaks]
 
         solver = self.solver_choice.get()
-        fit_workers_eff = self._resolve_fit_workers()
-        unc_workers_eff = self._resolve_unc_workers()
+        workers_eff = self._resolve_unc_workers()
         cfg = {
             "peaks": peaks_list,
             "solver": solver,
@@ -3763,8 +3730,7 @@ class PeakFitApp:
             "perf_gpu": bool(self.perf_gpu.get()),
             "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
             "perf_seed_all": bool(self.perf_seed_all.get()),
-            "perf_max_workers": int(fit_workers_eff),
-            "perf_unc_workers": int(unc_workers_eff),
+            "perf_max_workers": int(workers_eff),
             "perf_seed": self.cfg.get("perf_seed", ""),
             "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
             "perf_blas_threads": int(self.perf_blas_threads.get()),
@@ -4865,17 +4831,6 @@ class PeakFitApp:
         self._abort_evt.clear()
         self.abort_btn.config(state=tk.NORMAL)
         self._progress_begin("uncertainty")
-        # Perf snapshot for debug parity with batch uncertainty runs
-        try:
-            from infra import performance
-
-            cfg_perf = performance.get_parallel_config()
-            self.ilog(
-                f"[DEBUG] perf: fit_workers={cfg_perf.fit_workers} unc_workers={cfg_perf.unc_workers} "
-                f"blas_threads=1 seed_all={cfg_perf.seed_all} seed={cfg_perf.seed_value}"
-            )
-        except Exception:
-            pass
         self.status_info("Computing uncertainty…")
         self.run_in_thread(work, done)
 
@@ -4894,9 +4849,8 @@ class PeakFitApp:
                 seed = int(seed_txt)
             except Exception:
                 seed = None
-        # apply_global_seed stores the seed and, if enabled, seeds RNGs globally.
-        # No need to call set_seed separately.
-        performance.apply_global_seed(seed, bool(self.perf_seed_all.get()))
+        effective_seed = seed if bool(self.perf_seed_all.get()) else None
+        performance.set_seed(effective_seed)
         # Parse workers safely even if the Entry is blank while typing
         try:
             w_txt = str(self.perf_max_workers.get()).strip()
@@ -4906,16 +4860,7 @@ class PeakFitApp:
             workers = int(float(w_txt)) if w_txt else 0
         except Exception:
             workers = 0
-        try:
-            unc_txt = str(self.perf_unc_workers.get()).strip()
-        except Exception:
-            unc_txt = ""
-        try:
-            unc_workers = int(float(unc_txt)) if unc_txt else 0
-        except Exception:
-            unc_workers = 0
         performance.set_max_workers(workers)
-        performance.set_unc_workers(unc_workers)
         performance.set_gpu_chunk(self.gpu_chunk_var.get())
         self.cfg["perf_numba"] = bool(self.perf_numba.get())
         self.cfg["perf_gpu"] = bool(self.perf_gpu.get())
@@ -4923,7 +4868,6 @@ class PeakFitApp:
         self.cfg["perf_seed_all"] = bool(self.perf_seed_all.get())
         self.cfg["perf_seed"] = seed if seed is not None else ""
         self.cfg["perf_max_workers"] = workers
-        self.cfg["perf_unc_workers"] = unc_workers
         self.cfg["perf_parallel_strategy"] = str(self.perf_parallel_strategy.get())
         self.cfg["perf_blas_threads"] = int(self.perf_blas_threads.get())
         self.cfg["unc_boot_solver_follow"] = bool(self.unc_boot_follow_var.get())
@@ -4956,33 +4900,19 @@ class PeakFitApp:
         except Exception:
             libs = []
         save_config(self.cfg)
+        requested = 0
         try:
-            fit_req = int(self.perf_max_workers.get())
+            requested = int(self.perf_max_workers.get())
         except Exception:
-            fit_req = workers
-        try:
-            unc_req = int(self.perf_unc_workers.get())
-        except Exception:
-            unc_req = unc_workers
-        fit_eff = self._resolve_fit_workers()
-        unc_eff = self._resolve_unc_workers()
-        self.ilog("[DEBUG] apply_performance()")
+            pass
+        eff = self._resolve_unc_workers()
         self.log(
-            "Backend: %s | fit_workers_req=%s | fit_workers_eff=%s | unc_workers_req=%s | unc_workers_eff=%s | "
-            "strategy=%s | MKL_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s OMP_NUM_THREADS=%s | seed_all=%s seed=%s"
-            % (
-                performance.which_backend(),
-                fit_req,
-                fit_eff,
-                unc_req,
-                unc_eff,
-                strategy,
-                os.environ.get("MKL_NUM_THREADS", "-"),
-                os.environ.get("OPENBLAS_NUM_THREADS", "-"),
-                os.environ.get("OMP_NUM_THREADS", "-"),
-                bool(self.perf_seed_all.get()),
-                seed if seed is not None else "-",
-            )
+            "Backend: "
+            f"{performance.which_backend()} | workers_requested={requested} | workers_effective={eff} | "
+            f"strategy={strategy} | "
+            f"MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS', '-')} "
+            f"OPENBLAS_NUM_THREADS={os.environ.get('OPENBLAS_NUM_THREADS', '-')} "
+            f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '-')}"
         )
         self.status_var.set("Performance options applied.")
 
@@ -5164,7 +5094,6 @@ class PeakFitApp:
             "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
             "perf_seed_all": bool(self.perf_seed_all.get()),
             "perf_max_workers": int(self.perf_max_workers.get()),
-            "perf_unc_workers": int(self.perf_unc_workers.get()),
         }
         center_bounds = (self.fit_xmin, self.fit_xmax) if (opts.get("centers_in_window") or opts.get("bound_centers_to_window")) else (np.nan, np.nan)
         if self.x is not None and self.x.size > 1:
@@ -5493,7 +5422,6 @@ class PeakFitApp:
                     "cache_baseline": bool(self.perf_cache_baseline.get()),
                     "seed_all": bool(self.perf_seed_all.get()),
                     "max_workers": int(self.perf_max_workers.get()),
-                    "unc_workers": int(self.perf_unc_workers.get()),
                 }
                 locks = getattr(self, "_last_unc_locks", [])
 

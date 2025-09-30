@@ -7,7 +7,6 @@ import numpy as np
 
 from core.residuals import build_residual
 from core.peaks import Peak
-from infra import performance
 
 
 class UncReport(TypedDict):
@@ -37,9 +36,6 @@ def bayesian(
     except Exception as exc:  # pragma: no cover - optional dependency
         raise RuntimeError("emcee is required for Bayesian uncertainty") from exc
 
-    cfg_perf = performance.get_parallel_config()
-    performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
-
     x = np.asarray(init_from_solver["x"], dtype=float)
     y = np.asarray(init_from_solver["y"], dtype=float)
     peaks_tpl: list[Peak] = list(init_from_solver["peaks"])
@@ -62,16 +58,11 @@ def bayesian(
     ndim = theta0.size
     nwalkers = int(sampler_cfg.get("nwalkers", 2 * ndim))
     nsteps = int(sampler_cfg.get("nsteps", 1000))
-    seed_cfg = sampler_cfg.get("seed")
-    if seed_cfg is None and cfg_perf.seed_all:
-        seed_cfg = cfg_perf.seed_value
-    rng = np.random.default_rng(seed_cfg)
+    rng = np.random.default_rng(sampler_cfg.get("seed"))
     p0 = theta0 + 1e-4 * rng.standard_normal((nwalkers, ndim))
 
-    with performance.blas_single_thread_ctx():
-        performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
-        sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob)
-        sampler.run_mcmc(p0, nsteps, progress=False)
+    sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob)
+    sampler.run_mcmc(p0, nsteps, progress=False)
     samples = sampler.get_chain(flat=True)
 
     mean = samples.mean(axis=0)
