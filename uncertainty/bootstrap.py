@@ -5,7 +5,6 @@ from typing import Sequence, TypedDict
 
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
-import os
 
 from core.peaks import Peak
 from infra import performance
@@ -104,17 +103,22 @@ def bootstrap(base_solver: str, resample_cfg: dict, residual_builder) -> UncRepo
     seed_base = resample_cfg.get("seed")
     start_peaks = _peaks_from_theta(theta, peaks)
 
-    max_workers = int(resample_cfg.get("workers", 0))
-    if max_workers <= 0:
-        mw = performance.get_max_workers()
-        max_workers = mw if mw > 0 else (os.cpu_count() or 1)
+    cfg_perf = performance.get_parallel_config()
+    try:
+        workers_req = int(resample_cfg.get("workers", 0) or 0)
+    except Exception:
+        workers_req = 0
+    draw_workers = workers_req if workers_req > 0 else cfg_perf.unc_workers
+    draw_workers = max(1, int(draw_workers))
     args_common = (base_solver, x, fitted, r, start_peaks, mode, baseline, options, seed_base)
-    if max_workers > 1:
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            iter_args = (args_common + (i,) for i in range(n))
-            samples_list = list(ex.map(_bootstrap_worker, iter_args))
-    else:
-        samples_list = [_bootstrap_worker(args_common + (i,)) for i in range(n)]
+    with performance.blas_single_thread_ctx():
+        performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
+        if draw_workers > 1:
+            with ProcessPoolExecutor(max_workers=draw_workers) as ex:
+                iter_args = (args_common + (i,) for i in range(n))
+                samples_list = list(ex.map(_bootstrap_worker, iter_args))
+        else:
+            samples_list = [_bootstrap_worker(args_common + (i,)) for i in range(n)]
 
     samples = np.vstack(samples_list) if samples_list else np.empty((0, theta.size))
     mean_theta = samples.mean(axis=0) if samples.size else theta
