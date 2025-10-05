@@ -160,6 +160,12 @@ def route_uncertainty(
         jitter = _norm_jitter(ctx.get("bootstrap_jitter", ctx.get("jitter", 0.0)))
         ctx["bootstrap_jitter"] = jitter
         ctx["strict_refit"] = True
+        strategy = str(ctx.get("perf_parallel_strategy", "outer"))
+        ctx["perf_parallel_strategy"] = strategy
+        try:
+            ctx["perf_blas_threads"] = int(ctx.get("perf_blas_threads", 0) or 0)
+        except Exception:
+            ctx["perf_blas_threads"] = 0
         if "unc_workers" not in ctx and "workers" in locals():
             ctx["unc_workers"] = workers
         if "unc_band_workers" not in ctx:
