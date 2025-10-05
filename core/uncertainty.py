@@ -570,6 +570,14 @@ def bootstrap_ci(
     jitter_scale = float(fit.get("bootstrap_jitter", 0.0))
     allow_linear = bool(fit.get("allow_linear_fallback", True))
 
+    # Propagate performance threading knobs for downstream bootstrap helpers.
+    strategy = str(fit.get("perf_parallel_strategy", "outer"))
+    fit["perf_parallel_strategy"] = strategy
+    try:
+        fit["perf_blas_threads"] = int(fit.get("perf_blas_threads", 0) or 0)
+    except Exception:
+        fit["perf_blas_threads"] = 0
+
     # Resolve worker count for DRAW phase
     if workers not in (None, False):
         _workers_req = workers
@@ -582,6 +590,10 @@ def bootstrap_ci(
 
     # Resolve worker count for BAND predict_full (optional separate knob)
     _band_req = fit.get("unc_band_workers", fit.get("unc_workers", None))
+    try:
+        band_workers_requested = max(0, int(_band_req or 0))
+    except Exception:
+        band_workers_requested = 0
     try:
         band_workers = max(0, min(int(_band_req or 0), os.cpu_count() or 1))
     except Exception:
@@ -1146,7 +1158,12 @@ def bootstrap_ci(
                 band_gated = False
                 band_skip_reason = None
                 diagnostics["band_backend"] = band_backend
-                diagnostics["band_workers_used"] = int(band_workers) if band_workers > 0 else None
+                diagnostics["band_workers_used"] = (
+                    int(band_workers_requested) if band_workers_requested > 0 else None
+                )
+                diagnostics["band_workers_effective"] = (
+                    int(band_workers) if band_workers > 0 else None
+                )
                 try:
                     import cupy as cp  # optional
                     cp.get_default_memory_pool().free_all_blocks()
@@ -1179,7 +1196,10 @@ def bootstrap_ci(
     diag.update(diagnostics)
     diag["bootstrap_mode"] = "linearized" if use_linearized_fast_path else "refit"
     diag["draw_workers_used"] = int(draw_workers) if draw_workers > 0 else None
-    diag["band_workers_used"] = int(band_workers) if band_workers > 0 else None
+    diag["band_workers_used"] = (
+        int(band_workers_requested) if band_workers_requested > 0 else None
+    )
+    diag["band_workers_effective"] = int(band_workers) if band_workers > 0 else None
     diag["theta_jitter_scale"] = float(jitter_scale)
     diag["jitter_applied_any"] = bool(jitter_scale > 0)
     diag["jitter_free_params"] = int(np.sum(free_mask))
