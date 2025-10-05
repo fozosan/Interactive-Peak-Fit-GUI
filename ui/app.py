@@ -4876,7 +4876,7 @@ class PeakFitApp:
             except Exception:
                 _bt_raw = 0
             blas_effective = 1 if strategy == "outer" else (_bt_raw if _bt_raw > 0 else "lib")
-            self.ilog(
+            self.dlog(
                 f"[DEBUG] perf: fit_workers={cfg_perf.fit_workers} unc_workers={cfg_perf.unc_workers} "
                 f"blas_threads={blas_effective} seed_all={cfg_perf.seed_all} seed={cfg_perf.seed_value}"
             )
@@ -4972,7 +4972,7 @@ class PeakFitApp:
             unc_req = unc_workers
         fit_eff = self._resolve_fit_workers()
         unc_eff = self._resolve_unc_workers()
-        self.ilog("[DEBUG] apply_performance()")
+        self.dlog("[DEBUG] apply_performance()")
         self.log(
             "Backend: %s | fit_workers_req=%s | fit_workers_eff=%s | unc_workers_req=%s | unc_workers_eff=%s | "
             "strategy=%s | MKL_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s OMP_NUM_THREADS=%s | seed_all=%s seed=%s"
