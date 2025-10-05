@@ -39,9 +39,9 @@ except Exception:  # pragma: no cover - cupy not available
     _CUPY_OK = False
 
 try:  # pragma: no cover - optional import
-    from threadpoolctl import ThreadpoolController
+    from threadpoolctl import threadpool_limits
 except Exception:  # pragma: no cover - threadpoolctl not available
-    ThreadpoolController = None
+    threadpool_limits = None
 
 
 # ---------------------------------------------------------------------------
@@ -226,25 +226,27 @@ def blas_single_thread_ctx():
 
     env_keys = ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")
     prev_env = {k: os.environ.get(k) for k in env_keys}
-    controller = None
+    for key in env_keys:
+        os.environ[key] = "1"
+
+    if threadpool_limits is None:
+        note_tpctl_absence_once()
+        try:
+            yield
+        finally:
+            for key, value in prev_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return
+
     try:
-        if ThreadpoolController is not None:  # pragma: no branch - optional
-            try:
-                controller = ThreadpoolController()
-                controller.limit(limits=1)
-            except Exception:
-                controller = None
-        else:
-            note_tpctl_absence_once()
-        for key in env_keys:
-            os.environ[key] = "1"
-        yield
+        with threadpool_limits(limits=1, user_api="blas"), threadpool_limits(
+            limits=1, user_api="openmp"
+        ):
+            yield
     finally:
-        if controller is not None:
-            try:  # pragma: no cover - optional backend restore
-                controller.restore_initial_limits()
-            except Exception:
-                pass
         for key, value in prev_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -256,40 +258,41 @@ def blas_single_thread_ctx():
 def blas_limit_ctx(threads: int | None):
     """Limit BLAS/OpenMP threadpools within the scope.
 
-    ``None`` or ``<=0`` ⇒ no clamp (leave libraries as-is).
+    None or <=0 ⇒ no clamp (leave libraries as-is).
     """
 
     try:
-        if threads is None or int(threads) <= 0:
-            yield
-            return
-        threads = int(threads)
+        t = None if threads is None else int(threads)
     except Exception:
+        t = None
+
+    if t is None or t <= 0:
         yield
         return
 
     env_keys = ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")
     prev_env = {k: os.environ.get(k) for k in env_keys}
-    controller = None
-    try:
-        if ThreadpoolController is not None:  # pragma: no branch - optional
-            try:
-                controller = ThreadpoolController()
-                controller.limit(limits=threads)
-            except Exception:
-                controller = None
-        else:
-            note_tpctl_absence_once()
+    for key in env_keys:
+        os.environ[key] = str(t)
 
-        for key in env_keys:
-            os.environ[key] = str(threads)
-        yield
+    if threadpool_limits is None:
+        note_tpctl_absence_once()
+        try:
+            yield
+        finally:
+            for key, value in prev_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return
+
+    try:
+        with threadpool_limits(limits=t, user_api="blas"), threadpool_limits(
+            limits=t, user_api="openmp"
+        ):
+            yield
     finally:
-        if controller is not None:
-            try:  # pragma: no cover - optional backend restore
-                controller.restore_initial_limits()
-            except Exception:
-                pass
         for key, value in prev_env.items():
             if value is None:
                 os.environ.pop(key, None)

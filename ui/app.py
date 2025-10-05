@@ -212,11 +212,9 @@ from matplotlib.widgets import SpanSelector
 
 # ---- Threadpool runtime control (optional) ----
 try:
-    from threadpoolctl import ThreadpoolController, threadpool_info
-
-    _TP_CONTROLLER = ThreadpoolController()
+    from threadpoolctl import threadpool_limits, threadpool_info
 except Exception:
-    _TP_CONTROLLER = None
+    threadpool_limits = None
 
     def threadpool_info():  # type: ignore
         return []
@@ -281,30 +279,9 @@ def _safe_int(x, default=None):
 
 
 def _set_thread_limits(strategy: str, blas_threads):
-    """
-    Clamp both BLAS and OpenMP pools using threadpoolctl.
-    - strategy == 'outer' => 1 thread per pool (outer parallelism)
-    - strategy == 'inner' => respect blas_threads (if valid)
-    """
+    """UI helper: actual clamping is handled in the performance layer."""
 
-    if _TP_CONTROLLER is None:
-        return
-
-    if str(strategy).lower() == "outer":
-        t = 1
-    else:
-        t = _safe_int(blas_threads, default=None)
-        if t is None or t < 1:
-            return
-
-    try:
-        _TP_CONTROLLER.set_limit(limits=t, user_api="blas")
-    except Exception:
-        pass
-    try:
-        _TP_CONTROLLER.set_limit(limits=t, user_api="openmp")
-    except Exception:
-        pass
+    return
 
 
 def log_action(fn):
