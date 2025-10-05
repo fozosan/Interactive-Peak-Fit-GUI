@@ -5,7 +5,6 @@ from typing import Sequence, TypedDict
 
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
-import os
 
 from core.peaks import Peak
 from infra import performance
@@ -41,8 +40,35 @@ def _bootstrap_worker(args):
         idx,
     ) = args
 
-    if performance._SEED is not None:
-        np.random.seed(performance._SEED + idx)
+    # Deterministic per-draw seeding based on base seed + index
+    _seed = None if seed_base is None else int(seed_base) + int(idx)
+
+    try:
+        import random as _random  # type: ignore
+
+        if _seed is not None:
+            _random.seed(_seed)
+    except Exception:
+        pass
+
+    try:
+        if _seed is not None:
+            np.random.seed(_seed)
+    except Exception:
+        pass
+
+    try:
+        import cupy as _cp  # type: ignore
+
+        if _seed is not None:
+            _cp.random.seed(_seed)
+    except Exception:
+        pass
+
+    try:
+        rng = np.random.default_rng(_seed)
+    except Exception:
+        rng = None
 
     if base_solver == "classic":
         from fit.classic import solve as solver
@@ -55,7 +81,11 @@ def _bootstrap_worker(args):
     else:  # pragma: no cover - unknown solver
         raise ValueError("unknown solver")
 
-    rng = np.random.default_rng(seed_base + idx if seed_base is not None else None)
+    if rng is None:
+        try:
+            rng = np.random.default_rng(_seed)
+        except Exception:
+            rng = np.random.RandomState(_seed)
     resampled = rng.choice(resid, size=resid.size, replace=True)
     y_boot = fitted - resampled
     pk_copy = [
@@ -104,17 +134,34 @@ def bootstrap(base_solver: str, resample_cfg: dict, residual_builder) -> UncRepo
     seed_base = resample_cfg.get("seed")
     start_peaks = _peaks_from_theta(theta, peaks)
 
-    max_workers = int(resample_cfg.get("workers", 0))
-    if max_workers <= 0:
-        mw = performance.get_max_workers()
-        max_workers = mw if mw > 0 else (os.cpu_count() or 1)
+    cfg_perf = performance.get_parallel_config()
+    try:
+        workers_req = int(resample_cfg.get("workers", 0) or 0)
+    except Exception:
+        workers_req = 0
+    draw_workers = workers_req if workers_req > 0 else cfg_perf.unc_workers
+    draw_workers = max(1, int(draw_workers))
     args_common = (base_solver, x, fitted, r, start_peaks, mode, baseline, options, seed_base)
-    if max_workers > 1:
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            iter_args = (args_common + (i,) for i in range(n))
-            samples_list = list(ex.map(_bootstrap_worker, iter_args))
+    strategy = str(resample_cfg.get("perf_parallel_strategy", "outer"))
+    try:
+        blas_threads_cfg = int(resample_cfg.get("perf_blas_threads", 0) or 0)
+    except Exception:
+        blas_threads_cfg = 0
+    if strategy == "outer":
+        child_blas: int | None = 1
+    elif blas_threads_cfg > 0:
+        child_blas = blas_threads_cfg
     else:
-        samples_list = [_bootstrap_worker(args_common + (i,)) for i in range(n)]
+        child_blas = None
+
+    performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
+    with performance.blas_limit_ctx(child_blas):
+        if draw_workers > 1:
+            with ProcessPoolExecutor(max_workers=draw_workers) as ex:
+                iter_args = (args_common + (i,) for i in range(n))
+                samples_list = list(ex.map(_bootstrap_worker, iter_args))
+        else:
+            samples_list = [_bootstrap_worker(args_common + (i,)) for i in range(n)]
 
     samples = np.vstack(samples_list) if samples_list else np.empty((0, theta.size))
     mean_theta = samples.mean(axis=0) if samples.size else theta

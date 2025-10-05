@@ -13,8 +13,11 @@ summation order deterministic by stacking components and using ``np.sum``.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
 import math
 import os
+import random
 from typing import Callable, Optional
 
 import numpy as np
@@ -35,6 +38,11 @@ except Exception:  # pragma: no cover - cupy not available
     _cp = None
     _CUPY_OK = False
 
+try:  # pragma: no cover - optional import
+    from threadpoolctl import ThreadpoolController
+except Exception:  # pragma: no cover - threadpoolctl not available
+    ThreadpoolController = None
+
 
 # ---------------------------------------------------------------------------
 # Global state controlled via setters
@@ -44,8 +52,11 @@ _BACKEND = "numpy"
 
 _CACHE_BASELINE = True
 _MAX_WORKERS = 0
+_UNC_WORKERS = 0
 _SEED: Optional[int] = None
+_SEED_ALL = False
 _GPU_CHUNK = 262_144
+_TPCTL_NOTED = False
 
 _LOG: Optional[Callable[[str, str], None]] = None
 
@@ -71,6 +82,21 @@ def _log(msg: str, level: str = "INFO") -> None:
         _LOG(msg, level)
     except Exception:
         pass
+
+
+def note_tpctl_absence_once() -> None:
+    """Log a single debug note when threadpoolctl is unavailable."""
+
+    global _TPCTL_NOTED
+    if not _TPCTL_NOTED:
+        try:
+            _log(
+                "threadpoolctl not available; BLAS clamp relies on env vars only.",
+                "DEBUG",
+            )
+        except Exception:
+            pass
+        _TPCTL_NOTED = True
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +167,151 @@ def set_max_workers(n: int) -> None:
     _MAX_WORKERS = max(0, int(n))
 
 
+def set_unc_workers(n: int) -> None:
+    """Set uncertainty worker cap (0 ⇒ auto)."""
+
+    global _UNC_WORKERS
+    _UNC_WORKERS = max(0, int(n))
+
+
+def get_unc_workers() -> int:
+    return _UNC_WORKERS
+
+
 def get_max_workers() -> int:
     return _MAX_WORKERS
+
+
+def _resolve_workers(n: Optional[int]) -> int:
+    if not n:
+        try:
+            return max(1, os.cpu_count() or 1)
+        except Exception:
+            return 1
+    try:
+        return max(1, int(n))
+    except Exception:
+        return 1
+
+
+def apply_global_seed(seed: Optional[int], enable: bool) -> None:
+    """Apply deterministic seeding across supported RNGs."""
+
+    global _SEED, _SEED_ALL
+    _SEED_ALL = bool(enable)
+    _SEED = int(seed) if seed is not None else None
+    if not _SEED_ALL or _SEED is None:
+        return
+
+    try:
+        random.seed(_SEED)
+    except Exception:
+        pass
+
+    try:
+        np.random.seed(_SEED)
+    except Exception:
+        pass
+
+    if _cp is not None:
+        try:  # pragma: no cover - optional backend
+            _cp.random.seed(_SEED)
+        except Exception:
+            pass
+
+
+@contextmanager
+def blas_single_thread_ctx():
+    """Limit BLAS/OpenMP libraries to a single thread within the context."""
+
+    env_keys = ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")
+    prev_env = {k: os.environ.get(k) for k in env_keys}
+    controller = None
+    try:
+        if ThreadpoolController is not None:  # pragma: no branch - optional
+            try:
+                controller = ThreadpoolController()
+                controller.limit(limits=1)
+            except Exception:
+                controller = None
+        else:
+            note_tpctl_absence_once()
+        for key in env_keys:
+            os.environ[key] = "1"
+        yield
+    finally:
+        if controller is not None:
+            try:  # pragma: no cover - optional backend restore
+                controller.restore_initial_limits()
+            except Exception:
+                pass
+        for key, value in prev_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
+def blas_limit_ctx(threads: int | None):
+    """Limit BLAS/OpenMP threadpools within the scope.
+
+    ``None`` or ``<=0`` ⇒ no clamp (leave libraries as-is).
+    """
+
+    try:
+        if threads is None or int(threads) <= 0:
+            yield
+            return
+        threads = int(threads)
+    except Exception:
+        yield
+        return
+
+    env_keys = ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")
+    prev_env = {k: os.environ.get(k) for k in env_keys}
+    controller = None
+    try:
+        if ThreadpoolController is not None:  # pragma: no branch - optional
+            try:
+                controller = ThreadpoolController()
+                controller.limit(limits=threads)
+            except Exception:
+                controller = None
+        else:
+            note_tpctl_absence_once()
+
+        for key in env_keys:
+            os.environ[key] = str(threads)
+        yield
+    finally:
+        if controller is not None:
+            try:  # pragma: no cover - optional backend restore
+                controller.restore_initial_limits()
+            except Exception:
+                pass
+        for key, value in prev_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@dataclass(frozen=True)
+class ParallelConfig:
+    fit_workers: int
+    unc_workers: int
+    seed_all: bool = False
+    seed_value: Optional[int] = None
+
+
+def get_parallel_config() -> ParallelConfig:
+    return ParallelConfig(
+        fit_workers=_resolve_workers(_MAX_WORKERS),
+        unc_workers=_resolve_workers(_UNC_WORKERS),
+        seed_all=_SEED_ALL,
+        seed_value=_SEED,
+    )
 
 
 def set_gpu_chunk(n: int) -> None:
@@ -339,7 +508,9 @@ __all__ = [
     "set_cache_baseline",
     "set_seed",
     "set_max_workers",
+    "set_unc_workers",
     "get_max_workers",
+    "get_unc_workers",
     "set_gpu_chunk",
     "set_logger",
     "which_backend",
@@ -348,5 +519,10 @@ __all__ = [
     "design_matrix",
     "enable_shadow_compare",
     "cache_baseline_enabled",
+    "apply_global_seed",
+    "blas_single_thread_ctx",
+    "blas_limit_ctx",
+    "get_parallel_config",
+    "note_tpctl_absence_once",
 ]
 
