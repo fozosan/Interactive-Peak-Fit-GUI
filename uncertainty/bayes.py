@@ -40,6 +40,24 @@ def bayesian(
     cfg_perf = performance.get_parallel_config()
     performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
 
+    strategy = str(
+        sampler_cfg.get(
+            "perf_parallel_strategy",
+            init_from_solver.get("perf_parallel_strategy", "outer"),
+        )
+    )
+    try:
+        blas_threads = int(
+            sampler_cfg.get(
+                "perf_blas_threads",
+                init_from_solver.get("perf_blas_threads", 0),
+            )
+            or 0
+        )
+    except Exception:
+        blas_threads = 0
+    limit = 1 if strategy == "outer" else (blas_threads if blas_threads > 0 else None)
+
     x = np.asarray(init_from_solver["x"], dtype=float)
     y = np.asarray(init_from_solver["y"], dtype=float)
     peaks_tpl: list[Peak] = list(init_from_solver["peaks"])
@@ -63,20 +81,57 @@ def bayesian(
     nwalkers = int(sampler_cfg.get("nwalkers", 2 * ndim))
     nsteps = int(sampler_cfg.get("nsteps", 1000))
     seed_cfg = sampler_cfg.get("seed")
-    if seed_cfg is None and cfg_perf.seed_all:
-        seed_cfg = cfg_perf.seed_value
-    rng = np.random.default_rng(seed_cfg)
+    try:
+        seed_int = int(seed_cfg) if seed_cfg is not None else None
+    except Exception:
+        seed_int = None
+    seed_effective = (
+        seed_int if seed_int is not None else (cfg_perf.seed_value if cfg_perf.seed_all else None)
+    )
+    rng = np.random.default_rng(seed_effective)
     p0 = theta0 + 1e-4 * rng.standard_normal((nwalkers, ndim))
 
     performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
-    sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob)
-    sampler.run_mcmc(p0, nsteps, progress=False)
+    with performance.blas_limit_ctx(limit):
+        try:
+            sampler = emcee.EnsembleSampler(
+                nwalkers,
+                ndim,
+                log_prob,
+                random_state=seed_effective if seed_effective is not None else None,
+            )
+        except TypeError:
+            sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob)
+            if seed_effective is not None:
+                try:
+                    sampler.random_state = np.random.RandomState(int(seed_effective))
+                except Exception:
+                    pass
+        performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
+        sampler.run_mcmc(p0, nsteps, progress=False)
     samples = sampler.get_chain(flat=True)
 
     mean = samples.mean(axis=0)
     cov = np.cov(samples, rowvar=False)
     params = {"theta": mean, "cov": cov, "samples": samples}
     meta = {"nwalkers": nwalkers, "nsteps": nsteps}
+    meta.update(
+        {
+            "seed": (
+                int(seed_effective)
+                if seed_effective is not None
+                else seed_cfg
+            ),
+            "seed_all": bool(cfg_perf.seed_all),
+            "parallel_strategy": strategy,
+            "blas_threads": int(blas_threads),
+            "blas_effective": (
+                1
+                if strategy == "outer"
+                else (int(blas_threads) if blas_threads > 0 else None)
+            ),
+        }
+    )
 
     return UncReport(
         type="bayesian",

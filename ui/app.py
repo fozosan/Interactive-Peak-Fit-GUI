@@ -720,11 +720,13 @@ def _iter_peakwise(stats_map: Dict[str, Dict[str, Any]], n_peaks: int) -> Iterab
                     return x[i] if i < len(x) else None
                 return x
 
+            p25 = rec.get("p2_5", rec.get("p2.5"))
+            p975 = rec.get("p97_5", rec.get("p97.5"))
             row[pname] = {
                 "est": pick(rec.get("est")),
                 "sd": pick(rec.get("sd")),
-                "p2_5": pick(rec.get("p2_5")),
-                "p97_5": pick(rec.get("p97_5")),
+                "p2_5": pick(p25),
+                "p97_5": pick(p975),
             }
         rows.append((i + 1, row))
     return rows
@@ -746,6 +748,15 @@ def _format_unc_row(i: int, row: Dict[str, Any]) -> str:
 
     parts = [fmt("center"), fmt("fwhm"), fmt("height")]
     return f"Peak {i}: " + " | ".join(parts)
+
+
+def _set_thread_limits(strategy: str, blas_threads):
+    """No-op: clamping is centralized in infra.performance.blas_limit_ctx.
+
+    We still log threadpool_info pre/post for visibility, but do not clamp here.
+    """
+
+    return
 
 
 # ---------- Main GUI ----------

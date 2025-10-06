@@ -26,10 +26,12 @@ def _linear_fixture(n=60, sigma=0.03, seed=0):
 
 
 def _assert_param_block_has_consistent_keys(block: dict):
-    # Ensure unified dotted quantile keys and no underscored variants
+    # Ensure dotted quantile keys exist and, if underscored forms are present, they match
     assert {"est", "sd", "p2.5", "p97.5"} <= set(block.keys())
-    assert "p2_5" not in block
-    assert "p97_5" not in block
+    if "p2_5" in block:
+        assert pytest.approx(block["p2.5"]) == block["p2_5"]
+    if "p97_5" in block:
+        assert pytest.approx(block["p97.5"]) == block["p97_5"]
 
 
 def test_stats_keys_consistent_between_bootstrap_and_bayesian():

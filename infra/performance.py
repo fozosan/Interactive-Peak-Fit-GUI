@@ -43,6 +43,11 @@ try:  # pragma: no cover - optional import
 except Exception:  # pragma: no cover - threadpoolctl not available
     ThreadpoolController = None
 
+try:  # pragma: no cover - optional import
+    from threadpoolctl import threadpool_limits
+except Exception:  # pragma: no cover - threadpoolctl not available
+    threadpool_limits = None  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # Global state controlled via setters
@@ -227,6 +232,7 @@ def blas_single_thread_ctx():
     env_keys = ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")
     prev_env = {k: os.environ.get(k) for k in env_keys}
     controller = None
+    blas_cm = None
     try:
         if ThreadpoolController is not None:  # pragma: no branch - optional
             try:
@@ -236,9 +242,36 @@ def blas_single_thread_ctx():
                 controller = None
         else:
             note_tpctl_absence_once()
+        if threadpool_limits is not None:
+            try:
+                blas_cm = threadpool_limits(limits=1, user_api="blas")
+            except Exception:
+                blas_cm = None
+        else:
+            note_tpctl_absence_once()
         for key in env_keys:
             os.environ[key] = "1"
-        yield
+        if blas_cm is not None:
+            try:
+                with blas_cm:
+                    openmp_cm = None
+                    if threadpool_limits is not None:
+                        try:
+                            openmp_cm = threadpool_limits(limits=1, user_api="openmp")
+                        except Exception:
+                            openmp_cm = None
+                    if openmp_cm is not None:
+                        try:
+                            with openmp_cm:
+                                yield
+                        except Exception:
+                            yield
+                    else:
+                        yield
+            except Exception:
+                yield
+        else:
+            yield
     finally:
         if controller is not None:
             try:  # pragma: no cover - optional backend restore
@@ -253,7 +286,7 @@ def blas_single_thread_ctx():
 
 
 @contextmanager
-def blas_limit_ctx(threads: int | None):
+def blas_limit_ctx(threads: Optional[int]):
     """Limit BLAS/OpenMP threadpools within the scope.
 
     ``None`` or ``<=0`` ⇒ no clamp (leave libraries as-is).
@@ -271,6 +304,7 @@ def blas_limit_ctx(threads: int | None):
     env_keys = ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")
     prev_env = {k: os.environ.get(k) for k in env_keys}
     controller = None
+    blas_cm = None
     try:
         if ThreadpoolController is not None:  # pragma: no branch - optional
             try:
@@ -280,10 +314,38 @@ def blas_limit_ctx(threads: int | None):
                 controller = None
         else:
             note_tpctl_absence_once()
-
+        if threadpool_limits is not None:
+            try:
+                blas_cm = threadpool_limits(limits=threads, user_api="blas")
+            except Exception:
+                blas_cm = None
+        else:
+            note_tpctl_absence_once()
         for key in env_keys:
             os.environ[key] = str(threads)
-        yield
+        if blas_cm is not None:
+            try:
+                with blas_cm:
+                    openmp_cm = None
+                    if threadpool_limits is not None:
+                        try:
+                            openmp_cm = threadpool_limits(
+                                limits=threads, user_api="openmp"
+                            )
+                        except Exception:
+                            openmp_cm = None
+                    if openmp_cm is not None:
+                        try:
+                            with openmp_cm:
+                                yield
+                        except Exception:
+                            yield
+                    else:
+                        yield
+            except Exception:
+                yield
+        else:
+            yield
     finally:
         if controller is not None:
             try:  # pragma: no cover - optional backend restore
