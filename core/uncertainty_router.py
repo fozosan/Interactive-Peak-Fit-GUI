@@ -200,6 +200,19 @@ def route_uncertainty(
         thin = int(ctx.get("bayes_thin", 1))
         prior_sigma = str(ctx.get("bayes_prior_sigma", "half_cauchy"))
 
+        strategy = str(ctx.get("perf_parallel_strategy", "outer"))
+        ctx["perf_parallel_strategy"] = strategy
+        try:
+            blas_threads = int(ctx.get("perf_blas_threads", 0) or 0)
+        except Exception:
+            blas_threads = 0
+        ctx["perf_blas_threads"] = blas_threads
+        sampler_cfg = dict(ctx.get("bayes_sampler_cfg", {}))
+        sampler_cfg.setdefault("seed", seed)
+        sampler_cfg.setdefault("perf_parallel_strategy", strategy)
+        sampler_cfg.setdefault("perf_blas_threads", blas_threads)
+        ctx["bayes_sampler_cfg"] = sampler_cfg
+
         return unc.bayesian_ci(
             theta_hat=theta_hat,
             model=model_eval,

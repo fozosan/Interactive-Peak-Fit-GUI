@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 
 from core.uncertainty import bootstrap_ci
@@ -66,4 +68,6 @@ def test_band_cpu_parallel_matches_sequential():
     _, lo_par, hi_par = r_par.band
     np.testing.assert_allclose(lo_seq, lo_par, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(hi_seq, hi_par, rtol=1e-12, atol=1e-12)
-    assert r_par.diagnostics.get("band_workers_used") == 4
+    assert r_par.diagnostics.get("band_workers_requested") == 4
+    expected_effective = min(4, os.cpu_count() or 1)
+    assert r_par.diagnostics.get("band_workers_effective") == expected_effective

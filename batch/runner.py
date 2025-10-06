@@ -41,22 +41,13 @@ class _NopCtx:
 
 
 def _tp_limits_ctx_for_config(config: dict):
-    try:
-        from threadpoolctl import threadpool_limits
-    except Exception:
-        performance.note_tpctl_absence_once()
-        return _NopCtx()
     strategy = str(config.get("perf_parallel_strategy", "outer"))
     try:
-        blas_threads = int(config.get("perf_blas_threads", 0))
+        _bt = int(config.get("perf_blas_threads", 0) or 0)
     except Exception:
-        blas_threads = 0
-    limit = 1 if strategy == "outer" else (blas_threads if blas_threads > 0 else None)
-    try:
-        return threadpool_limits(limits=limit) if limit is not None else _NopCtx()
-    except Exception:
-        performance.note_tpctl_absence_once()
-        return _NopCtx()
+        _bt = 0
+    limit = 1 if strategy == "outer" else (_bt if _bt > 0 else None)
+    return performance.blas_limit_ctx(limit)
 
 
 def _norm_jitter(v, default=0.02):
