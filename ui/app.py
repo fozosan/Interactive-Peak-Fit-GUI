@@ -210,6 +210,15 @@ matplotlib.rcParams["font.family"] = "Arial"
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.widgets import SpanSelector
 
+# ---- Threadpool runtime control (optional) ----
+try:
+    from threadpoolctl import threadpool_limits, threadpool_info
+except Exception:
+    threadpool_limits = None
+
+    def threadpool_info():  # type: ignore
+        return []
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from tkinter import simpledialog
@@ -260,6 +269,19 @@ def _safe_bool(v, default=False):
         return bool(v)
     except Exception:
         return default
+
+
+def _safe_int(x, default=None):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _set_thread_limits(strategy: str, blas_threads):
+    """UI helper: actual clamping is handled in the performance layer."""
+
+    return
 
 
 def log_action(fn):
@@ -4372,6 +4394,16 @@ class PeakFitApp:
 
     @log_action
     def run_uncertainty(self):
+        strategy = str(self.perf_parallel_strategy.get())
+        blas_raw = None
+        try:
+            blas_raw = self.perf_blas_threads.get()
+        except Exception:
+            blas_raw = None
+        _set_thread_limits(strategy, blas_raw)
+        self.dlog(
+            f"[DEBUG] [perf] pre-run_uncertainty threadpools={threadpool_info()}"
+        )
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Uncertainty", "Load data and perform a fit first.")
             return
@@ -4964,14 +4996,14 @@ class PeakFitApp:
                 for k in ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"):
                     os.environ.pop(k, None)
 
-        # Log effective libs
-        try:
-            from threadpoolctl import threadpool_info
-
-            libs = threadpool_info()
-            self.dlog(f"threadpool_info={libs}")
-        except Exception:
-            libs = []
+        # Log effective libs and clamp via threadpoolctl when available
+        pre_info = threadpool_info()
+        self.dlog(f"[DEBUG] threadpool_info_pre={pre_info}")
+        _set_thread_limits(strategy, blas_threads)
+        post_info = threadpool_info()
+        self.dlog(f"[DEBUG] threadpool_info_post={post_info}")
+        libs = post_info
+        self.dlog(f"threadpool_info={libs}")
         save_config(self.cfg)
         try:
             fit_req = int(self.perf_max_workers.get())

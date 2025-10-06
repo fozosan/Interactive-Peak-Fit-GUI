@@ -39,9 +39,9 @@ except Exception:  # pragma: no cover - cupy not available
     _CUPY_OK = False
 
 try:  # pragma: no cover - optional import
-    from threadpoolctl import ThreadpoolController
+    from threadpoolctl import threadpool_limits
 except Exception:  # pragma: no cover - threadpoolctl not available
-    ThreadpoolController = None
+    threadpool_limits = None
 
 try:  # pragma: no cover - optional import
     from threadpoolctl import threadpool_limits
@@ -273,11 +273,6 @@ def blas_single_thread_ctx():
         else:
             yield
     finally:
-        if controller is not None:
-            try:  # pragma: no cover - optional backend restore
-                controller.restore_initial_limits()
-            except Exception:
-                pass
         for key, value in prev_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -289,15 +284,15 @@ def blas_single_thread_ctx():
 def blas_limit_ctx(threads: Optional[int]):
     """Limit BLAS/OpenMP threadpools within the scope.
 
-    ``None`` or ``<=0`` ⇒ no clamp (leave libraries as-is).
+    None or <=0 ⇒ no clamp (leave libraries as-is).
     """
 
     try:
-        if threads is None or int(threads) <= 0:
-            yield
-            return
-        threads = int(threads)
+        t = None if threads is None else int(threads)
     except Exception:
+        t = None
+
+    if t is None or t <= 0:
         yield
         return
 
@@ -347,11 +342,6 @@ def blas_limit_ctx(threads: Optional[int]):
         else:
             yield
     finally:
-        if controller is not None:
-            try:  # pragma: no cover - optional backend restore
-                controller.restore_initial_limits()
-            except Exception:
-                pass
         for key, value in prev_env.items():
             if value is None:
                 os.environ.pop(key, None)
