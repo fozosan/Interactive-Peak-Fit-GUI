@@ -39,13 +39,9 @@ except Exception:  # pragma: no cover - cupy not available
     _CUPY_OK = False
 
 try:  # pragma: no cover - optional import
-    from threadpoolctl import threadpool_limits
+    from threadpoolctl import ThreadpoolController, threadpool_limits
 except Exception:  # pragma: no cover - threadpoolctl not available
-    threadpool_limits = None
-
-try:  # pragma: no cover - optional import
-    from threadpoolctl import threadpool_limits
-except Exception:  # pragma: no cover - threadpoolctl not available
+    ThreadpoolController = None  # type: ignore
     threadpool_limits = None  # type: ignore
 
 
@@ -185,6 +181,11 @@ def get_unc_workers() -> int:
 
 def get_max_workers() -> int:
     return _MAX_WORKERS
+
+
+def which_backend() -> str:
+    """Return the current numeric backend label (e.g., 'numpy', 'cupy')."""
+    return _BACKEND
 
 
 def _resolve_workers(n: Optional[int]) -> int:

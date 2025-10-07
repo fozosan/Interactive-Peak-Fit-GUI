@@ -243,6 +243,7 @@ try:
     from core.uncertainty import (
         BAND_SKIP_DIAG_DISABLED,
         BAND_SKIP_DIAG_UNHEALTHY,
+        BAND_SKIP_INSUFF_DRAWS,
         BAND_SKIP_ABORTED,
     )
 except Exception:  # pragma: no cover - NotAvailable may be absent
@@ -269,6 +270,13 @@ def _safe_bool(v, default=False):
         return bool(v)
     except Exception:
         return default
+
+
+def _finite_or_nan(x):
+    try:
+        return float(x) if np.isfinite(float(x)) else float("nan")
+    except Exception:
+        return float("nan")
 
 
 def _safe_int(x, default=None):
@@ -4723,6 +4731,15 @@ class PeakFitApp:
                 return
 
             res = result
+            diag = {}
+            try:
+                if isinstance(result, dict):
+                    diag = result.get("diagnostics", {}) or {}
+                else:
+                    diag = getattr(result, "diagnostics", {}) or {}
+            except Exception:
+                diag = {}
+            debug = _safe_bool(self.debug_mode_var.get(), False)
             try:
                 # Ensure method/label hints are present to avoid 'unknown' in logs/exports
                 if isinstance(res, dict):
@@ -4794,7 +4811,7 @@ class PeakFitApp:
                 pass
 
             self.status_info(f"Computed {label} uncertainty.")
-            if isinstance(label, str) and label.startswith("Bayesian"):
+            if isinstance(label, str) and label.lower().startswith("bayesian"):
                 try:
                     out = res
                     d = (
@@ -4804,13 +4821,13 @@ class PeakFitApp:
                         or {}
                     )
                     if bool(d.get("diagnostics_enabled")):
-                        ess_min = d.get("ess_min")
-                        rhat_max = d.get("rhat_max")
-                        mcse_mean = d.get("mcse_mean")
+                        ess_min = _finite_or_nan(d.get("ess_min"))
+                        rhat_max = _finite_or_nan(d.get("rhat_max"))
+                        mcse_mean = _finite_or_nan(d.get("mcse_mean"))
                         self.log_threadsafe(
-                            f"Posterior health: ess_min={ess_min if np.isfinite(ess_min) else 'nan'}, "
-                            f"rhat_max={rhat_max if np.isfinite(rhat_max) else 'nan'}, "
-                            f"MCSE_mean={mcse_mean if np.isfinite(mcse_mean) else 'nan'}"
+                            f"Posterior health: ess_min={ess_min:.3g}, "
+                            f"rhat_max={rhat_max:.3g}, "
+                            f"MCSE_mean={mcse_mean:.3g}"
                         )
                 except Exception:
                     pass
@@ -4818,13 +4835,12 @@ class PeakFitApp:
                 if isinstance(result, dict):
                     lbl = str(result.get("method") or result.get("label") or "").lower()
                     if "bayes" in lbl or "bayesian" in lbl:
-                        diag = result.get("diagnostics", {}) or {}
                         band = result.get("band", None)
                         if band is None and bool(diag.get("band_gated")):
-                            reason = str(diag.get("band_skip_reason", "gated"))
-                            if reason == BAND_SKIP_DIAG_DISABLED:
+                            band_skip = diag.get("band_skip_reason")
+                            if band_skip == BAND_SKIP_DIAG_DISABLED:
                                 self.status_warn("Bayesian band not computed: diagnostics were OFF (no force).")
-                            elif reason == BAND_SKIP_DIAG_UNHEALTHY:
+                            elif band_skip == BAND_SKIP_DIAG_UNHEALTHY:
                                 thr = diag.get("band_gating_thresholds", {})
                                 ess = thr.get("ess_min")
                                 ess_req = thr.get("ess_min_req")
@@ -4835,12 +4851,33 @@ class PeakFitApp:
                                 self.status_warn(
                                     f"Bayesian band gated: ESS_min={ess:.3g} (≥{ess_req}), R̂_max={rh:.3g} (≤{rh_req}), MCSE_mean={mc:.3g} (≤{mc_req})."
                                 )
-                            elif reason == BAND_SKIP_ABORTED:
+                            elif band_skip == BAND_SKIP_INSUFF_DRAWS:
+                                msg = (
+                                    "Bayesian band skipped: not enough posterior draws to build a stable band. "
+                                    "Try increasing walkers/steps or reducing thinning; alternatively lower the band draw cap in Settings."
+                                )
+                                self.log_threadsafe(msg)
+                                if debug:
+                                    # These fields are added by bayesian_ci for precise logging.
+                                    dr_used = diag.get("band_draws_used")
+                                    min_req = diag.get("bayes_band_min_required")
+                                    cap = diag.get("bayes_band_max_draws")
+                                    self.dlog(
+                                        f"[DEBUG] draws_used={dr_used}, min_required={min_req}, cap={cap}"
+                                    )
+                            elif band_skip == BAND_SKIP_ABORTED:
                                 self.status_warn("Bayesian band aborted before completion.")
                         elif band is not None and bool(diag.get("band_forced")):
                             self.status_info("Bayesian band computed (forced).")
             except Exception:
                 pass
+            # Always record backend + worker normalization for troubleshooting
+            _bk = diag.get("numpy_backend")
+            _bw_req = diag.get("band_workers_requested")
+            _bw_eff = diag.get("band_workers_effective")
+            self.dlog(
+                f"[DEBUG] band backend={_bk}, workers requested={_bw_req}, effective={_bw_eff}"
+            )
             # Mirror Bayesian band to the plot state so export parity holds
             try:
                 if isinstance(self.last_uncertainty, dict):
