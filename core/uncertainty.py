@@ -1222,6 +1222,11 @@ def bootstrap_ci(
     diag["jitter_free_params"] = int(np.sum(free_mask))
     diag["jitter_last_rms"] = float(jitter_rms_last)
     diag["jitter_last_applied"] = bool(jitter_applied_last)
+    # Record the numeric backend for parity across methods.
+    try:
+        diag["numpy_backend"] = performance.which_backend()
+    except Exception:
+        diag["numpy_backend"] = "numpy"
     if jitter_reason_last:
         diag["jitter_reason"] = jitter_reason_last
 
@@ -1339,6 +1344,8 @@ def bayesian_ci(
     bayes_band_enabled: bool = bool(fc.get("bayes_band_enabled", False))
     bayes_band_force: bool = bool(fc.get("bayes_band_force", False))
     bayes_band_max_draws: int = int(fc.get("bayes_band_max_draws", 512) or 512)
+    # Surface settings into diagnostics for UI/debug logging.
+    diag_perf["bayes_band_max_draws"] = int(bayes_band_max_draws)
     thr_ess_min = float(fc.get("bayes_diag_ess_min", 200.0))
     thr_rhat_max = float(fc.get("bayes_diag_rhat_max", 1.05))
     thr_mcse_mean = float(fc.get("bayes_diag_mcse_mean", float("inf")))
@@ -1804,6 +1811,11 @@ def bayesian_ci(
         "diagnostics_enabled": bool(diagnostics_enabled),
         # Fill band worker diagnostics after band logic for consistency.
     })
+    # Record backend used for the Bayesian path too.
+    try:
+        diag["numpy_backend"] = performance.which_backend()
+    except Exception:
+        diag["numpy_backend"] = "numpy"
     if diag_notes:
         diag["notes"] = diag_notes
 
@@ -1826,6 +1838,8 @@ def bayesian_ci(
         n_total = int(n_samp)
         max_draws = max(1, int(bayes_band_max_draws))
         min_required = min(BAYES_BAND_MIN_DRAWS, max_draws)
+        # Expose the computed minimum requirement.
+        diag["bayes_band_min_required"] = int(min_required)
         if n_total < min_required:
             diag["band_gated"] = True
             diag["band_forced"] = bool(bayes_band_force)

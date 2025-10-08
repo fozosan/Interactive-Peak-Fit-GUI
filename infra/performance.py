@@ -39,13 +39,9 @@ except Exception:  # pragma: no cover - cupy not available
     _CUPY_OK = False
 
 try:  # pragma: no cover - optional import
-    from threadpoolctl import threadpool_limits
+    from threadpoolctl import ThreadpoolController, threadpool_limits
 except Exception:  # pragma: no cover - threadpoolctl not available
-    threadpool_limits = None
-
-try:  # pragma: no cover - optional import
-    from threadpoolctl import threadpool_limits
-except Exception:  # pragma: no cover - threadpoolctl not available
+    ThreadpoolController = None  # type: ignore
     threadpool_limits = None  # type: ignore
 
 
@@ -54,6 +50,11 @@ except Exception:  # pragma: no cover - threadpoolctl not available
 _NUMBA_USER = False
 _GPU_USER = False
 _BACKEND = "numpy"
+
+
+def which_backend() -> str:
+    """Return the current numeric backend label (e.g., 'numpy', 'cupy', 'numba')."""
+    return _BACKEND
 
 _CACHE_BASELINE = True
 _MAX_WORKERS = 0
@@ -369,10 +370,6 @@ def get_parallel_config() -> ParallelConfig:
 def set_gpu_chunk(n: int) -> None:
     global _GPU_CHUNK
     _GPU_CHUNK = max(16_384, int(n))
-
-
-def which_backend() -> str:
-    return _BACKEND
 
 
 def enable_shadow_compare(flag: bool, rtol: float = 1e-10, atol: float = 1e-12) -> None:

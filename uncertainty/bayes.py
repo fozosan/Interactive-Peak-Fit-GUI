@@ -114,24 +114,18 @@ def bayesian(
     mean = samples.mean(axis=0)
     cov = np.cov(samples, rowvar=False)
     params = {"theta": mean, "cov": cov, "samples": samples}
-    meta = {"nwalkers": nwalkers, "nsteps": nsteps}
-    meta.update(
-        {
-            "seed": (
-                int(seed_effective)
-                if seed_effective is not None
-                else seed_cfg
-            ),
-            "seed_all": bool(cfg_perf.seed_all),
-            "parallel_strategy": strategy,
-            "blas_threads": int(blas_threads),
-            "blas_effective": (
-                1
-                if strategy == "outer"
-                else (int(blas_threads) if blas_threads > 0 else None)
-            ),
-        }
-    )
+    meta = {
+        "nwalkers": nwalkers,
+        "nsteps": nsteps,
+        "seed": (int(seed_effective) if seed_effective is not None else seed_cfg),
+        "seed_all": bool(cfg_perf.seed_all),
+        "parallel_strategy": strategy,
+        "blas_threads": int(blas_threads),
+        "blas_effective": (
+            1 if strategy == "outer" else (int(blas_threads) if blas_threads > 0 else None)
+        ),
+        "numpy_backend": performance.which_backend(),
+    }
 
     return UncReport(
         type="bayesian",
