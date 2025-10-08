@@ -51,6 +51,11 @@ _NUMBA_USER = False
 _GPU_USER = False
 _BACKEND = "numpy"
 
+
+def which_backend() -> str:
+    """Return the current numeric backend label (e.g., 'numpy', 'cupy', 'numba')."""
+    return _BACKEND
+
 _CACHE_BASELINE = True
 _MAX_WORKERS = 0
 _UNC_WORKERS = 0
@@ -181,11 +186,6 @@ def get_unc_workers() -> int:
 
 def get_max_workers() -> int:
     return _MAX_WORKERS
-
-
-def which_backend() -> str:
-    """Return the current numeric backend label (e.g., 'numpy', 'cupy')."""
-    return _BACKEND
 
 
 def _resolve_workers(n: Optional[int]) -> int:
@@ -370,10 +370,6 @@ def get_parallel_config() -> ParallelConfig:
 def set_gpu_chunk(n: int) -> None:
     global _GPU_CHUNK
     _GPU_CHUNK = max(16_384, int(n))
-
-
-def which_backend() -> str:
-    return _BACKEND
 
 
 def enable_shadow_compare(flag: bool, rtol: float = 1e-10, atol: float = 1e-12) -> None:

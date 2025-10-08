@@ -4811,6 +4811,16 @@ class PeakFitApp:
                 pass
 
             self.status_info(f"Computed {label} uncertainty.")
+            # Always record backend + worker normalization for troubleshooting (if present)
+            try:
+                _bk = diag.get("numpy_backend") if isinstance(diag, dict) else None
+                _bw_req = diag.get("band_workers_requested") if isinstance(diag, dict) else None
+                _bw_eff = diag.get("band_workers_effective") if isinstance(diag, dict) else None
+                self.dlog(
+                    f"[DEBUG] backend={_bk}, band_workers requested={_bw_req}, effective={_bw_eff}"
+                )
+            except Exception:
+                pass
             if isinstance(label, str) and label.lower().startswith("bayesian"):
                 try:
                     out = res
@@ -4871,13 +4881,6 @@ class PeakFitApp:
                             self.status_info("Bayesian band computed (forced).")
             except Exception:
                 pass
-            # Always record backend + worker normalization for troubleshooting
-            _bk = diag.get("numpy_backend")
-            _bw_req = diag.get("band_workers_requested")
-            _bw_eff = diag.get("band_workers_effective")
-            self.dlog(
-                f"[DEBUG] band backend={_bk}, workers requested={_bw_req}, effective={_bw_eff}"
-            )
             # Mirror Bayesian band to the plot state so export parity holds
             try:
                 if isinstance(self.last_uncertainty, dict):
