@@ -185,7 +185,7 @@ import re
 import time
 import csv
 from dataclasses import dataclass
-from functools import wraps
+from functools import wraps  # used by @log_action
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple, Optional
 from types import SimpleNamespace  # ensure this import exists
@@ -875,31 +875,6 @@ class PeakFitApp:
         except Exception:
             return None
 
-    def _boot_follow_enabled(self) -> bool:
-        try:
-            return bool(self.unc_boot_follow_var.get())
-        except Exception:
-            return bool(self.cfg.get("unc_boot_solver_follow", True))
-
-    def _set_boot_follow(self, val: bool) -> None:
-        follow = bool(val)
-        try:
-            self.unc_boot_follow_var.set(follow)
-            return
-        except Exception:
-            self._cfg_set("unc_boot_solver_follow", follow)
-            if follow and hasattr(self, "boot_solver_choice") and hasattr(self, "solver_choice"):
-                try:
-                    choice = self.solver_choice.get()
-                    self.boot_solver_choice.set(choice)
-                    self._cfg_set("unc_boot_solver", choice)
-                except Exception:
-                    pass
-            try:
-                self._update_bootstrap_tie_widgets()
-            except Exception:
-                pass
-
     @log_action
     def _on_debug_toggle(self, *_):
         try:
@@ -913,15 +888,14 @@ class PeakFitApp:
             if hasattr(self, "solver_choice")
             else "modern_trf"
         )
-        ui_pick: Optional[str]
+        boot: Optional[str] = None
         if hasattr(self, "boot_solver_choice"):
             try:
-                ui_pick = self.boot_solver_choice.get()
+                boot = self.boot_solver_choice.get()
             except Exception:
-                ui_pick = None
-        else:
-            ui_pick = self.cfg.get("unc_boot_solver")
-        boot = main if self._boot_follow_enabled() or not ui_pick else ui_pick
+                boot = None
+        if not boot:
+            boot = self.cfg.get("unc_boot_solver") or main
         try:
             if str(boot).lower().startswith("lmfit") and not bool(
                 getattr(self, "has_lmfit", False)
@@ -938,7 +912,7 @@ class PeakFitApp:
                     pass
         except Exception:
             pass
-        return str(boot)
+        return str(boot or main)
 
     def __init__(self, root, cfg=None):
         self.root = root
@@ -958,7 +932,8 @@ class PeakFitApp:
         self.cfg.setdefault("export_unc_wide", False)
         self.cfg.setdefault("unc_alpha", 0.05)
         self.cfg.setdefault("unc_center_resid", True)
-        self.cfg.setdefault("unc_boot_solver_follow", True)
+        # Group B: user override marker for bootstrap solver selection
+        self.boot_solver_overridden = False
         self.cfg.setdefault("bootstrap_jitter", 0.02)
         self.cfg.setdefault("log_debug_mode", False)
         self.cfg.setdefault("bayes_walkers", 0)
@@ -1083,6 +1058,9 @@ class PeakFitApp:
             self.solver_choice.set("modern_vp")
             self.cfg["solver_choice"] = "modern_vp"
             save_config(self.cfg)
+        # Group B: legacy follow config removed and bootstrap solver defaults to main solver
+        self.cfg.pop("unc_boot_solver_follow", None)
+        self.cfg.setdefault("unc_boot_solver", self.solver_choice.get())
         _base_key = self.solver_choice.get()
         self.solver_title = tk.StringVar(value=SOLVER_LABELS.get(_base_key, _base_key))
         self.classic_maxfev = tk.IntVar(value=20000)
@@ -1120,11 +1098,7 @@ class PeakFitApp:
             value=str(self.cfg.get("perf_parallel_strategy", "outer"))
         )
         self.perf_blas_threads = tk.IntVar(value=int(self.cfg.get("perf_blas_threads", 0)))
-        self.unc_boot_follow_var = tk.BooleanVar(
-            value=bool(self.cfg.get("unc_boot_solver_follow", True))
-        )
         self.debug_mode_var.trace_add("write", lambda *_: self._on_debug_toggle())
-        self.unc_boot_follow_var.trace_add("write", self._on_unc_boot_follow)
 
         self.ci_band = None
         self.show_ci_band = tk.BooleanVar(value=bool(self.cfg.get("ui_show_uncertainty_band", False)))
@@ -1674,7 +1648,9 @@ class PeakFitApp:
         unc_frame = ttk.Frame(unc_box)
         unc_frame.pack(fill=tk.X, pady=2)
         r = 0
-        ttk.Label(unc_frame, text="Jitter %").grid(row=r, column=0, sticky="e")
+        # --- Bootstrap controls (hidden unless Bootstrap is selected) ---
+        self._jitter_label = ttk.Label(unc_frame, text="Jitter %")
+        self._jitter_label.grid(row=r, column=0, sticky="e")
         self._jitter_entry = ttk.Entry(unc_frame, textvariable=self.bootstrap_jitter_var, width=6)
         self._jitter_entry.grid(row=r, column=1, sticky="w")
         # Clamp jitter% on blur to [0, 50]
@@ -1684,13 +1660,16 @@ class PeakFitApp:
             pass
         r += 1
         # Bootstrap refit solver override
-        ttk.Label(unc_frame, text="Refit solver").grid(row=r, column=0, sticky="e")
+        self._boot_solver_label = ttk.Label(unc_frame, text="Refit solver")
+        self._boot_solver_label.grid(row=r, column=0, sticky="e")
         boot_solver = self.cfg.get("unc_boot_solver", self.solver_choice.get())
         if not getattr(self, "has_lmfit", False) and str(boot_solver).lower().startswith("lmfit"):
             boot_solver = self.solver_choice.get()
             self.cfg["unc_boot_solver"] = boot_solver
             save_config(self.cfg)
         self.boot_solver_choice = tk.StringVar(value=str(boot_solver))
+        if self.boot_solver_choice.get() and self.boot_solver_choice.get() != self.solver_choice.get():
+            self.boot_solver_overridden = True
         # Only offer LMFIT if actually available
         def _available_solvers():
             ordered = ["classic", "modern_vp", "modern_trf"]
@@ -1711,18 +1690,13 @@ class PeakFitApp:
             if self.boot_solver_choice.get() not in _vals:
                 self.boot_solver_choice.set(self.solver_choice.get())
                 self._cfg_set("unc_boot_solver", self.boot_solver_choice.get())
+                self.boot_solver_overridden = False
         except Exception:
             pass
         self._boot_solver_cb.bind(
             "<<ComboboxSelected>>",
             lambda _e: self._on_boot_solver_choice(),
         )
-        r += 1
-        ttk.Checkbutton(
-            unc_frame,
-            text="Bootstrap base solver follows main solver",
-            variable=self.unc_boot_follow_var,
-        ).grid(row=r, column=0, columnspan=2, sticky="w", pady=(2, 0))
         r += 1
         ttk.Label(unc_frame, text="CI α").grid(row=r, column=0, sticky="e")
         _alpha_entry = ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6)
@@ -1736,23 +1710,24 @@ class PeakFitApp:
         ttk.Checkbutton(unc_frame, text="Center residuals", variable=self.center_resid_var).grid(row=r, column=2, sticky="w")
         r += 1
 
-        bay = ttk.LabelFrame(unc_frame, text="Bayesian")
-        bay.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 0))
-        ttk.Label(bay, text="Walkers").grid(row=0, column=0, sticky="e")
-        walkers_entry = ttk.Entry(bay, textvariable=self.bayes_walkers_var, width=6)
+        # --- Bayesian controls (hidden unless Bayesian is selected) ---
+        self._bayes_frame = ttk.LabelFrame(unc_frame, text="Bayesian")
+        self._bayes_frame.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 0))
+        ttk.Label(self._bayes_frame, text="Walkers").grid(row=0, column=0, sticky="e")
+        walkers_entry = ttk.Entry(self._bayes_frame, textvariable=self.bayes_walkers_var, width=6)
         walkers_entry.grid(row=0, column=1, sticky="w")
-        ttk.Label(bay, text="Burn-in").grid(row=0, column=2, sticky="e")
-        burn_entry = ttk.Entry(bay, textvariable=self.bayes_burn_var, width=6)
+        ttk.Label(self._bayes_frame, text="Burn-in").grid(row=0, column=2, sticky="e")
+        burn_entry = ttk.Entry(self._bayes_frame, textvariable=self.bayes_burn_var, width=6)
         burn_entry.grid(row=0, column=3, sticky="w")
-        ttk.Label(bay, text="Steps").grid(row=1, column=0, sticky="e")
-        steps_entry = ttk.Entry(bay, textvariable=self.bayes_steps_var, width=6)
+        ttk.Label(self._bayes_frame, text="Steps").grid(row=1, column=0, sticky="e")
+        steps_entry = ttk.Entry(self._bayes_frame, textvariable=self.bayes_steps_var, width=6)
         steps_entry.grid(row=1, column=1, sticky="w")
-        ttk.Label(bay, text="Thin").grid(row=1, column=2, sticky="e")
-        thin_entry = ttk.Entry(bay, textvariable=self.bayes_thin_var, width=6)
+        ttk.Label(self._bayes_frame, text="Thin").grid(row=1, column=2, sticky="e")
+        thin_entry = ttk.Entry(self._bayes_frame, textvariable=self.bayes_thin_var, width=6)
         thin_entry.grid(row=1, column=3, sticky="w")
-        ttk.Label(bay, text="σ prior").grid(row=2, column=0, sticky="e")
+        ttk.Label(self._bayes_frame, text="σ prior").grid(row=2, column=0, sticky="e")
         ttk.Combobox(
-            bay,
+            self._bayes_frame,
             textvariable=self.bayes_prior_var,
             width=12,
             values=("half_cauchy", "half_normal"),
@@ -1818,23 +1793,19 @@ class PeakFitApp:
         r += 1
 
         # --- Bootstrap ties (visible + enabled only when Bootstrap + LMFIT refit solver) ---
-        ties = ttk.LabelFrame(unc_frame, text="Bootstrap ties (LMFIT only)")
-        ties.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 0))
+        self._boot_ties_frame = ttk.LabelFrame(unc_frame, text="Bootstrap ties (LMFIT only)")
+        self._boot_ties_frame.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 0))
         self.chk_share_fwhm = ttk.Checkbutton(
-            ties, text="Share FWHM across peaks", variable=self.lmfit_share_fwhm
+            self._boot_ties_frame, text="Share FWHM across peaks", variable=self.lmfit_share_fwhm
         )
         self.chk_share_fwhm.grid(row=0, column=0, sticky="w", padx=2, pady=1)
         self.chk_share_eta = ttk.Checkbutton(
-            ties, text="Share η across peaks", variable=self.lmfit_share_eta
+            self._boot_ties_frame, text="Share η across peaks", variable=self.lmfit_share_eta
         )
         self.chk_share_eta.grid(row=0, column=1, sticky="w", padx=2, pady=1)
 
         self._update_unc_widgets()
         self._on_uncertainty_method_changed()
-        try:
-            self._on_unc_boot_follow()
-        except Exception:
-            pass
 
         # Axes / label controls
         axes_box = ttk.Labelframe(right, text="Axes / Labels")
@@ -1997,16 +1968,25 @@ class PeakFitApp:
     @log_action
     def _on_boot_solver_choice(self, *_):
         if hasattr(self, "boot_solver_choice"):
+            chosen = self.boot_solver_choice.get()
+        else:
+            chosen = None
+        if chosen is not None:
             try:
-                self._cfg_set("unc_boot_solver", self.boot_solver_choice.get())
+                self._cfg_set("unc_boot_solver", chosen)
+            except Exception:
+                try:
+                    self.cfg["unc_boot_solver"] = chosen
+                except Exception:
+                    pass
+        self.boot_solver_overridden = True
+        if chosen is not None:
+            try:
+                self.dlog(
+                    f"Uncertainty solver manually set to '{chosen}' (overriding main solver selection)"
+                )
             except Exception:
                 pass
-        # user touched it -> stop following main solver
-        try:
-            self.unc_boot_follow_var.set(False)
-        except Exception:
-            self._set_boot_follow(False)
-        # immediate visual/state feedback
         try:
             self._update_unc_widgets()
             self._update_bootstrap_tie_widgets()
@@ -2014,39 +1994,35 @@ class PeakFitApp:
             pass
 
     @log_action
-    def _on_unc_boot_follow(self, *_):
-        self._cfg_set("unc_boot_solver_follow", bool(self.unc_boot_follow_var.get()))
-        if self._boot_follow_enabled():
+    def _on_solver_change(self, *_):
+        new_solver = self.solver_choice.get()
+        self.solver_title.set(SOLVER_LABELS.get(new_solver, new_solver))
+        self.cfg["solver_choice"] = new_solver
+        save_config(self.cfg)
+        if not getattr(self, "boot_solver_overridden", False):
+            self.boot_solver_overridden = False
             try:
-                self.boot_solver_choice.set(self.solver_choice.get())
-                self._cfg_set("unc_boot_solver", self.solver_choice.get())
+                if hasattr(self, "boot_solver_choice"):
+                    self.boot_solver_choice.set(new_solver)
             except Exception:
                 pass
-        # disable/enable combobox when following
-        try:
-            state = "disabled" if self._boot_follow_enabled() else "readonly"
-            self._boot_solver_cb.configure(state=state)
-        except Exception:
-            pass
-
-    @log_action
-    def _on_solver_change(self):
-        choice = self.solver_choice.get()
-        self.solver_title.set(SOLVER_LABELS.get(choice, choice))
-        self.cfg["solver_choice"] = choice
-        save_config(self.cfg)
-        # sync bootstrap default if following main solver
-        if hasattr(self, "boot_solver_choice") and self._boot_follow_enabled():
             try:
-                self.boot_solver_choice.set(choice)
-                self._cfg_set("unc_boot_solver", choice)
+                self._cfg_set("unc_boot_solver", new_solver)
+            except Exception:
+                try:
+                    self.cfg["unc_boot_solver"] = new_solver
+                except Exception:
+                    pass
+            try:
+                self.dlog(
+                    f"Syncing bootstrap solver to main solver '{new_solver}' by default"
+                )
             except Exception:
                 pass
         self._show_solver_opts()
         self._update_unc_widgets()
         try:
-            if self._boot_follow_enabled():
-                self._update_unc_widgets()
+            self._update_bootstrap_tie_widgets()
         except Exception:
             pass
 
@@ -2488,26 +2464,41 @@ class PeakFitApp:
         self._set_ci_toggle_state(True)
 
         is_boot = (method_key == "bootstrap")
-        jitter = getattr(self, "_jitter_entry", None)
-        if jitter is not None:
+        is_bayes = (method_key == "bayesian")
+        # Show only the controls for the selected method
+        try:
+            (self._jitter_label.grid if is_boot else self._jitter_label.grid_remove)()
+            (self._jitter_entry.grid if is_boot else self._jitter_entry.grid_remove)()
+        except Exception:
+            pass
+        try:
+            (self._boot_solver_label.grid if is_boot else self._boot_solver_label.grid_remove)()
+            (self._boot_solver_cb.grid if is_boot else self._boot_solver_cb.grid_remove)()
+        except Exception:
+            pass
+        try:
+            (self._boot_ties_frame.grid if is_boot else self._boot_ties_frame.grid_remove)()
+        except Exception:
+            pass
+        try:
+            (self._bayes_frame.grid if is_bayes else self._bayes_frame.grid_remove)()
+        except Exception:
+            pass
+        bayes_band = getattr(self, "_bayes_band_frame", None)
+        if bayes_band is not None:
             try:
-                jitter.configure(state="normal" if is_boot else "disabled")
+                (bayes_band.grid if is_bayes else bayes_band.grid_remove)()
             except Exception:
                 pass
+        # keep bootstrap jitter enabled/disabled appropriately when visible
+        try:
+            self._jitter_entry.configure(state=("normal" if is_boot else "disabled"))
+        except Exception:
+            pass
         boot_cb = getattr(self, "_boot_solver_cb", None)
         if boot_cb is not None:
             try:
-                state = "disabled"
-                if is_boot:
-                    state = "disabled" if self._boot_follow_enabled() else "readonly"
-                boot_cb.configure(state=state)
-            except Exception:
-                pass
-            try:
-                if is_boot:
-                    boot_cb.grid()
-                else:
-                    boot_cb.grid_remove()
+                boot_cb.configure(state="readonly")
             except Exception:
                 pass
         options_row = getattr(self, "_boot_options_row", None)
@@ -2523,15 +2514,6 @@ class PeakFitApp:
                     options_row.pack_forget()
                 except Exception:
                     pass
-        bayes_frame = getattr(self, "_bayes_band_frame", None)
-        if bayes_frame is not None:
-            try:
-                if method_key == "bayesian":
-                    bayes_frame.grid()
-                else:
-                    bayes_frame.grid_remove()
-            except Exception:
-                pass
 
         # refresh Bootstrap tie widgets (enable only for Bootstrap + LMFIT refit solver)
         self._update_bootstrap_tie_widgets()
@@ -3827,7 +3809,6 @@ class PeakFitApp:
                 self.bayes_prior_var.get()
                 or self.cfg.get("bayes_prior_sigma", "half_cauchy")
             ),
-            "unc_boot_solver_follow": bool(self.unc_boot_follow_var.get()),
             "log_debug_mode": bool(self.debug_mode_var.get()),
         }
 
@@ -4810,7 +4791,13 @@ class PeakFitApp:
             except Exception:
                 pass
 
-            self.status_info(f"Computed {label} uncertainty.")
+            label_dict = self.last_uncertainty if isinstance(self.last_uncertainty, dict) else {}
+            human_label = (
+                (label_dict.get("label") if isinstance(label_dict, dict) else None)
+                or self._unc_method_label(self.last_uncertainty)
+                or str(label)
+            )
+            self.status_info(f"Computed {human_label} uncertainty.")
             # Always record backend + worker normalization for troubleshooting (if present)
             try:
                 _bk = diag.get("numpy_backend") if isinstance(diag, dict) else None
@@ -5015,7 +5002,6 @@ class PeakFitApp:
         self.cfg["perf_unc_workers"] = unc_workers
         self.cfg["perf_parallel_strategy"] = str(self.perf_parallel_strategy.get())
         self.cfg["perf_blas_threads"] = int(self.perf_blas_threads.get())
-        self.cfg["unc_boot_solver_follow"] = bool(self.unc_boot_follow_var.get())
         self.cfg["log_debug_mode"] = bool(self.debug_mode_var.get())
 
         # Set env for child processes/futures
