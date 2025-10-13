@@ -4847,6 +4847,23 @@ class PeakFitApp:
             else:
                 self.ci_band = None
             self._set_ci_toggle_state(True)
+            # If a band just became available, honor the user's saved per-method preference.
+            try:
+                mk = self._unc_selected_method_key()
+                if (
+                    getattr(self, "ci_band", None) is not None
+                    and bool(getattr(self, "_band_pref", {}).get(mk, False))
+                    and not bool(self.show_ci_band_var.get())
+                ):
+                    try:
+                        self._suspend_ci_trace = True
+                        self.show_ci_band_var.set(True)
+                    finally:
+                        self._suspend_ci_trace = False
+                    # Render immediately now that the toggle is on
+                    self._toggle_ci_band()
+            except Exception:
+                pass
 
             # persist band for export when method is asymptotic or Bayesian
             try:
