@@ -855,6 +855,22 @@ class PeakFitApp:
         except Exception:
             pass
 
+    def _persist_band_prefs(self):
+        """Write per-method CI band preferences back to the config file."""
+        try:
+            self.cfg["ui_band_pref_asymptotic"] = bool(
+                self._band_pref.get("asymptotic", False)
+            )
+            self.cfg["ui_band_pref_bootstrap"] = bool(
+                self._band_pref.get("bootstrap", True)
+            )
+            self.cfg["ui_band_pref_bayesian"] = bool(
+                self._band_pref.get("bayesian", False)
+            )
+            save_config(self.cfg)
+        except Exception:
+            pass
+
     def _perf_seed_value(self) -> Optional[int]:
         seed_cfg = self.cfg.get("perf_seed", "")
         seed_var = getattr(self, "seed_var", None)
@@ -932,6 +948,16 @@ class PeakFitApp:
         self.cfg.setdefault("export_unc_wide", False)
         self.cfg.setdefault("unc_alpha", 0.05)
         self.cfg.setdefault("unc_center_resid", True)
+        # --- Per-method CI-band preference (state sync) ---
+        self.cfg.setdefault("ui_band_pref_asymptotic", False)
+        self.cfg.setdefault("ui_band_pref_bootstrap", True)
+        self.cfg.setdefault("ui_band_pref_bayesian", False)
+        self._band_pref = {
+            "asymptotic": bool(self.cfg.get("ui_band_pref_asymptotic", False)),
+            "bootstrap": bool(self.cfg.get("ui_band_pref_bootstrap", True)),
+            "bayesian": bool(self.cfg.get("ui_band_pref_bayesian", False)),
+        }
+        self._last_unc_method_key = None  # tracks source method for band-pref memory
         # Group B: user override marker for bootstrap solver selection
         self.boot_solver_overridden = False
         self.cfg.setdefault("bootstrap_jitter", 0.02)
@@ -1060,6 +1086,7 @@ class PeakFitApp:
             save_config(self.cfg)
         # Group B: legacy follow config removed and bootstrap solver defaults to main solver
         self.cfg.pop("unc_boot_solver_follow", None)
+        save_config(self.cfg)
         self.cfg.setdefault("unc_boot_solver", self.solver_choice.get())
         _base_key = self.solver_choice.get()
         self.solver_title = tk.StringVar(value=SOLVER_LABELS.get(_base_key, _base_key))
@@ -1622,12 +1649,40 @@ class PeakFitApp:
         self._suspend_ci_trace = False
 
         def _ci_trace_guard(*_e):
+            # Guard against re-entrancy from var.set()
             if getattr(self, "_suspend_ci_trace", False):
                 return
             try:
+                band = getattr(self, "ci_band", None)
+                # If no band exists, ensure the checkbox is OFF without re-entering.
+                if band is None and bool(self.show_ci_band_var.get()):
+                    # Record the user's intent (so it can be restored later),
+                    # then untick the UI toggle to reflect current unavailability.
+                    try:
+                        mk = self._unc_selected_method_key()
+                        if mk in self._band_pref:
+                            self._band_pref[mk] = True
+                            self._persist_band_prefs()
+                    except Exception:
+                        pass
+                    try:
+                        self._suspend_ci_trace = True
+                        self.show_ci_band_var.set(False)
+                    finally:
+                        self._suspend_ci_trace = False
+                    return
+                # Persist per-method preference on any user change
+                try:
+                    mk = self._unc_selected_method_key()
+                    if mk in self._band_pref:
+                        self._band_pref[mk] = bool(self.show_ci_band_var.get())
+                        self._persist_band_prefs()
+                except Exception:
+                    pass
+                # Toggle rendering to match the new state
                 self._toggle_ci_band()
             except Exception:
-                pass
+                return
 
         try:
             for info in list(self.show_ci_band.trace_info() or []):
@@ -2452,13 +2507,25 @@ class PeakFitApp:
     def _on_uncertainty_method_changed(self, *_):
         method_key = self._unc_selected_method_key()
 
-        # Always keep the checkbox enabled; when switching to Bayesian, untick it.
-        if method_key == "bayesian":
-            try:
-                self._suspend_ci_trace = True
-                self.show_ci_band_var.set(False)  # untick but DO NOT disable
-            finally:
-                self._suspend_ci_trace = False
+        # Save the old method's band pref before switching
+        try:
+            old_key = getattr(self, "_last_unc_method_key", None)
+            if old_key and old_key in self._band_pref:
+                self._band_pref[old_key] = bool(self.show_ci_band_var.get())
+                self._persist_band_prefs()
+        except Exception:
+            pass
+
+        # Always keep the checkbox enabled; for Bayesian, force OFF (bands gated elsewhere)
+        try:
+            self._suspend_ci_trace = True
+            if method_key == "bayesian":
+                self.show_ci_band_var.set(False)
+            else:
+                # restore user preference for this method
+                self.show_ci_band_var.set(bool(self._band_pref.get(method_key, False)))
+        finally:
+            self._suspend_ci_trace = False
 
         # Checkbox remains enabled regardless of method; actual rendering depends on band availability.
         self._set_ci_toggle_state(True)
@@ -2495,6 +2562,8 @@ class PeakFitApp:
             self._jitter_entry.configure(state=("normal" if is_boot else "disabled"))
         except Exception:
             pass
+        # Track current method for next switch
+        self._last_unc_method_key = method_key
         boot_cb = getattr(self, "_boot_solver_cb", None)
         if boot_cb is not None:
             try:
@@ -4778,6 +4847,23 @@ class PeakFitApp:
             else:
                 self.ci_band = None
             self._set_ci_toggle_state(True)
+            # If a band just became available, honor the user's saved per-method preference.
+            try:
+                mk = self._unc_selected_method_key()
+                if (
+                    getattr(self, "ci_band", None) is not None
+                    and bool(getattr(self, "_band_pref", {}).get(mk, False))
+                    and not bool(self.show_ci_band_var.get())
+                ):
+                    try:
+                        self._suspend_ci_trace = True
+                        self.show_ci_band_var.set(True)
+                    finally:
+                        self._suspend_ci_trace = False
+                    # Render immediately now that the toggle is on
+                    self._toggle_ci_band()
+            except Exception:
+                pass
 
             # persist band for export when method is asymptotic or Bayesian
             try:
