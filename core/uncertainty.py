@@ -1268,6 +1268,32 @@ def _smooth_envelope(y: np.ndarray) -> np.ndarray:
         return np.convolve(yp, kernel, mode="valid")
 
 
+# --- MCSE for quantiles (Bayesian diagnostics; dependency-free)
+def _mcse_quantile(samples: np.ndarray, q: float, batches: int = 20) -> float:
+    """
+    Batch-replicate MCSE for a quantile (q in [0,1]).
+    Returns NaN if insufficient draws.
+    """
+    try:
+        s = np.asarray(samples).ravel()
+        n = s.size
+        if n == 0 or batches < 2 or n < batches:
+            return float("nan")
+        k = n // batches
+        if k < 2:
+            return float("nan")
+        qs = []
+        for i in range(batches):
+            chunk = s[i * k : (i + 1) * k]
+            if chunk.size:
+                qs.append(np.quantile(chunk, q))
+        if len(qs) < 2:
+            return float("nan")
+        return float(np.std(qs, ddof=1) / np.sqrt(len(qs)))
+    except Exception:
+        return float("nan")
+
+
 def bayesian_ci(
     theta_hat: np.ndarray, *,
     model=None, predict_full=None, x_all=None, y_all=None,
@@ -1736,7 +1762,18 @@ def bayesian_ci(
     default_names = [f"p{i}" for i in range(P)]
     custom_names = list(param_names) if param_names is not None else []
     for idx in range(P):
-        stats_flat = _scalar_stats_for(T_full[:, idx])
+        draws_flat = T_full[:, idx]
+        stats_flat = _scalar_stats_for(draws_flat)
+        try:
+            alpha_lo = float(alpha) / 2.0
+            alpha_hi = 1.0 - alpha_lo
+        except Exception:
+            alpha_lo = 0.025
+            alpha_hi = 0.975
+        lo_mcse = _mcse_quantile(draws_flat, alpha_lo)
+        hi_mcse = _mcse_quantile(draws_flat, alpha_hi)
+        stats_flat["ci_lo_mcse"] = float(lo_mcse)
+        stats_flat["ci_hi_mcse"] = float(hi_mcse)
         param_stats[default_names[idx]] = stats_flat
         if idx < len(custom_names):
             key = str(custom_names[idx])
@@ -1796,6 +1833,61 @@ def bayesian_ci(
         except Exception as e:
             diag_notes.append(repr(e))
 
+    # --- Attach per-parameter MCSE for Bayesian CI endpoints.
+    ci_mcse_diag = {}
+    try:
+        if T_full.size:
+            alpha_lo = float(alpha) / 2.0
+            alpha_hi = 1.0 - alpha_lo
+        else:
+            alpha_lo = float(alpha) / 2.0
+            alpha_hi = 1.0 - alpha_lo
+    except Exception:
+        alpha_lo = 0.025
+        alpha_hi = 0.975
+    try:
+        if T_full.size:
+            diag_ci: Dict[str, Any] = {}
+            if n_pk > 0:
+                for name, offset in (("center", 0), ("height", 1), ("fwhm", 2), ("eta", 3)):
+                    blk = param_stats.get(name)
+                    if not isinstance(blk, dict):
+                        continue
+                    lo_list: List[float] = []
+                    hi_list: List[float] = []
+                    for i in range(n_pk):
+                        draws_i = T_full[:, 4 * i + offset]
+                        lo_mcse = float(_mcse_quantile(draws_i, alpha_lo))
+                        hi_mcse = float(_mcse_quantile(draws_i, alpha_hi))
+                        lo_list.append(lo_mcse)
+                        hi_list.append(hi_mcse)
+                    blk["ci_lo_mcse"] = lo_list
+                    blk["ci_hi_mcse"] = hi_list
+                    if lo_list or hi_list:
+                        diag_ci[name] = {
+                            "ci_lo_mcse": lo_list[0] if lo_list else float("nan"),
+                            "ci_hi_mcse": hi_list[0] if hi_list else float("nan"),
+                        }
+            sig_blk = param_stats.get("sigma")
+            # Guard: if sigma draws were not captured in this code path, skip MCSE for σ gracefully.
+            try:
+                _sig_draws = sigma_draws  # noqa: F821
+            except NameError:
+                _sig_draws = None
+            if isinstance(sig_blk, dict) and _sig_draws is not None:
+                lo_mcse = float(_mcse_quantile(_sig_draws, alpha_lo))
+                hi_mcse = float(_mcse_quantile(_sig_draws, alpha_hi))
+                sig_blk["ci_lo_mcse"] = lo_mcse
+                sig_blk["ci_hi_mcse"] = hi_mcse
+                diag_ci["sigma"] = {"ci_lo_mcse": lo_mcse, "ci_hi_mcse": hi_mcse}
+            if diag_ci:
+                ci_mcse_diag = diag_ci
+    except Exception:
+        ci_mcse_diag = {}
+
+    # --- OPTIONAL: summarize CI MCSE for logs (populated later if available)
+    ci_mcse_diag_for_log: Dict[str, Any] = dict(ci_mcse_diag)
+
     diag = dict(diag_perf)
     diag.update({
         "n_draws": int(n_samp),
@@ -1811,6 +1903,8 @@ def bayesian_ci(
         "diagnostics_enabled": bool(diagnostics_enabled),
         # Fill band worker diagnostics after band logic for consistency.
     })
+    if ci_mcse_diag_for_log:
+        diag["ci_mcse"] = ci_mcse_diag_for_log
     # Record backend used for the Bayesian path too.
     try:
         diag["numpy_backend"] = performance.which_backend()

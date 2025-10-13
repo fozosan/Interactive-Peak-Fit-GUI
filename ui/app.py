@@ -1086,7 +1086,6 @@ class PeakFitApp:
             save_config(self.cfg)
         # Group B: legacy follow config removed and bootstrap solver defaults to main solver
         self.cfg.pop("unc_boot_solver_follow", None)
-        save_config(self.cfg)
         self.cfg.setdefault("unc_boot_solver", self.solver_choice.get())
         _base_key = self.solver_choice.get()
         self.solver_title = tk.StringVar(value=SOLVER_LABELS.get(_base_key, _base_key))
@@ -4886,6 +4885,18 @@ class PeakFitApp:
             self.status_info(f"Computed {human_label} uncertainty.")
             # Always record backend + worker normalization for troubleshooting (if present)
             try:
+                if isinstance(self.last_uncertainty, dict):
+                    _stats = self.last_uncertainty.get("stats") or []
+                    if isinstance(_stats, list) and _stats:
+                        first_row = _stats[0] if isinstance(_stats[0], dict) else {}
+                        center_blk = first_row.get("center") if isinstance(first_row, dict) else None
+                        if isinstance(center_blk, dict):
+                            _mcse_lo = center_blk.get("ci_lo_mcse")
+                            _mcse_hi = center_blk.get("ci_hi_mcse")
+                            if _mcse_lo is not None or _mcse_hi is not None:
+                                self.dlog(
+                                    f"[DEBUG] Bayesian CI MCSE (first peak center): lo={_mcse_lo!r}, hi={_mcse_hi!r}"
+                                )
                 _bk = diag.get("numpy_backend") if isinstance(diag, dict) else None
                 _bw_req = diag.get("band_workers_requested") if isinstance(diag, dict) else None
                 _bw_eff = diag.get("band_workers_effective") if isinstance(diag, dict) else None
