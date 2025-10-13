@@ -138,7 +138,13 @@ def _normalize_param_stats(stats: dict | Sequence[dict]) -> tuple[list[dict], di
                     or _to_series(blk.get("p97.5"))
                     or _to_series(blk.get("ci_hi"))
                 )
-                n = max(len(rows), len(est), len(sd), len(lo), len(hi))
+                lo_mcse = _to_series(blk.get("ci_lo_mcse"))
+                hi_mcse = _to_series(blk.get("ci_hi_mcse"))
+                # include MCSE vector lengths to avoid truncation when they differ
+                n = max(
+                    len(rows), len(est), len(sd), len(lo), len(hi),
+                    len(lo_mcse), len(hi_mcse)
+                )
                 while len(rows) < n:
                     rows.append({})
                 for idx in range(n):
@@ -150,6 +156,12 @@ def _normalize_param_stats(stats: dict | Sequence[dict]) -> tuple[list[dict], di
                     )
                     rec[f"{name}_p97_5"] = (
                         _opt_float(hi[idx]) if idx < len(hi) else rec.get(f"{name}_p97_5")
+                    )
+                    rec[f"{name}_ci_lo_mcse"] = (
+                        _opt_float(lo_mcse[idx]) if idx < len(lo_mcse) else rec.get(f"{name}_ci_lo_mcse")
+                    )
+                    rec[f"{name}_ci_hi_mcse"] = (
+                        _opt_float(hi_mcse[idx]) if idx < len(hi_mcse) else rec.get(f"{name}_ci_hi_mcse")
                     )
             stats_seq = []
         else:
@@ -171,10 +183,14 @@ def _normalize_param_stats(stats: dict | Sequence[dict]) -> tuple[list[dict], di
                 hi = _get_pct(blk, "p97_5", "p97.5")
                 if hi is None:
                     hi = blk.get("ci_hi")
+                lo_mcse = blk.get("ci_lo_mcse")
+                hi_mcse = blk.get("ci_hi_mcse")
                 rec[f"{name}_est"] = _opt_float(est)
                 rec[f"{name}_sd"] = _opt_float(sd)
                 rec[f"{name}_p2_5"] = _opt_float(lo)
                 rec[f"{name}_p97_5"] = _opt_float(hi)
+                rec[f"{name}_ci_lo_mcse"] = _opt_float(lo_mcse)
+                rec[f"{name}_ci_hi_mcse"] = _opt_float(hi_mcse)
             rows.append(rec)
 
     if isinstance(stats, Mapping):
@@ -186,6 +202,10 @@ def _normalize_param_stats(stats: dict | Sequence[dict]) -> tuple[list[dict], di
             wide["sigma_sd"] = float(sig.get("sd")) if sig.get("sd") is not None else None
             wide["sigma_p2_5"] = float(lo) if lo is not None else None
             wide["sigma_p97_5"] = float(hi) if hi is not None else None
+            lo_mcse = sig.get("ci_lo_mcse")
+            hi_mcse = sig.get("ci_hi_mcse")
+            wide["sigma_ci_lo_mcse"] = float(lo_mcse) if lo_mcse is not None else None
+            wide["sigma_ci_hi_mcse"] = float(hi_mcse) if hi_mcse is not None else None
 
         for name, d in stats.items():
             if name in ("center", "height", "fwhm", "eta", "sigma", "rows"):
@@ -196,7 +216,9 @@ def _normalize_param_stats(stats: dict | Sequence[dict]) -> tuple[list[dict], di
             sd = d.get("sd")
             lo = _get_pct(d, "p2_5", "p2.5")
             hi = _get_pct(d, "p97_5", "p97.5")
-            for key, val in (("est", est), ("sd", sd), ("p2_5", lo), ("p97_5", hi)):
+            lo_mcse = d.get("ci_lo_mcse")
+            hi_mcse = d.get("ci_hi_mcse")
+            for key, val in (("est", est), ("sd", sd), ("p2_5", lo), ("p97_5", hi), ("ci_lo_mcse", lo_mcse), ("ci_hi_mcse", hi_mcse)):
                 wide[f"{name}_{key}"] = float(val) if val is not None else None
 
     return rows, wide
@@ -1507,7 +1529,15 @@ def _write_unc_txt(
     txt = _format_unc_text(file_path, unc_norm, solver_meta, baseline_meta, perf_meta, locks)
     txt_path.write_text(txt, encoding="utf-8")
 
-# --- BEGIN: add wide exporter next to existing long-format helpers ---
+# --- BEGIN: batch-wide exporter (single source of truth for these columns) ---
+
+BATCH_WIDE_COLUMNS = [
+    "file_id","peak","method","rmse","dof",
+    "center","center_stderr","center_ci_lo","center_ci_hi","center_ci_lo_mcse","center_ci_hi_mcse",
+    "height","height_stderr","height_ci_lo","height_ci_hi","height_ci_lo_mcse","height_ci_hi_mcse",
+    "fwhm","fwhm_stderr","fwhm_ci_lo","fwhm_ci_hi","fwhm_ci_lo_mcse","fwhm_ci_hi_mcse",
+    "eta","eta_stderr","eta_ci_lo","eta_ci_hi","eta_ci_lo_mcse","eta_ci_hi_mcse",
+]
 
 def _iter_peak_rows_wide(
     file_path: Union[str, "Path"],
@@ -1519,7 +1549,14 @@ def _iter_peak_rows_wide(
       center, center_stderr, center_ci_lo, center_ci_hi, center_p2_5, center_p97_5,
       height, height_stderr, height_ci_lo, height_ci_hi, height_p2_5, height_p97_5,
       fwhm,   fwhm_stderr,   fwhm_ci_lo,   fwhm_ci_hi,   fwhm_p2_5,   fwhm_p97_5,
-      eta,    eta_stderr,    eta_ci_lo,    eta_ci_hi,    eta_p2_5,    eta_p97_5
+      eta,    eta_stderr,    eta_ci_lo,    eta_ci_hi,    eta_p2_5,    eta_p97_5,
+      center_ci_lo_mcse, center_ci_hi_mcse,
+      height_ci_lo_mcse, height_ci_hi_mcse,
+      fwhm_ci_lo_mcse,   fwhm_ci_hi_mcse,
+      eta_ci_lo_mcse,    eta_ci_hi_mcse
+
+    NOTE: this helper uses column 'file'. The batch-wide writer uses 'file_id'.
+    Do not mix their outputs without mapping the column names.
     """
     fname   = str(file_path)
     label   = unc_norm.get("label", "unknown")
@@ -1544,6 +1581,8 @@ def _iter_peak_rows_wide(
                 f"{name}_ci_hi": _to_float(pm.get("ci_hi")),
                 f"{name}_p2_5": _to_float(pm.get("p2_5")),
                 f"{name}_p97_5": _to_float(pm.get("p97_5")),
+                f"{name}_ci_lo_mcse": _to_float(pm.get("ci_lo_mcse")),
+                f"{name}_ci_hi_mcse": _to_float(pm.get("ci_hi_mcse")),
             }
 
         out = {
@@ -1616,6 +1655,32 @@ def iter_uncertainty_rows(
                 }
             )
     return rows
+
+
+def write_batch_uncertainty_csv(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
+    """Write batch-wide uncertainty CSV with appended MCSE columns."""
+
+    path = Path(path)
+    header = list(BATCH_WIDE_COLUMNS)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=header,
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for rec in rows:
+            row: dict[str, Any] = {}
+            for col in header:
+                val = rec.get(col, "")
+                if isinstance(val, float):
+                    if not math.isfinite(val):
+                        val = ""
+                elif val is None:
+                    val = ""
+                row[col] = val
+            writer.writerow(row)
 
 
 def write_uncertainty_csv_legacy(
@@ -1709,6 +1774,12 @@ def write_uncertainty_csvs(
                 "fwhm","fwhm_stderr","fwhm_ci_lo","fwhm_ci_hi",
                 "eta","eta_stderr","eta_ci_lo","eta_ci_hi",
             ]
+            header.extend([
+                "center_ci_lo_mcse","center_ci_hi_mcse",
+                "height_ci_lo_mcse","height_ci_hi_mcse",
+                "fwhm_ci_lo_mcse","fwhm_ci_hi_mcse",
+                "eta_ci_lo_mcse","eta_ci_hi_mcse",
+            ])
             extra_cols = [k for k in wide_map.keys() if k not in header]
             extra_cols.sort()
             header.extend(extra_cols)
@@ -1740,6 +1811,17 @@ def write_uncertainty_csvs(
                         row_out[f"{param}_stderr"] = sd
                         row_out[f"{param}_ci_lo"] = qlo_val
                         row_out[f"{param}_ci_hi"] = qhi_val
+                        lo_mcse_val = rec.get(f"{param}_ci_lo_mcse")
+                        hi_mcse_val = rec.get(f"{param}_ci_hi_mcse")
+                        lo_mcse = _to_float(lo_mcse_val)
+                        hi_mcse = _to_float(hi_mcse_val)
+                        # For consistency with batch writer, emit blanks for non-finite values.
+                        row_out[f"{param}_ci_lo_mcse"] = (
+                            lo_mcse if math.isfinite(lo_mcse) else ""
+                        )
+                        row_out[f"{param}_ci_hi_mcse"] = (
+                            hi_mcse if math.isfinite(hi_mcse) else ""
+                        )
                     for col in extra_cols:
                         val = wide_map.get(col)
                         if isinstance(val, str):
