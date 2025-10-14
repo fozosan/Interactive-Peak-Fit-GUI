@@ -793,19 +793,16 @@ def _set_thread_limits(strategy: str, blas_threads):
 # ---------- Main GUI ----------
 class PeakFitApp:
     # Local copy to normalize GUI jitter slider (percent → fraction)
-    @staticmethod
-    def _norm_jitter_val(val) -> float:
+    def _norm_jitter_val(self, v: float) -> float:
+        """Clamp bootstrap jitter to a safe [0..0.25] range."""
+
         try:
-            f = float(val)
+            v = float(v)
         except Exception:
-            return 0.02
-        if f > 1.5:
-            f = f / 100.0
-        if f < 0.0:
-            f = 0.0
-        if f > 1.0:
-            f = 1.0
-        return f
+            v = 0.02
+        if v < 0.0:
+            v = 0.0
+        return v if v <= 0.25 else 0.25
 
     def dlog(self, msg):
         """Instance debug logger respecting the UI toggle."""
@@ -874,12 +871,13 @@ class PeakFitApp:
 
         try:
             jitter_raw = getattr(self, "bootstrap_jitter_var", None)
-            jitter_val = float(jitter_raw.get()) / 100.0 if jitter_raw is not None else float(cfg.get("bootstrap_jitter", 0.02))
-        except Exception:
-            try:
+            if jitter_raw is not None:
+                jv = float(jitter_raw.get())
+                jitter_val = jv / 100.0 if jv > 1.0 else jv
+            else:
                 jitter_val = float(cfg.get("bootstrap_jitter", 0.02))
-            except Exception:
-                jitter_val = 0.02
+        except Exception:
+            jitter_val = 0.02
         jitter = self._norm_jitter_val(jitter_val)
 
         seed = None

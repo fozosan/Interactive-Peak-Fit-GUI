@@ -18,6 +18,7 @@ import copy
 import numpy as np
 import math
 import logging
+from contextlib import nullcontext
 
 if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safeguard
     os.environ.setdefault("MPLBACKEND", "Agg")
@@ -32,22 +33,29 @@ from infra import performance
 logger = logging.getLogger(__name__)
 
 
-class _NopCtx:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-
 def _tp_limits_ctx_for_config(config: dict):
+    """
+    Robust BLAS/threadpool limiter for batch path.
+    Returns a real context object (threadpool_limits or nullcontext), never a generator.
+    """
+
+    try:
+        from threadpoolctl import threadpool_limits  # type: ignore
+    except Exception:
+        threadpool_limits = None  # type: ignore
+
     strategy = str(config.get("perf_parallel_strategy", "outer"))
     try:
         _bt = int(config.get("perf_blas_threads", 0) or 0)
     except Exception:
         _bt = 0
     limit = 1 if strategy == "outer" else (_bt if _bt > 0 else None)
-    return performance.blas_limit_ctx(limit)
+    if threadpool_limits is not None and limit is not None:
+        try:
+            return threadpool_limits(limits=limit)
+        except Exception:
+            return nullcontext()
+    return nullcontext()
 
 
 def _norm_jitter(v, default=0.02):
@@ -542,9 +550,11 @@ def run_batch(
                         "perf_blas_threads": _blas_cfg,
                     }
                 )
+                workers_eff = int(unc_workers)
+                band_workers_eff = int(unc_band_workers)
                 fit_ctx.update({
-                    "unc_workers": int(unc_workers),
-                    "unc_band_workers": int(unc_band_workers),
+                    "unc_workers": workers_eff if workers_eff > 0 else None,
+                    "unc_band_workers": band_workers_eff if band_workers_eff > 0 else None,
                     "unc_use_gpu": bool(config.get("unc_use_gpu", False)),
                 })
 
@@ -624,8 +634,10 @@ def run_batch(
 
                 workers_eff = int(unc_workers)
                 band_workers_eff = int(unc_band_workers)
-                fit_ctx["unc_workers"] = workers_eff if unc_req_cfg > 0 else 0
-                fit_ctx["unc_band_workers"] = band_workers_eff if band_req_cfg > 0 else 0
+                fit_ctx["unc_workers"] = workers_eff if workers_eff > 0 else None
+                fit_ctx["unc_band_workers"] = (
+                    band_workers_eff if band_workers_eff > 0 else None
+                )
 
                 if str(unc_method_canon).lower() == "bootstrap":
                     bounds = res.get("bounds")
@@ -645,7 +657,7 @@ def run_batch(
                     except Exception:
                         _bt_raw = 0
                     blas_effective = 1 if strategy == "outer" else (_bt_raw if _bt_raw > 0 else "lib")
-                    workers_arg = workers_eff if unc_req_cfg > 0 else None
+                    workers_arg = workers_eff if workers_eff > 0 else None
 
                     perf_line = (
                         f"[DEBUG] perf: fit_workers={cfg_perf.fit_workers} unc_workers={workers_eff} "
@@ -673,7 +685,7 @@ def run_batch(
                             workers=workers_arg,
                             alpha=alpha,
                             center_residuals=center_res,
-                            return_band=True,
+                            return_band=band_pref_bootstrap,
                             jitter=jitter_frac,
                         )
                     if isinstance(unc_res, dict):
@@ -706,7 +718,9 @@ def run_batch(
                         "bayes_diagnostics": bool(
                             config.get("bayes_diagnostics", config.get("bayes_diag", False))
                         ),
-                        "unc_band_workers": band_workers_eff,
+                        "unc_band_workers": band_workers_eff
+                        if band_workers_eff > 0
+                        else None,
                         "bayes_band_enabled": bool(config.get("bayes_band_enabled", False)),
                         "bayes_band_force": bool(config.get("bayes_band_force", False)),
                         "bayes_band_max_draws": int(config.get("bayes_band_max_draws", 512) or 512),
@@ -752,7 +766,7 @@ def run_batch(
                             fit_ctx=fit_ctx,
                             x_all=x_fit,
                             y_all=y_fit,
-                            workers=workers_eff,
+                            workers=(workers_eff if workers_eff > 0 else None),
                             seed=seed_val,
                             n_boot=bootstrap_n,
                         )
