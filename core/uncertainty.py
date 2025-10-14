@@ -1788,10 +1788,15 @@ def bayesian_ci(
     post = chain_post[:, :, :P_free] if P_free > 0 else None
     post_swapped = None
     try:
+        # emcee returns (nsteps, nwalkers, nparams)
         chain_full = sampler.get_chain(flat=False)
-        post_full = chain_full[-int(n_steps):, :, :]
-        if int(thin) > 1:
-            post_full = post_full[::int(thin), :, :]
+        post_full = np.asarray(chain_full, float)
+        steps_take = int(n_steps)
+        if steps_take > 0 and post_full.shape[0] >= steps_take:
+            post_full = post_full[-steps_take:, :, :]
+        t = int(thin)
+        if t > 1:
+            post_full = post_full[::t, :, :]
         post = post_full[:, :, :P_free] if P_free > 0 else None
     except Exception as e:
         diag_notes.append(repr(e))
@@ -1809,6 +1814,7 @@ def bayesian_ci(
 
     if diagnostics_enabled and post is not None and post.size:
         try:
+            # diagnostics expect (nchains, ndraws, nparams)
             post_swapped = np.swapaxes(post, 0, 1)
             ess_val = ess_autocorr(post_swapped)
             ess_arr = np.asarray(ess_val, dtype=float)
@@ -1829,7 +1835,8 @@ def bayesian_ci(
                 sd_vals = np.nanstd(T_full, axis=0, ddof=1)
                 mcse_vals = np.asarray(sd_vals, float) / np.sqrt(max(ess_min, 1.0))
                 if mcse_vals.size:
-                    mcse_mean = float(np.nanmax(mcse_vals))
+                    # Mean MCSE is more stable than the worst-parameter max.
+                    mcse_mean = float(np.nanmean(mcse_vals))
         except Exception as e:
             diag_notes.append(repr(e))
 
