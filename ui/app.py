@@ -798,11 +798,11 @@ class PeakFitApp:
         try:
             f = float(val)
         except Exception:
-            return 0.0
-        if f < 0:
-            f = 0.0
-        if f > 1.5:  # treat as percent
+            return 0.02
+        if f > 1.5:
             f = f / 100.0
+        if f < 0.0:
+            f = 0.0
         if f > 1.0:
             f = 1.0
         return f

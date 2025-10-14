@@ -480,10 +480,20 @@ def run_batch(
                     model_eval = _predict_full_from_peaks
 
                 fit_ctx = dict(res.get("fit_ctx") or {})
-                solver_choice = str(
-                    config.get("solver_choice", res.get("solver", "modern_trf"))
+                solver_choice = (
+                    config.get("solver_choice")
+                    or config.get("solver")
+                    or res.get("solver")
+                    or "modern_trf"
                 )
-                boot_solver = str(config.get("unc_boot_solver", solver_choice))
+                solver_choice = str(solver_choice)
+                boot_solver = (
+                    config.get("unc_boot_solver")
+                    or solver_choice
+                    or config.get("solver")
+                    or "modern_vp"
+                )
+                boot_solver = str(boot_solver)
                 has_lmfit = bool(res.get("has_lmfit", config.get("has_lmfit", False)))
                 if boot_solver.lower().startswith("lmfit") and not has_lmfit:
                     boot_solver = solver_choice
