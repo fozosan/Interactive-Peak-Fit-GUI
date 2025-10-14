@@ -188,6 +188,7 @@ from dataclasses import dataclass
 from functools import wraps  # used by @log_action
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple, Optional
+from contextlib import nullcontext
 from types import SimpleNamespace  # ensure this import exists
 from core.data_io import (
     write_uncertainty_csvs,
@@ -797,11 +798,11 @@ class PeakFitApp:
         try:
             f = float(val)
         except Exception:
-            return 0.0
-        if f < 0:
-            f = 0.0
-        if f > 1.5:  # treat as percent
+            return 0.02
+        if f > 1.5:
             f = f / 100.0
+        if f < 0.0:
+            f = 0.0
         if f > 1.0:
             f = 1.0
         return f
@@ -847,6 +848,86 @@ class PeakFitApp:
                     return False
 
             return _Nop()
+
+    # --- Bootstrap parity helpers (F) ---
+    def _bootstrap_cfg_from_gui(self):
+        """Extract Bootstrap + perf + band prefs mirroring GUI settings."""
+        cfg = getattr(self, "cfg", {}) or {}
+        solver = None
+        try:
+            solver = getattr(self, "boot_solver_choice", None)
+            if solver is not None:
+                solver = solver.get()
+        except Exception:
+            solver = None
+        if not solver:
+            solver = cfg.get("unc_boot_solver") or cfg.get("solver_choice") or "modern_vp"
+        solver = str(solver)
+
+        try:
+            n_boot = int(getattr(self, "boot_n_var", None).get())  # type: ignore[arg-type]
+        except Exception:
+            try:
+                n_boot = int(cfg.get("bootstrap_n", 1000) or 1000)
+            except Exception:
+                n_boot = 1000
+
+        try:
+            jitter_raw = getattr(self, "bootstrap_jitter_var", None)
+            jitter_val = float(jitter_raw.get()) / 100.0 if jitter_raw is not None else float(cfg.get("bootstrap_jitter", 0.02))
+        except Exception:
+            try:
+                jitter_val = float(cfg.get("bootstrap_jitter", 0.02))
+            except Exception:
+                jitter_val = 0.02
+        jitter = self._norm_jitter_val(jitter_val)
+
+        seed = None
+        try:
+            seed_all = bool(getattr(self, "perf_seed_all", None).get())  # type: ignore[arg-type]
+        except Exception:
+            seed_all = bool(cfg.get("perf_seed_all", False))
+        if seed_all:
+            seed = self._perf_seed_value()
+
+        try:
+            workers_raw = getattr(self, "perf_unc_workers", None)
+            workers_val = int(float(workers_raw.get())) if workers_raw is not None else int(cfg.get("perf_unc_workers", 0) or 0)
+        except Exception:
+            try:
+                workers_val = int(cfg.get("perf_unc_workers", 0) or 0)
+            except Exception:
+                workers_val = 0
+        workers = workers_val if workers_val > 0 else None
+
+        band_pref = bool(cfg.get("ui_band_pref_bootstrap", True))
+        return {
+            "solver": solver,
+            "n": int(n_boot),
+            "jitter": float(jitter),
+            "workers": workers,
+            "seed": seed,
+            "band_pref": band_pref,
+        }
+
+    def _blas_limit_ctx(self):
+        """Mirror single-file BLAS/threads policy during batch uncertainty."""
+        cfg = getattr(self, "cfg", {}) or {}
+        try:
+            strategy = str(cfg.get("perf_parallel_strategy", cfg.get("perf_strategy", "outer")))
+        except Exception:
+            strategy = "outer"
+        try:
+            blas_threads = int(cfg.get("perf_blas_threads", 0) or 0)
+        except Exception:
+            blas_threads = 0
+        limit = 1 if strategy == "outer" else (blas_threads if blas_threads > 0 else None)
+        if threadpool_limits is not None and limit is not None:
+            try:
+                return threadpool_limits(limits=limit)
+            except Exception:
+                pass
+        return nullcontext()
     # --- small config helper used by Bootstrap controls ---
     def _cfg_set(self, key, value):
         try:
@@ -3838,7 +3919,15 @@ class PeakFitApp:
 
         solver = self.solver_choice.get()
         fit_workers_eff = self._resolve_fit_workers()
-        unc_workers_eff = self._resolve_unc_workers()
+        try:
+            unc_workers_raw = int(float(self.perf_unc_workers.get()))
+        except Exception:
+            try:
+                unc_workers_raw = int(self.cfg.get("perf_unc_workers", 0) or 0)
+            except Exception:
+                unc_workers_raw = 0
+
+        boot_cfg = self._bootstrap_cfg_from_gui()
         cfg = {
             "peaks": peaks_list,
             "solver": solver,
@@ -3855,12 +3944,18 @@ class PeakFitApp:
             "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
             "perf_seed_all": bool(self.perf_seed_all.get()),
             "perf_max_workers": int(fit_workers_eff),
-            "perf_unc_workers": int(unc_workers_eff),
-            "perf_seed": self.cfg.get("perf_seed", ""),
+            "perf_unc_workers": int(unc_workers_raw),
+            "perf_seed": boot_cfg["seed"] if boot_cfg["seed"] is not None else "",
             "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
             "perf_blas_threads": int(self.perf_blas_threads.get()),
             "output_dir": str(output_dir),
             "output_base": output_base,
+            "unc_boot_solver": boot_cfg["solver"],
+            "bootstrap_n": int(boot_cfg["n"]),
+            "bootstrap_jitter": float(boot_cfg["jitter"]),
+            "ui_band_pref_bootstrap": bool(boot_cfg["band_pref"]),
+            "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
+            "lmfit_share_eta": bool(self.lmfit_share_eta.get()),
             # Bayesian band configuration
             "bayes_band_enabled": bool(self.bayes_band_enabled_var.get()),
             "bayes_band_force": bool(self.bayes_band_force_var.get()),

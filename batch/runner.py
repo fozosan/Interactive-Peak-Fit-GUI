@@ -209,6 +209,7 @@ def run_batch(
         base_name = Path(peak_output_cfg).stem.replace("_fit", "")
     peak_output = out_dir / f"{base_name}_fit.csv"
     export_unc_wide = bool(config.get("export_unc_wide", False))
+    band_pref_bootstrap = bool(config.get("ui_band_pref_bootstrap", True))
     # Choose uncertainty method: explicit arg > config aliases > default
     unc_choice = (
         unc_method
@@ -218,13 +219,13 @@ def run_batch(
         or "asymptotic"
     )
     unc_method_canon = data_io.canonical_unc_label(unc_choice)
-    perf_seed_all = bool(config.get("perf_seed_all", cfg_perf.seed_all))
-    seed_default = cfg_perf.seed_value if cfg_perf.seed_value is not None else ""
-    _perf_seed_cfg = config.get("perf_seed", seed_default)
-    try:
-        perf_seed = int(_perf_seed_cfg) if str(_perf_seed_cfg) not in ("", "None") else cfg_perf.seed_value
-    except Exception:
-        perf_seed = cfg_perf.seed_value
+    perf_seed_all = bool(config.get("perf_seed_all", False))
+    perf_seed = None
+    if perf_seed_all:
+        try:
+            perf_seed = int(str(config.get("perf_seed", "")).strip())
+        except Exception:
+            perf_seed = None
     if log:
         log(f"batch uncertainty method={unc_method_canon}")
         log(f"batch compute_uncertainty={bool(compute_uncertainty)}")
@@ -235,7 +236,6 @@ def run_batch(
     processed = 0
 
     for i, path in enumerate(files, 1):
-        file_index = i - 1
         if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
             return {"aborted": True, "records": [], "reason": "user-abort"}
         if progress:
@@ -480,10 +480,20 @@ def run_batch(
                     model_eval = _predict_full_from_peaks
 
                 fit_ctx = dict(res.get("fit_ctx") or {})
-                solver_choice = str(
-                    config.get("solver_choice", res.get("solver", "modern_trf"))
+                solver_choice = (
+                    config.get("solver_choice")
+                    or config.get("solver")
+                    or res.get("solver")
+                    or "modern_trf"
                 )
-                boot_solver = str(config.get("unc_boot_solver", solver_choice))
+                solver_choice = str(solver_choice)
+                boot_solver = (
+                    config.get("unc_boot_solver")
+                    or solver_choice
+                    or config.get("solver")
+                    or "modern_vp"
+                )
+                boot_solver = str(boot_solver)
                 has_lmfit = bool(res.get("has_lmfit", config.get("has_lmfit", False)))
                 if boot_solver.lower().startswith("lmfit") and not has_lmfit:
                     boot_solver = solver_choice
@@ -512,11 +522,14 @@ def run_batch(
                             else (res.get("p0") if res.get("p0") is not None else theta_hat),
                             float,
                         ),
-                        "strict_refit": True,
                         "centers_ref": centers_ref,
                         "relabel_by_center": True,
                     }
                 )
+                if str(boot_solver).lower() == "lmfit_vp":
+                    fit_ctx["strict_refit"] = True
+                else:
+                    fit_ctx.pop("strict_refit", None)
                 try:
                     _blas_cfg = int(config.get("perf_blas_threads", 0) or 0)
                 except Exception:
@@ -611,8 +624,8 @@ def run_batch(
 
                 workers_eff = int(unc_workers)
                 band_workers_eff = int(unc_band_workers)
-                fit_ctx["unc_workers"] = workers_eff
-                fit_ctx["unc_band_workers"] = band_workers_eff
+                fit_ctx["unc_workers"] = workers_eff if unc_req_cfg > 0 else 0
+                fit_ctx["unc_band_workers"] = band_workers_eff if band_req_cfg > 0 else 0
 
                 if str(unc_method_canon).lower() == "bootstrap":
                     bounds = res.get("bounds")
@@ -620,13 +633,7 @@ def run_batch(
                     alpha = float(config.get("unc_alpha", 0.05))
                     center_res = bool(config.get("unc_center_resid", True))
                     n_boot = bootstrap_n
-                    if (perf_seed_all or cfg_perf.seed_all) and (
-                        (perf_seed is not None) or (cfg_perf.seed_value is not None)
-                    ):
-                        base = perf_seed if perf_seed is not None else cfg_perf.seed_value
-                        seed_val = int(base) + file_index
-                    else:
-                        seed_val = None
+                    seed_val = perf_seed if perf_seed_all and (perf_seed is not None) else None
 
                     jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
                     jac_mat = np.atleast_2d(np.asarray(jac_mat, float))
@@ -638,19 +645,18 @@ def run_batch(
                     except Exception:
                         _bt_raw = 0
                     blas_effective = 1 if strategy == "outer" else (_bt_raw if _bt_raw > 0 else "lib")
+                    workers_arg = workers_eff if unc_req_cfg > 0 else None
 
                     perf_line = (
                         f"[DEBUG] perf: fit_workers={cfg_perf.fit_workers} unc_workers={workers_eff} "
-                        f"blas_threads={blas_effective} seed_all={perf_seed_all or cfg_perf.seed_all} seed={seed_val}"
+                        f"blas_threads={blas_effective} seed_all={perf_seed_all} seed={seed_val}"
                     )
                     logger.debug(perf_line)
                     if log:
                         log(perf_line)
 
                     with _tp_limits_ctx_for_config(config):
-                        performance.apply_global_seed(
-                            seed_val, perf_seed_all or cfg_perf.seed_all
-                        )
+                        performance.apply_global_seed(seed_val, perf_seed_all)
                         unc_res = bootstrap_ci(
                             theta=theta_hat,
                             residual=residual_vec,
@@ -664,10 +670,11 @@ def run_batch(
                             locked_mask=locked_mask,
                             n_boot=n_boot,
                             seed=seed_val,
-                            workers=workers_eff,
+                            workers=workers_arg,
                             alpha=alpha,
                             center_residuals=center_res,
                             return_band=True,
+                            jitter=jitter_frac,
                         )
                     if isinstance(unc_res, dict):
                         diag = (unc_res.get("diagnostics") or {})
@@ -717,13 +724,7 @@ def run_batch(
                         ),
                         "abort_event": abort_event,
                     })
-                    if (perf_seed_all or cfg_perf.seed_all) and (
-                        (perf_seed is not None) or (cfg_perf.seed_value is not None)
-                    ):
-                        base = perf_seed if perf_seed is not None else cfg_perf.seed_value
-                        seed_val = int(base) + file_index
-                    else:
-                        seed_val = None
+                    seed_val = perf_seed if perf_seed_all and (perf_seed is not None) else None
                     workers_eff = int(unc_workers)
                     strategy = str(config.get("perf_parallel_strategy", "outer"))
                     try:
@@ -734,16 +735,14 @@ def run_batch(
 
                     perf_line = (
                         f"[DEBUG] perf: fit_workers={cfg_perf.fit_workers} unc_workers={workers_eff} "
-                        f"blas_threads={blas_effective} seed_all={perf_seed_all or cfg_perf.seed_all} seed={seed_val}"
+                        f"blas_threads={blas_effective} seed_all={perf_seed_all} seed={seed_val}"
                     )
                     logger.debug(perf_line)
                     if log:
                         log(perf_line)
 
                     with _tp_limits_ctx_for_config(config):
-                        performance.apply_global_seed(
-                            seed_val, perf_seed_all or cfg_perf.seed_all
-                        )
+                        performance.apply_global_seed(seed_val, perf_seed_all)
                         unc_res = route_uncertainty(
                             unc_method_canon,
                             theta_hat=theta_hat,
@@ -783,45 +782,95 @@ def run_batch(
                 dof_val = float(res.get("dof", 1)) if isinstance(res, dict) else 1.0
             unc_norm["dof"] = max(1, int(dof_val))
 
-            data_io.write_uncertainty_txt(
-                out_dir / f"{stem}_uncertainty.txt",
-                unc_norm,
-                peaks=fitted,
-                method_label=method_lbl,
-                file_path=path,
-            )
+            base_path = out_dir / stem
+            band = unc_norm.get("band") or unc_norm.get("prediction_band")
+            is_bootstrap = method_lbl.lower().startswith("bootstrap")
 
-            data_io.write_uncertainty_csvs(
-                out_dir / stem,
-                path,
-                unc_norm,
-                write_wide=export_unc_wide,
-            )
+            if is_bootstrap:
+                data_io.write_uncertainty_csvs(
+                    base_path,
+                    path,
+                    unc_norm,
+                    write_wide=True,
+                )
+                txt_path = base_path.with_name(base_path.name + "_uncertainty.txt")
+                solver_meta = res.get("solver_meta", {}) if isinstance(res, dict) else {}
+                baseline_meta = res.get("baseline_meta", {}) if isinstance(res, dict) else {}
+                perf_meta = res.get("perf_meta", {}) if isinstance(res, dict) else {}
+                locks = res.get("locks", []) if isinstance(res, dict) else []
+                try:
+                    data_io._write_unc_txt(txt_path, path, unc_norm, solver_meta, baseline_meta, perf_meta, locks)
+                except Exception:
+                    data_io.write_uncertainty_txt(
+                        txt_path,
+                        unc_norm,
+                        peaks=fitted,
+                        method_label=method_lbl,
+                        file_path=path,
+                        solver_meta=solver_meta,
+                        baseline_meta=baseline_meta,
+                        perf_meta=perf_meta,
+                        locks=locks,
+                    )
 
-            band = unc_norm.get("band")
-            if band is not None:
-                xb, lob, hib = band
-                band_csv = out_dir / f"{stem}_uncertainty_band.csv"
-                with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                    writer = csv.writer(fh, lineterminator="\n")
-                    ci_pct = 95
-                    try:
-                        alpha = float(
-                            unc_norm.get(
-                                "alpha",
-                                unc_norm.get("diagnostics", {}).get("alpha", 0.05),
+                if band_pref_bootstrap and band is not None:
+                    if isinstance(band, (tuple, list)) and len(band) == 3:
+                        xb, lob, hib = band
+                        band_csv = base_path.with_name(base_path.name + "_band.csv")
+                        with band_csv.open("w", newline="", encoding="utf-8") as fh:
+                            writer = csv.writer(fh, lineterminator="\n")
+                            writer.writerow(["x", "ci_lo", "ci_hi"])
+                            for xi, lo, hi in zip(xb, lob, hib):
+                                if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
+                                    return {"aborted": True, "records": [], "reason": "user-abort"}
+                                try:
+                                    xi_f = float(xi)
+                                    lo_f = float(lo)
+                                    hi_f = float(hi)
+                                except Exception:
+                                    continue
+                                if not (math.isfinite(xi_f) and math.isfinite(lo_f) and math.isfinite(hi_f)):
+                                    continue
+                                writer.writerow([xi_f, lo_f, hi_f])
+            else:
+                data_io.write_uncertainty_txt(
+                    out_dir / f"{stem}_uncertainty.txt",
+                    unc_norm,
+                    peaks=fitted,
+                    method_label=method_lbl,
+                    file_path=path,
+                )
+
+                data_io.write_uncertainty_csvs(
+                    base_path,
+                    path,
+                    unc_norm,
+                    write_wide=export_unc_wide,
+                )
+
+                if band is not None:
+                    xb, lob, hib = band
+                    band_csv = out_dir / f"{stem}_uncertainty_band.csv"
+                    with band_csv.open("w", newline="", encoding="utf-8") as fh:
+                        writer = csv.writer(fh, lineterminator="\n")
+                        ci_pct = 95
+                        try:
+                            alpha = float(
+                                unc_norm.get(
+                                    "alpha",
+                                    unc_norm.get("diagnostics", {}).get("alpha", 0.05),
+                                )
                             )
-                        )
-                        ci_pct = int(round(100 * (1.0 - alpha)))
-                    except Exception:
-                        pass
-                    writer.writerow(["x", f"y_lo{ci_pct}", f"y_hi{ci_pct}"])
-                    for xi, lo, hi in zip(xb, lob, hib):
-                        if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
-                            return {"aborted": True, "records": [], "reason": "user-abort"}
-                        if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
-                            continue
-                        writer.writerow([float(xi), float(lo), float(hi)])
+                            ci_pct = int(round(100 * (1.0 - alpha)))
+                        except Exception:
+                            pass
+                        writer.writerow(["x", f"y_lo{ci_pct}", f"y_hi{ci_pct}"])
+                        for xi, lo, hi in zip(xb, lob, hib):
+                            if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
+                                return {"aborted": True, "records": [], "reason": "user-abort"}
+                            if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
+                                continue
+                            writer.writerow([float(xi), float(lo), float(hi)])
 
             for row in data_io.iter_uncertainty_rows(path, unc_norm):
                 if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
