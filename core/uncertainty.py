@@ -21,6 +21,85 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 
+# -----------------------
+# Internal helper utilities
+# -----------------------
+
+
+def _norm_solver_and_sharing(fit: Dict, kw: Dict) -> Tuple[str, bool, bool]:
+    """Normalize solver name and sharing flags in a single place."""
+    solver = str(
+        (fit or {}).get("solver")
+        or (fit or {}).get("solver_used")
+        or kw.get("solver")
+        or "modern_trf"
+    ).lower()
+    # Generic share flags (solver-agnostic)
+    share_fwhm = bool((fit or {}).get("share_fwhm", False))
+    share_eta = bool((fit or {}).get("share_eta", False))
+    # LMFit-specific share flags only apply if LMFit is actually used
+    if solver.startswith("lmfit"):
+        share_fwhm = share_fwhm or bool((fit or {}).get("lmfit_share_fwhm", False))
+        share_eta = share_eta or bool((fit or {}).get("lmfit_share_eta", False))
+    return solver, share_fwhm, share_eta
+
+
+def _build_residual_vector(
+    residual: np.ndarray,
+    y_all: Optional[np.ndarray],
+    y_hat: Optional[np.ndarray],
+    mode: str,
+    center: bool,
+) -> np.ndarray:
+    """Prefer RAW residuals (y - y_hat) to avoid weighting artifacts; fallback safely."""
+    mode = str(mode or "raw").lower()
+    if mode == "raw" and (y_all is not None) and (y_hat is not None):
+        r = np.asarray(y_all, float).reshape(-1) - np.asarray(y_hat, float).reshape(-1)
+        if center:
+            r = r - float(np.mean(r))
+        return r
+    # fallback to provided residuals (may be weighted upstream)
+    r = np.asarray(residual, float).reshape(-1).copy()
+    if center:
+        r = r - float(np.mean(r))
+    return r
+
+
+def _relabel_by_center(theta_new: np.ndarray, theta_ref: np.ndarray, block: int = 4) -> np.ndarray:
+    """Reorder parameter blocks so peak identity is consistent w.r.t. reference centers."""
+    try:
+        ref_c = np.asarray(theta_ref[0::block], float)
+        cur_c = np.asarray(theta_new[0::block], float)
+        used = set()
+        order: List[int] = []
+        for target in ref_c:
+            j_best, d_best = None, float("inf")
+            for j, cval in enumerate(cur_c):
+                if j in used:
+                    continue
+                d = abs(float(cval) - float(target))
+                if d < d_best:
+                    d_best, j_best = d, j
+            if j_best is None:
+                j_best = next(i for i in range(len(cur_c)) if i not in used)
+            used.add(j_best)
+            order.append(int(j_best))
+        th_re = np.empty_like(theta_new)
+        for new_i, old_i in enumerate(order):
+            th_re[block * new_i : block * (new_i + 1)] = theta_new[block * old_i : block * (old_i + 1)]
+        return th_re
+    except Exception:
+        return theta_new
+
+
+def _validate_vector_length(name: str, arr: np.ndarray, n: int) -> None:
+    if arr is None:
+        return
+    if np.asarray(arr).size != int(n):
+        raise ValueError(
+            f"{name} produced vector of wrong size (got {np.asarray(arr).size}, want {n})"
+        )
+
 try:
     from scipy.optimize import nnls as _nnls
 except Exception:  # pragma: no cover - optional dependency
@@ -622,6 +701,10 @@ def bootstrap_ci(
     """
     t0 = time.time()
     fit_ctx = dict(fit_ctx or {})
+    _solver_name, share_fwhm, share_eta = _norm_solver_and_sharing(fit_ctx, {})
+    fit_ctx["solver"] = _solver_name
+    fit_ctx["share_fwhm"] = share_fwhm
+    fit_ctx["share_eta"] = share_eta
     # Accept explicit jitter kw (normalized fraction) for GUI/batch calls
     if jitter is not None:
         try:
@@ -633,12 +716,11 @@ def bootstrap_ci(
     progress_cb = fit.get("progress_cb")
     abort_evt = fit.get("abort_event")
     peaks_obj = fit.get("peaks") or fit.get("peaks_out") or fit.get("peaks_in")
-    solver = fit.get("solver", "classic")
-    fit.setdefault("solver", solver)
+    fit.setdefault("bootstrap_residual_mode", "raw")
+    fit.setdefault("relabel_by_center", True)
+    fit.setdefault("center_residuals", bool(center_residuals))
     baseline = fit.get("baseline", None)
     mode = fit.get("mode", "add") or "add"
-    share_fwhm = bool(fit.get("lmfit_share_fwhm", False))
-    share_eta = bool(fit.get("lmfit_share_eta", False))
     jitter_scale = float(fit.get("bootstrap_jitter", 0.0))
     allow_linear = bool(fit.get("allow_linear_fallback", True))
 
@@ -649,6 +731,16 @@ def bootstrap_ci(
         fit["perf_blas_threads"] = int(fit.get("perf_blas_threads", 0) or 0)
     except Exception:
         fit["perf_blas_threads"] = 0
+
+    diag_perf = {
+        "parallel_strategy": strategy,
+        "blas_threads": int(fit.get("perf_blas_threads", 0) or 0),
+    }
+    # Emit breadcrumbs for logs/debugging (no behavior change)
+    diag_perf["solver_used"] = str(fit.get("solver", "")).lower()
+    diag_perf["share_fwhm"] = bool(fit.get("share_fwhm", False))
+    diag_perf["share_eta"] = bool(fit.get("share_eta", False))
+    diag_perf["bootstrap_residual_mode"] = str(fit.get("bootstrap_residual_mode", "raw"))
 
     # Resolve worker count for DRAW phase
     if workers not in (None, False):
@@ -690,7 +782,7 @@ def bootstrap_ci(
 
     # Inputs
     theta = np.asarray(theta, float)
-    residual = np.asarray(residual, float)
+    residual = np.asarray(residual, float).reshape(-1)
     n = int(residual.size)
     J = np.asarray(jacobian, float)
 
@@ -707,29 +799,37 @@ def bootstrap_ci(
     # Canonical starting point for jitter (allow caller override via theta0)
     theta0 = np.asarray(fit.get("theta0", theta), float)
 
-    # Center residuals if requested
-    r = residual - residual.mean() if center_residuals else residual.copy()
-
     # Baseline model prediction (prefer predict_full to avoid loss-mode mismatch)
     diag_notes: List[str] = []
+    y_hat = None
     if callable(predict_full):
         try:
             y_hat = np.asarray(predict_full(theta), float)
         except Exception as e:
             diag_notes.append(repr(e))
-            base = y_all if y_all is not None else np.zeros_like(residual)
-            y_hat = base - residual
-    else:
+            y_hat = None
+    if y_hat is not None:
+        y_hat = np.asarray(y_hat, float).reshape(-1)
+    if y_all is not None:
+        y_all = np.asarray(y_all, float).reshape(-1)
+
+    r = _build_residual_vector(
+        residual=residual,
+        y_all=None if y_all is None else np.asarray(y_all, float),
+        y_hat=None if y_hat is None else np.asarray(y_hat, float),
+        mode=str(fit.get("bootstrap_residual_mode", "raw")),
+        center=bool(fit.get("center_residuals", True)),
+    )
+
+    if y_hat is None:
         base = y_all if y_all is not None else np.zeros_like(residual)
-        y_hat = base - residual
-    if y_hat.size != n:
-        y_hat = y_hat[:n]
+        y_hat = np.asarray(base, float).reshape(-1) - r
+    _validate_vector_length("predict_full", y_hat, n)
     if y_all is None:
-        y_all = (y_hat + residual)[:n]
+        y_all = (y_hat + r)
     else:
-        y_all = np.atleast_1d(np.asarray(y_all, float))
-        if y_all.size != n:
-            y_all = (y_hat + residual)[:n]
+        y_all = np.atleast_1d(np.asarray(y_all, float).reshape(-1))
+        _validate_vector_length("y_all", y_all, n)
 
     # If we have no peaks, fall back to asymptotic CI to avoid crashy path
     if not peaks_obj:
@@ -804,8 +904,8 @@ def bootstrap_ci(
         _sig = None
 
     def _mk_cfg():
-        cfg = {"solver": solver, "mode": mode}
-        if str(solver).lower().startswith("lmfit"):
+        cfg = {"solver": _solver_name, "mode": mode}
+        if str(_solver_name).lower().startswith("lmfit"):
             # Only used if lmfit backend honors these flags
             cfg["lmfit_share_fwhm"] = share_fwhm
             cfg["lmfit_share_eta"] = share_eta
@@ -841,6 +941,8 @@ def bootstrap_ci(
                 call_base["cfg"] = cfg
             elif "config" in params:
                 call_base["config"] = cfg
+            if "solver" in params:
+                call_base["solver"] = _solver_name
 
             # support both new spellings for peaks
             if "peaks_in" in params:
@@ -880,6 +982,8 @@ def bootstrap_ci(
 
             call_with_theta = dict(call_base)
             call_with_theta["theta_init"] = theta_arr
+            if "solver" in params:
+                call_with_theta.setdefault("solver", _solver_name)
             try:
                 res_theta = _fit_api.run_fit_consistent(**call_with_theta)
             except Exception:
@@ -901,6 +1005,7 @@ def bootstrap_ci(
             "fit_mask": fit_mask_full,
             "locked_mask": locked_mask,
             "bounds": bounds,
+            "solver": _solver_name,
         }
         variants = [
             {"peaks_in": peaks_start, **common_kwargs},
@@ -920,7 +1025,8 @@ def bootstrap_ci(
         res = _fit_api.run_fit_consistent(
             x, y, cfg_legacy,
             theta_init=theta_arr, locked_mask=locked_mask,
-            bounds=bounds, baseline=baseline
+            bounds=bounds, baseline=baseline,
+            solver=_solver_name,
         )
         th = np.asarray(res.get("theta", theta_arr), float)
         ok = np.all(np.isfinite(th))
@@ -1039,6 +1145,9 @@ def bootstrap_ci(
             th_new, ok = refit(theta_init, x_all, y_b)
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
+        else:
+            if ok and bool(fit.get("relabel_by_center", True)):
+                th_new = _relabel_by_center(np.asarray(th_new, float), theta0, block=4)
 
         if not ok and (Jf is None or not Jf.size or np.sum(free_mask) == 0):
             try:
@@ -1047,8 +1156,15 @@ def bootstrap_ci(
             except Exception as e:
                 if err_msg is None:
                     err_msg = f"{type(e).__name__}: {e}"
+            else:
+                if ok and bool(fit.get("relabel_by_center", True)):
+                    th_new = _relabel_by_center(np.asarray(th_new, float), theta0, block=4)
 
-        return b, np.asarray(th_new, float), bool(ok), err_msg, (jitter_applied, jitter_reason, jitter_rms_local)
+        return b, np.asarray(th_new, float), bool(ok), err_msg, (
+            jitter_applied,
+            jitter_reason,
+            jitter_rms_local,
+        )
 
     def _pulse(done_i: int):
         nonlocal next_pulse_at, last_pulse_t
@@ -1241,7 +1357,8 @@ def bootstrap_ci(
                 except Exception:
                     pass
 
-    diag = {
+    diag = dict(diag_perf)
+    diag.update({
         "B": int(n_boot),
         "n_boot": int(n_boot),
         "n_success": int(n_success),
@@ -1257,7 +1374,7 @@ def bootstrap_ci(
         "band_reason": band_reason,
         "refit_errors": refit_errors,
         "alpha": float(alpha),
-    }
+    })
     diag["band_gated"] = bool(band_gated)
     if band_skip_reason is not None:
         diag["band_skip_reason"] = band_skip_reason
@@ -1367,6 +1484,12 @@ def bayesian_ci(
         raise RuntimeError("Bayesian method requires emcee>=3") from e
 
     fit_ctx = dict(fit_ctx or {})
+    fit = fit_ctx
+    _solver_name, _share_fwhm, _share_eta = _norm_solver_and_sharing(fit, {})
+    fit["solver"] = _solver_name
+    fit["share_fwhm"] = bool(_share_fwhm)
+    fit["share_eta"] = bool(_share_eta)
+
     theta_hat = np.asarray(theta_hat, float)
     diag_notes: List[str] = []
     # Significance level for credible intervals (used in per-parameter quantiles)
@@ -1414,9 +1537,13 @@ def bayesian_ci(
             1 if strategy == "outer" else (int(blas_threads) if blas_threads > 0 else None)
         ),
     }
+    # Emit breadcrumbs for logs/debugging (no behavior change)
+    diag_perf["solver_used"] = str(fit_ctx.get("solver", "")).lower()
+    diag_perf["share_fwhm"] = bool(fit_ctx.get("share_fwhm", False))
+    diag_perf["share_eta"] = bool(fit_ctx.get("share_eta", False))
     # Optional tying (LMFIT "share FWHM/eta"): collapse tied params to one free scalar
-    share_fwhm = bool(fit_ctx.get("lmfit_share_fwhm", False))
-    share_eta = bool(fit_ctx.get("lmfit_share_eta", False))
+    share_fwhm = bool(fit_ctx.get("share_fwhm", False))
+    share_eta = bool(fit_ctx.get("share_eta", False))
     # Toggle diagnostics (ESS/R̂/MCSE); default off; honor legacy key for compatibility
     _diag_flag = fit_ctx.get("bayes_diagnostics", None)
     if _diag_flag is None:

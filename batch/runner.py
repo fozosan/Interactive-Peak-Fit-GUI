@@ -495,6 +495,12 @@ def run_batch(
                     or "modern_trf"
                 )
                 solver_choice = str(solver_choice)
+                fit_ctx.setdefault("solver", solver_choice)
+                fit_ctx.setdefault("bootstrap_residual_mode", "raw")
+                fit_ctx.setdefault("relabel_by_center", True)
+                if not str(solver_choice).lower().startswith("lmfit"):
+                    fit_ctx.pop("lmfit_share_fwhm", None)
+                    fit_ctx.pop("lmfit_share_eta", None)
                 boot_solver = (
                     config.get("unc_boot_solver")
                     or solver_choice

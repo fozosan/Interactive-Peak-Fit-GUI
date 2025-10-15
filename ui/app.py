@@ -1037,6 +1037,7 @@ class PeakFitApp:
             "bayesian": bool(self.cfg.get("ui_band_pref_bayesian", False)),
         }
         self._last_unc_method_key = None  # tracks source method for band-pref memory
+        self._unc_change_busy = False
         # Group B: user override marker for bootstrap solver selection
         self.boot_solver_overridden = False
         self.cfg.setdefault("bootstrap_jitter", 0.02)
@@ -2583,88 +2584,94 @@ class PeakFitApp:
 
     @log_action
     def _on_uncertainty_method_changed(self, *_):
-        method_key = self._unc_selected_method_key()
-
-        # Save the old method's band pref before switching
+        if getattr(self, "_unc_change_busy", False):
+            return
+        self._unc_change_busy = True
         try:
-            old_key = getattr(self, "_last_unc_method_key", None)
-            if old_key and old_key in self._band_pref:
-                self._band_pref[old_key] = bool(self.show_ci_band_var.get())
-                self._persist_band_prefs()
-        except Exception:
-            pass
+            method_key = self._unc_selected_method_key()
 
-        # Always keep the checkbox enabled; for Bayesian, force OFF (bands gated elsewhere)
-        try:
-            self._suspend_ci_trace = True
-            if method_key == "bayesian":
-                self.show_ci_band_var.set(False)
-            else:
-                # restore user preference for this method
-                self.show_ci_band_var.set(bool(self._band_pref.get(method_key, False)))
+            # Save the old method's band pref before switching
+            try:
+                old_key = getattr(self, "_last_unc_method_key", None)
+                if old_key and old_key in self._band_pref:
+                    self._band_pref[old_key] = bool(self.show_ci_band_var.get())
+                    self._persist_band_prefs()
+            except Exception:
+                pass
+
+            # Always keep the checkbox enabled; for Bayesian, force OFF (bands gated elsewhere)
+            try:
+                self._suspend_ci_trace = True
+                if method_key == "bayesian":
+                    self.show_ci_band_var.set(False)
+                else:
+                    # restore user preference for this method
+                    self.show_ci_band_var.set(bool(self._band_pref.get(method_key, False)))
+            finally:
+                self._suspend_ci_trace = False
+
+            # Checkbox remains enabled regardless of method; actual rendering depends on band availability.
+            self._set_ci_toggle_state(True)
+
+            is_boot = method_key == "bootstrap"
+            is_bayes = method_key == "bayesian"
+            # Show only the controls for the selected method
+            try:
+                (self._jitter_label.grid if is_boot else self._jitter_label.grid_remove)()
+                (self._jitter_entry.grid if is_boot else self._jitter_entry.grid_remove)()
+            except Exception:
+                pass
+            try:
+                (self._boot_solver_label.grid if is_boot else self._boot_solver_label.grid_remove)()
+                (self._boot_solver_cb.grid if is_boot else self._boot_solver_cb.grid_remove)()
+            except Exception:
+                pass
+            try:
+                (self._boot_ties_frame.grid if is_boot else self._boot_ties_frame.grid_remove)()
+            except Exception:
+                pass
+            try:
+                (self._bayes_frame.grid if is_bayes else self._bayes_frame.grid_remove)()
+            except Exception:
+                pass
+            bayes_band = getattr(self, "_bayes_band_frame", None)
+            if bayes_band is not None:
+                try:
+                    (bayes_band.grid if is_bayes else bayes_band.grid_remove)()
+                except Exception:
+                    pass
+            # keep bootstrap jitter enabled/disabled appropriately when visible
+            try:
+                self._jitter_entry.configure(state=("normal" if is_boot else "disabled"))
+            except Exception:
+                pass
+            # Track current method for next switch
+            self._last_unc_method_key = method_key
+            boot_cb = getattr(self, "_boot_solver_cb", None)
+            if boot_cb is not None:
+                try:
+                    boot_cb.configure(state="readonly")
+                except Exception:
+                    pass
+            options_row = getattr(self, "_boot_options_row", None)
+            if options_row is not None:
+                if is_boot:
+                    try:
+                        options_row.pack_forget()
+                        options_row.pack(fill=tk.X, pady=2, before=self._unc_action_row)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        options_row.pack_forget()
+                    except Exception:
+                        pass
+
+            # refresh Bootstrap tie widgets (enable only for Bootstrap + LMFIT refit solver)
+            self._update_bootstrap_tie_widgets()
+            # for asymptotic/bootstrap the checkbox remains user-controlled
         finally:
-            self._suspend_ci_trace = False
-
-        # Checkbox remains enabled regardless of method; actual rendering depends on band availability.
-        self._set_ci_toggle_state(True)
-
-        is_boot = (method_key == "bootstrap")
-        is_bayes = (method_key == "bayesian")
-        # Show only the controls for the selected method
-        try:
-            (self._jitter_label.grid if is_boot else self._jitter_label.grid_remove)()
-            (self._jitter_entry.grid if is_boot else self._jitter_entry.grid_remove)()
-        except Exception:
-            pass
-        try:
-            (self._boot_solver_label.grid if is_boot else self._boot_solver_label.grid_remove)()
-            (self._boot_solver_cb.grid if is_boot else self._boot_solver_cb.grid_remove)()
-        except Exception:
-            pass
-        try:
-            (self._boot_ties_frame.grid if is_boot else self._boot_ties_frame.grid_remove)()
-        except Exception:
-            pass
-        try:
-            (self._bayes_frame.grid if is_bayes else self._bayes_frame.grid_remove)()
-        except Exception:
-            pass
-        bayes_band = getattr(self, "_bayes_band_frame", None)
-        if bayes_band is not None:
-            try:
-                (bayes_band.grid if is_bayes else bayes_band.grid_remove)()
-            except Exception:
-                pass
-        # keep bootstrap jitter enabled/disabled appropriately when visible
-        try:
-            self._jitter_entry.configure(state=("normal" if is_boot else "disabled"))
-        except Exception:
-            pass
-        # Track current method for next switch
-        self._last_unc_method_key = method_key
-        boot_cb = getattr(self, "_boot_solver_cb", None)
-        if boot_cb is not None:
-            try:
-                boot_cb.configure(state="readonly")
-            except Exception:
-                pass
-        options_row = getattr(self, "_boot_options_row", None)
-        if options_row is not None:
-            if is_boot:
-                try:
-                    options_row.pack_forget()
-                    options_row.pack(fill=tk.X, pady=2, before=self._unc_action_row)
-                except Exception:
-                    pass
-            else:
-                try:
-                    options_row.pack_forget()
-                except Exception:
-                    pass
-
-        # refresh Bootstrap tie widgets (enable only for Bootstrap + LMFIT refit solver)
-        self._update_bootstrap_tie_widgets()
-        # for asymptotic/bootstrap the checkbox remains user-controlled
+            self._unc_change_busy = False
 
 
     def _update_bootstrap_tie_widgets(self):
