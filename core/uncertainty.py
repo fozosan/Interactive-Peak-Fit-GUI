@@ -712,6 +712,9 @@ def bootstrap_ci(
         except Exception:
             pass
     fit = fit_ctx
+    # Pull constraints from fit_ctx (batch/gui parity)
+    bounds = fit.get("bounds", bounds)
+    locked_mask = fit.get("locked_mask", locked_mask)
     strict_refit = bool(fit.get("strict_refit", False))
     progress_cb = fit.get("progress_cb")
     abort_evt = fit.get("abort_event")
@@ -1485,10 +1488,16 @@ def bayesian_ci(
 
     fit_ctx = dict(fit_ctx or {})
     fit = fit_ctx
+    # Normalize solver & any sharing hints (shared helper)
     _solver_name, _share_fwhm, _share_eta = _norm_solver_and_sharing(fit, {})
     fit["solver"] = _solver_name
     fit["share_fwhm"] = bool(_share_fwhm)
     fit["share_eta"] = bool(_share_eta)
+    # IMPORTANT: By default, do NOT tie parameters inside MCMC.
+    # Only respect sharing if explicitly enabled by user.
+    if not bool(fit.get("bayes_respect_sharing", False)):
+        fit["share_fwhm"] = False
+        fit["share_eta"] = False
 
     theta_hat = np.asarray(theta_hat, float)
     diag_notes: List[str] = []
@@ -1541,7 +1550,7 @@ def bayesian_ci(
     diag_perf["solver_used"] = str(fit_ctx.get("solver", "")).lower()
     diag_perf["share_fwhm"] = bool(fit_ctx.get("share_fwhm", False))
     diag_perf["share_eta"] = bool(fit_ctx.get("share_eta", False))
-    # Optional tying (LMFIT "share FWHM/eta"): collapse tied params to one free scalar
+    # Optional tying inside MCMC (OFF by default unless 'bayes_respect_sharing' True)
     share_fwhm = bool(fit_ctx.get("share_fwhm", False))
     share_eta = bool(fit_ctx.get("share_eta", False))
     # Toggle diagnostics (ESS/R̂/MCSE); default off; honor legacy key for compatibility
