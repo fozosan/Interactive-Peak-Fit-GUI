@@ -157,28 +157,38 @@ class UncertaintyResult:
             rows_from_stats = [dict(r) for r in stats_obj if isinstance(r, dict)]
 
         if rows_from_stats:
+            # Aggregate rows -> vector blocks and ALWAYS mirror dotted/underscored quantiles per row.
             agg: Dict[str, Dict[str, list[Any]]] = {}
             for row in rows_from_stats:
                 for key in block_keys:
                     blk = row.get(key)
                     dest = agg.setdefault(key, {})
                     if isinstance(blk, dict):
-                        for fld, val in blk.items():
-                            dest.setdefault(fld, []).append(val)
-                        if "p2.5" in blk and "p2_5" not in dest:
-                            dest.setdefault("p2_5", []).append(blk.get("p2.5"))
-                        if "p97.5" in blk and "p97_5" not in dest:
-                            dest.setdefault("p97_5", []).append(blk.get("p97.5"))
+                        # Scalarize and append est/sd (or NaN if missing)
+                        est_v = _to_float(blk.get("est"))
+                        sd_v = _to_float(blk.get("sd"))
+                        dest.setdefault("est", []).append(est_v)
+                        dest.setdefault("sd", []).append(sd_v)
+                        # Mirror quantiles so both alias styles have identical per-peak lengths
+                        qlo = blk.get("p2_5", blk.get("p2.5"))
+                        qhi = blk.get("p97_5", blk.get("p97.5"))
+                        qlo_f = _to_float(qlo)
+                        qhi_f = _to_float(qhi)
+                        dest.setdefault("p2_5", []).append(qlo_f)
+                        dest.setdefault("p2.5", []).append(qlo_f)
+                        dest.setdefault("p97_5", []).append(qhi_f)
+                        dest.setdefault("p97.5", []).append(qhi_f)
                     else:
-                        dest.setdefault("est", []).append(float("nan"))
-                        dest.setdefault("sd", []).append(float("nan"))
-                        dest.setdefault("p2_5", []).append(float("nan"))
-                        dest.setdefault("p97_5", []).append(float("nan"))
+                        # Non-dict row → pad all fields to keep lengths aligned
+                        nan = float("nan")
+                        dest.setdefault("est", []).append(nan)
+                        dest.setdefault("sd", []).append(nan)
+                        dest.setdefault("p2_5", []).append(nan)
+                        dest.setdefault("p2.5", []).append(nan)
+                        dest.setdefault("p97_5", []).append(nan)
+                        dest.setdefault("p97.5", []).append(nan)
             for key, block in agg.items():
-                if "p2_5" in block and "p2.5" not in block:
-                    block["p2.5"] = list(block["p2_5"])
-                if "p97_5" in block and "p97.5" not in block:
-                    block["p97.5"] = list(block["p97_5"])
+                # Ensure dotted/underscored quantile aliases both exist (already mirrored above).
                 stats_map[key] = block
 
         max_len = 0
@@ -1888,7 +1898,7 @@ def bayesian_ci(
         except Exception as e:
             diag_notes.append(repr(e))
 
-    # --- Build per-peak stats (list of dicts) so the UI doesn't broadcast one fwhm/eta to all peaks.
+    # --- Build per-peak stats (list of dicts) from draws, using param_names to map columns.
     try:
         if T_full.size and n_pk > 0:
             try:
@@ -1896,6 +1906,28 @@ def bayesian_ci(
                 alpha_hi = 1.0 - alpha_lo
             except Exception:
                 alpha_lo, alpha_hi = 0.025, 0.975
+
+            # Build column index map from param_names if provided
+            name_to_idx: Dict[str, int] = {}
+            if isinstance(param_names, (list, tuple)):
+                for idx, nm in enumerate(param_names):
+                    try:
+                        name_to_idx[str(nm)] = int(idx)
+                    except Exception:
+                        pass
+
+            def _find_col(pk_idx: int, kind: str, fallback: int) -> int:
+                """Prefer param_names mapping; fallback to 4*i+offset if not found."""
+                if name_to_idx:
+                    cand = [
+                        f"{kind}{pk_idx+1}",
+                        f"{kind}_{pk_idx+1}",
+                        f"{kind}[{pk_idx+1}]",
+                    ]
+                    for c in cand:
+                        if c in name_to_idx:
+                            return int(name_to_idx[c])
+                return int(fallback)
 
             def _one_param_stats(arr: np.ndarray) -> Dict[str, Any]:
                 # Base scalar stats
@@ -1929,22 +1961,58 @@ def bayesian_ci(
             stats_by_peak = []
             for pk_idx in range(int(n_pk)):
                 base = 4 * pk_idx
+                i_center = _find_col(pk_idx, "center", base + 0)
+                i_height = _find_col(pk_idx, "height", base + 1)
+                i_fwhm = _find_col(pk_idx, "fwhm", base + 2)
+                i_eta = _find_col(pk_idx, "eta", base + 3)
+                # Guard against out-of-range indices
+                cols = T_full.shape[1]
+
+                def _safe_col(i: int) -> np.ndarray:
+                    return T_full[:, min(max(0, i), cols - 1)] if cols else np.asarray([])
+
                 row = {
-                    "center": _one_param_stats(T_full[:, base + 0]),
-                    "height": _one_param_stats(T_full[:, base + 1]),
-                    "fwhm": _one_param_stats(T_full[:, base + 2]),
-                    "eta": _one_param_stats(T_full[:, base + 3]),
+                    "center": _one_param_stats(_safe_col(i_center)),
+                    "height": _one_param_stats(_safe_col(i_height)),
+                    "fwhm": _one_param_stats(_safe_col(i_fwhm)),
+                    "eta": _one_param_stats(_safe_col(i_eta)),
                 }
+                # If a field ended with NaN, backfill from vector blocks (same index) when present.
+                for _k in ("center", "height", "fwhm", "eta"):
+                    blk = base_param_stats.get(_k) if isinstance(base_param_stats, dict) else None
+                    if isinstance(blk, dict):
+                        try:
+                            est_list = blk.get("est")
+                            sd_list = blk.get("sd")
+                            if not np.isfinite(row[_k].get("est", np.nan)) and isinstance(est_list, (list, tuple, np.ndarray)):
+                                row[_k]["est"] = float(est_list[pk_idx]) if pk_idx < len(est_list) else float("nan")
+                            if not np.isfinite(row[_k].get("sd", np.nan)) and isinstance(sd_list, (list, tuple, np.ndarray)):
+                                row[_k]["sd"] = float(sd_list[pk_idx]) if pk_idx < len(sd_list) else float("nan")
+                        except Exception:
+                            pass
                 stats_by_peak.append(row)
             if stats_by_peak:
-                new_param_stats: Dict[str, Any] = {"rows": stats_by_peak}
-                for key, val in base_param_stats.items():
-                    if key in {"center", "height", "fwhm", "eta"}:
-                        continue
-                    new_param_stats[key] = val
+                # Preserve any existing vector blocks and append per-peak rows for UI consumption.
+                new_param_stats: Dict[str, Any] = dict(base_param_stats)
+                new_param_stats["rows"] = stats_by_peak
                 param_stats = new_param_stats
     except Exception as exc:
         diag_notes.append(repr(exc))
+
+    # --- Decide band computation based on diagnostics (disable unless healthy or explicitly forced)
+    try:
+        band_pref = bool((fit_ctx or {}).get("bayes_band_enabled", False)) and bool(return_band)
+        band_force = bool((fit_ctx or {}).get("bayes_band_force", False))
+        ess_thr = float((fit_ctx or {}).get("bayes_band_ess_min", 200.0))
+        rhat_thr = float((fit_ctx or {}).get("bayes_band_rhat_max", 1.2))
+        diag_good = (np.isfinite(ess_min) and ess_min >= ess_thr) and (not np.isfinite(rhat_max) or rhat_max <= rhat_thr)
+        if band_pref and not (diag_good or band_force):
+            return_band = False
+            diag_notes.append("bayes_band_skipped: diagnostics failed and force disabled")
+        elif band_pref and band_force and not diag_good:
+            diag_notes.append("bayes_band_forced: diagnostics failed")
+    except Exception:
+        pass
 
     # --- Retain CI MCSE diagnostics (unchanged contract)
     ci_mcse_diag = {}
