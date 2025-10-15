@@ -141,9 +141,59 @@ class UncertaintyResult:
             return out
 
         block_keys = ("center", "height", "fwhm", "eta")
+
+        stats_obj = self.stats
+        # Build a working map and synthesize vector blocks from per-peak rows if present.
+        if isinstance(stats_obj, dict):
+            stats_map: Dict[str, Any] = dict(stats_obj)
+        else:
+            stats_map = {}
+
+        rows_from_stats: list[Dict[str, Any]] = []
+        maybe_rows = stats_map.get("rows") if isinstance(stats_map, dict) else None
+        if isinstance(maybe_rows, (list, tuple)):
+            rows_from_stats = [dict(r) for r in maybe_rows if isinstance(r, dict)]
+        elif isinstance(stats_obj, (list, tuple)):
+            rows_from_stats = [dict(r) for r in stats_obj if isinstance(r, dict)]
+
+        if rows_from_stats:
+            # Aggregate rows -> vector blocks and ALWAYS mirror dotted/underscored quantiles per row.
+            agg: Dict[str, Dict[str, list[Any]]] = {}
+            for row in rows_from_stats:
+                for key in block_keys:
+                    blk = row.get(key)
+                    dest = agg.setdefault(key, {})
+                    if isinstance(blk, dict):
+                        # Scalarize and append est/sd (or NaN if missing)
+                        est_v = _to_float(blk.get("est"))
+                        sd_v = _to_float(blk.get("sd"))
+                        dest.setdefault("est", []).append(est_v)
+                        dest.setdefault("sd", []).append(sd_v)
+                        # Mirror quantiles so both alias styles have identical per-peak lengths
+                        qlo = blk.get("p2_5", blk.get("p2.5"))
+                        qhi = blk.get("p97_5", blk.get("p97.5"))
+                        qlo_f = _to_float(qlo)
+                        qhi_f = _to_float(qhi)
+                        dest.setdefault("p2_5", []).append(qlo_f)
+                        dest.setdefault("p2.5", []).append(qlo_f)
+                        dest.setdefault("p97_5", []).append(qhi_f)
+                        dest.setdefault("p97.5", []).append(qhi_f)
+                    else:
+                        # Non-dict row → pad all fields to keep lengths aligned
+                        nan = float("nan")
+                        dest.setdefault("est", []).append(nan)
+                        dest.setdefault("sd", []).append(nan)
+                        dest.setdefault("p2_5", []).append(nan)
+                        dest.setdefault("p2.5", []).append(nan)
+                        dest.setdefault("p97_5", []).append(nan)
+                        dest.setdefault("p97.5", []).append(nan)
+            for key, block in agg.items():
+                # Ensure dotted/underscored quantile aliases both exist (already mirrored above).
+                stats_map[key] = block
+
         max_len = 0
         for key in block_keys:
-            st = self.stats.get(key)
+            st = stats_map.get(key) if isinstance(stats_map, dict) else None
             if not isinstance(st, dict):
                 continue
             max_len = max(
@@ -157,7 +207,7 @@ class UncertaintyResult:
         processed: set[str] = set()
         if max_len > 0:
             for key in block_keys:
-                st = self.stats.get(key)
+                st = stats_map.get(key) if isinstance(stats_map, dict) else None
                 if not isinstance(st, dict):
                     continue
                 processed.add(key)
@@ -184,8 +234,14 @@ class UncertaintyResult:
                     q05.append(lo)
                     q95.append(hi)
 
-        for name, st in self.stats.items():
+        if isinstance(stats_map, dict):
+            items_iter = stats_map.items()
+        else:
+            items_iter = []
+        for name, st in items_iter:
             if name in processed:
+                continue
+            if name == "rows":
                 continue
             # Skip flat p-indexed aliases if grouped blocks were detected to avoid duplicates
             if max_len > 0 and isinstance(name, str) and name.startswith("p") and name[1:].isdigit():
@@ -1702,7 +1758,7 @@ def bayesian_ci(
             "p97_5": hi97,
         }
 
-    param_stats: Dict[str, Dict[str, Any]] = {
+    param_stats: Dict[str, Any] = {
         "center": _stat_vec(0),
         "height": _stat_vec(1),
         "fwhm": _stat_vec(2),
@@ -1780,6 +1836,8 @@ def bayesian_ci(
             if key and key not in param_stats:
                 param_stats[key] = dict(stats_flat)
 
+    base_param_stats = dict(param_stats)
+
     ess_min = float("nan")
     rhat_max = float("nan")
     mcse_mean = float("nan")
@@ -1840,7 +1898,123 @@ def bayesian_ci(
         except Exception as e:
             diag_notes.append(repr(e))
 
-    # --- Attach per-parameter MCSE for Bayesian CI endpoints.
+    # --- Build per-peak stats (list of dicts) from draws, using param_names to map columns.
+    try:
+        if T_full.size and n_pk > 0:
+            try:
+                alpha_lo = float(alpha) / 2.0
+                alpha_hi = 1.0 - alpha_lo
+            except Exception:
+                alpha_lo, alpha_hi = 0.025, 0.975
+
+            # Build column index map from param_names if provided
+            name_to_idx: Dict[str, int] = {}
+            if isinstance(param_names, (list, tuple)):
+                for idx, nm in enumerate(param_names):
+                    try:
+                        name_to_idx[str(nm)] = int(idx)
+                    except Exception:
+                        pass
+
+            def _find_col(pk_idx: int, kind: str, fallback: int) -> int:
+                """Prefer param_names mapping; fallback to 4*i+offset if not found."""
+                if name_to_idx:
+                    cand = [
+                        f"{kind}{pk_idx+1}",
+                        f"{kind}_{pk_idx+1}",
+                        f"{kind}[{pk_idx+1}]",
+                    ]
+                    for c in cand:
+                        if c in name_to_idx:
+                            return int(name_to_idx[c])
+                return int(fallback)
+
+            def _one_param_stats(arr: np.ndarray) -> Dict[str, Any]:
+                # Base scalar stats
+                s = _scalar_stats_for(arr)
+                # Force scalars for est/sd
+                try:
+                    s["est"] = float(s.get("est", np.nan))
+                except Exception:
+                    s["est"] = float("nan")
+                try:
+                    s["sd"] = float(s.get("sd", np.nan))
+                except Exception:
+                    s["sd"] = float("nan")
+                # Ensure both dotted and underscored aliases exist
+                p_lo = s.get("p2_5", s.get("p2.5", None))
+                p_hi = s.get("p97_5", s.get("p97.5", None))
+                if p_lo is not None:
+                    s.setdefault("p2_5", p_lo)
+                    s.setdefault("p2.5", p_lo)
+                if p_hi is not None:
+                    s.setdefault("p97_5", p_hi)
+                    s.setdefault("p97.5", p_hi)
+                # MCSE on CI endpoints
+                try:
+                    s["ci_lo_mcse"] = float(_mcse_quantile(arr, alpha_lo))
+                    s["ci_hi_mcse"] = float(_mcse_quantile(arr, alpha_hi))
+                except Exception:
+                    pass
+                return s
+
+            stats_by_peak = []
+            for pk_idx in range(int(n_pk)):
+                base = 4 * pk_idx
+                i_center = _find_col(pk_idx, "center", base + 0)
+                i_height = _find_col(pk_idx, "height", base + 1)
+                i_fwhm = _find_col(pk_idx, "fwhm", base + 2)
+                i_eta = _find_col(pk_idx, "eta", base + 3)
+                # Guard against out-of-range indices
+                cols = T_full.shape[1]
+
+                def _safe_col(i: int) -> np.ndarray:
+                    return T_full[:, min(max(0, i), cols - 1)] if cols else np.asarray([])
+
+                row = {
+                    "center": _one_param_stats(_safe_col(i_center)),
+                    "height": _one_param_stats(_safe_col(i_height)),
+                    "fwhm": _one_param_stats(_safe_col(i_fwhm)),
+                    "eta": _one_param_stats(_safe_col(i_eta)),
+                }
+                # If a field ended with NaN, backfill from vector blocks (same index) when present.
+                for _k in ("center", "height", "fwhm", "eta"):
+                    blk = base_param_stats.get(_k) if isinstance(base_param_stats, dict) else None
+                    if isinstance(blk, dict):
+                        try:
+                            est_list = blk.get("est")
+                            sd_list = blk.get("sd")
+                            if not np.isfinite(row[_k].get("est", np.nan)) and isinstance(est_list, (list, tuple, np.ndarray)):
+                                row[_k]["est"] = float(est_list[pk_idx]) if pk_idx < len(est_list) else float("nan")
+                            if not np.isfinite(row[_k].get("sd", np.nan)) and isinstance(sd_list, (list, tuple, np.ndarray)):
+                                row[_k]["sd"] = float(sd_list[pk_idx]) if pk_idx < len(sd_list) else float("nan")
+                        except Exception:
+                            pass
+                stats_by_peak.append(row)
+            if stats_by_peak:
+                # Preserve any existing vector blocks and append per-peak rows for UI consumption.
+                new_param_stats: Dict[str, Any] = dict(base_param_stats)
+                new_param_stats["rows"] = stats_by_peak
+                param_stats = new_param_stats
+    except Exception as exc:
+        diag_notes.append(repr(exc))
+
+    # --- Decide band computation based on diagnostics (disable unless healthy or explicitly forced)
+    try:
+        band_pref = bool((fit_ctx or {}).get("bayes_band_enabled", False)) and bool(return_band)
+        band_force = bool((fit_ctx or {}).get("bayes_band_force", False))
+        ess_thr = float((fit_ctx or {}).get("bayes_band_ess_min", 200.0))
+        rhat_thr = float((fit_ctx or {}).get("bayes_band_rhat_max", 1.2))
+        diag_good = (np.isfinite(ess_min) and ess_min >= ess_thr) and (not np.isfinite(rhat_max) or rhat_max <= rhat_thr)
+        if band_pref and not (diag_good or band_force):
+            return_band = False
+            diag_notes.append("bayes_band_skipped: diagnostics failed and force disabled")
+        elif band_pref and band_force and not diag_good:
+            diag_notes.append("bayes_band_forced: diagnostics failed")
+    except Exception:
+        pass
+
+    # --- Retain CI MCSE diagnostics (unchanged contract)
     ci_mcse_diag = {}
     try:
         if T_full.size:
@@ -1857,25 +2031,23 @@ def bayesian_ci(
             diag_ci: Dict[str, Any] = {}
             if n_pk > 0:
                 for name, offset in (("center", 0), ("height", 1), ("fwhm", 2), ("eta", 3)):
-                    blk = param_stats.get(name)
-                    if not isinstance(blk, dict):
-                        continue
+                    blk = param_stats if isinstance(param_stats, dict) else None
                     lo_list: List[float] = []
                     hi_list: List[float] = []
-                    for i in range(n_pk):
+                    for i in range(int(n_pk)):
                         draws_i = T_full[:, 4 * i + offset]
-                        lo_mcse = float(_mcse_quantile(draws_i, alpha_lo))
-                        hi_mcse = float(_mcse_quantile(draws_i, alpha_hi))
-                        lo_list.append(lo_mcse)
-                        hi_list.append(hi_mcse)
-                    blk["ci_lo_mcse"] = lo_list
-                    blk["ci_hi_mcse"] = hi_list
-                    if lo_list or hi_list:
-                        diag_ci[name] = {
-                            "ci_lo_mcse": lo_list[0] if lo_list else float("nan"),
-                            "ci_hi_mcse": hi_list[0] if hi_list else float("nan"),
-                        }
-            sig_blk = param_stats.get("sigma")
+                        lo_list.append(float(_mcse_quantile(draws_i, alpha_lo)))
+                        hi_list.append(float(_mcse_quantile(draws_i, alpha_hi)))
+                    if blk is not None:
+                        blk_stats = blk.get(name)
+                        if isinstance(blk_stats, dict):
+                            blk_stats["ci_lo_mcse"] = float(np.nanmean(lo_list)) if lo_list else float("nan")
+                            blk_stats["ci_hi_mcse"] = float(np.nanmean(hi_list)) if hi_list else float("nan")
+                    diag_ci[name] = {
+                        "ci_lo_mcse": float(np.nanmean(lo_list)) if lo_list else float("nan"),
+                        "ci_hi_mcse": float(np.nanmean(hi_list)) if hi_list else float("nan"),
+                    }
+            sig_blk = param_stats.get("sigma") if isinstance(param_stats, dict) else None
             # Guard: if sigma draws were not captured in this code path, skip MCSE for σ gracefully.
             try:
                 _sig_draws = sigma_draws  # noqa: F821

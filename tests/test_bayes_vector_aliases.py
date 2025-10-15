@@ -32,11 +32,26 @@ def test_bayesian_vector_stats_have_underscore_aliases():
         return_band=False,
     )
 
-    # Vector blocks should include both dotted and underscored keys, and match numerically
+    stats = r.stats
+    rows = stats.get("rows") if isinstance(stats, dict) else stats
+    assert isinstance(rows, list)
+    assert rows, "expected per-peak rows"
+
+    # Per-row aliases exist and match, est/sd are scalars
+    for row in rows:
+        for key in ("center", "height", "fwhm", "eta"):
+            blk = row.get(key, {})
+            assert isinstance(blk, dict)
+            assert {"p2.5", "p97.5", "p2_5", "p97_5"} <= set(blk.keys())
+            assert blk["p2_5"] == blk["p2.5"]
+            assert blk["p97_5"] == blk["p97.5"]
+            assert isinstance(blk.get("est"), (int, float))
+            assert isinstance(blk.get("sd"), (int, float))
+
+    # Vector blocks must still exist alongside rows (exporters depend on them)
     for key in ("center", "height", "fwhm", "eta"):
-        blk = r.stats[key]
-        assert {"p2.5", "p97.5", "p2_5", "p97_5"} <= set(blk.keys())
-        assert blk["p2_5"] == blk["p2.5"]
-        assert blk["p97_5"] == blk["p97.5"]
-        # also basic shape checks (lists of equal length)
-        assert len(blk["p2_5"]) == len(blk["p97_5"]) == len(blk["est"]) == len(blk["sd"])
+        assert key in stats and isinstance(stats[key], dict)
+        for fld in ("est", "sd", "p2_5", "p97_5"):
+            assert fld in stats[key]
+        n = len(stats[key]["est"])
+        assert n >= 1 and all(isinstance(v, (int, float)) for v in stats[key]["est"])
