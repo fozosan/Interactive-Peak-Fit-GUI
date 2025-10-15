@@ -34,4 +34,6 @@ def test_bayesian_basic(two_peak_data, tmp_path):
     assert "±" in text
     df2 = pd.read_csv(paths["unc_csv"])
     for pname in res.param_stats.keys():
+        if pname == "rows":
+            continue
         assert f"{pname}_sd" in df2.columns

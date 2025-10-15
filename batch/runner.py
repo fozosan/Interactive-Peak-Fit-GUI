@@ -508,6 +508,9 @@ def run_batch(
 
                 jitter_frac = _norm_jitter(config.get("bootstrap_jitter", 0.02))
                 centers_ref = [float(p.center) for p in peaks_obj] if peaks_obj else []
+                # Make the chosen bootstrap solver visible to inner refits.
+                fit_ctx["unc_boot_solver"] = str(boot_solver)
+
                 fit_ctx.update(
                     {
                         "residual_fn": residual_fn,
@@ -554,7 +557,9 @@ def run_batch(
                 band_workers_eff = int(unc_band_workers)
                 fit_ctx.update({
                     "unc_workers": workers_eff if workers_eff > 0 else None,
-                    "unc_band_workers": band_workers_eff if band_workers_eff > 0 else None,
+                    "unc_band_workers": (
+                        band_workers_eff if band_workers_eff > 0 else None
+                    ),
                     "unc_use_gpu": bool(config.get("unc_use_gpu", False)),
                 })
 
@@ -569,7 +574,9 @@ def run_batch(
                     res=res,
                     config=config,
                 ):
-                    peaks_in = res.get("peaks_out") or res.get("peaks") or []
+                    peaks_in = copy.deepcopy(
+                        res.get("peaks_out") or res.get("peaks") or []
+                    )
                     cfg = copy.deepcopy(config)
                     fit_mask = np.ones_like(x, bool)
 
@@ -582,11 +589,27 @@ def run_batch(
                                 j = 4 * i
                                 pk.center = float(t[j + 0])
                                 pk.height = float(t[j + 1])
-                                pk.fwhm   = float(t[j + 2])
-                                pk.eta    = float(t[j + 3])
+                                pk.fwhm = float(t[j + 2])
+                                pk.eta = float(t[j + 3])
                     except Exception:
                         # Fall back to original peaks_in if anything goes sideways
                         peaks_start = peaks_in
+
+                    # Ensure the refit uses the requested bootstrap solver.
+                    solver_choice = str(fit_ctx.get("unc_boot_solver", "")) or str(
+                        config.get("unc_boot_solver")
+                        or config.get("solver_choice")
+                        or "modern_vp"
+                    )
+                    # Set BOTH keys for maximum compatibility across fitter backends:
+                    cfg["solver_choice"] = solver_choice
+                    cfg["solver"] = solver_choice
+                    if solver_choice.lower() in ("lmfit_vp", "lmfit-vp", "lmfit"):
+                        cfg["strict_refit"] = True
+                        cfg["relabel_by_center"] = True
+                    else:
+                        cfg.pop("strict_refit", None)
+                        cfg["relabel_by_center"] = True
 
                     # Single modern call; success if it returns without error
                     try:

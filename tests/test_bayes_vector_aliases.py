@@ -32,11 +32,18 @@ def test_bayesian_vector_stats_have_underscore_aliases():
         return_band=False,
     )
 
+    stats = r.stats
+    rows = stats.get("rows") if isinstance(stats, dict) else stats
+    assert isinstance(rows, list)
+    assert rows, "expected per-peak rows"
+
     # Vector blocks should include both dotted and underscored keys, and match numerically
-    for key in ("center", "height", "fwhm", "eta"):
-        blk = r.stats[key]
-        assert {"p2.5", "p97.5", "p2_5", "p97_5"} <= set(blk.keys())
-        assert blk["p2_5"] == blk["p2.5"]
-        assert blk["p97_5"] == blk["p97.5"]
-        # also basic shape checks (lists of equal length)
-        assert len(blk["p2_5"]) == len(blk["p97_5"]) == len(blk["est"]) == len(blk["sd"])
+    for row in rows:
+        for key in ("center", "height", "fwhm", "eta"):
+            blk = row.get(key, {})
+            assert isinstance(blk, dict)
+            assert {"p2.5", "p97.5", "p2_5", "p97_5"} <= set(blk.keys())
+            assert blk["p2_5"] == blk["p2.5"]
+            assert blk["p97_5"] == blk["p97.5"]
+            # also basic shape checks (scalar entries)
+            assert isinstance(blk.get("est"), (int, float))
