@@ -865,6 +865,10 @@ def bootstrap_ci(
         peaks_obj = _peaks_from_theta(theta0)
 
     user_refit = fit.get("refit", None)
+    if not callable(user_refit):
+        module_refit = globals().get("refit", None)
+        if callable(module_refit):
+            user_refit = module_refit
 
     if not peaks_obj and not callable(user_refit):
         ymodel = predict_full if callable(predict_full) else (lambda _th: np.asarray(y_all, float))
@@ -898,20 +902,25 @@ def bootstrap_ci(
         )
 
     # --- Robust refit adapter (supports both signatures) ---
-    from inspect import signature
+    from inspect import signature, Parameter
     from . import fit_api as _fit_api
     try:
         _sig = signature(_fit_api.run_fit_consistent)
+        allows_var_kw = any(p.kind == Parameter.VAR_KEYWORD for p in _sig.parameters.values())
     except Exception as e:
         diag_notes.append(repr(e))
         _sig = None
+        allows_var_kw = True
 
     def _mk_cfg():
         cfg = {
             "solver": _solver_name,
             "mode": mode,
+            # Enforce strict refits unless explicitly overridden
             "no_solver_fallbacks": True,
         }
+        if isinstance(fit, dict) and "no_solver_fallbacks" in fit:
+            cfg["no_solver_fallbacks"] = bool(fit.get("no_solver_fallbacks"))
         if str(_solver_name).lower().startswith("lmfit"):
             # Only used if lmfit backend honors these flags
             cfg["lmfit_share_fwhm"] = share_fwhm
@@ -920,7 +929,90 @@ def bootstrap_ci(
 
     def _robust_refit(theta_init, x, y):
         cfg = _mk_cfg()
-        theta_arr = np.asarray(theta_init, float)
+        theta_arr = np.asarray(theta_init, float).copy()
+
+        param_names = set(_sig.parameters.keys()) if _sig is not None else None
+
+        def _filter_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+            if allows_var_kw:
+                return dict(kwargs)
+            if param_names is None:
+                return dict(kwargs)
+            return {k: v for k, v in kwargs.items() if k in param_names}
+
+        lb_arr = ub_arr = None
+        if bounds is not None:
+            try:
+                lb_arr, ub_arr = bounds
+            except Exception:
+                lb_arr = ub_arr = None
+        if lb_arr is not None:
+            lb_arr = np.asarray(lb_arr, float)
+        if ub_arr is not None:
+            ub_arr = np.asarray(ub_arr, float)
+        if (lb_arr is None or ub_arr is None) and peaks_obj:
+            def _try_import_pack():
+                try:
+                    from fit.bounds import pack_theta_bounds as _ptb
+
+                    return _ptb
+                except Exception:
+                    try:
+                        from .fit.bounds import pack_theta_bounds as _ptb  # type: ignore
+
+                        return _ptb
+                    except Exception:
+                        return None
+
+            _ptb = _try_import_pack()
+            if _ptb is not None:
+                x_vals = np.asarray(x, float) if x is not None else np.asarray([], float)
+                try:
+                    solver_opts = dict(fit.get("solver_options", {}) or {})
+                except Exception:
+                    solver_opts = {}
+                derived: Optional[Tuple[np.ndarray, np.ndarray]] = None
+                try:
+                    _lb, _ub, *_rest = _ptb(peaks_obj)
+                    derived = (np.asarray(_lb, float), np.asarray(_ub, float))
+                except Exception:
+                    pass
+                if derived is None:
+                    try:
+                        _head, (_lb, _ub) = _ptb(peaks_obj, x_vals, solver_opts)
+                        derived = (np.asarray(_lb, float), np.asarray(_ub, float))
+                    except Exception:
+                        pass
+                if derived is None:
+                    try:
+                        _lb, _ub, *_rest = _ptb(peaks_obj, x_vals, solver_opts)
+                        derived = (np.asarray(_lb, float), np.asarray(_ub, float))
+                    except Exception:
+                        pass
+                if derived is not None:
+                    if lb_arr is None:
+                        lb_arr = derived[0]
+                    if ub_arr is None:
+                        ub_arr = derived[1]
+        if lb_arr is not None and ub_arr is not None:
+            eps = 1e-12
+            gap = np.asarray(ub_arr - lb_arr, float)
+            if gap.shape != theta_arr.shape:
+                try:
+                    gap = np.broadcast_to(gap, theta_arr.shape)
+                except Exception:
+                    gap = np.zeros_like(theta_arr)
+            delta = np.minimum(eps, 0.5 * np.where(np.isfinite(gap), gap, eps))
+            lo_eff = np.asarray(lb_arr, float)
+            hi_eff = np.asarray(ub_arr, float)
+            lo_eff = np.where(np.isfinite(lo_eff), lo_eff + delta, lo_eff)
+            hi_eff = np.where(np.isfinite(hi_eff), hi_eff - delta, hi_eff)
+            mask_flip = hi_eff < lo_eff
+            if np.any(mask_flip):
+                mid = 0.5 * (np.asarray(lb_arr, float) + np.asarray(ub_arr, float))
+                lo_eff = np.where(mask_flip, mid, lo_eff)
+                hi_eff = np.where(mask_flip, mid, hi_eff)
+            theta_arr = np.minimum(np.maximum(theta_arr, lo_eff), hi_eff)
 
         # Prepare peaks with jittered start values so p0 follows theta_init
         peaks_start = peaks_obj
@@ -932,11 +1024,13 @@ def bootstrap_ci(
                     j = 4 * i
                     pk.center = float(t[j + 0])
                     pk.height = float(t[j + 1])
-                    pk.fwhm   = float(t[j + 2])
-                    pk.eta    = float(t[j + 3])
+                    pk.fwhm = float(t[j + 2])
+                    pk.eta = float(t[j + 3])
                 peaks_start = ps
         except Exception:
             peaks_start = peaks_obj  # best effort, don’t fail the draw
+
+        attempt_errors: List[str] = []
 
         fit_mask_full = np.ones_like(x, dtype=bool)
         if _sig:
@@ -979,8 +1073,9 @@ def bootstrap_ci(
                     call_base[k] = v
             res_main = None
             try:
-                res_main = _fit_api.run_fit_consistent(**call_base)
-            except Exception:
+                res_main = _fit_api.run_fit_consistent(**_filter_kwargs(call_base))
+            except Exception as exc:
+                attempt_errors.append(f"{type(exc).__name__}: {exc}")
                 res_main = None
             if res_main is not None:
                 th_main = np.asarray(res_main.get("theta", theta_arr), float)
@@ -992,8 +1087,9 @@ def bootstrap_ci(
             if "solver" in params:
                 call_with_theta.setdefault("solver", _solver_name)
             try:
-                res_theta = _fit_api.run_fit_consistent(**call_with_theta)
-            except Exception:
+                res_theta = _fit_api.run_fit_consistent(**_filter_kwargs(call_with_theta))
+            except Exception as exc:
+                attempt_errors.append(f"{type(exc).__name__}: {exc}")
                 res_theta = None
             if res_theta is not None:
                 th_theta = np.asarray(res_theta.get("theta", theta_arr), float)
@@ -1021,23 +1117,43 @@ def bootstrap_ci(
         for kwargs in variants:
             res_main = None
             try:
-                res_main = _fit_api.run_fit_consistent(**kwargs)
-            except Exception:
+                res_main = _fit_api.run_fit_consistent(**_filter_kwargs(kwargs))
+            except Exception as exc:
+                attempt_errors.append(f"{type(exc).__name__}: {exc}")
                 res_main = None
             if res_main is not None:
                 th_main = np.asarray(res_main.get("theta", theta_arr), float)
                 if np.all(np.isfinite(th_main)):
                     return th_main, True
 
-        res = _fit_api.run_fit_consistent(
-            x, y, cfg_legacy,
-            theta_init=theta_arr, locked_mask=locked_mask,
-            bounds=bounds, baseline=baseline,
-            solver=_solver_name,
-        )
-        th = np.asarray(res.get("theta", theta_arr), float)
-        ok = np.all(np.isfinite(th))
-        return th, ok
+        if param_names is None or "theta_init" in param_names or allows_var_kw:
+            kwargs_final = {
+                "x": x,
+                "y": y,
+                "cfg": cfg_legacy,
+                "theta_init": theta_arr,
+                "locked_mask": locked_mask,
+                "bounds": bounds,
+                "baseline": baseline,
+                "solver": _solver_name,
+            }
+            if param_names is None or "peaks_in" in (param_names or set()) or allows_var_kw:
+                kwargs_final["peaks_in"] = peaks_start
+            elif param_names and "peaks" in param_names:
+                kwargs_final["peaks"] = peaks_start
+            try:
+                res = _fit_api.run_fit_consistent(**_filter_kwargs(kwargs_final))
+            except Exception as exc:
+                attempt_errors.append(f"{type(exc).__name__}: {exc}")
+            else:
+                th = np.asarray(res.get("theta", theta_arr), float)
+                ok = np.all(np.isfinite(th))
+                if ok:
+                    return th, True
+
+        if attempt_errors:
+            raise RuntimeError(attempt_errors[-1])
+        return np.asarray(theta_arr, float), False
 
     # --- Optional user-supplied refit from fit_ctx (batch path) ---
     if callable(user_refit):
@@ -1069,6 +1185,11 @@ def bootstrap_ci(
                     out_local = user_refit(theta_init, x, y)
 
             out = out_local
+            if isinstance(out, dict):
+                th_dict = out.get("theta", theta_init)
+                th_new = np.asarray(th_dict, float)
+                ok_flag = bool(out.get("fit_ok", True)) and np.all(np.isfinite(th_new))
+                return th_new, ok_flag or (not strict_refit and np.all(np.isfinite(th_new)))
             if isinstance(out, tuple) and len(out) == 2:
                 th_new, ok = out
                 th_new = np.asarray(th_new, float)
@@ -1117,10 +1238,23 @@ def bootstrap_ci(
     linear_fallbacks = 0
     linear_lambda = None
     refit_errors: List[str] = []
+    MAX_CAPTURED_REFIT_ERRORS = 64
+
+    def _record_refit_error(msg: Optional[str]) -> None:
+        if not msg:
+            return
+        if len(refit_errors) < MAX_CAPTURED_REFIT_ERRORS:
+            refit_errors.append(str(msg))
+
     pulse_step = max(1, int(n_boot // 20))
     next_pulse_at = 0
     last_pulse_t = time.monotonic()
     aborted = False
+
+    diag_failure = {
+        "bootstrap_mode": "linearized" if use_linearized_fast_path else "refit",
+        "refit_errors": [],
+    }
 
     def _one_draw(b: int):
         rng_local = rng_streams[b]
@@ -1204,8 +1338,7 @@ def bootstrap_ci(
                 except Exception as e:
                     # Count as failed draw; capture first few error messages
                     n_fail += 1
-                    if len(refit_errors) < 5:
-                        refit_errors.append(f"{type(e).__name__}: {e}")
+                    _record_refit_error(f"{type(e).__name__}: {e}")
                     done_cnt += 1
                     _pulse(done_cnt)
                     continue
@@ -1218,8 +1351,7 @@ def bootstrap_ci(
                     n_success += 1
                 else:
                     n_fail += 1
-                    if err_msg and err_msg not in refit_errors and len(refit_errors) < 5:
-                        refit_errors.append(err_msg)
+                    _record_refit_error(err_msg)
     else:
         for b in range(int(n_boot)):
             if abort_evt is not None:
@@ -1236,14 +1368,33 @@ def bootstrap_ci(
                 n_success += 1
             else:
                 n_fail += 1
-                if err_msg and err_msg not in refit_errors and len(refit_errors) < 5:
-                    refit_errors.append(err_msg)
+                _record_refit_error(err_msg)
             _pulse(b + 1)
 
     if not T_list or len(T_list) < 2:
-        raise RuntimeError(
+        diag_failure_local = dict(diag_perf)
+        diag_failure_local.update(diag_failure)
+        diag_failure_local.update({
+            "B": int(n_boot),
+            "n_boot": int(n_boot),
+            "n_success": int(n_success),
+            "n_fail": int(n_fail),
+            "n_linear_fallback": int(linear_fallbacks),
+            "linear_lambda": float(linear_lambda) if linear_lambda is not None else None,
+            "seed": seed,
+            "pct_at_bounds": None,
+            "pct_at_bounds_units": "percent",
+            "aborted": bool(aborted or ((abort_evt.is_set()) if abort_evt is not None else False)),
+            "refit_errors": list(refit_errors[:16]),
+            "alpha": float(alpha),
+        })
+        diag_failure_local["bootstrap_mode"] = "linearized" if use_linearized_fast_path else "refit"
+        diag_failure_local.setdefault("refit_errors", [])
+        err = RuntimeError(
             f"Insufficient successful bootstrap refits (success={n_success}, fail={n_fail})"
         )
+        setattr(err, "diagnostics", diag_failure_local)
+        raise err
 
     T = np.vstack(T_list)
     mean = T.mean(axis=0)
@@ -1379,7 +1530,7 @@ def bootstrap_ci(
         "runtime_s": float(time.time() - t0),
         "band_source": "bootstrap-percentile" if band is not None else None,
         "band_reason": band_reason,
-        "refit_errors": refit_errors,
+        "refit_errors": list(refit_errors[:16]),
         "alpha": float(alpha),
     })
     diag["band_gated"] = bool(band_gated)

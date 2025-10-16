@@ -144,6 +144,122 @@ def test_bootstrap_passes_bounds_and_locks(monkeypatch):
     assert "bounds" in kw and "locked_mask" in kw
 
 
+def test_bootstrap_theta_init_is_clipped_to_bounds(monkeypatch):
+    u = importlib.import_module("core.uncertainty")
+    fit_api = importlib.import_module("core.fit_api")
+
+    captured = {"called": False}
+
+    def _rfc(*args, **kwargs):
+        bounds = kwargs.get("bounds")
+        peaks_in = kwargs.get("peaks_in") or kwargs.get("peaks") or []
+        x_vals = kwargs.get("x") if "x" in kwargs else (args[0] if args else None)
+        theta_out = []
+        for pk in peaks_in or []:
+            theta_out.extend([pk.center, pk.height, pk.fwhm, pk.eta])
+        th = np.asarray(theta_out if theta_out else theta, float)
+        if bounds is not None:
+            lb_arr, ub_arr = bounds
+            lb_arr = np.asarray(lb_arr, float)
+            ub_arr = np.asarray(ub_arr, float)
+        else:
+            from fit.bounds import pack_theta_bounds
+
+            x_arr = np.asarray(x_vals, float) if x_vals is not None else np.asarray([], float)
+            _, (lb_arr, ub_arr) = pack_theta_bounds(peaks_in, x_arr, {})
+        assert np.all(th >= lb_arr - 1e-12) and np.all(th <= ub_arr + 1e-12), "theta_init not inside bounds"
+        captured["called"] = True
+        return {"theta": th}
+
+    class DummyRNG:
+        def integers(self, low, high=None, size=None):
+            return np.zeros(size, dtype=int)
+
+        def normal(self, loc=0.0, scale=1.0, size=None):
+            scale_arr = np.asarray(scale, float)
+            noise = np.ones_like(scale_arr, float) * 10.0
+            return loc + noise * scale_arr
+
+    def _spawn(seed, n):
+        return [DummyRNG() for _ in range(int(n))]
+
+    monkeypatch.setattr(u, "_spawn_rng_streams", _spawn, raising=True)
+    monkeypatch.setattr(fit_api, "run_fit_consistent", _rfc, raising=True)
+
+    theta = np.array([10.0, 1.0, 0.05, 0.5])
+    lb = theta - np.array([0.1, 0.2, 0.02, 0.3])
+    ub = theta + np.array([0.1, 0.3, 0.02, 0.3])
+    peaks = [Peak(center=float(theta[0]), height=float(theta[1]), fwhm=float(theta[2]), eta=float(theta[3]))]
+
+    x = np.linspace(0, 1, 16)
+    y = np.ones_like(x)
+    resid = y - y
+    J = np.eye(x.size, theta.size)
+
+    res = u.bootstrap_ci(
+        theta,
+        jacobian=J,
+        residual=resid,
+        x_all=x,
+        y_all=y,
+        predict_full=lambda th: np.ones_like(x),
+        fit_ctx={
+            "bounds": (lb, ub),
+            "peaks": peaks,
+            "unc_workers": 0,
+            "n_boot": 2,
+            "allow_linear_fallback": False,
+            "bootstrap_jitter": 0.5,
+        },
+        n_boot=2,
+        workers=0,
+        seed=123,
+        return_band=False,
+    )
+    assert res is not None and captured["called"]
+
+
+def test_bootstrap_disables_solver_fallbacks_by_default(monkeypatch):
+    u = importlib.import_module("core.uncertainty")
+    fit_api = importlib.import_module("core.fit_api")
+
+    seen_cfg: list[dict] = []
+
+    def _rfc(*args, **kwargs):
+        cfg = kwargs.get("cfg") or kwargs.get("config") or {}
+        if isinstance(cfg, dict):
+            seen_cfg.append(dict(cfg))
+        else:
+            seen_cfg.append({})
+        if "peaks_in" not in kwargs and "peaks" not in kwargs:
+            raise TypeError("missing peaks_in")
+        return {"theta": np.asarray([1.0, 1.0, 1.0, 0.5], float)}
+
+    monkeypatch.setattr(fit_api, "run_fit_consistent", _rfc, raising=True)
+
+    theta = np.asarray([1.0, 1.0, 1.0, 0.5], float)
+    x = np.linspace(0, 1, 8)
+    y = np.ones_like(x)
+    residual = np.zeros_like(x)
+    jacobian = np.eye(x.size, theta.size)
+
+    res = u.bootstrap_ci(
+        theta,
+        residual=residual,
+        jacobian=jacobian,
+        x_all=x,
+        y_all=y,
+        predict_full=lambda th: y,
+        fit_ctx={"n_boot": 2, "unc_workers": 0, "allow_linear_fallback": False},
+        n_boot=2,
+        workers=0,
+        return_band=False,
+    )
+
+    assert res is not None
+    assert any(bool(cfg.get("no_solver_fallbacks")) for cfg in seen_cfg)
+
+
 def test_fit_api_no_solver_fallbacks(monkeypatch):
     import core.fit_api as fit_api
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Callable, Dict, Any
 
@@ -23,7 +24,7 @@ from .weights import noise_weights
 from .residuals import build_residual, jacobian_fd, build_residual_jac
 from . import signals
 from .signals import polynomial_baseline
-from fit import orchestrator
+from fit import orchestrator, solve as fit_solve
 from fit.bounds import pack_theta_bounds
 from infra import performance
 from fit import classic, modern, modern_vp, lmfit_backend
@@ -234,13 +235,34 @@ def run_fit_consistent(
             except Exception:
                 _no_fb = _no_fb
 
-        res = (
-            orchestrator.step_once(x_fit, y_solver, peaks_start, mode, base_solver, opts)
-            if _no_fb
-            else orchestrator.run_fit_with_fallbacks(
+        if _no_fb:
+            res = None
+            # Prefer orchestrator.step_once when available and signature-compatible.
+            step_once = getattr(orchestrator, "step_once", None)
+            if callable(step_once):
+                try:
+                    sig = inspect.signature(step_once)
+                except Exception:
+                    sig = None
+                expects_state = bool(
+                    sig
+                    and len(sig.parameters) == 1
+                    and all(
+                        p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                        for p in sig.parameters.values()
+                    )
+                )
+                if not expects_state:
+                    try:
+                        res = step_once(x_fit, y_solver, peaks_start, mode, base_solver, opts)
+                    except TypeError:
+                        res = None
+            if res is None:
+                res = fit_solve(x_fit, y_solver, peaks_start, mode, base_solver, opts)
+        else:
+            res = orchestrator.run_fit_with_fallbacks(
                 x_fit, y_solver, peaks_start, mode, base_solver, opts
             )
-        )
         theta = np.asarray(res.theta, float)
         resid_fn = build_residual(x_fit, y_fit, res.peaks_out, mode, base_fit, "linear", None)
         rmse = float(np.sqrt(np.mean(resid_fn(theta) ** 2))) if theta.size else float("nan")
