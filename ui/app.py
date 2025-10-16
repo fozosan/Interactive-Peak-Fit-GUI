@@ -4284,14 +4284,29 @@ class PeakFitApp:
             r0 = resid_fn(theta)
             J = jacobian_fd(resid_fn, theta)
 
-            def predict_full(th):
-                total = np.zeros_like(x_fit, float)
-                for i in range(len(self.peaks)):
+            def _predict_fit_local(
+                th,
+                *,
+                _x=x_fit,
+                _peaks=self.peaks,
+                _base=base_fit,
+                _mode=mode,
+            ):
+                total = np.zeros_like(_x, float)
+                for i in range(len(_peaks)):
                     c, h, fw, eta = th[4 * i : 4 * (i + 1)]
-                    total += pseudo_voigt(x_fit, h, c, fw, eta)
-                if add_mode and base_fit is not None:
-                    total = total + base_fit
+                    total += pseudo_voigt(_x, h, c, fw, eta)
+                if _mode == "add" and _base is not None:
+                    total = total + _base
                 return total
+
+            predict_fit = _predict_fit_local
+            try:
+                _probe = np.asarray(predict_fit(np.asarray(theta, float)), float)
+                if int(_probe.size) != int(x_fit.size):
+                    predict_fit = _predict_fit_local
+            except Exception:
+                predict_fit = _predict_fit_local
 
             boot_solver = self._select_bootstrap_solver()
 
@@ -4307,7 +4322,7 @@ class PeakFitApp:
                     getattr(self, "share_eta_var", None) and self.share_eta_var.get()
                 ),
                 "residual_fn": (lambda th: resid_fn(th)),
-                "predict_full": predict_full,
+                "predict_full": predict_fit,
                 "x_all": x_fit,
                 "y_all": y_fit,
                 "unc_workers": workers,
@@ -4316,6 +4331,9 @@ class PeakFitApp:
                 "solver": boot_solver,
                 "strict_refit": True,
                 "bootstrap_jitter": jitter_frac,
+                "bounds": (lo, hi),
+                "locked_mask": locked_mask,
+                "theta0": np.asarray(theta, float),
             }
             # helpful breadcrumb in logs for parity/debugging
             try:
@@ -4345,7 +4363,7 @@ class PeakFitApp:
                     theta=theta,
                     residual=r0,
                     jacobian=J,
-                    predict_full=predict_full,
+                    predict_full=predict_fit,
                     x_all=x_fit,
                     y_all=y_fit,
                     fit_ctx=fit_ctx,
@@ -4670,14 +4688,29 @@ class PeakFitApp:
                 r0 = resid_fn(theta)
                 J = jacobian_fd(resid_fn, theta)
 
-                def predict_full(th):
-                    total = np.zeros_like(x_fit, float)
-                    for i in range(len(self.peaks)):
+                def _predict_fit_local(
+                    th,
+                    *,
+                    _x=x_fit,
+                    _peaks=self.peaks,
+                    _base=base_fit,
+                    _mode=mode,
+                ):
+                    total = np.zeros_like(_x, float)
+                    for i in range(len(_peaks)):
                         c, h, fw, eta = th[4 * i : 4 * (i + 1)]
-                        total += pseudo_voigt(x_fit, h, c, fw, eta)
-                    if add_mode and base_fit is not None:
-                        total = total + base_fit
+                        total += pseudo_voigt(_x, h, c, fw, eta)
+                    if _mode == "add" and _base is not None:
+                        total = total + _base
                     return total
+
+                predict_fit = _predict_fit_local
+                try:
+                    _probe = np.asarray(predict_fit(np.asarray(theta, float)), float)
+                    if int(_probe.size) != int(x_fit.size):
+                        predict_fit = _predict_fit_local
+                except Exception:
+                    predict_fit = _predict_fit_local
 
                 boot_solver = self._select_bootstrap_solver()
                 fit_ctx = {
@@ -4686,7 +4719,7 @@ class PeakFitApp:
                     "baseline": base_fit,
                     "mode": mode,
                     "residual_fn": (lambda th: resid_fn(th)),
-                    "predict_full": predict_full,
+                    "predict_full": predict_fit,
                     "x_all": x_fit,
                     "y_all": y_fit,
                     "solver": boot_solver,
@@ -4701,6 +4734,8 @@ class PeakFitApp:
                     "strict_refit": True,
                     "bootstrap_jitter": jitter_frac,
                     "unc_band_workers": band_workers,
+                    "bounds": (lo, hi),
+                    "theta0": np.asarray(theta, float),
                 }
 
                 try:
@@ -4728,16 +4763,16 @@ class PeakFitApp:
                         theta=theta,
                         residual=r0,
                         jacobian=J,
-                        predict_full=predict_full,
-                        x_all=x_fit,
-                        y_all=y_fit,
-                        locked_mask=locked_mask,
-                        fit_ctx=fit_ctx,
-                        n_boot=n_boot,
-                        seed=seed_val,
-                        workers=workers,
-                        return_band=bool(self.show_ci_band_var.get()),
-                        alpha=alpha,
+                    predict_full=predict_fit,
+                    x_all=x_fit,
+                    y_all=y_fit,
+                    locked_mask=locked_mask,
+                    fit_ctx=fit_ctx,
+                    n_boot=n_boot,
+                    seed=seed_val,
+                    workers=workers,
+                    return_band=True,
+                    alpha=alpha,
                         center_residuals=bool(self.center_resid_var.get()),
                     )
                 if abort_evt.is_set():
