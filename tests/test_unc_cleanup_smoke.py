@@ -3,14 +3,19 @@ import importlib.util
 import importlib.machinery
 import sys
 import numpy as np
+import types
+
+from core.peaks import Peak
 
 
 def test_helpers_exist_and_basic_behave():
     u = importlib.import_module("core.uncertainty")
-    for name in ("_norm_solver_and_sharing",
-                 "_build_residual_vector",
-                 "_relabel_by_center",
-                 "_validate_vector_length"):
+    for name in (
+        "_norm_solver_and_sharing",
+        "_build_residual_vector",
+        "_relabel_by_center",
+        "_validate_vector_length",
+    ):
         assert hasattr(u, name), f"missing helper {name}"
     y = np.array([1.0, 2.0, 3.0, 4.0])
     yhat = np.array([0.5, 2.5, 2.5, 5.0])
@@ -32,21 +37,18 @@ def test_bayes_sharing_default_off(monkeypatch):
             self.dim = dim
             self.log_prob = log_prob
             self.pool = pool
-            self.acceptance_fraction = np.zeros(nwalkers)
+            self.random_state = random_state
+            self.acceptance_fraction = np.full(nwalkers, 0.5, dtype=float)
+            self._calls = []
 
-        def run_mcmc(self, state, *a, **k):
+        def run_mcmc(self, state, step, **kwargs):
+            self._calls.append(np.asarray(state, float))
             return state, None, None
 
-        @property
-        def chain(self):
-            return np.zeros((2, 2, 2))
-
-        @property
-        def blobs(self):
-            return None
-
-        def get_chain(self, *a, **k):
-            return np.zeros((1, self.nwalkers, self.dim))
+        def get_chain(self, discard=0, thin=1, flat=False):
+            steps = max(len(self._calls), discard + 2)
+            chain = np.zeros((steps, self.nwalkers, self.dim), float)
+            return chain[discard::thin]
 
         def get_blobs(self, *a, **k):
             return None
@@ -72,17 +74,15 @@ def test_bayes_sharing_default_off(monkeypatch):
 def test_bootstrap_passes_bounds_and_locks(monkeypatch):
     u = importlib.import_module("core.uncertainty")
 
+    # Stub fit_api.run_fit_consistent to capture kwargs
     captured = {}
-    fit_api = importlib.import_module("core.fit_api")
+    theta = np.array([10.0, 1.0, 2.0, 0.5])
 
     def _rfc(
         x,
         y,
-        cfg=None,
-        config=None,
-        solver=None,
         peaks_in=None,
-        peaks=None,
+        cfg=None,
         baseline=None,
         mode=None,
         fit_mask=None,
@@ -97,11 +97,8 @@ def test_bootstrap_passes_bounds_and_locks(monkeypatch):
         kwargs = {
             "x": x,
             "y": y,
-            "cfg": cfg,
-            "config": config,
-            "solver": solver,
             "peaks_in": peaks_in,
-            "peaks": peaks,
+            "cfg": cfg,
             "baseline": baseline,
             "mode": mode,
             "fit_mask": fit_mask,
@@ -113,13 +110,13 @@ def test_bootstrap_passes_bounds_and_locks(monkeypatch):
             "theta_init": theta_init,
         }
         kwargs.update(extra)
-        captured.setdefault("kwargs", []).append(kwargs)
-        theta_init_arr = np.asarray(theta_init if theta_init is not None else np.zeros(4), float)
-        return {"theta": theta_init_arr}
+        captured["kwargs"] = kwargs
+        theta_init = np.asarray(theta_init if theta_init is not None else np.zeros_like(theta), float)
+        return {"theta": theta_init}
 
-    monkeypatch.setattr(fit_api, "run_fit_consistent", _rfc, raising=True)
+    fit_api_module = importlib.import_module("core.fit_api")
+    monkeypatch.setattr(fit_api_module, "run_fit_consistent", _rfc, raising=True)
 
-    theta = np.array([10.0, 1.0, 2.0, 0.5])
     x = np.linspace(0, 1, 16)
     y = np.ones_like(x)
     resid = y - y
@@ -137,16 +134,54 @@ def test_bootstrap_passes_bounds_and_locks(monkeypatch):
             "locked_mask": np.array([False, True, False, False]),
             "unc_workers": 0,
             "n_boot": 2,
-            "allow_linear_fallback": False,
         },
         n_boot=2,
         workers=0,
         return_band=False,
     )
     assert out is not None
-    calls = captured.get("kwargs", [])
-    assert calls, "run_fit_consistent was not invoked"
-    assert any(
-        "bounds" in kw and "locked_mask" in kw
-        for kw in calls
-    ), f"expected bounds/locked_mask in calls, saw: {calls}"
+    kw = captured.get("kwargs", {})
+    assert "bounds" in kw and "locked_mask" in kw
+
+
+def test_fit_api_no_solver_fallbacks(monkeypatch):
+    import core.fit_api as fit_api
+
+    called = {"once": 0, "fb": 0}
+
+    def _once(x_fit, y_solver, peaks_start, mode, base_solver, opts):
+        called["once"] += 1
+        return types.SimpleNamespace(
+            theta=np.asarray(theta0, float),
+            peaks_out=peaks_start,
+            success=True,
+            solver=opts.get("solver", "modern_trf"),
+        )
+
+    def _fb(x_fit, y_solver, peaks_start, mode, base_solver, opts):
+        called["fb"] += 1
+        return types.SimpleNamespace(
+            theta=np.asarray(theta0, float),
+            peaks_out=peaks_start,
+            success=True,
+            solver=opts.get("solver", "modern_trf"),
+        )
+
+    dummy_orch = types.SimpleNamespace(step_once=_once, run_fit_with_fallbacks=_fb)
+    monkeypatch.setattr(fit_api, "orchestrator", dummy_orch, raising=True)
+
+    x = np.linspace(0, 1, 8)
+    y = np.ones_like(x)
+    peaks_in = [Peak(center=0.4, height=1.0, fwhm=0.2, eta=0.5)]
+    theta0 = np.array([p.center for p in peaks_in] + [p.height for p in peaks_in] + [p.fwhm for p in peaks_in] + [p.eta for p in peaks_in])
+    res = fit_api.run_fit_consistent(
+        x=x,
+        y=y,
+        peaks_in=peaks_in,
+        cfg={"solver": "modern_trf", "no_solver_fallbacks": True},
+        baseline=None,
+        mode="add",
+        fit_mask=np.ones_like(x, bool),
+    )
+    assert called["once"] == 1 and called["fb"] == 0
+    assert res.get("theta") is not None

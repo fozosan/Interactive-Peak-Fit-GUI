@@ -907,7 +907,11 @@ def bootstrap_ci(
         _sig = None
 
     def _mk_cfg():
-        cfg = {"solver": _solver_name, "mode": mode}
+        cfg = {
+            "solver": _solver_name,
+            "mode": mode,
+            "no_solver_fallbacks": True,
+        }
         if str(_solver_name).lower().startswith("lmfit"):
             # Only used if lmfit backend honors these flags
             cfg["lmfit_share_fwhm"] = share_fwhm

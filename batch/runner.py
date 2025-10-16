@@ -504,7 +504,6 @@ def run_batch(
                 )
                 solver_choice = str(solver_choice)
                 # Normalize & seed bootstrap defaults for parity with GUI
-                fit_ctx.setdefault("solver", solver_choice)
                 fit_ctx.setdefault("bootstrap_residual_mode", "raw")
                 fit_ctx.setdefault("relabel_by_center", True)
                 fit_ctx.setdefault("center_residuals", True)
@@ -543,18 +542,18 @@ def run_batch(
                         "baseline": base_fit,
                         "mode": mode,
                         "peaks": peaks_obj,
+                        # set solver once to the chosen bootstrap engine
                         "solver": boot_solver,
                         "bootstrap_jitter": jitter_frac,
                         "lmfit_share_fwhm": bool(config.get("lmfit_share_fwhm", False)),
                         "lmfit_share_eta": bool(config.get("lmfit_share_eta", False)),
                         "centers_ref": centers_ref,
                         "relabel_by_center": True,
+                        # Parity with GUI: never use linearized fallback path
+                        "allow_linear_fallback": False,
+                        "strict_refit": True,
                     }
                 )
-                if str(boot_solver).lower() == "lmfit_vp":
-                    fit_ctx["strict_refit"] = True
-                else:
-                    fit_ctx.pop("strict_refit", None)
                 try:
                     _blas_cfg = int(config.get("perf_blas_threads", 0) or 0)
                 except Exception:

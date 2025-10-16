@@ -223,8 +223,23 @@ def run_fit_consistent(
 
         y_solver = y_target if mode == "subtract" else y_fit
         base_solver = None if mode == "subtract" else base_fit
-        res = orchestrator.run_fit_with_fallbacks(
-            x_fit, y_solver, peaks_start, mode, base_solver, opts
+        # respect strict disabling of solver fallbacks when requested
+        _no_fb = bool((cfg or {}).get("no_solver_fallbacks", False))
+        cfg_config = None
+        if isinstance(cfg, dict):
+            cfg_config = cfg.get("config")
+        if not _no_fb and isinstance(cfg_config, dict):
+            try:
+                _no_fb = bool(cfg_config.get("no_solver_fallbacks", False))
+            except Exception:
+                _no_fb = _no_fb
+
+        res = (
+            orchestrator.step_once(x_fit, y_solver, peaks_start, mode, base_solver, opts)
+            if _no_fb
+            else orchestrator.run_fit_with_fallbacks(
+                x_fit, y_solver, peaks_start, mode, base_solver, opts
+            )
         )
         theta = np.asarray(res.theta, float)
         resid_fn = build_residual(x_fit, y_fit, res.peaks_out, mode, base_fit, "linear", None)

@@ -3,6 +3,7 @@ import re, sys, json, pathlib
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 P_CORE = ROOT / "core" / "uncertainty.py"
 P_BATCH = ROOT / "batch" / "runner.py"
+P_FIT = ROOT / "core" / "fit_api.py"
 
 def read(p: pathlib.Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
@@ -42,6 +43,8 @@ def check_batch(text: str):
         'fit_ctx["bounds"]',
         'fit_ctx["locked_mask"]',
         'fit_ctx["theta0"]',
+        '"allow_linear_fallback": False',
+        '"strict_refit": True',
     ]:
         if s not in text:
             ok = False; notes.append(f"batch: missing {s}")
@@ -51,13 +54,29 @@ def check_batch(text: str):
         ok = False; notes.append("batch: missing predict_full length guard")
     return ok, notes
 
+def check_fit_api(text: str):
+    ok, notes = True, []
+    need = [
+        "no_solver_fallbacks",
+        "orchestrator.step_once",
+        "orchestrator.run_fit_with_fallbacks",
+    ]
+    for s in need:
+        if s not in text:
+            ok = False; notes.append(f"fit_api: missing {s}")
+    return ok, notes
+
 def main():
     core_ok, core_notes = check_core(read(P_CORE))
     batch_ok, batch_notes = check_batch(read(P_BATCH))
-    report = {"core": {"ok": core_ok, "notes": core_notes},
-              "batch": {"ok": batch_ok, "notes": batch_notes}}
+    fit_ok, fit_notes = check_fit_api(read(P_FIT))
+    report = {
+        "core": {"ok": core_ok, "notes": core_notes},
+        "batch": {"ok": batch_ok, "notes": batch_notes},
+        "fit_api": {"ok": fit_ok, "notes": fit_notes},
+    }
     print(json.dumps(report, indent=2))
-    sys.exit(0 if (core_ok and batch_ok) else 1)
+    sys.exit(0 if (core_ok and batch_ok and fit_ok) else 1)
 
 if __name__ == "__main__":
     main()
