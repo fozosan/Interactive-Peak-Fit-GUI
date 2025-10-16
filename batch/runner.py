@@ -484,7 +484,15 @@ def run_batch(
                     if _mode == "add" and _base is not None:
                         total = total + _base
                     return total
-                if model_eval is None:
+                # Always ensure predict_full matches the fit-range length; fallback to local builder if not.
+                if callable(model_eval):
+                    try:
+                        _probe = np.asarray(model_eval(theta_hat), float)
+                        if _probe.size != x_fit.size:
+                            model_eval = _predict_full_from_peaks
+                    except Exception:
+                        model_eval = _predict_full_from_peaks
+                else:
                     model_eval = _predict_full_from_peaks
 
                 fit_ctx = dict(res.get("fit_ctx") or {})
@@ -495,9 +503,15 @@ def run_batch(
                     or "modern_trf"
                 )
                 solver_choice = str(solver_choice)
-                fit_ctx.setdefault("solver", solver_choice)
+                # Normalize & seed bootstrap defaults for parity with GUI
                 fit_ctx.setdefault("bootstrap_residual_mode", "raw")
                 fit_ctx.setdefault("relabel_by_center", True)
+                fit_ctx.setdefault("center_residuals", True)
+                # Hand the solved peak list and constraints from THIS fit
+                fit_ctx["peaks_out"] = peaks_obj
+                fit_ctx["bounds"] = res.get("bounds")
+                fit_ctx["locked_mask"] = res.get("locked_mask")
+                fit_ctx["theta0"] = theta_hat
                 if not str(solver_choice).lower().startswith("lmfit"):
                     fit_ctx.pop("lmfit_share_fwhm", None)
                     fit_ctx.pop("lmfit_share_eta", None)
@@ -528,27 +542,18 @@ def run_batch(
                         "baseline": base_fit,
                         "mode": mode,
                         "peaks": peaks_obj,
-                        "peaks_out": peaks_obj,
+                        # set solver once to the chosen bootstrap engine
                         "solver": boot_solver,
                         "bootstrap_jitter": jitter_frac,
-                        "bounds": res.get("bounds"),
-                        "locked_mask": res.get("locked_mask"),
                         "lmfit_share_fwhm": bool(config.get("lmfit_share_fwhm", False)),
                         "lmfit_share_eta": bool(config.get("lmfit_share_eta", False)),
-                        "theta0": np.asarray(
-                            res.get("theta0")
-                            if res.get("theta0") is not None
-                            else (res.get("p0") if res.get("p0") is not None else theta_hat),
-                            float,
-                        ),
                         "centers_ref": centers_ref,
                         "relabel_by_center": True,
+                        # Parity with GUI: never use linearized fallback path
+                        "allow_linear_fallback": False,
+                        "strict_refit": True,
                     }
                 )
-                if str(boot_solver).lower() == "lmfit_vp":
-                    fit_ctx["strict_refit"] = True
-                else:
-                    fit_ctx.pop("strict_refit", None)
                 try:
                     _blas_cfg = int(config.get("perf_blas_threads", 0) or 0)
                 except Exception:
