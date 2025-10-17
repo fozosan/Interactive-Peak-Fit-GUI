@@ -454,6 +454,7 @@ def run_batch(
                 )
                 base_fit = res.get("baseline")
                 mode = res.get("mode", "add")
+                add_mode = mode == "add"
 
                 rj = res.get("residual_jac")
                 residual_fn = res.get("residual_fn")
@@ -475,7 +476,7 @@ def run_batch(
                     residual_vec = residual_fn(theta_hat)
                 residual_vec = np.asarray(residual_vec, float)
 
-                # Use the fit-range sized predictor; fallback to a local builder on x_fit if missing.
+                # Predictor: prefer solver-provided fit-window function; otherwise build locally on x_fit.
                 model_eval = res.get("predict_fit")
 
                 def _predict_fit_local(
@@ -484,24 +485,25 @@ def run_batch(
                     _x=x_fit,
                     _peaks=peaks_obj,
                     _base=base_fit,
-                    _mode=mode,
+                    _add=add_mode,
                 ):
                     total = np.zeros_like(_x, float)
-                    for idx in range(len(_peaks)):
-                        c, h, fw, eta = th[4 * idx : 4 * (idx + 1)]
+                    t = np.asarray(th, float).ravel()
+                    for i in range(len(_peaks)):
+                        j = 4 * i
+                        c, h, fw, eta = t[j : j + 4]
                         total += models.pseudo_voigt(_x, h, c, fw, eta)
-                    if _mode == "add" and _base is not None:
+                    if _add and _base is not None:
                         total = total + _base
                     return total
-                # Keep behavior identical except ensure the predictor lives on x_fit.
+
                 if not callable(model_eval):
                     model_eval = _predict_fit_local
                 else:
                     try:
                         _probe = np.asarray(
-                            model_eval(np.asarray(theta_hat, float)),
-                            float,
-                        )
+                            model_eval(np.asarray(theta_hat, float)), float
+                        ).reshape(-1)
                         if int(_probe.size) != int(x_fit.size):
                             model_eval = _predict_fit_local
                     except Exception:
@@ -522,10 +524,12 @@ def run_batch(
                 # Hand the solved peak list and constraints from THIS fit
                 fit_ctx["peaks_out"] = peaks_obj
                 # Forward exact constraints and start used by the solver so bootstrap refits respect them
-                if res.get("bounds") is not None:
-                    fit_ctx["bounds"] = res.get("bounds")
-                if res.get("locked_mask") is not None:
-                    fit_ctx["locked_mask"] = res.get("locked_mask")
+                bounds_exact = res.get("bounds")
+                if bounds_exact is not None:
+                    fit_ctx["bounds"] = bounds_exact
+                locked_exact = res.get("locked_mask")
+                if locked_exact is not None:
+                    fit_ctx["locked_mask"] = locked_exact
                 fit_ctx["theta0"] = np.asarray(theta_hat, float)
                 if not str(solver_choice).lower().startswith("lmfit"):
                     fit_ctx.pop("lmfit_share_fwhm", None)
@@ -547,6 +551,10 @@ def run_batch(
                 centers_ref = [float(p.center) for p in peaks_obj] if peaks_obj else []
                 # Make the chosen bootstrap solver visible to inner refits.
                 fit_ctx["unc_boot_solver"] = str(boot_solver)
+
+                # Also mirror constraints at the top level when invoking bootstrap_ci.
+                top_bounds = bounds_exact
+                top_locked = locked_exact
 
                 fit_ctx.update(
                     {
@@ -785,13 +793,13 @@ def run_batch(
                                 theta=theta_hat,
                                 residual=residual_vec,
                                 jacobian=jac_mat,
-                    predict_full=model_eval,  # fit-range sized
+                                predict_full=model_eval,  # fit-range sized
                                 x_all=x_fit,
                                 y_all=y_fit,
                                 fit_ctx=fit_ctx_local,
-                                bounds=bounds,
+                                bounds=top_bounds if top_bounds is not None else bounds,
                                 param_names=res.get("param_names"),
-                                locked_mask=locked_mask,
+                                locked_mask=top_locked if top_locked is not None else locked_mask,
                                 n_boot=n_boot,
                                 seed=seed_val,
                                 workers=workers_arg,
