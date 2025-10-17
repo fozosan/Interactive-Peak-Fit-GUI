@@ -4226,7 +4226,7 @@ class PeakFitApp:
             if bool(getattr(pk, "lock_eta", False)):
                 locked_mask[4 * i + 3] = True
 
-        # Shared bounds mirroring interactive uncertainty path
+        # Shared bounds mirroring interactive uncertainty path (fallback)
         n_pk = len(self.peaks)
         P = 4 * n_pk
         lo = np.full(P, -np.inf, float)
@@ -4262,6 +4262,7 @@ class PeakFitApp:
         jitter_frac = float(unc_sig.get("jitter", 0.0) or 0.0)
         center_res = bool(self.center_resid_var.get())
 
+        # NOTE: This method is the "fast" uncertainty path used by the GUI.
         if method_key == "asymptotic":
             res = self._run_asymptotic_uncertainty()
             if res is None:
@@ -4283,6 +4284,8 @@ class PeakFitApp:
         elif method_key == "bootstrap":
             r0 = resid_fn(theta)
             J = jacobian_fd(resid_fn, theta)
+            # Compute solver constraints (lo/hi) on the FIT-RANGE before launching bootstrap,
+            # so refits respect the same bounds as the main fit.
 
             def _predict_fit_local(
                 th,
@@ -4300,6 +4303,7 @@ class PeakFitApp:
                     total = total + _base
                 return total
 
+            # Robust, fit-window predictor (shape-checked)
             predict_fit = _predict_fit_local
             try:
                 _probe = np.asarray(predict_fit(np.asarray(theta, float)), float)
@@ -4307,6 +4311,19 @@ class PeakFitApp:
                     predict_fit = _predict_fit_local
             except Exception:
                 predict_fit = _predict_fit_local
+            # Build (lo, hi) bounds for the refit path on the SAME x-fit window:
+            # Prefer the solver's packed bounds so bootstrap refits mirror the main fit exactly.
+            try:
+                from fit.bounds import pack_theta_bounds as _pack_theta_bounds
+                _hdr, (lo, hi) = _pack_theta_bounds(
+                    self.peaks,
+                    np.asarray(x_fit, float),
+                    dict(self.cfg.get("solver_options", {}) or {}),
+                )
+            except Exception:
+                # Fall back to the heuristic arrays computed above if packing isn't available
+                lo = np.asarray(lo, float)
+                hi = np.asarray(hi, float)
 
             boot_solver = self._select_bootstrap_solver()
 
@@ -4322,16 +4339,18 @@ class PeakFitApp:
                     getattr(self, "share_eta_var", None) and self.share_eta_var.get()
                 ),
                 "residual_fn": (lambda th: resid_fn(th)),
+                # The uncertainty core expects "predict_full" as the name, but we intentionally
+                # provide a FIT-RANGE sized predictor here (it must match len(x_all)).
                 "predict_full": predict_fit,
                 "x_all": x_fit,
                 "y_all": y_fit,
                 "unc_workers": workers,
+                "bounds": (lo, hi),
                 "unc_band_workers": band_workers,
                 "unc_use_gpu": bool(getattr(self, "use_gpu_var", None) and self.use_gpu_var.get()),
                 "solver": boot_solver,
                 "strict_refit": True,
                 "bootstrap_jitter": jitter_frac,
-                "bounds": (lo, hi),
                 "locked_mask": locked_mask,
                 "theta0": np.asarray(theta, float),
             }
@@ -4363,12 +4382,12 @@ class PeakFitApp:
                     theta=theta,
                     residual=r0,
                     jacobian=J,
-                    predict_full=predict_fit,
+                    predict_full=predict_fit,     # fit-range sized, shape-checked
                     x_all=x_fit,
                     y_all=y_fit,
                     fit_ctx=fit_ctx,
+                    bounds=(lo, hi),              # mirror constraints at the top level too
                     locked_mask=locked_mask,
-                    bounds=(lo, hi),
                     return_band=True,
                     alpha=alpha,
                     center_residuals=center_res,

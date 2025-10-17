@@ -96,8 +96,10 @@ def _validate_vector_length(name: str, arr: np.ndarray, n: int) -> None:
     if arr is None:
         return
     if np.asarray(arr).size != int(n):
+        # Be explicit about the contract: predictors must live on the fit window (len(x_all) == n).
         raise ValueError(
-            f"{name} produced vector of wrong size (got {np.asarray(arr).size}, want {n})"
+            f"{name} produced vector of wrong size (got {np.asarray(arr).size}, want {n}); "
+            f"provide a predictor defined on the fit window (len(x_all) == {n})."
         )
 
 try:

@@ -118,17 +118,14 @@ def run_fit_consistent(
     x = np.asarray(x, float)
     y = np.asarray(y, float)
 
-    # --- Robustness: ensure fit_mask matches x shape to avoid accidental range expansion ---
-    try:
-        _x_guard = np.asarray(x, float)
-    except Exception:
-        _x_guard = None
-    if _x_guard is not None and fit_mask is not None:
-        _fit_mask_guard = np.asarray(fit_mask, bool)
-        if _fit_mask_guard.shape != _x_guard.shape:
+    # Guard: fit_mask must match x shape to avoid accidental range expansion
+    if fit_mask is not None:
+        mask_arr = np.asarray(fit_mask, bool)
+        if mask_arr.shape != x.shape:
             raise ValueError(
-                f"fit_mask shape {_fit_mask_guard.shape} must match x shape {_x_guard.shape}"
+                f"fit_mask shape {mask_arr.shape} must match x shape {x.shape}"
             )
+        fit_mask = mask_arr
 
     mask = np.asarray(fit_mask, bool)
     if mask.shape != x.shape:
