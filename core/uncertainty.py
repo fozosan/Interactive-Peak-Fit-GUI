@@ -716,7 +716,14 @@ def bootstrap_ci(
             pass
     fit = fit_ctx
     # Pull constraints from fit_ctx (batch/gui parity)
-    bounds = fit.get("bounds", bounds)
+    bounds_arg = bounds
+    bounds_from_ctx = fit.get("bounds", None)
+    if bounds_arg is None and bounds_from_ctx is not None:
+        bounds = bounds_from_ctx
+    else:
+        bounds = bounds_arg
+    if bounds is not None:
+        fit["bounds"] = bounds
     locked_mask = fit.get("locked_mask", locked_mask)
     strict_refit = bool(fit.get("strict_refit", False))
     progress_cb = fit.get("progress_cb")
@@ -1215,11 +1222,40 @@ def bootstrap_ci(
         return None
 
     # Free-parameter mask for optional linear fallback
-    P = theta.size
+    P = int(np.asarray(theta, float).size)
 
     locked_arr = _canon_locked_mask(locked_mask, P)
     locked_mask = locked_arr if locked_arr is not None else None
     free_mask = np.ones(P, bool) if locked_arr is None else ~locked_arr
+
+    # ------------------------------------------------------------------
+    # Resolve parameter bounds into ALWAYS-defined arrays `lo` / `hi`.
+    # Prefer the explicit function arg `bounds_arg`; else `fit_ctx['bounds']`;
+    # else default to ±inf of length P.
+    # ------------------------------------------------------------------
+    bounds_source = "default"
+    bounds_local = bounds
+    if bounds_arg is not None:
+        bounds_local = bounds_arg
+        bounds_source = "arg"
+    elif bounds_from_ctx is not None:
+        bounds_local = bounds_from_ctx
+        bounds_source = "fit_ctx"
+
+    lo = hi = None
+    if bounds_local is not None:
+        try:
+            lo, hi = bounds_local
+        except Exception:
+            lo, hi = None, None
+
+    lo = np.full(P, -np.inf, dtype=float) if lo is None else np.asarray(lo, float).reshape(-1)
+    hi = np.full(P,  np.inf, dtype=float) if hi is None else np.asarray(hi, float).reshape(-1)
+    if lo.size != P:
+        lo = np.full(P, -np.inf, dtype=float)
+    if hi.size != P:
+        hi = np.full(P,  np.inf, dtype=float)
+    # ------------------------------------------------------------------
 
     Jf = J[:, free_mask] if (J.ndim == 2) else None
     # Disable linear fallback when parameters are tied (LMFIT) or globally disabled
@@ -1385,6 +1421,9 @@ def bootstrap_ci(
             "n_linear_fallback": int(linear_fallbacks),
             "linear_lambda": float(linear_lambda) if linear_lambda is not None else None,
             "seed": seed,
+            "bounds_source": bounds_source,
+            "bounds_len": int(P),
+            "bounds_any_finite": bool(np.any(np.isfinite(lo)) or np.any(np.isfinite(hi))),
             "pct_at_bounds": None,
             "pct_at_bounds_units": "percent",
             "aborted": bool(aborted or ((abort_evt.is_set()) if abort_evt is not None else False)),
@@ -1409,13 +1448,14 @@ def bootstrap_ci(
     stats = {names[i]: {"est": float(mean[i]), "sd": float(sd[i]), "p2.5": float(qlo[i]), "p97.5": float(qhi[i])}
              for i in range(P)}
 
-    # % of successful thetas hitting bounds (useful for diagnosing degeneracy)
+    # % of successful thetas hitting bounds (diagnose degeneracy)
     pct_at_bounds = 0.0
-    if bounds is not None:
-        lo_b, hi_b = bounds
-        lo_hit = np.any(np.isclose(T, lo_b, rtol=0, atol=0), axis=1) if (lo_b is not None) else False
-        hi_hit = np.any(np.isclose(T, hi_b, rtol=0, atol=0), axis=1) if (hi_b is not None) else False
+    try:
+        lo_hit = np.any(np.isclose(T, lo, rtol=0, atol=0), axis=1)
+        hi_hit = np.any(np.isclose(T, hi, rtol=0, atol=0), axis=1)
         pct_at_bounds = float(100.0 * np.mean(lo_hit | hi_hit))
+    except Exception:
+        pct_at_bounds = 0.0
     # pct_at_bounds is expressed in percent (0-100)
 
     # Optional percentile band (subsample to control memory)
@@ -1558,8 +1598,9 @@ def bootstrap_ci(
                         x_all is None
                         or (n is not None and _len(x_all) != n)
                     )
-                    x_out = np.arange(int(n or 0)) if need_default_x else np.asarray(x_all)
-                    band = (x_out, band_lo, band_hi)
+                    if need_default_x:
+                        x_all = np.arange(int(n or 0))
+                    band = (x_all, band_lo, band_hi)
                     band_gated = False
                     band_skip_reason = None
                     band_reason = None
@@ -1584,6 +1625,9 @@ def bootstrap_ci(
         "n_linear_fallback": int(linear_fallbacks),
         "linear_lambda": float(linear_lambda) if linear_lambda is not None else None,
         "seed": seed,
+        "bounds_source": bounds_source,
+        "bounds_len": int(P),
+        "bounds_any_finite": bool(np.any(np.isfinite(lo)) or np.any(np.isfinite(hi))),
         "pct_at_bounds": pct_at_bounds,
         "pct_at_bounds_units": "percent",
         "aborted": bool(aborted or ((abort_evt.is_set()) if abort_evt is not None else False)),
