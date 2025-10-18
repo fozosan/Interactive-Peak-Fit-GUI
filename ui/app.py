@@ -4985,6 +4985,7 @@ class PeakFitApp:
                         predict_full=predict_fit,
                         x_all=x_fit,
                         y_all=y_fit,
+                        bounds=(lo, hi),
                         locked_mask=locked_mask,
                         fit_ctx=fit_ctx,
                         n_boot=n_boot,
