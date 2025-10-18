@@ -625,8 +625,8 @@ def asymptotic_ci(
     G = finite_diff_jacobian(ymodel_fn, theta)
     var = np.einsum("ij,jk,ik->i", G, cov, G)
     band_std = np.sqrt(np.maximum(var, 0.0))
-    lo = y0 - z * band_std
-    hi = y0 + z * band_std
+    band_lo = y0 - z * band_std
+    band_hi = y0 + z * band_std
     x = np.arange(y0.size)
 
     names = [f"p{i}" for i in range(theta.size)]
@@ -655,7 +655,7 @@ def asymptotic_ci(
 
     _add_percentile_aliases_inplace(stats)
 
-    band = (x, lo, hi)
+    band = (x, band_lo, band_hi)
     diag: Dict[str, object] = {"alpha": alpha, "param_order": names}
     label = "Asymptotic (JᵀJ)"
     return UncertaintyResult(
@@ -1423,6 +1423,9 @@ def bootstrap_ci(
     band_skip_reason = None
     band_gated = False
     diagnostics: Dict[str, object] = {}
+    # Ensure band arrays are always defined in function scope (avoid UnboundLocalError)
+    band_lo = None
+    band_hi = None
     if return_band:
         if predict_full is None or len(T_list) < BOOT_BAND_MIN_SAMPLES:
             band_reason = "missing model or insufficient samples"
@@ -1491,23 +1494,23 @@ def bootstrap_ci(
                             Y = cp.stack([y if isinstance(y, cp.ndarray) else cp.asarray(y) for y in Y_list], axis=0)
                         else:
                             Y = cp.asarray(np.stack(Y_list, axis=0))
-                        lo = cp.quantile(Y, float(alpha/2), axis=0)
-                        hi = cp.quantile(Y, float(1 - alpha/2), axis=0)
-                        lo = cp.asnumpy(lo); hi = cp.asnumpy(hi)
+                        band_lo = cp.quantile(Y, float(alpha/2), axis=0)
+                        band_hi = cp.quantile(Y, float(1 - alpha/2), axis=0)
+                        band_lo = cp.asnumpy(band_lo); band_hi = cp.asnumpy(band_hi)
                         band_backend = "cupy"
                     else:
                         Y = np.stack(Y_list, axis=0)
-                        lo = np.quantile(Y, alpha/2, axis=0)
-                        hi = np.quantile(Y, 1 - alpha/2, axis=0)
+                        band_lo = np.quantile(Y, alpha/2, axis=0)
+                        band_hi = np.quantile(Y, 1 - alpha/2, axis=0)
                 except Exception:
                     if not Y_list:
                         raise RuntimeError("bootstrap_band_empty")
                     Y = np.stack(Y_list, axis=0)
-                    lo = np.quantile(Y, alpha/2, axis=0)
-                    hi = np.quantile(Y, 1 - alpha/2, axis=0)
+                    band_lo = np.quantile(Y, alpha/2, axis=0)
+                    band_hi = np.quantile(Y, 1 - alpha/2, axis=0)
                     band_backend = "numpy"
 
-                band = (x_all, lo, hi)
+                band = (x_all, band_lo, band_hi)
                 band_gated = False
                 band_skip_reason = None
                 diagnostics["band_backend"] = band_backend
