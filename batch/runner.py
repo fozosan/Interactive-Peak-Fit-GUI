@@ -23,9 +23,10 @@ from contextlib import nullcontext
 if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safeguard
     os.environ.setdefault("MPLBACKEND", "Agg")
 
-from core import data_io, models, peaks, signals, fit_api
-from core.residuals import build_residual
-from core.uncertainty import finite_diff_jacobian, bootstrap_ci, UncertaintyResult
+import core.data_io as data_io
+from core import models, peaks, signals, fit_api
+from core.residuals import build_residual, finite_diff_jacobian
+from core.uncertainty import bootstrap_ci, UncertaintyResult
 from core.uncertainty_router import route_uncertainty
 from infra import performance
 
@@ -217,13 +218,35 @@ def run_batch(
         base_name = Path(peak_output_cfg).stem.replace("_fit", "")
     peak_output = out_dir / f"{base_name}_fit.csv"
     export_unc_wide = bool(config.get("export_unc_wide", False))
-    band_pref_bootstrap = bool(config.get("ui_band_pref_bootstrap", True))
+    export_cfg = dict(config.get("export", {}) or {})
+    unc_section = dict(config.get("uncertainty", {}) or {})
+
+    def _method_key(val) -> str:
+        if isinstance(val, dict):
+            val = val.get("method", "")
+        if val is None:
+            return ""
+        return str(val).strip().lower()
+
+    unc_method_arg = _method_key(unc_method)
+    want_unc_config = bool(export_cfg.get("include_uncertainty", False))
+    method_requested = bool(unc_method_arg)
+    if compute_uncertainty is None:
+        compute_uncertainty_flag = bool(want_unc_config or method_requested)
+    else:
+        compute_uncertainty_flag = bool(compute_uncertainty)
+    need_band = bool(export_cfg.get("include_band", False)) or bool(
+        unc_section.get("return_band", False)
+    )
+    band_pref_bootstrap = bool(config.get("ui_band_pref_bootstrap", True)) or need_band
+    compute_uncertainty = compute_uncertainty_flag
+    expected_unc = want_unc_config or (compute_uncertainty_flag and method_requested)
     # Choose uncertainty method: explicit arg > config aliases > default
     unc_choice = (
-        unc_method
-        or config.get("unc_method")
-        or config.get("uncertainty_method")
-        or config.get("uncertainty")
+        unc_method_arg
+        or _method_key(config.get("unc_method"))
+        or _method_key(config.get("uncertainty_method"))
+        or _method_key(unc_section)
         or "asymptotic"
     )
     unc_method_canon = data_io.canonical_unc_label(unc_choice)
@@ -445,8 +468,25 @@ def run_batch(
         if res["fit_ok"] and fitted and compute_uncertainty:
             try:
                 theta_hat = np.asarray(res["theta"], float)
-                x_fit = np.asarray(res.get("x_fit") or res.get("x"), float)
-                y_fit = np.asarray(res.get("y_fit") or res.get("y"), float)
+                x_all = res.get("x")
+                if x_all is None:
+                    x_all = x
+                x_all = np.asarray(x_all, float)
+
+                y_all = res.get("y")
+                if y_all is None:
+                    y_all = y
+                y_all = np.asarray(y_all, float)
+
+                x_fit = res.get("x_fit")
+                if x_fit is None:
+                    x_fit = x_all
+                x_fit = np.asarray(x_fit, float)
+
+                y_fit = res.get("y_fit")
+                if y_fit is None:
+                    y_fit = y_all
+                y_fit = np.asarray(y_fit, float)
                 peaks_obj = (
                     res.get("peaks_out")
                     or res.get("peaks")
@@ -477,7 +517,7 @@ def run_batch(
                 residual_vec = np.asarray(residual_vec, float)
 
                 # Predictor: prefer solver-provided fit-window function; otherwise build locally on x_fit.
-                model_eval = res.get("predict_fit")
+                predict_fit_fn = res.get("predict_fit")
 
                 def _predict_fit_local(
                     th,
@@ -497,17 +537,53 @@ def run_batch(
                         total = total + _base
                     return total
 
-                if not callable(model_eval):
-                    model_eval = _predict_fit_local
+                if not callable(predict_fit_fn):
+                    predict_fit_fn = _predict_fit_local
                 else:
                     try:
                         _probe = np.asarray(
-                            model_eval(np.asarray(theta_hat, float)), float
+                            predict_fit_fn(np.asarray(theta_hat, float)), float
                         ).reshape(-1)
                         if int(_probe.size) != int(x_fit.size):
-                            model_eval = _predict_fit_local
+                            predict_fit_fn = _predict_fit_local
                     except Exception:
-                        model_eval = _predict_fit_local
+                        predict_fit_fn = _predict_fit_local
+
+                predict_full_fn = res.get("predict_full")
+                if callable(predict_full_fn):
+                    try:
+                        _probe_full = np.asarray(
+                            predict_full_fn(np.asarray(theta_hat, float)), float
+                        ).reshape(-1)
+                        if int(_probe_full.size) != int(x_all.size):
+                            raise ValueError("predict_full size mismatch")
+                    except Exception:
+                        predict_full_fn = None
+
+                if not callable(predict_full_fn):
+                    base_all = np.asarray(base_fit, float) if (
+                        add_mode and base_fit is not None
+                    ) else None
+
+                    def _predict_full_bootstrap(
+                        th,
+                        *,
+                        _x=x_all,
+                        _peaks=peaks_obj,
+                        _base=base_all,
+                        _add=add_mode,
+                    ):
+                        total = np.zeros_like(_x, float)
+                        t = np.asarray(th, float).ravel()
+                        for i in range(len(_peaks)):
+                            j = 4 * i
+                            c, h, fw, eta = t[j : j + 4]
+                            total += models.pseudo_voigt(_x, h, c, fw, eta)
+                        if _add and _base is not None:
+                            total = total + _base
+                        return total
+
+                    predict_full_fn = _predict_full_bootstrap
 
                 fit_ctx = dict(res.get("fit_ctx") or {})
                 solver_choice = (
@@ -559,9 +635,10 @@ def run_batch(
                 fit_ctx.update(
                     {
                         "residual_fn": residual_fn,
-                        "predict_full": model_eval,
-                        "x_all": x_fit,
-                        "y_all": y_fit,
+                        "predict_full": predict_full_fn,
+                        "predict_fit": predict_fit_fn,
+                        "x_all": x_all,
+                        "y_all": y_all,
                         "baseline": base_fit,
                         "mode": mode,
                         "peaks": peaks_obj,
@@ -762,6 +839,7 @@ def run_batch(
 
                     jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
                     jac_mat = np.atleast_2d(np.asarray(jac_mat, float))
+                    jac = jac_mat
 
                     fit_ctx["abort_event"] = abort_event
                     strategy = str(config.get("perf_parallel_strategy", "outer"))
@@ -792,14 +870,14 @@ def run_batch(
                             unc_res = bootstrap_ci(
                                 theta=theta_hat,
                                 residual=residual_vec,
-                                jacobian=jac_mat,
-                                predict_full=model_eval,  # fit-range sized
-                                x_all=x_fit,
-                                y_all=y_fit,
+                                jacobian=jac,
+                                predict_full=predict_full_fn,
+                                x_all=x_all,
+                                y_all=y_all,
                                 fit_ctx=fit_ctx_local,
-                                bounds=top_bounds if top_bounds is not None else bounds,
+                                bounds=top_bounds if top_bounds is not None else bounds_exact,
                                 param_names=res.get("param_names"),
-                                locked_mask=top_locked if top_locked is not None else locked_mask,
+                                locked_mask=top_locked if top_locked is not None else locked_exact,
                                 n_boot=n_boot,
                                 seed=seed_val,
                                 workers=workers_arg,
@@ -888,10 +966,10 @@ def run_batch(
                             theta_hat=theta_hat,
                             residual_fn=residual_fn,
                             jacobian=jac,
-                            model_eval=model_eval,
+                            model_eval=predict_fit_fn,
                             fit_ctx=fit_ctx,
-                            x_all=x_fit,
-                            y_all=y_fit,
+                            x_all=x_all,
+                            y_all=y_all,
                             workers=(workers_eff if workers_eff > 0 else None),
                             seed=seed_val,
                             n_boot=bootstrap_n,
@@ -1018,6 +1096,13 @@ def run_batch(
                 unc_rows.append(row)
             if log:
                 log(f"{Path(path).name}: uncertainty={method_lbl}")
+
+        if expected_unc and unc_res is None:
+            msg = "Batch export requested uncertainty but none was computed"
+            logger.error(msg)
+            if log:
+                log(f"{Path(path).name}: {msg}")
+            raise RuntimeError(msg)
 
         trace_path = None
         if save_traces:

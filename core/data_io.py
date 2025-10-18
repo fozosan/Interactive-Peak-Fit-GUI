@@ -6,7 +6,8 @@ artifacts. Implementations follow the Peakfit 3.x blueprint.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, Mapping
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from collections.abc import Mapping
 
 import csv
 import io
@@ -309,6 +310,43 @@ def derive_export_paths(user_path: str) -> dict:
         "unc_csv": base.with_name(base.name + "_uncertainty.csv"),
         "unc_band": base.with_name(base.name + "_uncertainty_band.csv"),
     }
+
+
+def build_export_artifacts(
+    *_,
+    meta: Optional[Dict[str, Any]] = None,
+    export_tables: Optional[Dict[str, Any]] = None,
+    export_arrays: Optional[Dict[str, Any]] = None,
+    unc_result: UncertaintyResult | None = None,
+    **__,
+) -> Dict[str, Dict[str, Any]]:
+    """Return export payload dictionaries, enriching them with uncertainty data."""
+
+    meta_out: Dict[str, Any] = {} if meta is None else dict(meta)
+    tables_out: Dict[str, Any] = {} if export_tables is None else dict(export_tables)
+    arrays_out: Dict[str, Any] = {} if export_arrays is None else dict(export_arrays)
+
+    if unc_result is not None:
+        diag = unc_result.diagnostics or {}
+        meta_out["unc_method"] = unc_result.method
+        meta_out["unc_label"] = unc_result.label
+        alpha_val = diag.get("alpha") if isinstance(diag, Mapping) else None
+        try:
+            meta_out["unc_alpha"] = float(alpha_val) if alpha_val is not None else None
+        except Exception:
+            meta_out["unc_alpha"] = None
+
+        tables_out["unc_stats"] = _unc_stats_to_table(unc_result.stats)
+
+        if unc_result.band is not None:
+            bx, blo, bhi = unc_result.band
+            arrays_out["unc_band_x"] = np.asarray(bx)
+            arrays_out["unc_band_lo"] = np.asarray(blo)
+            arrays_out["unc_band_hi"] = np.asarray(bhi)
+            if isinstance(diag, Mapping):
+                meta_out["unc_band_backend"] = diag.get("band_backend")
+
+    return {"meta": meta_out, "tables": tables_out, "arrays": arrays_out}
 
 
 def peaks_to_dicts(peaks: Iterable[Any]) -> List[Dict[str, Any]]:
@@ -1337,6 +1375,94 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
             out["label"] = "Asymptotic (JᵀJ)"
 
     return out
+
+
+def _unc_stats_to_table(stats: Any) -> list[dict[str, Any]]:
+    """Normalize ``UncertaintyResult.stats`` into a flat table for exports."""
+
+    table: list[dict[str, Any]] = []
+    if stats is None:
+        return table
+
+    norm_rows, _ = _normalize_param_stats(stats)
+    if norm_rows:
+        for idx, rec in enumerate(norm_rows, start=1):
+            for name in ("center", "height", "fwhm", "eta"):
+                est = rec.get(f"{name}_est")
+                sd = rec.get(f"{name}_sd")
+                lo = rec.get(f"{name}_p2_5")
+                hi = rec.get(f"{name}_p97_5")
+                if est is None and sd is None and lo is None and hi is None:
+                    continue
+                table.append(
+                    {
+                        "peak": idx,
+                        "name": name,
+                        "est": est,
+                        "sd": sd,
+                        "p2.5": lo,
+                        "p97.5": hi,
+                        "p2_5": lo,
+                        "p97_5": hi,
+                    }
+                )
+        return table
+
+    stats_map = _as_mapping(stats)
+    if not stats_map:
+        return table
+
+    def _as_list(val: Any) -> list[Any]:
+        if val is None:
+            return []
+        if isinstance(val, (list, tuple)):
+            return list(val)
+        try:
+            arr = np.asarray(val)
+        except Exception:
+            return [val]
+        if arr.ndim == 0:
+            return [arr.item()]
+        return arr.reshape(-1).tolist()
+
+    for name, blk in stats_map.items():
+        blk_map = _as_mapping(blk)
+        if not blk_map:
+            continue
+        est_list = _as_list(blk_map.get("est"))
+        sd_list = _as_list(blk_map.get("sd") or blk_map.get("stderr") or blk_map.get("sigma"))
+        lo_list = _as_list(
+            blk_map.get("p2_5")
+            or blk_map.get("p2.5")
+            or blk_map.get("ci_lo")
+        )
+        hi_list = _as_list(
+            blk_map.get("p97_5")
+            or blk_map.get("p97.5")
+            or blk_map.get("ci_hi")
+        )
+        n = max(1, len(est_list), len(sd_list), len(lo_list), len(hi_list))
+
+        def pick(seq: list[Any], i: int) -> Any:
+            return seq[i] if i < len(seq) else None
+
+        for idx in range(n):
+            lo_val = pick(lo_list, idx)
+            hi_val = pick(hi_list, idx)
+            table.append(
+                {
+                    "peak": idx + 1 if n > 1 else 1,
+                    "name": name,
+                    "est": pick(est_list, idx),
+                    "sd": pick(sd_list, idx),
+                    "p2.5": lo_val,
+                    "p97.5": hi_val,
+                    "p2_5": lo_val,
+                    "p97_5": hi_val,
+                }
+            )
+
+    return table
 
 
 def _iter_param_rows(

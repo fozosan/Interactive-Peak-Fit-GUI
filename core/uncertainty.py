@@ -8,7 +8,8 @@ rather than ultimate statistical rigour.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union, List
+from typing import Any, Callable, Dict, Optional, Tuple, Union, List
+from typing import Sequence
 
 import logging
 import warnings
@@ -1426,6 +1427,35 @@ def bootstrap_ci(
     # Ensure band arrays are always defined in function scope (avoid UnboundLocalError)
     band_lo = None
     band_hi = None
+
+    # --- Safe defaults for band workers & perf diag ---
+    try:
+        _existing_bw_effective = band_workers_effective  # type: ignore[name-defined]
+    except NameError:
+        _existing_bw_effective = None
+    if not _existing_bw_effective:
+        try:
+            bw_from_ctx = int((fit_ctx or {}).get("unc_band_workers", 0))
+        except Exception:
+            bw_from_ctx = 0
+        try:
+            workers_int = int(workers or 0)
+        except Exception:
+            workers_int = 0
+        band_workers_effective = bw_from_ctx or workers_int
+    else:
+        band_workers_effective = _existing_bw_effective
+
+    try:
+        _ = diag_perf  # type: ignore[name-defined]
+    except NameError:
+        diag_perf = {}
+
+    # Ensure the threadpool worker count placeholder exists
+    try:
+        band_workers  # type: ignore[name-defined]
+    except NameError:
+        band_workers = int(band_workers_effective or 0)
     if return_band:
         if predict_full is None or len(T_list) < BOOT_BAND_MIN_SAMPLES:
             band_reason = "missing model or insufficient samples"
@@ -1449,7 +1479,7 @@ def bootstrap_ci(
             if progress_cb:
                 try:
                     progress_cb(
-                        f"Bootstrap band: using {n_used} resamples, workers={band_workers_effective or 0}"
+                        f"Bootstrap band: using {n_used} resamples, workers={band_workers_effective}"
                     )
                 except Exception:
                     pass
@@ -1510,6 +1540,10 @@ def bootstrap_ci(
                     band_hi = np.quantile(Y, 1 - alpha/2, axis=0)
                     band_backend = "numpy"
 
+                # Ensure x_all is defined and matches the prediction length
+                if x_all is None:
+                    _n = int(band_lo.shape[0])
+                    x_all = np.arange(_n)
                 band = (x_all, band_lo, band_hi)
                 band_gated = False
                 band_skip_reason = None
