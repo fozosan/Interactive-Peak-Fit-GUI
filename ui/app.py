@@ -267,6 +267,14 @@ except Exception:  # pragma: no cover - optional dependency may be missing
     lmfit_backend = None
 
 
+# ---------- Debug helpers (stateful, low-noise) ----------
+def _kv(d: dict) -> str:
+    try:
+        return " ".join(f"{k}={v}" for k, v in d.items())
+    except Exception:
+        return str(d)
+
+
 def _safe_bool(v, default=False):
     try:
         return bool(v)
@@ -957,6 +965,7 @@ class PeakFitApp:
         try:
             self.cfg[key] = value
             save_config(self.cfg)
+            self._debug_snapshot("config.saved", key=key, value=value)
         except Exception:
             pass
 
@@ -1081,6 +1090,13 @@ class PeakFitApp:
         self.cfg.setdefault("bayes_diag_ess_min", 200.0)
         self.cfg.setdefault("bayes_diag_rhat_max", 1.05)
         self.cfg.setdefault("bayes_diag_mcse_mean", float("inf"))
+        # Debug/log defaults so debug calls are safe before UI builds
+        self._log_console = None
+        self._log_visible = False
+        self._log_frame = None
+        self._log_buffer: list[str] = []
+        self._auto_show_log_on_warn = True
+        self._auto_show_log_on_error = True
         if "bootstrap_seed" in self.cfg:
             try:
                 self.log_threadsafe("Note: 'bootstrap_seed' is deprecated; use Performance → Seed.")
@@ -1232,6 +1248,10 @@ class PeakFitApp:
         self.perf_blas_threads = tk.IntVar(value=int(self.cfg.get("perf_blas_threads", 0)))
         self.debug_mode_var.trace_add("write", lambda *_: self._on_debug_toggle())
 
+        # Debug logging convenience
+        self._debug_prefix = "[DEBUG]"
+        self._debug_snapshot("config.loaded")
+
         unc_section_cfg = dict(self.cfg.get("uncertainty") or {})
         return_band_pref = bool(
             unc_section_cfg.get(
@@ -1326,6 +1346,88 @@ class PeakFitApp:
         self._unc_job_id = 0
         self._unc_running = False
         self._last_unc_log = None
+
+        self._debug_snapshot("init")
+
+    # --- Debug API ----------------------------------------------------------
+    def _is_debug(self) -> bool:
+        try:
+            return bool(self.debug_mode_var.get())
+        except Exception:
+            return bool(getattr(self, "cfg", {}).get("log_debug_mode", False))
+
+    def _dbg(self, msg: str) -> None:
+        if not self._is_debug():
+            return
+        try:
+            self.log(f"{self._debug_prefix} {msg}")
+        except Exception:
+            pass
+
+    def _debug_snapshot(self, where: str, **extra) -> None:
+        if not self._is_debug():
+            return
+        try:
+            label = str(self.unc_method.get()) if hasattr(self, "unc_method") else ""
+        except Exception:
+            label = ""
+        try:
+            key = method_display_to_key(label)
+        except Exception:
+            key = str(label).strip().lower()
+        try:
+            show_band = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else False
+        except Exception:
+            show_band = False
+        try:
+            seed_all = bool(self.perf_seed_all.get()) if hasattr(self, "perf_seed_all") else False
+        except Exception:
+            seed_all = False
+        try:
+            seed_val = self._perf_seed_value() if seed_all and hasattr(self, "_perf_seed_value") else None
+        except Exception:
+            seed_val = None
+        try:
+            workers_fit = self._resolve_fit_workers()
+        except Exception:
+            workers_fit = None
+        try:
+            workers_unc = self._resolve_unc_workers()
+        except Exception:
+            workers_unc = None
+        state = {
+            "file": getattr(getattr(self, "current_file", None), "name", "—"),
+            "peaks": len(getattr(self, "peaks", []) or []),
+            "unc_label": label,
+            "unc_key": key,
+            "solver": str(self.solver_choice.get()) if hasattr(self, "solver_choice") else "",
+            "show_band": show_band,
+            "seed_all": seed_all,
+            "seed": seed_val,
+            "workers_fit": workers_fit,
+            "workers_unc": workers_unc,
+        }
+        state.update(extra or {})
+        self._dbg(f"{where}: {_kv(state)}")
+
+    def _debug_uncertainty_import(self) -> None:
+        if not self._is_debug():
+            return
+        try:
+            import inspect
+            import core.uncertainty as _unc
+
+            co = getattr(_unc.bootstrap_ci, "__code__", None)
+            path = getattr(co, "co_filename", None)
+            try:
+                src = inspect.getsource(_unc.bootstrap_ci)
+            except Exception:
+                src = ""
+            self._dbg(
+                f"uncertainty.import path={path} band_lo_present={'band_lo' in src}"
+            )
+        except Exception as exc:
+            self._dbg(f"uncertainty.import failed: {exc!r}")
 
     # ----- UI -----
     def _build_ui(self):
@@ -2086,9 +2188,12 @@ class PeakFitApp:
         self._log_console = None
         self._log_visible = False
         self._log_frame = None
-        self._log_buffer: list[str] = []
-        self._auto_show_log_on_warn = True
-        self._auto_show_log_on_error = True
+        if not hasattr(self, "_log_buffer"):
+            self._log_buffer = []
+        if not hasattr(self, "_auto_show_log_on_warn"):
+            self._auto_show_log_on_warn = True
+        if not hasattr(self, "_auto_show_log_on_error"):
+            self._auto_show_log_on_error = True
 
         # Initial peak list height
         self.refresh_tree()
@@ -2208,10 +2313,13 @@ class PeakFitApp:
         if current.startswith("Bootstrap"):
             self.unc_method.set(boot_label)
         self._on_uncertainty_method_changed()
+        self._debug_snapshot("_update_unc_widgets")
 
     @log_action
     def _on_unc_method_change(self, _e=None):
         label = self.unc_method.get()
+        self._dbg(f"_on_unc_method_change: label='{label}'")
+        self._debug_snapshot("_on_unc_method_change(pre)")
         method_key = method_display_to_key(label)
         self.cfg["unc_method"] = method_key
         try:
@@ -2223,6 +2331,7 @@ class PeakFitApp:
         save_config(self.cfg)
         self._update_unc_widgets()
         self._on_uncertainty_method_changed()
+        self._debug_snapshot("_on_unc_method_change(post)")
 
     def _get_int(self, name: str, default: int) -> int:
         try:
@@ -2527,6 +2636,7 @@ class PeakFitApp:
 
     def _toggle_ci_band(self, *_):
         val = bool(self.show_ci_band_var.get())
+        self._dbg(f"_toggle_ci_band: value={val}")
         self.cfg["ui_show_uncertainty_band"] = val
         try:
             unc_section = self.cfg.setdefault("uncertainty", {})
@@ -2535,6 +2645,7 @@ class PeakFitApp:
             pass
         save_config(self.cfg)
         self.refresh_plot()
+        self._debug_snapshot("_toggle_ci_band", show_band=val)
 
     def _set_ci_toggle_state(self, enabled: bool):
         try:
@@ -2719,6 +2830,7 @@ class PeakFitApp:
                 save_config(self.cfg)
             except Exception:
                 pass
+            self._debug_snapshot("_on_uncertainty_method_changed", method_key=method_key)
         finally:
             self._unc_change_busy = False
 
@@ -4655,6 +4767,8 @@ class PeakFitApp:
         self.dlog(
             f"[DEBUG] [perf] pre-run_uncertainty threadpools={threadpool_info()}"
         )
+        self._debug_uncertainty_import()
+        self._debug_snapshot("run_uncertainty(start)")
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Uncertainty", "Load data and perform a fit first.")
             return
@@ -4804,6 +4918,20 @@ class PeakFitApp:
                     predict_fit = _predict_fit_local
 
                 boot_solver = self._select_bootstrap_solver()
+                show_band = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else True
+                self._dbg(
+                    "Bootstrap plan: "
+                    + _kv(
+                        {
+                            "solver": boot_solver,
+                            "n_boot": n_boot,
+                            "seed": seed_val,
+                            "workers": int(workers or 0),
+                            "band_workers": int(band_workers or 0),
+                            "return_band": show_band,
+                        }
+                    )
+                )
                 fit_ctx = {
                     "x": x_fit,
                     "y": y_fit,
@@ -4862,7 +4990,7 @@ class PeakFitApp:
                         n_boot=n_boot,
                         seed=seed_val,
                         workers=workers,
-                        return_band=True,
+                        return_band=show_band,
                         alpha=alpha,
                         center_residuals=bool(self.center_resid_var.get()),
                     )
@@ -4884,6 +5012,24 @@ class PeakFitApp:
                             )
                 except Exception:
                     pass
+                self._dbg(
+                    "Bayesian plan: "
+                    + _kv(
+                        {
+                            "solver": self.solver_choice.get(),
+                            "workers": int(workers or 0),
+                            "band_workers": int(band_workers or 0),
+                            "seed_all": bool(self.perf_seed_all.get()),
+                            "seed": self._perf_seed_value()
+                            if bool(self.perf_seed_all.get())
+                            else None,
+                            "return_band": bool(self.show_ci_band_var.get()),
+                            "band_enabled": bool(self.bayes_band_enabled_var.get())
+                            if hasattr(self, "bayes_band_enabled_var")
+                            else None,
+                        }
+                    )
+                )
                 def predict_full(th):
                     total = np.zeros_like(x_fit, float)
                     for i in range(len(self.peaks)):
@@ -5484,6 +5630,11 @@ class PeakFitApp:
                     unc_rows.extend(_dio.iter_uncertainty_rows(in_path, unc_norm))
 
                 self.status_info(f"[Batch] Uncertainty: {label} for {in_path.name}.")
+                self._debug_snapshot(
+                    "batch._export_uncertainty",
+                    label=label,
+                    show_band=bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else None,
+                )
             except Exception as e:
                 self.status_warn(f"[Batch] Uncertainty skipped for {in_path.name} ({e.__class__.__name__}).")
         else:
@@ -5510,6 +5661,12 @@ class PeakFitApp:
         files = sorted([p for p in in_dir.iterdir() if p.suffix.lower() in {".csv", ".txt", ".dat"}])
 
         all_rows: List[dict] = []
+        self._debug_snapshot(
+            "batch.start",
+            in_dir=str(in_dir),
+            out_dir=str(out_dir),
+            n_files=len(files),
+        )
         for p in files:
             if getattr(self, "_abort_evt", None) and self._abort_evt.is_set():
                 self.status_warn("[Batch] Aborted by user.")
@@ -5520,6 +5677,7 @@ class PeakFitApp:
         if all_rows:
             _dio.write_batch_uncertainty_long(out_dir, all_rows)
         self.status_info(f"Batch done: processed {len(files)} files.")
+        self._debug_snapshot("batch.done", n_rows=len(all_rows))
 
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:

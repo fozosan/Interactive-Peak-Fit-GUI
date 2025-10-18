@@ -1424,9 +1424,9 @@ def bootstrap_ci(
     band_skip_reason = None
     band_gated = False
     diagnostics: Dict[str, object] = {}
-    # Ensure band arrays are always defined in function scope (avoid UnboundLocalError)
-    band_lo = None
-    band_hi = None
+    # Ensure band arrays are always defined even if band is gated/aborted
+    band_lo: np.ndarray | None = None
+    band_hi: np.ndarray | None = None
 
     # --- Safe defaults for band workers & perf diag ---
     try:
@@ -1451,7 +1451,7 @@ def bootstrap_ci(
     except NameError:
         diag_perf = {}
 
-    # Ensure the threadpool worker count placeholder exists
+    # Provide a local variable always present for the threadpool section
     try:
         band_workers  # type: ignore[name-defined]
     except NameError:
@@ -1479,7 +1479,7 @@ def bootstrap_ci(
             if progress_cb:
                 try:
                     progress_cb(
-                        f"Bootstrap band: using {n_used} resamples, workers={band_workers_effective}"
+                        f"Bootstrap band: using {n_used} resamples, workers={int(band_workers_effective or 0)}"
                     )
                 except Exception:
                     pass
@@ -1526,7 +1526,8 @@ def bootstrap_ci(
                             Y = cp.asarray(np.stack(Y_list, axis=0))
                         band_lo = cp.quantile(Y, float(alpha/2), axis=0)
                         band_hi = cp.quantile(Y, float(1 - alpha/2), axis=0)
-                        band_lo = cp.asnumpy(band_lo); band_hi = cp.asnumpy(band_hi)
+                        band_lo = cp.asnumpy(band_lo)
+                        band_hi = cp.asnumpy(band_hi)
                         band_backend = "cupy"
                     else:
                         Y = np.stack(Y_list, axis=0)
@@ -1540,13 +1541,33 @@ def bootstrap_ci(
                     band_hi = np.quantile(Y, 1 - alpha/2, axis=0)
                     band_backend = "numpy"
 
-                # Ensure x_all is defined and matches the prediction length
-                if x_all is None:
-                    _n = int(band_lo.shape[0])
-                    x_all = np.arange(_n)
-                band = (x_all, band_lo, band_hi)
-                band_gated = False
-                band_skip_reason = None
+                # Build band tuple safely, even if x_all is None or lengths differ
+                if band_lo is not None and band_hi is not None:
+                    try:
+                        n = int(band_lo.shape[0])
+                    except Exception:
+                        n = None
+
+                    def _len(obj):
+                        try:
+                            return len(obj)
+                        except Exception:
+                            return None
+
+                    need_default_x = (
+                        x_all is None
+                        or (n is not None and _len(x_all) != n)
+                    )
+                    x_out = np.arange(int(n or 0)) if need_default_x else np.asarray(x_all)
+                    band = (x_out, band_lo, band_hi)
+                    band_gated = False
+                    band_skip_reason = None
+                    band_reason = None
+                else:
+                    band = None
+                    band_gated = True
+                    band_skip_reason = "band_arrays_missing"
+                    band_reason = band_reason or "band_arrays_missing"
                 diagnostics["band_backend"] = band_backend
                 try:
                     import cupy as cp  # optional
@@ -1569,12 +1590,16 @@ def bootstrap_ci(
         "runtime_s": float(time.time() - t0),
         "band_source": "bootstrap-percentile" if band is not None else None,
         "band_reason": band_reason,
+        "band_gated": bool(band_gated),
+        "band_skip_reason": band_skip_reason,
+        "band_workers_effective": (
+            int(band_workers_effective)
+            if band_workers_effective
+            else int(band_workers or 0)
+        ),
         "refit_errors": list(refit_errors[:16]),
         "alpha": float(alpha),
     })
-    diag["band_gated"] = bool(band_gated)
-    if band_skip_reason is not None:
-        diag["band_skip_reason"] = band_skip_reason
     if diag_notes:
         diag["notes"] = diag_notes
     # Merge any per-band diagnostics (e.g. workers_used, band_backend)
@@ -1584,9 +1609,10 @@ def bootstrap_ci(
     diag["band_workers_requested"] = (
         int(band_workers_requested) if band_workers_requested > 0 else None
     )
-    diag["band_workers_effective"] = (
-        int(band_workers_effective) if band_workers_effective is not None else None
-    )
+    if diag.get("band_workers_effective") is None:
+        diag["band_workers_effective"] = (
+            int(band_workers_effective) if band_workers_effective is not None else None
+        )
     diag["theta_jitter_scale"] = float(jitter_scale)
     diag["jitter_applied_any"] = bool(jitter_scale > 0)
     diag["jitter_free_params"] = int(np.sum(free_mask))
