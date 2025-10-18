@@ -8,7 +8,8 @@ rather than ultimate statistical rigour.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union, List
+from typing import Any, Callable, Dict, Optional, Tuple, Union, List
+from typing import Sequence
 
 import logging
 import warnings
@@ -625,8 +626,8 @@ def asymptotic_ci(
     G = finite_diff_jacobian(ymodel_fn, theta)
     var = np.einsum("ij,jk,ik->i", G, cov, G)
     band_std = np.sqrt(np.maximum(var, 0.0))
-    lo = y0 - z * band_std
-    hi = y0 + z * band_std
+    band_lo = y0 - z * band_std
+    band_hi = y0 + z * band_std
     x = np.arange(y0.size)
 
     names = [f"p{i}" for i in range(theta.size)]
@@ -655,7 +656,7 @@ def asymptotic_ci(
 
     _add_percentile_aliases_inplace(stats)
 
-    band = (x, lo, hi)
+    band = (x, band_lo, band_hi)
     diag: Dict[str, object] = {"alpha": alpha, "param_order": names}
     label = "Asymptotic (JᵀJ)"
     return UncertaintyResult(
@@ -1423,6 +1424,38 @@ def bootstrap_ci(
     band_skip_reason = None
     band_gated = False
     diagnostics: Dict[str, object] = {}
+    # Ensure band arrays are always defined in function scope (avoid UnboundLocalError)
+    band_lo = None
+    band_hi = None
+
+    # --- Safe defaults for band workers & perf diag ---
+    try:
+        _existing_bw_effective = band_workers_effective  # type: ignore[name-defined]
+    except NameError:
+        _existing_bw_effective = None
+    if not _existing_bw_effective:
+        try:
+            bw_from_ctx = int((fit_ctx or {}).get("unc_band_workers", 0))
+        except Exception:
+            bw_from_ctx = 0
+        try:
+            workers_int = int(workers or 0)
+        except Exception:
+            workers_int = 0
+        band_workers_effective = bw_from_ctx or workers_int
+    else:
+        band_workers_effective = _existing_bw_effective
+
+    try:
+        _ = diag_perf  # type: ignore[name-defined]
+    except NameError:
+        diag_perf = {}
+
+    # Ensure the threadpool worker count placeholder exists
+    try:
+        band_workers  # type: ignore[name-defined]
+    except NameError:
+        band_workers = int(band_workers_effective or 0)
     if return_band:
         if predict_full is None or len(T_list) < BOOT_BAND_MIN_SAMPLES:
             band_reason = "missing model or insufficient samples"
@@ -1446,7 +1479,7 @@ def bootstrap_ci(
             if progress_cb:
                 try:
                     progress_cb(
-                        f"Bootstrap band: using {n_used} resamples, workers={band_workers_effective or 0}"
+                        f"Bootstrap band: using {n_used} resamples, workers={band_workers_effective}"
                     )
                 except Exception:
                     pass
@@ -1491,23 +1524,27 @@ def bootstrap_ci(
                             Y = cp.stack([y if isinstance(y, cp.ndarray) else cp.asarray(y) for y in Y_list], axis=0)
                         else:
                             Y = cp.asarray(np.stack(Y_list, axis=0))
-                        lo = cp.quantile(Y, float(alpha/2), axis=0)
-                        hi = cp.quantile(Y, float(1 - alpha/2), axis=0)
-                        lo = cp.asnumpy(lo); hi = cp.asnumpy(hi)
+                        band_lo = cp.quantile(Y, float(alpha/2), axis=0)
+                        band_hi = cp.quantile(Y, float(1 - alpha/2), axis=0)
+                        band_lo = cp.asnumpy(band_lo); band_hi = cp.asnumpy(band_hi)
                         band_backend = "cupy"
                     else:
                         Y = np.stack(Y_list, axis=0)
-                        lo = np.quantile(Y, alpha/2, axis=0)
-                        hi = np.quantile(Y, 1 - alpha/2, axis=0)
+                        band_lo = np.quantile(Y, alpha/2, axis=0)
+                        band_hi = np.quantile(Y, 1 - alpha/2, axis=0)
                 except Exception:
                     if not Y_list:
                         raise RuntimeError("bootstrap_band_empty")
                     Y = np.stack(Y_list, axis=0)
-                    lo = np.quantile(Y, alpha/2, axis=0)
-                    hi = np.quantile(Y, 1 - alpha/2, axis=0)
+                    band_lo = np.quantile(Y, alpha/2, axis=0)
+                    band_hi = np.quantile(Y, 1 - alpha/2, axis=0)
                     band_backend = "numpy"
 
-                band = (x_all, lo, hi)
+                # Ensure x_all is defined and matches the prediction length
+                if x_all is None:
+                    _n = int(band_lo.shape[0])
+                    x_all = np.arange(_n)
+                band = (x_all, band_lo, band_hi)
                 band_gated = False
                 band_skip_reason = None
                 diagnostics["band_backend"] = band_backend

@@ -239,6 +239,7 @@ except Exception:
 # aliases used in export-parity logic
 from core.data_io import normalize_unc_result as _normalize_unc_result
 import core.uncertainty as core_uncertainty
+from ui.uncertainty_utils import method_display_to_key
 try:
     from core.uncertainty import UncertaintyResult, NotAvailable
     from core.uncertainty import (
@@ -400,6 +401,7 @@ DEFAULTS = {
     "ui_eta": 0.5,
     "ui_add_peaks_on_click": True,
     "unc_method": "asymptotic",
+    "uncertainty": {"method": "asymptotic", "return_band": True},
     "x_label_auto_math": True,
     "ui_show_legend": True,
     "legend_center_sigfigs": 6,
@@ -421,6 +423,26 @@ def load_config():
         try:
             data = json.loads(CONFIG_PATH.read_text())
             cfg = {**DEFAULTS, **data}
+            # Ensure nested uncertainty config exists and is independent of defaults
+            unc_section = dict(cfg.get("uncertainty") or {})
+            legacy_method = data.get("unc_method", cfg.get("unc_method"))
+            if "method" not in unc_section:
+                method = str(legacy_method or unc_section.get("method") or "asymptotic").strip().lower()
+                if method.startswith("boot"):
+                    method = "bootstrap"
+                elif method.startswith("bayes"):
+                    method = "bayesian"
+                elif not method:
+                    method = "asymptotic"
+                unc_section["method"] = method
+            legacy_band = data.get("ui_show_uncertainty_band")
+            if legacy_band is None:
+                legacy_band = data.get("show_uncertainty_band")
+            if "return_band" not in unc_section:
+                unc_section["return_band"] = bool(legacy_band) if legacy_band is not None else bool(unc_section.get("return_band", True))
+            cfg["uncertainty"] = unc_section
+            # Maintain legacy alias for compatibility
+            cfg["unc_method"] = unc_section.get("method", "asymptotic")
             # Migration: move legacy saved_peaks into templates["default"] if templates is empty
             if cfg.get("saved_peaks") and not cfg.get("templates"):
                 cfg["templates"] = {"default": cfg["saved_peaks"]}
@@ -457,8 +479,12 @@ def load_config():
                     }
             return cfg
         except Exception:
-            return dict(DEFAULTS)
-    return dict(DEFAULTS)
+            cfg = dict(DEFAULTS)
+            cfg["uncertainty"] = dict(cfg.get("uncertainty") or {})
+            return cfg
+    cfg = dict(DEFAULTS)
+    cfg["uncertainty"] = dict(cfg.get("uncertainty") or {})
+    return cfg
 
 def save_config(cfg):
     try:
@@ -1206,8 +1232,15 @@ class PeakFitApp:
         self.perf_blas_threads = tk.IntVar(value=int(self.cfg.get("perf_blas_threads", 0)))
         self.debug_mode_var.trace_add("write", lambda *_: self._on_debug_toggle())
 
+        unc_section_cfg = dict(self.cfg.get("uncertainty") or {})
+        return_band_pref = bool(
+            unc_section_cfg.get(
+                "return_band",
+                self.cfg.get("ui_show_uncertainty_band", False),
+            )
+        )
         self.ci_band = None
-        self.show_ci_band = tk.BooleanVar(value=bool(self.cfg.get("ui_show_uncertainty_band", False)))
+        self.show_ci_band = tk.BooleanVar(value=return_band_pref)
         self.show_ci_band_var = self.show_ci_band
         # Uncertainty state
         self.last_uncertainty = None
@@ -1217,7 +1250,7 @@ class PeakFitApp:
         self._abort_evt = threading.Event()
 
         # Uncertainty and performance controls
-        unc_cfg = self.cfg.get("unc_method", "asymptotic")
+        unc_cfg = unc_section_cfg.get("method", self.cfg.get("unc_method", "asymptotic"))
         if unc_cfg == "bootstrap":
             _base_key = self.solver_choice.get()
             _base_label = SOLVER_LABELS.get(_base_key, _base_key)
@@ -2179,12 +2212,14 @@ class PeakFitApp:
     @log_action
     def _on_unc_method_change(self, _e=None):
         label = self.unc_method.get()
-        if label.startswith("Bootstrap"):
-            self.cfg["unc_method"] = "bootstrap"
-        elif label.startswith("Bayesian"):
-            self.cfg["unc_method"] = "bayesian"
-        else:
-            self.cfg["unc_method"] = "asymptotic"
+        method_key = method_display_to_key(label)
+        self.cfg["unc_method"] = method_key
+        try:
+            unc_section = self.cfg.setdefault("uncertainty", {})
+            unc_section["method"] = method_key
+            unc_section.setdefault("return_band", bool(self.show_ci_band_var.get()))
+        except Exception:
+            pass
         save_config(self.cfg)
         self._update_unc_widgets()
         self._on_uncertainty_method_changed()
@@ -2491,7 +2526,13 @@ class PeakFitApp:
             self._suspend_clicks()
 
     def _toggle_ci_band(self, *_):
-        self.cfg["ui_show_uncertainty_band"] = bool(self.show_ci_band_var.get())
+        val = bool(self.show_ci_band_var.get())
+        self.cfg["ui_show_uncertainty_band"] = val
+        try:
+            unc_section = self.cfg.setdefault("uncertainty", {})
+            unc_section["return_band"] = val
+        except Exception:
+            pass
         save_config(self.cfg)
         self.refresh_plot()
 
@@ -2670,6 +2711,14 @@ class PeakFitApp:
             # refresh Bootstrap tie widgets (enable only for Bootstrap + LMFIT refit solver)
             self._update_bootstrap_tie_widgets()
             # for asymptotic/bootstrap the checkbox remains user-controlled
+            try:
+                unc_section = self.cfg.setdefault("uncertainty", {})
+                unc_section["method"] = method_key
+                unc_section["return_band"] = bool(self.show_ci_band_var.get())
+                self.cfg["unc_method"] = method_key
+                save_config(self.cfg)
+            except Exception:
+                pass
         finally:
             self._unc_change_busy = False
 
@@ -4187,14 +4236,7 @@ class PeakFitApp:
     # --- BEGIN: batch uncertainty helpers ---
     def _unc_selected_method_key(self) -> str:
         """Return the canonical uncertainty method key."""
-        label = str(self.unc_method.get()).lower()
-        if label.startswith("asymptotic"):
-            return "asymptotic"
-        if label.startswith("bootstrap"):
-            return "bootstrap"
-        if label.startswith("bayes"):
-            return "bayesian"
-        return label.strip()
+        return method_display_to_key(self.unc_method.get())
 
     def _compute_uncertainty_sync(self, method: str, x_fit, y_fit, base_fit, add_mode: bool):
         """Compute uncertainty synchronously for batch processing."""
@@ -4303,10 +4345,25 @@ class PeakFitApp:
                     total = total + _base
                 return total
 
+            def _predict_model(theta_vec):
+                try:
+                    y_pred = self.model.ymodel(theta_vec)
+                except Exception:
+                    return _predict_fit_local(theta_vec)
+                try:
+                    y_arr = np.asarray(y_pred, dtype=float)
+                except Exception:
+                    return _predict_fit_local(theta_vec)
+                if y_arr.ndim > 1:
+                    y_arr = np.asarray(y_arr).reshape(-1)
+                if int(y_arr.size) != int(x_fit.size):
+                    return _predict_fit_local(theta_vec)
+                return y_arr
+
             # Robust, fit-window predictor (shape-checked)
-            predict_fit = _predict_fit_local
             try:
-                _probe = np.asarray(predict_fit(np.asarray(theta, float)), float)
+                predict_fit = _predict_model
+                _probe = np.asarray(predict_fit(np.asarray(theta, float)), dtype=float)
                 if int(_probe.size) != int(x_fit.size):
                     predict_fit = _predict_fit_local
             except Exception:
@@ -4723,9 +4780,24 @@ class PeakFitApp:
                         total = total + _base
                     return total
 
-                predict_fit = _predict_fit_local
+                def _predict_model(theta_vec):
+                    try:
+                        y_pred = self.model.ymodel(theta_vec)
+                    except Exception:
+                        return _predict_fit_local(theta_vec)
+                    try:
+                        y_arr = np.asarray(y_pred, dtype=float)
+                    except Exception:
+                        return _predict_fit_local(theta_vec)
+                    if y_arr.ndim > 1:
+                        y_arr = np.asarray(y_arr).reshape(-1)
+                    if int(y_arr.size) != int(x_fit.size):
+                        return _predict_fit_local(theta_vec)
+                    return y_arr
+
                 try:
-                    _probe = np.asarray(predict_fit(np.asarray(theta, float)), float)
+                    predict_fit = _predict_model
+                    _probe = np.asarray(predict_fit(np.asarray(theta, float)), dtype=float)
                     if int(_probe.size) != int(x_fit.size):
                         predict_fit = _predict_fit_local
                 except Exception:
@@ -4782,16 +4854,16 @@ class PeakFitApp:
                         theta=theta,
                         residual=r0,
                         jacobian=J,
-                    predict_full=predict_fit,
-                    x_all=x_fit,
-                    y_all=y_fit,
-                    locked_mask=locked_mask,
-                    fit_ctx=fit_ctx,
-                    n_boot=n_boot,
-                    seed=seed_val,
-                    workers=workers,
-                    return_band=True,
-                    alpha=alpha,
+                        predict_full=predict_fit,
+                        x_all=x_fit,
+                        y_all=y_fit,
+                        locked_mask=locked_mask,
+                        fit_ctx=fit_ctx,
+                        n_boot=n_boot,
+                        seed=seed_val,
+                        workers=workers,
+                        return_band=True,
+                        alpha=alpha,
                         center_residuals=bool(self.center_resid_var.get()),
                     )
                 if abort_evt.is_set():
@@ -5423,6 +5495,11 @@ class PeakFitApp:
         try:
             method_key = self._unc_selected_method_key()
             self.cfg["unc_method"] = method_key
+            try:
+                unc_section = self.cfg.setdefault("uncertainty", {})
+                unc_section["method"] = method_key
+            except Exception:
+                pass
             save_config(self.cfg)
         except Exception:
             pass

@@ -14,6 +14,27 @@ from .peaks import Peak
 from infra import performance as perf
 
 
+def finite_diff_jacobian(
+    residual_fn: Callable[[np.ndarray], np.ndarray],
+    theta: np.ndarray,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """Forward-difference Jacobian of ``residual_fn`` evaluated at ``theta``."""
+
+    theta = np.asarray(theta, float)
+    r0 = np.asarray(residual_fn(theta), float)
+    m = r0.size
+    p = theta.size
+    J = np.empty((m, p), float)
+    for j in range(p):
+        h = eps * (1.0 + abs(theta[j]))
+        th = theta.copy()
+        th[j] += h
+        r1 = np.asarray(residual_fn(th), float)
+        J[:, j] = (r1 - r0) / h
+    return J
+
+
 def build_residual(
     x: np.ndarray,
     y: np.ndarray,
