@@ -4919,6 +4919,13 @@ class PeakFitApp:
 
                 boot_solver = self._select_bootstrap_solver()
                 show_band = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else True
+
+                # Normalize bounds before passing downstream; tolerate weird inputs
+                try:
+                    lo = np.asarray(lo, float).reshape(-1)
+                    hi = np.asarray(hi, float).reshape(-1)
+                except Exception:
+                    pass
                 self._dbg(
                     "Bootstrap plan: "
                     + _kv(
