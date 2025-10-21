@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Tuple, Union, List
 from typing import Sequence
 
+from numpy.typing import ArrayLike
+
 import logging
 import warnings
 import time
@@ -702,8 +704,60 @@ def bootstrap_ci(
       key (``"refit"`` or ``"linearized"``) describing which pathway produced
       the accepted draws.
     """
-    t0 = time.time()
+    # ------------------------------------------------------------------
+    # Normalize inputs used widely and ensure bounds arrays are defined
+    # immediately so every branch can safely reference them.
+    # ------------------------------------------------------------------
+    theta = np.asarray(theta, float)
+    P = int(theta.size)
+
     fit_ctx = dict(fit_ctx or {})
+
+    bounds_arg = bounds
+    bounds_from_ctx = fit_ctx.get("bounds", None)
+    bounds_source = "default"
+
+    bounds_local = None
+    if bounds_arg is not None:
+        bounds_local = bounds_arg
+        bounds_source = "arg"
+    elif bounds_from_ctx is not None:
+        bounds_local = bounds_from_ctx
+        bounds_source = "fit_ctx"
+
+    lo_raw = hi_raw = None
+    if bounds_local is not None:
+        try:
+            lo_raw, hi_raw = bounds_local
+        except Exception:
+            lo_raw = hi_raw = None
+
+    def _norm_bounds_component(raw: Optional[ArrayLike], fill_value: float) -> Tuple[np.ndarray, bool]:
+        if raw is None:
+            return np.full(P, fill_value, dtype=float), False
+        try:
+            arr = np.asarray(raw, float).reshape(-1)
+        except Exception:
+            return np.full(P, fill_value, dtype=float), False
+        if arr.size != P:
+            return np.full(P, fill_value, dtype=float), False
+        return arr, True
+
+    lo, lo_valid = _norm_bounds_component(lo_raw, -np.inf)
+    hi, hi_valid = _norm_bounds_component(hi_raw, np.inf)
+
+    bounds_provided = bounds_local is not None
+    bounds_valid_shape = (not bounds_provided) or (lo_valid and hi_valid)
+    bounds_unpack_ok = (not bounds_provided) or (lo_raw is not None or hi_raw is not None)
+    if bounds_provided and bounds_unpack_ok:
+        bounds = (lo, hi)
+    elif bounds_provided:
+        bounds = None
+    else:
+        bounds = None
+    # ------------------------------------------------------------------
+
+    t0 = time.time()
     _solver_name, share_fwhm, share_eta = _norm_solver_and_sharing(fit_ctx, {})
     fit_ctx["solver"] = _solver_name
     fit_ctx["share_fwhm"] = share_fwhm
@@ -1222,40 +1276,9 @@ def bootstrap_ci(
         return None
 
     # Free-parameter mask for optional linear fallback
-    P = int(np.asarray(theta, float).size)
-
     locked_arr = _canon_locked_mask(locked_mask, P)
     locked_mask = locked_arr if locked_arr is not None else None
     free_mask = np.ones(P, bool) if locked_arr is None else ~locked_arr
-
-    # ------------------------------------------------------------------
-    # Resolve parameter bounds into ALWAYS-defined arrays `lo` / `hi`.
-    # Prefer the explicit function arg `bounds_arg`; else `fit_ctx['bounds']`;
-    # else default to ±inf of length P.
-    # ------------------------------------------------------------------
-    bounds_source = "default"
-    bounds_local = bounds
-    if bounds_arg is not None:
-        bounds_local = bounds_arg
-        bounds_source = "arg"
-    elif bounds_from_ctx is not None:
-        bounds_local = bounds_from_ctx
-        bounds_source = "fit_ctx"
-
-    lo = hi = None
-    if bounds_local is not None:
-        try:
-            lo, hi = bounds_local
-        except Exception:
-            lo, hi = None, None
-
-    lo = np.full(P, -np.inf, dtype=float) if lo is None else np.asarray(lo, float).reshape(-1)
-    hi = np.full(P,  np.inf, dtype=float) if hi is None else np.asarray(hi, float).reshape(-1)
-    if lo.size != P:
-        lo = np.full(P, -np.inf, dtype=float)
-    if hi.size != P:
-        hi = np.full(P,  np.inf, dtype=float)
-    # ------------------------------------------------------------------
 
     Jf = J[:, free_mask] if (J.ndim == 2) else None
     # Disable linear fallback when parameters are tied (LMFIT) or globally disabled
@@ -1424,6 +1447,9 @@ def bootstrap_ci(
             "bounds_source": bounds_source,
             "bounds_len": int(P),
             "bounds_any_finite": bool(np.any(np.isfinite(lo)) or np.any(np.isfinite(hi))),
+            "bounds_provided": bool(bounds_provided),
+            "bounds_valid_shape": bool(bounds_valid_shape),
+            "bounds_unpack_ok": bool(bounds_unpack_ok),
             "pct_at_bounds": None,
             "pct_at_bounds_units": "percent",
             "aborted": bool(aborted or ((abort_evt.is_set()) if abort_evt is not None else False)),
@@ -1628,6 +1654,9 @@ def bootstrap_ci(
         "bounds_source": bounds_source,
         "bounds_len": int(P),
         "bounds_any_finite": bool(np.any(np.isfinite(lo)) or np.any(np.isfinite(hi))),
+        "bounds_provided": bool(bounds_provided),
+        "bounds_valid_shape": bool(bounds_valid_shape),
+        "bounds_unpack_ok": bool(bounds_unpack_ok),
         "pct_at_bounds": pct_at_bounds,
         "pct_at_bounds_units": "percent",
         "aborted": bool(aborted or ((abort_evt.is_set()) if abort_evt is not None else False)),
@@ -1648,6 +1677,18 @@ def bootstrap_ci(
         diag["notes"] = diag_notes
     # Merge any per-band diagnostics (e.g. workers_used, band_backend)
     diag.update(diagnostics)
+    diag.setdefault(
+        "bounds_source",
+        bounds_source if "bounds_source" in locals() else "unknown",
+    )
+    _bounds_any = False
+    if "lo" in locals() and "hi" in locals():
+        try:
+            _bounds_any = bool(np.any(np.isfinite(lo)) or np.any(np.isfinite(hi)))
+        except Exception:
+            _bounds_any = False
+    diag.setdefault("bounds_any_finite", _bounds_any)
+    diag.setdefault("bounds_len", int(P) if "P" in locals() else None)
     diag["bootstrap_mode"] = "linearized" if use_linearized_fast_path else "refit"
     diag["draw_workers_used"] = int(draw_workers) if draw_workers > 0 else None
     diag["band_workers_requested"] = (
