@@ -8,10 +8,12 @@ rather than ultimate statistical rigour.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Tuple, Union, List
-from typing import Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-from numpy.typing import ArrayLike
+try:  # numpy.typing is available in NumPy >= 1.20
+    from numpy.typing import ArrayLike
+except Exception:  # pragma: no cover
+    ArrayLike = Any  # type: ignore
 
 import logging
 import warnings
@@ -588,6 +590,8 @@ def asymptotic_ci(
     jacobian: Any,
     ymodel_fn: Callable[[np.ndarray], np.ndarray],
     alpha: float = 0.05,
+    locked_mask: Optional[np.ndarray] = None,
+    bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     **_ignored: Any,
 ) -> UncertaintyResult:
     """Return asymptotic parameter statistics and a prediction band.
@@ -598,31 +602,83 @@ def asymptotic_ci(
     """
 
     theta = np.asarray(theta_hat, float)
+    P = int(theta.size)
+
+    def _canon_locked_mask(mask, P):
+        if mask is None:
+            return None
+        lm = np.asarray(mask, bool).ravel()
+        if lm.size == P:
+            return lm
+        if P % 4 == 0 and lm.size == (P // 4):
+            return np.repeat(lm, 4)
+        return None
+
+    locked_arr = _canon_locked_mask(locked_mask, P)
+    locked_mask = locked_arr if locked_arr is not None else None
+    free_mask = np.ones(P, bool) if locked_mask is None else ~locked_mask
+
+    lo_raw = hi_raw = None
+    if bounds is not None:
+        try:
+            lo_raw, hi_raw = bounds
+        except Exception:
+            lo_raw = hi_raw = None
+
+    def _norm_bounds_component(raw: Optional[ArrayLike], fill_value: float) -> np.ndarray:
+        if raw is None:
+            return np.full(P, fill_value, dtype=float)
+        try:
+            arr = np.asarray(raw, float).reshape(-1)
+        except Exception:
+            return np.full(P, fill_value, dtype=float)
+        if arr.size != P:
+            return np.full(P, fill_value, dtype=float)
+        return arr
+
+    lo = _norm_bounds_component(lo_raw, -np.inf)
+    hi = _norm_bounds_component(hi_raw, np.inf)
+
     r = residual(theta) if callable(residual) else np.asarray(residual, float)
     J = jacobian(theta) if callable(jacobian) else np.asarray(jacobian, float)
 
-    m, n = J.shape
-    dof = max(m - n, 1)
+    m = int(J.shape[0])
+    n_free = int(np.sum(free_mask))
+    dof = max(m - n_free, 1)
+
+    Jf = J[:, free_mask] if n_free > 0 else J[:, :0]
     rss = float(np.dot(r, r))
     s2 = rss / dof
 
-    JTJ = J.T @ J
-    try:
-        U, s, Vt = np.linalg.svd(JTJ, full_matrices=False)
-    except np.linalg.LinAlgError:  # pragma: no cover
-        s = np.linalg.svd(JTJ, compute_uv=False)
-        U = Vt = np.eye(JTJ.shape[0])
-    cond = float(s[0] / s[-1]) if s[-1] != 0 else float("inf")
-    if cond > 1e8:  # pragma: no cover - warning path
-        warnings.warn("Ill conditioned Jacobian", RuntimeWarning)
-    s_inv = np.array([1 / si if si > 1e-12 * s[0] else 0.0 for si in s])
-    JTJ_inv = (Vt.T * (s_inv ** 2)) @ Vt
-    cov = s2 * JTJ_inv
+    if n_free > 0:
+        JTJ = Jf.T @ Jf
+        try:
+            U, s, Vt = np.linalg.svd(JTJ, full_matrices=False)
+        except np.linalg.LinAlgError:  # pragma: no cover
+            s = np.linalg.svd(JTJ, compute_uv=False)
+            U = Vt = np.eye(JTJ.shape[0])
+        cond = float(s[0] / s[-1]) if s[-1] != 0 else float("inf")
+        if cond > 1e8:  # pragma: no cover - warning path
+            warnings.warn("Ill conditioned Jacobian", RuntimeWarning)
+        s_inv = np.array([1 / si if si > 1e-12 * s[0] else 0.0 for si in s])
+        JTJ_inv = (Vt.T * (s_inv ** 2)) @ Vt
+        cov_free = s2 * JTJ_inv
+    else:
+        cond = 0.0
+        cov_free = np.zeros((0, 0))
 
-    std = np.sqrt(np.maximum(np.diag(cov), 0.0))
+    cov = np.zeros((P, P))
+    if n_free > 0:
+        cov[np.ix_(free_mask, free_mask)] = cov_free
+
+    std = np.zeros(P)
+    if n_free > 0:
+        std[free_mask] = np.sqrt(np.maximum(np.diag(cov_free), 0.0))
     z = _z_value(alpha)
     ci_lo = theta - z * std
     ci_hi = theta + z * std
+    ci_lo = np.maximum(ci_lo, lo)
+    ci_hi = np.minimum(ci_hi, hi)
 
     y0 = np.asarray(ymodel_fn(theta), float)
     G = finite_diff_jacobian(ymodel_fn, theta)
@@ -660,6 +716,10 @@ def asymptotic_ci(
 
     band = (x, band_lo, band_hi)
     diag: Dict[str, object] = {"alpha": alpha, "param_order": names}
+    n_free = int(np.sum(free_mask))
+    # Preferred key for downstream consumers; keep legacy alias for compatibility.
+    diag.setdefault("n_free_params", n_free)
+    diag.setdefault("locked_free_params", n_free)
     label = "Asymptotic (JᵀJ)"
     return UncertaintyResult(
         method="asymptotic",
@@ -725,36 +785,7 @@ def bootstrap_ci(
         bounds_local = bounds_from_ctx
         bounds_source = "fit_ctx"
 
-    lo_raw = hi_raw = None
-    if bounds_local is not None:
-        try:
-            lo_raw, hi_raw = bounds_local
-        except Exception:
-            lo_raw = hi_raw = None
-
-    def _norm_bounds_component(raw: Optional[ArrayLike], fill_value: float) -> Tuple[np.ndarray, bool]:
-        if raw is None:
-            return np.full(P, fill_value, dtype=float), False
-        try:
-            arr = np.asarray(raw, float).reshape(-1)
-        except Exception:
-            return np.full(P, fill_value, dtype=float), False
-        if arr.size != P:
-            return np.full(P, fill_value, dtype=float), False
-        return arr, True
-
-    lo, lo_valid = _norm_bounds_component(lo_raw, -np.inf)
-    hi, hi_valid = _norm_bounds_component(hi_raw, np.inf)
-
-    bounds_provided = bounds_local is not None
-    bounds_valid_shape = (not bounds_provided) or (lo_valid and hi_valid)
-    bounds_unpack_ok = (not bounds_provided) or (lo_raw is not None or hi_raw is not None)
-    if bounds_provided and bounds_unpack_ok:
-        bounds = (lo, hi)
-    elif bounds_provided:
-        bounds = None
-    else:
-        bounds = None
+    bounds = bounds_local
     # ------------------------------------------------------------------
 
     t0 = time.time()
@@ -1219,6 +1250,89 @@ def bootstrap_ci(
             raise RuntimeError(attempt_errors[-1])
         return np.asarray(theta_arr, float), False
 
+    # --- helper: canonicalize locked mask to parameter-length ---
+    def _canon_locked_mask(mask, P):
+        if mask is None:
+            return None
+        lm = np.asarray(mask, bool).ravel()
+        if lm.size == P:
+            return lm
+        if P % 4 == 0 and lm.size == (P // 4):
+            return np.repeat(lm, 4)
+        return None
+
+    locked_arr = _canon_locked_mask(locked_mask, P)
+    locked_mask = locked_arr if locked_arr is not None else None
+    free_mask = np.ones(P, bool) if locked_arr is None else ~locked_arr
+
+    # --- Normalize bounds (length-P, float) BEFORE any use ---
+    bounds_provided = bounds is not None
+    bounds_valid_shape = True
+    bounds_unpack_ok = True
+    lo_raw = hi_raw = None
+    if bounds is not None:
+        try:
+            lo_raw, hi_raw = bounds
+        except Exception:
+            bounds_unpack_ok = False
+            lo_raw = hi_raw = None
+
+    def _norm_bounds_component(raw, fill):
+        if raw is None:
+            return np.full(P, fill, dtype=float)
+        try:
+            arr = np.asarray(raw, float).reshape(-1)
+        except Exception:
+            return np.full(P, fill, dtype=float)
+        if arr.size == P:
+            return arr
+        # truncate/pad to P
+        out = np.full(P, fill, dtype=float)
+        n = min(P, int(arr.size))
+        if n:
+            out[:n] = arr[:n]
+        return out
+
+    lo = _norm_bounds_component(lo_raw, -np.inf)
+    hi = _norm_bounds_component(hi_raw, np.inf)
+
+    def _raw_size_matches(raw) -> bool:
+        if raw is None:
+            return True
+        try:
+            return np.asarray(raw, float).reshape(-1).size == P
+        except Exception:
+            return False
+
+    if bounds_provided:
+        bounds_valid_shape = _raw_size_matches(lo_raw) and _raw_size_matches(hi_raw)
+    else:
+        bounds_valid_shape = True
+
+    if not bounds_unpack_ok:
+        bounds_valid_shape = False
+
+    if bounds_provided and bounds_unpack_ok:
+        bounds = (lo, hi)
+    elif not bounds_provided:
+        bounds = None
+    else:
+        bounds = None
+
+    # --- Helper uses lo/hi and locked_mask; safe to define now ---
+    def _apply_locks_bounds(th: np.ndarray) -> np.ndarray:
+        th = np.asarray(th, float).copy()
+        th = np.clip(th, lo, hi)
+        if locked_mask is not None:
+            th[locked_mask] = theta[locked_mask]
+        return th
+
+    if bounds is not None:
+        try:
+            fit["bounds"] = bounds
+        except Exception:
+            pass
+
     # --- Optional user-supplied refit from fit_ctx (batch path) ---
     if callable(user_refit):
         from inspect import signature as _inspect_signature
@@ -1251,34 +1365,18 @@ def bootstrap_ci(
             out = out_local
             if isinstance(out, dict):
                 th_dict = out.get("theta", theta_init)
-                th_new = np.asarray(th_dict, float)
+                th_new = _apply_locks_bounds(th_dict)
                 ok_flag = bool(out.get("fit_ok", True)) and np.all(np.isfinite(th_new))
                 return th_new, ok_flag or (not strict_refit and np.all(np.isfinite(th_new)))
             if isinstance(out, tuple) and len(out) == 2:
                 th_new, ok = out
-                th_new = np.asarray(th_new, float)
+                th_new = _apply_locks_bounds(th_new)
                 return th_new, bool(ok) and np.all(np.isfinite(th_new))
             # Bare array return: allow only when strict_refit is disabled and values are finite
-            th_new = np.asarray(out, float)
+            th_new = _apply_locks_bounds(out)
             return th_new, (not strict_refit) and np.all(np.isfinite(th_new))
     else:
         refit = _robust_refit
-
-    # --- helper: canonicalize locked mask to parameter-length ---
-    def _canon_locked_mask(mask, P):
-        if mask is None:
-            return None
-        lm = np.asarray(mask, bool).ravel()
-        if lm.size == P:
-            return lm
-        if P % 4 == 0 and lm.size == (P // 4):
-            return np.repeat(lm, 4)
-        return None
-
-    # Free-parameter mask for optional linear fallback
-    locked_arr = _canon_locked_mask(locked_mask, P)
-    locked_mask = locked_arr if locked_arr is not None else None
-    free_mask = np.ones(P, bool) if locked_arr is None else ~locked_arr
 
     Jf = J[:, free_mask] if (J.ndim == 2) else None
     # Disable linear fallback when parameters are tied (LMFIT) or globally disabled
@@ -1288,6 +1386,14 @@ def bootstrap_ci(
     if strict_refit or jitter_scale > 0:
         use_linearized_fast_path = False
         Jf = None
+
+    refit_impl = refit
+
+    def refit(theta_init, x, y):
+        theta_init = _apply_locks_bounds(theta_init)
+        th_new, ok = refit_impl(theta_init, x, y)
+        th_new = _apply_locks_bounds(th_new)
+        return th_new, bool(ok)
 
     # Bootstrap loop
     if n_boot <= 0:
@@ -1316,9 +1422,13 @@ def bootstrap_ci(
     diag_failure = {
         "bootstrap_mode": "linearized" if use_linearized_fast_path else "refit",
         "refit_errors": [],
+        "linear_fallbacks": 0,
+        "linear_lambda_last": None,
     }
 
     def _one_draw(b: int):
+        nonlocal linear_fallbacks, linear_lambda
+        nonlocal diag_failure
         rng_local = rng_streams[b]
         # resample residuals
         idx = rng_local.integers(0, n, size=n)
@@ -1333,13 +1443,23 @@ def bootstrap_ci(
         if jitter_scale > 0:
             if np.any(free_mask):
                 step = jitter_scale * np.maximum(np.abs(theta_init), 1.0)
-                jit = rng_local.normal(0.0, step[free_mask])
-                theta_init[free_mask] += jit
-                jitter_applied = bool(jit.size and np.any(np.abs(jit) > 0))
-                if jit.size:
-                    jitter_rms_local = float(np.sqrt(np.mean(np.square(jit))))
+                eps = rng_local.normal(0.0, step)
+                eps = np.asarray(eps, float)
+                try:
+                    if eps.shape != theta_init.shape:
+                        eps = np.broadcast_to(eps, theta_init.shape)
+                except Exception:
+                    eps = np.zeros_like(theta_init)
+                eps = eps * free_mask.astype(float)
+                theta_init = theta_init + eps
+                jitter_vals = eps[free_mask]
+                jitter_applied = bool(jitter_vals.size and np.any(np.abs(jitter_vals) > 0))
+                if jitter_vals.size:
+                    jitter_rms_local = float(np.sqrt(np.mean(np.square(jitter_vals))))
             else:
                 jitter_reason = "no-free-params"
+
+        theta_init = _apply_locks_bounds(theta_init)
 
         ok = False
         th_new = theta_init
@@ -1351,10 +1471,12 @@ def bootstrap_ci(
         else:
             if ok and bool(fit.get("relabel_by_center", True)):
                 th_new = _relabel_by_center(np.asarray(th_new, float), theta0, block=4)
+                th_new = _apply_locks_bounds(th_new)
 
         if not ok and (Jf is None or not Jf.size or np.sum(free_mask) == 0):
             try:
                 th_try = theta_init + 1e-6 * (theta0 - theta_init)
+                th_try = _apply_locks_bounds(th_try)
                 th_new, ok = refit(th_try, x_all, y_b)
             except Exception as e:
                 if err_msg is None:
@@ -1362,6 +1484,47 @@ def bootstrap_ci(
             else:
                 if ok and bool(fit.get("relabel_by_center", True)):
                     th_new = _relabel_by_center(np.asarray(th_new, float), theta0, block=4)
+                    th_new = _apply_locks_bounds(th_new)
+        elif not ok and use_linearized_fast_path:
+            theta_lin = theta0.copy()
+            step = None
+            try:
+                rhs = np.asarray(r_b, float).reshape(-1)
+                step_free, *_ = np.linalg.lstsq(Jf, rhs, rcond=None)
+                step = np.zeros_like(theta_lin)
+                step[free_mask] = step_free
+            except Exception as e:
+                if err_msg is None:
+                    err_msg = f"{type(e).__name__}: {e}"
+            if step is not None:
+                theta_lin = theta_lin + step
+                theta_lin = _apply_locks_bounds(theta_lin)
+                linear_fallbacks += 1
+                linear_lambda = 0.0 if linear_lambda is None else linear_lambda
+                if bool(fit.get("relabel_by_center", True)):
+                    theta_lin = _relabel_by_center(np.asarray(theta_lin, float), theta0, block=4)
+                    theta_lin = _apply_locks_bounds(theta_lin)
+                th_new = np.asarray(theta_lin, float)
+                ok = np.all(np.isfinite(th_new))
+                if not strict_refit:
+                    try:
+                        theta_guess = _apply_locks_bounds(theta_lin)
+                        th_refit, ok_refit = refit(theta_guess, x_all, y_b)
+                    except Exception as e:
+                        if err_msg is None:
+                            err_msg = f"{type(e).__name__}: {e}"
+                    else:
+                        if ok_refit and bool(fit.get("relabel_by_center", True)):
+                            th_refit = _relabel_by_center(np.asarray(th_refit, float), theta0, block=4)
+                            th_refit = _apply_locks_bounds(th_refit)
+                        th_new = _apply_locks_bounds(th_refit)
+                        ok = bool(ok_refit and np.all(np.isfinite(th_new)))
+
+        diag_failure["linear_fallbacks"] = int(linear_fallbacks)
+        diag_failure["linear_lambda_last"] = (
+            float(linear_lambda) if linear_lambda is not None else None
+        )
+        th_new = _apply_locks_bounds(th_new)
 
         return b, np.asarray(th_new, float), bool(ok), err_msg, (
             jitter_applied,
