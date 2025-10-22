@@ -4343,7 +4343,8 @@ class PeakFitApp:
             inv_s = np.zeros_like(s)
             inv_s[nz] = 1.0 / (s[nz] ** 2)
             cov_free = (Vt.T * inv_s) @ Vt
-            cond = float(s[nz].max() / s[nz].min()) if rank > 0 else float("inf")
+            # Report cond(JᵀJ) to match the UI message; cond(JᵀJ) = cond(J)^2
+            cond = (float(s[nz].max() / s[nz].min()) ** 2) if rank > 0 else float("inf")
             cov_free = sigma2 * cov_free
         else:
             rank = 0
