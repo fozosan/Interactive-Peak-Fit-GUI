@@ -4490,11 +4490,37 @@ class PeakFitApp:
                     dict(self.cfg.get("solver_options", {}) or {}),
                 )
             except Exception:
-                # Fall back to the heuristic arrays computed above if packing isn't available
-                lo = np.asarray(lo, float)
-                hi = np.asarray(hi, float)
+                # Fallback: use unbounded parameter arrays (±inf) sized to theta
+                P = int(np.asarray(theta, float).size)
+                lo = np.full(P, -np.inf, dtype=float)
+                hi = np.full(P,  np.inf, dtype=float)
+                try:
+                    self._dbg("pack_theta_bounds failed; using ±inf parameter bounds")
+                except Exception:
+                    pass
 
             boot_solver = self._select_bootstrap_solver()
+
+            # --- Parameter bounds for bootstrap (independent of band arrays) ---
+            P = int(np.asarray(theta, float).size)
+            p_lo = np.full(P, -np.inf, dtype=float)
+            p_hi = np.full(P,  np.inf, dtype=float)
+            try:
+                lo_arr = np.asarray(lo, float).reshape(-1)
+                hi_arr = np.asarray(hi, float).reshape(-1)
+            except Exception:
+                lo_arr = None
+                hi_arr = None
+            if lo_arr is not None and lo_arr.size:
+                if int(lo_arr.size) == P:
+                    p_lo = lo_arr.copy()
+                else:
+                    p_lo[: min(P, int(lo_arr.size))] = lo_arr[: min(P, int(lo_arr.size))]
+            if hi_arr is not None and hi_arr.size:
+                if int(hi_arr.size) == P:
+                    p_hi = hi_arr.copy()
+                else:
+                    p_hi[: min(P, int(hi_arr.size))] = hi_arr[: min(P, int(hi_arr.size))]
 
             fit_ctx = {
                 "x": x_fit,
@@ -4514,7 +4540,6 @@ class PeakFitApp:
                 "x_all": x_fit,
                 "y_all": y_fit,
                 "unc_workers": workers,
-                "bounds": (lo, hi),
                 "unc_band_workers": band_workers,
                 "unc_use_gpu": bool(getattr(self, "use_gpu_var", None) and self.use_gpu_var.get()),
                 "solver": boot_solver,
@@ -4547,6 +4572,9 @@ class PeakFitApp:
             except Exception:
                 pass
             with self._tp_limits_ctx():
+                self._dbg(
+                    f"bounds check: P={P}, p_lo.shape={getattr(p_lo,'shape',None)}, p_hi.shape={getattr(p_hi,'shape',None)}"
+                )
                 res = core_uncertainty.bootstrap_ci(
                     theta=theta,
                     residual=r0,
@@ -4555,7 +4583,7 @@ class PeakFitApp:
                     x_all=x_fit,
                     y_all=y_fit,
                     fit_ctx=fit_ctx,
-                    bounds=(lo, hi),              # mirror constraints at the top level too
+                    bounds=(p_lo, p_hi),          # mirror constraints at the top level too
                     locked_mask=locked_mask,
                     return_band=True,
                     alpha=alpha,
@@ -4920,12 +4948,13 @@ class PeakFitApp:
                 boot_solver = self._select_bootstrap_solver()
                 show_band = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else True
 
-                # Normalize bounds before passing downstream; tolerate weird inputs
-                try:
-                    lo = np.asarray(lo, float).reshape(-1)
-                    hi = np.asarray(hi, float).reshape(-1)
-                except Exception:
-                    pass
+                # --- Parameter bounds for bootstrap (independent of band arrays) ---
+                P = int(np.asarray(theta, float).size)
+                p_lo = np.full(P, -np.inf, dtype=float)
+                p_hi = np.full(P,  np.inf, dtype=float)
+                # If this function has existing logic that determines per-parameter bounds,
+                # fold it into p_lo/p_hi here (keeping shapes length-P). Otherwise leave ±inf.
+
                 self._dbg(
                     "Bootstrap plan: "
                     + _kv(
@@ -4960,7 +4989,6 @@ class PeakFitApp:
                     "strict_refit": True,
                     "bootstrap_jitter": jitter_frac,
                     "unc_band_workers": band_workers,
-                    "bounds": (lo, hi),
                     "theta0": np.asarray(theta, float),
                 }
 
@@ -4985,6 +5013,9 @@ class PeakFitApp:
                 except Exception:
                     pass
                 with self._tp_limits_ctx():
+                    self._dbg(
+                        f"bounds check: P={P}, p_lo.shape={getattr(p_lo,'shape',None)}, p_hi.shape={getattr(p_hi,'shape',None)}"
+                    )
                     out = core_uncertainty.bootstrap_ci(
                         theta=theta,
                         residual=r0,
@@ -4992,7 +5023,7 @@ class PeakFitApp:
                         predict_full=predict_fit,
                         x_all=x_fit,
                         y_all=y_fit,
-                        bounds=(lo, hi),
+                        bounds=(p_lo, p_hi),
                         locked_mask=locked_mask,
                         fit_ctx=fit_ctx,
                         n_boot=n_boot,
