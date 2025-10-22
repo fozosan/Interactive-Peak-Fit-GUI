@@ -2205,7 +2205,7 @@ class PeakFitApp:
         if frame:
             frame.pack(side=tk.LEFT, padx=4)
 
-    def _solver_options(self, choice: str | None = None) -> dict:
+    def _solver_options(self, choice: Optional[str] = None) -> dict:
         solver = choice or self.solver_choice.get()
         if solver in ("modern_vp", "modern_trf"):
             min_fwhm = 1e-6
@@ -2750,17 +2750,6 @@ class PeakFitApp:
                     self._persist_band_prefs()
             except Exception:
                 pass
-
-            # Always keep the checkbox enabled; for Bayesian, force OFF (bands gated elsewhere)
-            try:
-                self._suspend_ci_trace = True
-                if method_key == "bayesian":
-                    self.show_ci_band_var.set(False)
-                else:
-                    # restore user preference for this method
-                    self.show_ci_band_var.set(bool(self._band_pref.get(method_key, False)))
-            finally:
-                self._suspend_ci_trace = False
 
             # Checkbox remains enabled regardless of method; actual rendering depends on band availability.
             self._set_ci_toggle_state(True)
@@ -4216,7 +4205,13 @@ class PeakFitApp:
         self.set_busy(True, "Batch running…")
         self.run_in_thread(work, done)
 
-    def _run_asymptotic_uncertainty(self):
+    def _run_asymptotic_uncertainty(
+        self,
+        *,
+        locked_mask: Optional[np.ndarray] = None,
+        bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        alpha: Optional[float] = None,
+    ):
         if self.x is None or self.y_raw is None or not self.peaks:
             self.ci_band = None
             return None
@@ -4238,10 +4233,6 @@ class PeakFitApp:
 
         resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
         J, r0 = self._fd_jacobian(resid_fn, theta)
-        rss = float(np.dot(r0, r0))
-        m = r0.size
-        cov, rank, cond = self._svd_cov_from_jacobian(J, rss, m)
-        self.param_sigma = self._safe_sqrt_vec(np.diag(cov))
 
         x_all = self.x
         base_all = self.baseline if (base_applied and add_mode) else None
@@ -4255,43 +4246,153 @@ class PeakFitApp:
                 total = total + base_all
             return total
 
-        y0 = ymodel(theta)
-        G = np.empty((x_all.size, theta.size), float)
-        for j in range(theta.size):
-            step = 1e-6 * max(1.0, abs(theta[j]))
-            tp = theta.copy()
-            tp[j] += step
-            G[:, j] = (ymodel(tp) - y0) / step
+        P = int(theta.size)
+        if locked_mask is None:
+            locked_mask_arr = np.zeros(P, dtype=bool)
+            for i, pk in enumerate(self.peaks):
+                if bool(getattr(pk, "lock_center", False)):
+                    locked_mask_arr[4 * i + 0] = True
+                if bool(getattr(pk, "lock_height", False)):
+                    locked_mask_arr[4 * i + 1] = True
+                if bool(getattr(pk, "lock_width", False)):
+                    locked_mask_arr[4 * i + 2] = True
+                if bool(getattr(pk, "lock_eta", False)):
+                    locked_mask_arr[4 * i + 3] = True
+        else:
+            locked_mask_arr = np.asarray(locked_mask, bool).reshape(-1)
+            if locked_mask_arr.size != P:
+                tmp = np.zeros(P, dtype=bool)
+                n = min(P, int(locked_mask_arr.size))
+                if n:
+                    tmp[:n] = locked_mask_arr[:n]
+                locked_mask_arr = tmp
 
-        var = np.einsum('ij,jk,ik->i', G, cov, G)
-        band_std = self._safe_sqrt_vec(var)
-        z = 1.96
-        lo = y0 - z * band_std
-        hi = y0 + z * band_std
+        lo_arr = np.full(P, -np.inf, dtype=float)
+        hi_arr = np.full(P, np.inf, dtype=float)
+        if bounds is not None:
+            try:
+                lo_raw, hi_raw = bounds
+            except Exception:
+                lo_raw = hi_raw = None
+            if lo_raw is not None:
+                try:
+                    lo_vec = np.asarray(lo_raw, float).reshape(-1)
+                    if int(lo_vec.size) == P:
+                        lo_arr = lo_vec.copy()
+                    else:
+                        n = min(P, int(lo_vec.size))
+                        if n:
+                            lo_arr[:n] = lo_vec[:n]
+                except Exception:
+                    pass
+            if hi_raw is not None:
+                try:
+                    hi_vec = np.asarray(hi_raw, float).reshape(-1)
+                    if int(hi_vec.size) == P:
+                        hi_arr = hi_vec.copy()
+                    else:
+                        n = min(P, int(hi_vec.size))
+                        if n:
+                            hi_arr[:n] = hi_vec[:n]
+                except Exception:
+                    pass
+
+        alpha_val = float(alpha if alpha is not None else self._safe_alpha())
+        try:
+            core_res = core_uncertainty.asymptotic_ci(
+                theta_hat=theta,
+                residual=r0,
+                jacobian=J,
+                ymodel_fn=ymodel,
+                alpha=alpha_val,
+                locked_mask=locked_mask_arr,
+                bounds=(lo_arr, hi_arr),
+            )
+        except Exception:
+            core_res = None
+
         warn_nonfinite = False
-        if not np.all(np.isfinite(lo)) or not np.all(np.isfinite(hi)):
-            lo = np.nan_to_num(lo)
-            hi = np.nan_to_num(hi)
-            warn_nonfinite = True
-        self.ci_band = (x_all, lo, hi)
+        if core_res is not None and core_res.band is not None:
+            xb, lob, hib = core_res.band
+            xb = np.asarray(xb)
+            lob = np.asarray(lob)
+            hib = np.asarray(hib)
+            warn_nonfinite = not (np.all(np.isfinite(lob)) and np.all(np.isfinite(hib)))
+            self.ci_band = (xb, lob, hib)
+        else:
+            self.ci_band = None
 
-        bw = (hi - lo)[mask]
-        bw_stats = (float(np.min(bw)), float(np.median(bw)), float(np.max(bw)))
+        theta_vec = np.asarray(theta, float)
+        free_mask = ~locked_mask_arr if locked_mask_arr is not None else np.ones(P, bool)
+        m = r0.size
+        rss = float(np.dot(r0, r0))
+        n_free = int(np.sum(free_mask))
+        dof = max(m - n_free, 1)
+        sigma2 = rss / dof if dof > 0 else 0.0
 
-        dof = max(m - rank, 1)
+        if n_free > 0:
+            Jf = J[:, free_mask]
+            try:
+                U, s, Vt = np.linalg.svd(Jf, full_matrices=False)
+            except np.linalg.LinAlgError:
+                s = np.linalg.svd(Jf, compute_uv=False)
+                U = Vt = np.eye(Jf.shape[1])
+            tol = max(Jf.shape) * np.finfo(float).eps * (s[0] if s.size else 0.0)
+            nz = s > tol
+            rank = int(np.count_nonzero(nz))
+            inv_s = np.zeros_like(s)
+            inv_s[nz] = 1.0 / (s[nz] ** 2)
+            cov_free = (Vt.T * inv_s) @ Vt
+            # Report cond(JᵀJ) to match the UI message; cond(JᵀJ) = cond(J)^2
+            cond = (float(s[nz].max() / s[nz].min()) ** 2) if rank > 0 else float("inf")
+            cov_free = sigma2 * cov_free
+        else:
+            rank = 0
+            cond = 0.0
+            cov_free = np.zeros((0, 0), dtype=float)
+
+        cov = np.zeros((P, P), dtype=float)
+        if n_free > 0:
+            cov[np.ix_(free_mask, free_mask)] = cov_free
+
+        std = np.zeros(P, dtype=float)
+        if n_free > 0:
+            std[free_mask] = np.sqrt(np.maximum(np.diag(cov_free), 0.0))
+        self.param_sigma = std
+
+        z = core_uncertainty._z_value(alpha_val)
+        ci_lo = theta_vec - z * std
+        ci_hi = theta_vec + z * std
+        ci_lo = np.maximum(ci_lo, lo_arr)
+        ci_hi = np.minimum(ci_hi, hi_arr)
+
+        bw_stats = (0.0, 0.0, 0.0)
+        try:
+            if self.ci_band is not None:
+                xb, lob, hib = self.ci_band
+                bw = (np.asarray(hib) - np.asarray(lob))[mask]
+                if bw.size:
+                    bw_stats = (
+                        float(np.min(bw)),
+                        float(np.median(bw)),
+                        float(np.max(bw)),
+                    )
+        except Exception:
+            pass
+
         info = {
             "m": m,
-            "n": theta.size,
+            "n": P,
             "rank": rank,
             "dof": dof,
             "cond": cond,
-            "rmse": math.sqrt(rss / m),
-            "s2": rss / dof,
+            "rmse": math.sqrt(rss / m) if m else float("nan"),
+            "s2": sigma2,
             "bw": bw_stats,
             "warn_nonfinite": warn_nonfinite,
         }
         self.unc_info = info
-        return cov, theta, info
+        return cov, theta_vec, info
 
     def _format_asymptotic_summary(self, cov, theta, info, band):
         lines: list[str] = []
@@ -4418,7 +4519,12 @@ class PeakFitApp:
 
         # NOTE: This method is the "fast" uncertainty path used by the GUI.
         if method_key == "asymptotic":
-            res = self._run_asymptotic_uncertainty()
+            bounds_tuple = (np.asarray(lo, float).copy(), np.asarray(hi, float).copy())
+            res = self._run_asymptotic_uncertainty(
+                locked_mask=locked_mask,
+                bounds=bounds_tuple,
+                alpha=alpha,
+            )
             if res is None:
                 return {"label": "unknown", "stats": []}
             cov, _th, _info = res
@@ -4844,8 +4950,48 @@ class PeakFitApp:
             for i, pk in enumerate(self.peaks):
                 if bool(getattr(pk, "lock_center", False)):
                     locked_mask[4 * i + 0] = True
+                if bool(getattr(pk, "lock_height", False)):
+                    locked_mask[4 * i + 1] = True
                 if bool(getattr(pk, "lock_width", False)):
                     locked_mask[4 * i + 2] = True
+                if bool(getattr(pk, "lock_eta", False)):
+                    locked_mask[4 * i + 3] = True
+
+            P = int(theta.size)
+            param_lo = np.full(P, -np.inf, dtype=float)
+            param_hi = np.full(P, np.inf, dtype=float)
+            try:
+                from fit.bounds import pack_theta_bounds as _pack_theta_bounds
+
+                _hdr, (lo_raw, hi_raw) = _pack_theta_bounds(
+                    self.peaks,
+                    np.asarray(x_fit, float),
+                    dict(self.cfg.get("solver_options", {}) or {}),
+                )
+            except Exception:
+                lo_raw = hi_raw = None
+            if lo_raw is not None:
+                try:
+                    lo_vec = np.asarray(lo_raw, float).reshape(-1)
+                    if int(lo_vec.size) == P:
+                        param_lo = lo_vec.copy()
+                    else:
+                        n = min(P, int(lo_vec.size))
+                        if n:
+                            param_lo[:n] = lo_vec[:n]
+                except Exception:
+                    pass
+            if hi_raw is not None:
+                try:
+                    hi_vec = np.asarray(hi_raw, float).reshape(-1)
+                    if int(hi_vec.size) == P:
+                        param_hi = hi_vec.copy()
+                    else:
+                        n = min(P, int(hi_vec.size))
+                        if n:
+                            param_hi[:n] = hi_vec[:n]
+                except Exception:
+                    pass
 
             alpha = self._safe_alpha()
             jitter_pct = self._safe_jitter_pct()
@@ -4866,7 +5012,11 @@ class PeakFitApp:
             self._cfg_set("bayes_thin", thin)
             self._cfg_set("bayes_diagnostics", bool(self.bayes_diag_var.get()))
             if method == "asymptotic":
-                res = self._run_asymptotic_uncertainty()
+                res = self._run_asymptotic_uncertainty(
+                    locked_mask=locked_mask,
+                    bounds=(param_lo.copy(), param_hi.copy()),
+                    alpha=alpha,
+                )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
                 if res is None:
@@ -4950,8 +5100,8 @@ class PeakFitApp:
 
                 # --- Parameter bounds for bootstrap (independent of band arrays) ---
                 P = int(np.asarray(theta, float).size)
-                p_lo = np.full(P, -np.inf, dtype=float)
-                p_hi = np.full(P,  np.inf, dtype=float)
+                p_lo = np.asarray(param_lo, float).copy()
+                p_hi = np.asarray(param_hi, float).copy()
                 # If this function has existing logic that determines per-parameter bounds,
                 # fold it into p_lo/p_hi here (keeping shapes length-P). Otherwise leave ±inf.
 
@@ -5015,6 +5165,9 @@ class PeakFitApp:
                 with self._tp_limits_ctx():
                     self._dbg(
                         f"bounds check: P={P}, p_lo.shape={getattr(p_lo,'shape',None)}, p_hi.shape={getattr(p_hi,'shape',None)}"
+                    )
+                    self._dbg(
+                        f"unc: show_band={bool(self.show_ci_band_var.get())} (solver={boot_solver})"
                     )
                     out = core_uncertainty.bootstrap_ci(
                         theta=theta,
@@ -5571,7 +5724,9 @@ class PeakFitApp:
 
     # --- BEGIN: hook batch runner to compute + export uncertainty ---
     @log_action
-    def _batch_process_file(self, in_path: Path, out_dir: Path, unc_rows: List[dict] | None = None):
+    def _batch_process_file(
+        self, in_path: Path, out_dir: Path, unc_rows: Optional[List[dict]] = None
+    ):
         """Process one spectrum: reset band, fit, export fit/trace, then compute and export uncertainty if enabled."""
         # reset any previous band so batch files don't leak state
         self.ci_band = None
