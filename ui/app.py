@@ -2752,6 +2752,15 @@ class PeakFitApp:
                 pass
 
             # Checkbox remains enabled regardless of method; actual rendering depends on band availability.
+            # Restore the user preference for this method (default True for non-Bayesian).
+            try:
+                self._suspend_ci_trace = True
+                default_on = (method_key != "bayesian")
+                self.show_ci_band_var.set(
+                    bool(self._band_pref.get(method_key, default_on))
+                )
+            finally:
+                self._suspend_ci_trace = False
             self._set_ci_toggle_state(True)
 
             is_boot = method_key == "bootstrap"
@@ -4307,6 +4316,7 @@ class PeakFitApp:
                 alpha=alpha_val,
                 locked_mask=locked_mask_arr,
                 bounds=(lo_arr, hi_arr),
+                xgrid=x_all,
             )
         except Exception:
             core_res = None
