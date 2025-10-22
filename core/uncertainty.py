@@ -592,6 +592,8 @@ def asymptotic_ci(
     alpha: float = 0.05,
     locked_mask: Optional[np.ndarray] = None,
     bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    *,
+    xgrid: Optional[np.ndarray] = None,
     **_ignored: Any,
 ) -> UncertaintyResult:
     """Return asymptotic parameter statistics and a prediction band.
@@ -686,7 +688,18 @@ def asymptotic_ci(
     band_std = np.sqrt(np.maximum(var, 0.0))
     band_lo = y0 - z * band_std
     band_hi = y0 + z * band_std
-    x = np.arange(y0.size)
+
+    # Use the caller-provided x-grid when available to avoid plotting offset.
+    x_arr: Optional[np.ndarray] = None
+    if xgrid is not None:
+        try:
+            x_arr = np.asarray(xgrid, float).reshape(-1)
+            if x_arr.size != y0.size:
+                x_arr = None
+        except Exception:
+            x_arr = None
+    if x_arr is None:
+        x_arr = np.arange(y0.size, dtype=float)
 
     names = [f"p{i}" for i in range(theta.size)]
     stats = {
@@ -714,7 +727,7 @@ def asymptotic_ci(
 
     _add_percentile_aliases_inplace(stats)
 
-    band = (x, band_lo, band_hi)
+    band = (x_arr, band_lo, band_hi)
     diag: Dict[str, object] = {"alpha": alpha, "param_order": names}
     n_free = int(np.sum(free_mask))
     # Preferred key for downstream consumers; keep legacy alias for compatibility.
@@ -1379,8 +1392,9 @@ def bootstrap_ci(
         refit = _robust_refit
 
     Jf = J[:, free_mask] if (J.ndim == 2) else None
-    # Disable linear fallback when parameters are tied (LMFIT) or globally disabled
-    if share_fwhm or share_eta or not allow_linear:
+    # Allow linearized fast path even when widths/etas are shared; the Jacobian
+    # already encodes ties. Only gate on the explicit allow_linear switch.
+    if not allow_linear:
         Jf = None
     use_linearized_fast_path = bool(Jf is not None and Jf.size and np.sum(free_mask) > 0)
     if strict_refit or jitter_scale > 0:
