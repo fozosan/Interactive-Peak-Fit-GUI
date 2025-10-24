@@ -187,15 +187,22 @@ import csv
 from dataclasses import dataclass
 from functools import wraps  # used by @log_action
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple, Optional
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Tuple, Optional, Mapping
 from contextlib import nullcontext
 from types import SimpleNamespace  # ensure this import exists
 from core.data_io import (
     write_uncertainty_csvs,
     write_uncertainty_txt,
 )
+try:
+    import core.data_io as _dio  # for build_peak_table/trace_table in batch exports
+except Exception:
+    # Will raise at first use if missing; kept non-fatal to avoid breaking app start
+    _dio = None  # type: ignore
 
 import numpy as np
+import pandas as pd
 
 import os
 import matplotlib
@@ -230,7 +237,6 @@ import traceback
 from scipy.signal import find_peaks
 
 from core import signals
-import core.data_io as _dio
 # --- Canonical uncertainty label: delegate to data_io when available ---
 try:
     _canonical_unc_label = _dio.canonical_unc_label  # type: ignore[attr-defined]
@@ -969,8 +975,39 @@ class PeakFitApp:
         except Exception:
             pass
 
+    def _persist_compute_prefs(self):
+        """Persist per-method compute-band preferences."""
+        prefs = {k: bool(v) for k, v in (getattr(self, "_compute_pref", {}) or {}).items()}
+        try:
+            self.cfg["unc_compute_pref"] = dict(prefs)
+        except Exception:
+            pass
+        try:
+            self.cfg["unc_compute_pref_json"] = json.dumps(prefs)
+        except Exception:
+            pass
+        try:
+            save_config(self.cfg)
+        except Exception:
+            pass
+
     def _persist_band_prefs(self):
-        """Write per-method CI band preferences back to the config file."""
+        """Store per-method Show/Compute preferences in the config."""
+        compute_pref = getattr(self, "_compute_pref", {}) or {}
+        try:
+            self.cfg["unc_band_pref"] = dict(self._band_pref)
+        except Exception:
+            pass
+        try:
+            self.cfg["unc_compute_pref"] = dict(compute_pref)
+        except Exception:
+            pass
+        try:
+            self.cfg["unc_compute_pref_json"] = json.dumps(
+                {k: bool(v) for k, v in compute_pref.items()}
+            )
+        except Exception:
+            pass
         try:
             self.cfg["ui_band_pref_asymptotic"] = bool(
                 self._band_pref.get("asymptotic", False)
@@ -980,6 +1017,15 @@ class PeakFitApp:
             )
             self.cfg["ui_band_pref_bayesian"] = bool(
                 self._band_pref.get("bayesian", False)
+            )
+            self.cfg["ui_band_compute_asymptotic"] = bool(
+                compute_pref.get("asymptotic", True)
+            )
+            self.cfg["ui_band_compute_bootstrap"] = bool(
+                compute_pref.get("bootstrap", True)
+            )
+            self.cfg["ui_band_compute_bayesian"] = bool(
+                compute_pref.get("bayesian", True)
             )
             save_config(self.cfg)
         except Exception:
@@ -1066,11 +1112,39 @@ class PeakFitApp:
         self.cfg.setdefault("ui_band_pref_asymptotic", False)
         self.cfg.setdefault("ui_band_pref_bootstrap", True)
         self.cfg.setdefault("ui_band_pref_bayesian", False)
+        self.cfg.setdefault("ui_band_compute_asymptotic", True)
+        self.cfg.setdefault("ui_band_compute_bootstrap", True)
+        self.cfg.setdefault("ui_band_compute_bayesian", True)
+        self.cfg.setdefault("unc_band_pref", {})
+        self.cfg.setdefault("unc_compute_pref", {})
+        stored_band_pref: Dict[str, bool] = {}
+        try:
+            stored_band_pref.update({k: bool(v) for k, v in dict(self.cfg.get("unc_band_pref", {})).items()})
+        except Exception:
+            pass
+        stored_compute_pref: Dict[str, bool] = {}
+        try:
+            stored_compute_pref.update({k: bool(v) for k, v in dict(self.cfg.get("unc_compute_pref", {})).items()})
+        except Exception:
+            pass
+        try:
+            raw_json = self.cfg.get("unc_compute_pref_json", "")
+            if raw_json:
+                stored_compute_pref.update({k: bool(v) for k, v in json.loads(raw_json).items()})
+        except Exception:
+            pass
         self._band_pref = {
             "asymptotic": bool(self.cfg.get("ui_band_pref_asymptotic", False)),
             "bootstrap": bool(self.cfg.get("ui_band_pref_bootstrap", True)),
             "bayesian": bool(self.cfg.get("ui_band_pref_bayesian", False)),
         }
+        self._band_pref.update(stored_band_pref)
+        self._compute_pref = {
+            "asymptotic": bool(self.cfg.get("ui_band_compute_asymptotic", True)),
+            "bootstrap": bool(self.cfg.get("ui_band_compute_bootstrap", True)),
+            "bayesian": bool(self.cfg.get("ui_band_compute_bayesian", True)),
+        }
+        self._compute_pref.update(stored_compute_pref)
         self._last_unc_method_key = None  # tracks source method for band-pref memory
         self._unc_change_busy = False
         # Group B: user override marker for bootstrap solver selection
@@ -1259,9 +1333,30 @@ class PeakFitApp:
                 self.cfg.get("ui_show_uncertainty_band", False),
             )
         )
+        compute_band_pref = bool(unc_section_cfg.get("compute_band", True))
         self.ci_band = None
         self.show_ci_band = tk.BooleanVar(value=return_band_pref)
         self.show_ci_band_var = self.show_ci_band
+        try:
+            existing_compute_var = self.compute_ci_band_var  # type: ignore[attr-defined]
+        except AttributeError:
+            existing_compute_var = None
+        if isinstance(existing_compute_var, tk.BooleanVar):
+            try:
+                existing_compute_var.set(bool(existing_compute_var.get()))
+            except Exception:
+                pass
+        else:
+            try:
+                self.compute_ci_band_var = tk.BooleanVar(value=compute_band_pref)
+            except Exception:
+                self.compute_ci_band_var = None
+        if isinstance(getattr(self, "compute_ci_band_var", None), tk.BooleanVar):
+            try:
+                self.compute_ci_band_var.set(bool(compute_band_pref))
+            except Exception:
+                pass
+        self._compute_chk = None
         # Uncertainty state
         self.last_uncertainty = None
         self._last_unc_locks: List[Dict[str, bool]] = []
@@ -1380,6 +1475,10 @@ class PeakFitApp:
         except Exception:
             show_band = False
         try:
+            compute_band = self._should_compute_ci_band()
+        except Exception:
+            compute_band = False
+        try:
             seed_all = bool(self.perf_seed_all.get()) if hasattr(self, "perf_seed_all") else False
         except Exception:
             seed_all = False
@@ -1402,6 +1501,7 @@ class PeakFitApp:
             "unc_key": key,
             "solver": str(self.solver_choice.get()) if hasattr(self, "solver_choice") else "",
             "show_band": show_band,
+            "compute_band": compute_band,
             "seed_all": seed_all,
             "seed": seed_val,
             "workers_fit": workers_fit,
@@ -1409,6 +1509,27 @@ class PeakFitApp:
         }
         state.update(extra or {})
         self._dbg(f"{where}: {_kv(state)}")
+
+    def _ensure_compute_toggle(self):
+        """Add a 'Compute band' checkbox just under the 'Show band' checkbox."""
+        try:
+            if self._compute_chk is not None or self.compute_ci_band_var is None:
+                return
+            parent = getattr(self, "_ci_toggle_chk", None)
+            parent = parent.master if parent is not None else None
+            if parent is None:
+                return
+            import tkinter.ttk as ttk
+
+            self._compute_chk = ttk.Checkbutton(
+                parent,
+                text="Compute band",
+                variable=self.compute_ci_band_var,
+                command=self._toggle_ci_compute,
+            )
+            self._compute_chk.pack(anchor="w", padx=4, pady=(0, 2))
+        except Exception:
+            pass
 
     def _debug_uncertainty_import(self) -> None:
         if not self._is_debug():
@@ -1858,6 +1979,7 @@ class PeakFitApp:
         self.chk_ci_band.pack(side=tk.LEFT, padx=4)
         self.ci_toggle = self.chk_ci_band
         self.band_chk = self.chk_ci_band
+        self._ci_toggle_chk = self.chk_ci_band
         self._set_ci_toggle_state(False)
         # Guard so forcing off for Bayesian won't persist/override user's saved pref
         self._suspend_ci_trace = False
@@ -1867,33 +1989,15 @@ class PeakFitApp:
             if getattr(self, "_suspend_ci_trace", False):
                 return
             try:
-                band = getattr(self, "ci_band", None)
-                # If no band exists, ensure the checkbox is OFF without re-entering.
-                if band is None and bool(self.show_ci_band_var.get()):
-                    # Record the user's intent (so it can be restored later),
-                    # then untick the UI toggle to reflect current unavailability.
-                    try:
-                        mk = self._unc_selected_method_key()
-                        if mk in self._band_pref:
-                            self._band_pref[mk] = True
-                            self._persist_band_prefs()
-                    except Exception:
-                        pass
-                    try:
-                        self._suspend_ci_trace = True
-                        self.show_ci_band_var.set(False)
-                    finally:
-                        self._suspend_ci_trace = False
-                    return
                 # Persist per-method preference on any user change
                 try:
                     mk = self._unc_selected_method_key()
-                    if mk in self._band_pref:
+                    if mk:
                         self._band_pref[mk] = bool(self.show_ci_band_var.get())
                         self._persist_band_prefs()
                 except Exception:
                     pass
-                # Toggle rendering to match the new state
+                # Toggle rendering to match the new state (no auto-unchecking)
                 self._toggle_ci_band()
             except Exception:
                 return
@@ -1912,6 +2016,7 @@ class PeakFitApp:
         except Exception:
             pass
         self.show_ci_band.trace_add("write", _ci_trace_guard)
+        self._ensure_compute_toggle()
 
         # Extra uncertainty controls
         unc_frame = ttk.Frame(unc_box)
@@ -2326,6 +2431,8 @@ class PeakFitApp:
             unc_section = self.cfg.setdefault("uncertainty", {})
             unc_section["method"] = method_key
             unc_section.setdefault("return_band", bool(self.show_ci_band_var.get()))
+            if "compute_band" not in unc_section:
+                unc_section["compute_band"] = self._should_compute_ci_band()
         except Exception:
             pass
         save_config(self.cfg)
@@ -2647,6 +2754,18 @@ class PeakFitApp:
         self.refresh_plot()
         self._debug_snapshot("_toggle_ci_band", show_band=val)
 
+    def _should_compute_ci_band(self) -> bool:
+        try:
+            var = getattr(self, "compute_ci_band_var", None)
+            if var is not None:
+                return bool(var.get())
+        except Exception:
+            pass
+        try:
+            return bool(self.show_ci_band_var.get())
+        except Exception:
+            return True
+
     def _set_ci_toggle_state(self, enabled: bool):
         try:
             widget = getattr(self, "band_chk", getattr(self, "ci_toggle", None))
@@ -2657,6 +2776,12 @@ class PeakFitApp:
         try:
             state = ("!disabled",) if enabled else ("disabled",)
             self.ci_toggle.state(state)
+        except Exception:
+            pass
+        try:
+            chk = getattr(self, "_compute_chk", None)
+            if chk is not None:
+                chk.state(["!disabled"] if enabled else ["disabled"])
         except Exception:
             pass
 
@@ -2742,26 +2867,38 @@ class PeakFitApp:
         try:
             method_key = self._unc_selected_method_key()
 
-            # Save the old method's band pref before switching
+            # Save the old method's band/compute prefs before switching
             try:
                 old_key = getattr(self, "_last_unc_method_key", None)
-                if old_key and old_key in self._band_pref:
-                    self._band_pref[old_key] = bool(self.show_ci_band_var.get())
-                    self._persist_band_prefs()
+                if old_key:
+                    if old_key in self._band_pref:
+                        self._band_pref[old_key] = bool(self.show_ci_band_var.get())
+                    if self.compute_ci_band_var is not None:
+                        self._compute_pref[old_key] = bool(self.compute_ci_band_var.get())
+                self._persist_band_prefs()
             except Exception:
                 pass
 
-            # Checkbox remains enabled regardless of method; actual rendering depends on band availability.
-            # Restore the user preference for this method (default True for non-Bayesian).
+            self._ensure_compute_toggle()
             try:
                 self._suspend_ci_trace = True
-                default_on = (method_key != "bayesian")
+                default_compute = method_key != "bayesian"
+                if self.compute_ci_band_var is not None:
+                    self.compute_ci_band_var.set(
+                        bool(self._compute_pref.get(method_key, default_compute))
+                    )
                 self.show_ci_band_var.set(
-                    bool(self._band_pref.get(method_key, default_on))
+                    bool(self._band_pref.get(method_key, False))
                 )
             finally:
                 self._suspend_ci_trace = False
+
             self._set_ci_toggle_state(True)
+            if self._compute_chk is not None:
+                try:
+                    self._compute_chk.state(["!disabled"])
+                except Exception:
+                    pass
 
             is_boot = method_key == "bootstrap"
             is_bayes = method_key == "bayesian"
@@ -2824,6 +2961,7 @@ class PeakFitApp:
                 unc_section = self.cfg.setdefault("uncertainty", {})
                 unc_section["method"] = method_key
                 unc_section["return_band"] = bool(self.show_ci_band_var.get())
+                unc_section["compute_band"] = self._should_compute_ci_band()
                 self.cfg["unc_method"] = method_key
                 save_config(self.cfg)
             except Exception:
@@ -2831,6 +2969,20 @@ class PeakFitApp:
             self._debug_snapshot("_on_uncertainty_method_changed", method_key=method_key)
         finally:
             self._unc_change_busy = False
+
+
+    def _toggle_ci_compute(self, *_):
+        try:
+            var = getattr(self, "compute_ci_band_var", None)
+            if var is None:
+                return
+            val = bool(var.get())
+            key = self._unc_selected_method_key()
+            if key:
+                self._compute_pref[key] = val
+                self._persist_compute_prefs()
+        except Exception:
+            pass
 
 
     def _update_bootstrap_tie_widgets(self):
@@ -4278,6 +4430,37 @@ class PeakFitApp:
 
         lo_arr = np.full(P, -np.inf, dtype=float)
         hi_arr = np.full(P, np.inf, dtype=float)
+        if P:
+            # Match the batch asymptotic defaults so GUI/batch produce consistent bounds.
+            try:
+                xlo = float(np.min(x_fit))
+                xhi = float(np.max(x_fit))
+            except Exception:
+                xlo = float(np.nanmin(self.x)) if self.x is not None else -np.inf
+                xhi = float(np.nanmax(self.x)) if self.x is not None else np.inf
+            if np.isfinite(xlo) and np.isfinite(xhi):
+                lo_arr[0::4] = xlo
+                hi_arr[0::4] = xhi
+            lo_arr[1::4] = 0.0
+            y_corr = y_fit if add_mode or base_fit is None else (y_fit - base_fit)
+            try:
+                yscale = float(np.nanmax(y_corr))
+            except Exception:
+                yscale = 1.0
+            if not np.isfinite(yscale) or yscale <= 0.0:
+                yscale = 1.0
+            hi_arr[1::4] = max(1.0, 1.5 * yscale)
+            try:
+                fwhm_min = float(self.classic_fwhm_min.get())
+            except Exception:
+                fwhm_min = 1e-2
+            fwhm_min = max(1e-3, fwhm_min)
+            width_span = float(xhi - xlo) if np.isfinite(xhi - xlo) else 0.0
+            hi_width = max(1.0, width_span)
+            lo_arr[2::4] = fwhm_min
+            hi_arr[2::4] = hi_width
+            lo_arr[3::4] = 0.0
+            hi_arr[3::4] = 1.0
         if bounds is not None:
             try:
                 lo_raw, hi_raw = bounds
@@ -4491,30 +4674,41 @@ class PeakFitApp:
             if bool(getattr(pk, "lock_eta", False)):
                 locked_mask[4 * i + 3] = True
 
-        # Shared bounds mirroring interactive uncertainty path (fallback)
-        n_pk = len(self.peaks)
-        P = 4 * n_pk
-        lo = np.full(P, -np.inf, float)
-        hi = np.full(P, np.inf, float)
-        xlo, xhi = float(np.min(x_fit)), float(np.max(x_fit))
-        lo[0::4] = xlo
-        hi[0::4] = xhi
-        lo[1::4] = 0.0
-        y_corr = y_fit if add_mode or base_fit is None else (y_fit - base_fit)
+        P = int(theta.size)
+        param_lo = np.full(P, -np.inf, dtype=float)
+        param_hi = np.full(P, np.inf, dtype=float)
         try:
-            yscale = float(np.nanmax(y_corr))
+            from fit.bounds import pack_theta_bounds as _pack_theta_bounds
+
+            _hdr, (lo_raw, hi_raw) = _pack_theta_bounds(
+                self.peaks,
+                np.asarray(x_fit, float),
+                dict(self.cfg.get("solver_options", {}) or {}),
+            )
         except Exception:
-            yscale = 1.0
-        if not np.isfinite(yscale) or yscale <= 0:
-            yscale = 1.0
-        hi[1::4] = max(1.0, 1.5 * yscale)
-        lo[2::4] = max(
-            1e-3,
-            float(self.classic_fwhm_min.get() if hasattr(self, "classic_fwhm_min") else 1e-2),
-        )
-        hi[2::4] = max(1.0, xhi - xlo)
-        lo[3::4] = 0.0
-        hi[3::4] = 1.0
+            lo_raw = hi_raw = None
+        if lo_raw is not None:
+            try:
+                lo_vec = np.asarray(lo_raw, float).reshape(-1)
+                if int(lo_vec.size) == P:
+                    param_lo = lo_vec.copy()
+                else:
+                    n = min(P, int(lo_vec.size))
+                    if n:
+                        param_lo[:n] = lo_vec[:n]
+            except Exception:
+                pass
+        if hi_raw is not None:
+            try:
+                hi_vec = np.asarray(hi_raw, float).reshape(-1)
+                if int(hi_vec.size) == P:
+                    param_hi = hi_vec.copy()
+                else:
+                    n = min(P, int(hi_vec.size))
+                    if n:
+                        param_hi[:n] = hi_vec[:n]
+            except Exception:
+                pass
 
         try:
             workers = int(self._resolve_unc_workers())
@@ -4527,9 +4721,18 @@ class PeakFitApp:
         jitter_frac = float(unc_sig.get("jitter", 0.0) or 0.0)
         center_res = bool(self.center_resid_var.get())
 
+        compute_pref = self._should_compute_ci_band()
+
         # NOTE: This method is the "fast" uncertainty path used by the GUI.
         if method_key == "asymptotic":
-            bounds_tuple = (np.asarray(lo, float).copy(), np.asarray(hi, float).copy())
+            compute_band = compute_pref
+            if not compute_band:
+                # compute disabled; leave any existing band as-is (plot visibility handled by Show toggle)
+                return {"label": "asymptotic", "stats": []}
+            bounds_tuple = (
+                np.asarray(param_lo, float).copy(),
+                np.asarray(param_hi, float).copy(),
+            )
             res = self._run_asymptotic_uncertainty(
                 locked_mask=locked_mask,
                 bounds=bounds_tuple,
@@ -4619,24 +4822,8 @@ class PeakFitApp:
 
             # --- Parameter bounds for bootstrap (independent of band arrays) ---
             P = int(np.asarray(theta, float).size)
-            p_lo = np.full(P, -np.inf, dtype=float)
-            p_hi = np.full(P,  np.inf, dtype=float)
-            try:
-                lo_arr = np.asarray(lo, float).reshape(-1)
-                hi_arr = np.asarray(hi, float).reshape(-1)
-            except Exception:
-                lo_arr = None
-                hi_arr = None
-            if lo_arr is not None and lo_arr.size:
-                if int(lo_arr.size) == P:
-                    p_lo = lo_arr.copy()
-                else:
-                    p_lo[: min(P, int(lo_arr.size))] = lo_arr[: min(P, int(lo_arr.size))]
-            if hi_arr is not None and hi_arr.size:
-                if int(hi_arr.size) == P:
-                    p_hi = hi_arr.copy()
-                else:
-                    p_hi[: min(P, int(hi_arr.size))] = hi_arr[: min(P, int(hi_arr.size))]
+            p_lo = np.asarray(param_lo, float).copy()
+            p_hi = np.asarray(param_hi, float).copy()
 
             fit_ctx = {
                 "x": x_fit,
@@ -4678,9 +4865,10 @@ class PeakFitApp:
                 req_workers = self._resolve_unc_workers()
             except Exception:
                 req_workers = 0
+            compute_band = compute_pref
+            show_pref = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else True
             try:
-                show_band = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else True
-                kind = "prediction" if show_band else "resampling"
+                kind = "prediction" if compute_band else "resampling"
                 self.log(
                     f"Bootstrap band ({kind}): draws={n_boot} | "
                     f"workers_requested={req_workers} | workers_band={band_workers or 0}"
@@ -4691,6 +4879,12 @@ class PeakFitApp:
                 self._dbg(
                     f"bounds check: P={P}, p_lo.shape={getattr(p_lo,'shape',None)}, p_hi.shape={getattr(p_hi,'shape',None)}"
                 )
+                try:
+                    self._dbg(
+                        f"unc: compute_band={compute_band} show_band={show_pref} (solver={boot_solver})"
+                    )
+                except Exception:
+                    pass
                 res = core_uncertainty.bootstrap_ci(
                     theta=theta,
                     residual=r0,
@@ -4701,7 +4895,7 @@ class PeakFitApp:
                     fit_ctx=fit_ctx,
                     bounds=(p_lo, p_hi),          # mirror constraints at the top level too
                     locked_mask=locked_mask,
-                    return_band=True,
+                    return_band=compute_band,
                     alpha=alpha,
                     center_residuals=center_res,
                     workers=workers,
@@ -4712,12 +4906,12 @@ class PeakFitApp:
         elif method_key == "bayesian":
             # Pre-run user notices (only if the user intends to see a band)
             try:
-                if self.show_ci_band_var.get() and not self.bayes_band_enabled_var.get():
+                if self._should_compute_ci_band() and self.show_ci_band_var.get() and not self.bayes_band_enabled_var.get():
                     self.status_warn("Bayesian band is disabled. Turn on 'Enable posterior band' to plot the band.")
             except Exception:
                 pass
             try:
-                if self.show_ci_band_var.get() and self.bayes_band_enabled_var.get():
+                if self._should_compute_ci_band() and self.show_ci_band_var.get() and self.bayes_band_enabled_var.get():
                     if (not self.bayes_diag_var.get()) and (not self.bayes_band_force_var.get()):
                         self.status_warn(
                             "Bayesian band will NOT be computed: diagnostics are OFF. Enable diagnostics or toggle 'Force band'."
@@ -4791,7 +4985,10 @@ class PeakFitApp:
                     seed=seed_val,
                     fit_ctx=fit_ctx,
                     locked_mask=locked_mask,
-                    bounds=(lo, hi),
+                    bounds=(
+                        np.asarray(param_lo, float).copy(),
+                        np.asarray(param_hi, float).copy(),
+                    ),
                     workers=workers,
                     n_walkers=(walkers or None),
                     n_burn=burn,
@@ -4858,6 +5055,56 @@ class PeakFitApp:
         # Safe config fallback; default True so batch jobs compute uncertainty unless explicitly disabled.
         cfg = getattr(self, "cfg", {}) or {}
         return bool(cfg.get("batch_compute_uncertainty", cfg.get("compute_uncertainty_batch", True)))
+
+    def _export_band_csv(self, out_path: Path) -> bool:
+        """Write the current uncertainty band to a CSV file."""
+        try:
+            band = getattr(self, "ci_band", None)
+            if band is None:
+                self.dlog("[DEBUG] export_band: no band present; skipping.")
+                return False
+            x, lo, hi = band
+            x = np.asarray(x, dtype=float).reshape(-1)
+            lo = np.asarray(lo, dtype=float).reshape(-1)
+            hi = np.asarray(hi, dtype=float).reshape(-1)
+            if not (x.size and lo.size and hi.size) or not (x.shape == lo.shape == hi.shape):
+                self.dlog("[DEBUG] export_band: band arrays have mismatched shapes; skipping.")
+                return False
+
+            df = pd.DataFrame({"x": x, "band_lo": lo, "band_hi": hi})
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            method_label = ""
+            method_var = getattr(self, "unc_method", None)
+            if method_var is not None:
+                try:
+                    method_label = str(method_var.get())
+                except Exception:
+                    method_label = str(method_var)
+
+            try:
+                alpha = float(self._safe_alpha())
+            except Exception:
+                alpha = np.nan
+
+            header_lines = [
+                "# Uncertainty band export",
+                f"# generated={datetime.now().isoformat(timespec='seconds')}",
+                f"# source={getattr(self, 'file_path', None) or '-'}",
+                f"# method={method_label}",
+                f"# alpha={alpha}",
+            ]
+
+            with out_path.open("w", encoding="utf-8", newline="") as f:
+                f.write("\n".join(header_lines) + "\n")
+                df.to_csv(f, index=False)
+
+            self.log(f"Saved band CSV: {out_path}")
+            return True
+        except Exception as exc:
+            self.log(f"Failed to save band CSV: {exc}", level="ERROR")
+            return False
 
     def _export_uncertainty_from_result(self, unc_norm, out_base: Path, file_path: str, *, write_wide: bool = True):
         saved: list[str] = []
@@ -4940,6 +5187,14 @@ class PeakFitApp:
         abort_evt = self._abort_evt
 
         def work():
+            try:
+                compute_band_flag = bool(self.compute_ci_band_var.get())
+            except Exception:
+                compute_band_flag = True
+            try:
+                show_band_flag = bool(self.show_ci_band_var.get())
+            except Exception:
+                show_band_flag = False
             # Always clear abort flag at start of run
             try:
                 abort_evt.clear()
@@ -5031,6 +5286,11 @@ class PeakFitApp:
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
                 if res is None:
                     return None
+                if not compute_band_flag:
+                    try:
+                        self.ci_band = None
+                    except Exception:
+                        pass
                 cov, th, _info = res
                 sigma = self._safe_sqrt_vec(np.diag(np.asarray(cov, float)))
                 param_stats = {
@@ -5106,7 +5366,8 @@ class PeakFitApp:
                     predict_fit = _predict_fit_local
 
                 boot_solver = self._select_bootstrap_solver()
-                show_band = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else True
+                compute_band = bool(compute_band_flag)
+                show_pref = bool(show_band_flag)
 
                 # --- Parameter bounds for bootstrap (independent of band arrays) ---
                 P = int(np.asarray(theta, float).size)
@@ -5124,7 +5385,8 @@ class PeakFitApp:
                             "seed": seed_val,
                             "workers": int(workers or 0),
                             "band_workers": int(band_workers or 0),
-                            "return_band": show_band,
+                            "return_band": compute_band,
+                            "show_pref": show_pref,
                         }
                     )
                 )
@@ -5164,8 +5426,7 @@ class PeakFitApp:
                 except Exception:
                     req_workers = 0
                 try:
-                    show_band = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else True
-                    kind = "prediction" if show_band else "resampling"
+                    kind = "prediction" if compute_band else "resampling"
                     self.log(
                         f"Bootstrap band ({kind}): draws={n_boot} | "
                         f"workers_requested={req_workers} | workers_band={band_workers or 0}"
@@ -5176,9 +5437,12 @@ class PeakFitApp:
                     self._dbg(
                         f"bounds check: P={P}, p_lo.shape={getattr(p_lo,'shape',None)}, p_hi.shape={getattr(p_hi,'shape',None)}"
                     )
-                    self._dbg(
-                        f"unc: show_band={bool(self.show_ci_band_var.get())} (solver={boot_solver})"
-                    )
+                    try:
+                        self._dbg(
+                            f"unc: compute_band={compute_band} show_band={show_pref} (solver={boot_solver})"
+                        )
+                    except Exception:
+                        pass
                     out = core_uncertainty.bootstrap_ci(
                         theta=theta,
                         residual=r0,
@@ -5192,7 +5456,7 @@ class PeakFitApp:
                         n_boot=n_boot,
                         seed=seed_val,
                         workers=workers,
-                        return_band=show_band,
+                        return_band=compute_band,
                         alpha=alpha,
                         center_residuals=bool(self.center_resid_var.get()),
                     )
@@ -5202,12 +5466,20 @@ class PeakFitApp:
             if method == "bayesian":
                 # Pre-run user notices (only if the user intends to see a band)
                 try:
-                    if self.show_ci_band_var.get() and not self.bayes_band_enabled_var.get():
+                    if (
+                        compute_band_flag
+                        and show_band_flag
+                        and not self.bayes_band_enabled_var.get()
+                    ):
                         self.status_warn("Bayesian band is disabled. Turn on 'Enable posterior band' to plot the band.")
                 except Exception:
                     pass
                 try:
-                    if self.show_ci_band_var.get() and self.bayes_band_enabled_var.get():
+                    if (
+                        compute_band_flag
+                        and show_band_flag
+                        and self.bayes_band_enabled_var.get()
+                    ):
                         if (not self.bayes_diag_var.get()) and (not self.bayes_band_force_var.get()):
                             self.status_warn(
                                 "Bayesian band will NOT be computed: diagnostics are OFF. Enable diagnostics or toggle 'Force band'."
@@ -5225,7 +5497,8 @@ class PeakFitApp:
                             "seed": self._perf_seed_value()
                             if bool(self.perf_seed_all.get())
                             else None,
-                            "return_band": bool(self.show_ci_band_var.get()),
+                            "return_band": compute_band_flag,
+                            "show_pref": show_band_flag,
                             "band_enabled": bool(self.bayes_band_enabled_var.get())
                             if hasattr(self, "bayes_band_enabled_var")
                             else None,
@@ -5314,6 +5587,7 @@ class PeakFitApp:
                         thin=thin,
                         prior_sigma=prior_sigma,
                         bounds=(lo, hi),
+                        return_band=compute_band_flag,
                     )
                 if abort_evt.is_set():
                     return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
@@ -5681,14 +5955,11 @@ class PeakFitApp:
         strategy = str(self.perf_parallel_strategy.get())
         blas_threads = int(self.perf_blas_threads.get())
         if strategy == "outer":
-            os.environ["MKL_NUM_THREADS"] = "1"
-            os.environ["OPENBLAS_NUM_THREADS"] = "1"
-            os.environ["OMP_NUM_THREADS"] = "1"
+            self._apply_thread_env("1", "1", "1")
         else:
             if blas_threads > 0:
-                os.environ["MKL_NUM_THREADS"] = str(blas_threads)
-                os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
-                os.environ["OMP_NUM_THREADS"] = str(blas_threads)
+                desired = str(blas_threads)
+                self._apply_thread_env(desired, desired, desired)
             else:
                 for k in ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"):
                     os.environ.pop(k, None)
@@ -5732,12 +6003,43 @@ class PeakFitApp:
         )
         self.status_var.set("Performance options applied.")
 
+    # minimize env toggling across older Python/BLAS/OpenMP combos
+    def _set_env_if_changed(self, key: str, val: str):
+        try:
+            cur = os.environ.get(key)
+            if cur != val:
+                os.environ[key] = val
+        except Exception:
+            pass
+
+    def _apply_thread_env(self, mkl: str, openblas: str, omp: str):
+        self._set_env_if_changed("MKL_NUM_THREADS", mkl)
+        self._set_env_if_changed("OPENBLAS_NUM_THREADS", openblas)
+        self._set_env_if_changed("OMP_NUM_THREADS", omp)
+
     # --- BEGIN: hook batch runner to compute + export uncertainty ---
     @log_action
     def _batch_process_file(
         self, in_path: Path, out_dir: Path, unc_rows: Optional[List[dict]] = None
     ):
         """Process one spectrum: reset band, fit, export fit/trace, then compute and export uncertainty if enabled."""
+        # Decoupled toggles: COMPUTE controls whether we materialize a band at all
+        try:
+            compute_band = bool(self.compute_ci_band_var.get())
+        except Exception:
+            compute_band = True
+        try:
+            show_band_ui = bool(self.show_ci_band_var.get())
+        except Exception:
+            show_band_ui = False
+
+        try:
+            self.dlog(
+                f"[DEBUG] batch toggles: compute_band={compute_band} show_band={show_band_ui}"
+            )
+        except Exception:
+            pass
+
         # reset any previous band so batch files don't leak state
         self.ci_band = None
         self._open_file(str(in_path))
@@ -5780,6 +6082,8 @@ class PeakFitApp:
         with trace_csv.open("w", encoding="utf-8", newline="") as fh:
             fh.write(trace_csv_s)
 
+        band_csv_path = out_dir / f"{in_path.stem}_band.csv"
+
         # Always decide via the batch toggle (not GUI history). If disabled or no peaks, skip with a log line.
         write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
 
@@ -5809,11 +6113,33 @@ class PeakFitApp:
                     add_mode=add_mode,
                 )
 
+                if not compute_band:
+                    # Stats are still useful, but ensure we don't carry over stale band data.
+                    self.ci_band = None
+
                 # Normalize, label, attach RMSE/DOF (using current file context)
                 unc_norm = _normalize_unc_result(unc_res)
                 raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or "")
                 label = _canonical_unc_label(raw_lbl) or self._unc_method_label({"method": method_key})
                 unc_norm["label"] = label
+
+                # Export the band CSV (x, lo, hi) when a band is present and compute is enabled.
+                band_triplet = unc_norm.get("band") if isinstance(unc_norm, Mapping) else None
+                band_written = False
+                if band_triplet:
+                    try:
+                        xb, lob, hib = band_triplet
+                        self.ci_band = (
+                            np.asarray(xb, dtype=float),
+                            np.asarray(lob, dtype=float),
+                            np.asarray(hib, dtype=float),
+                        )
+                        band_written = self._export_band_csv(band_csv_path)
+                    except Exception as exc:
+                        band_written = False
+                        self.dlog(f"[DEBUG] batch: band export failed during prep ({exc})")
+                else:
+                    self.dlog("[DEBUG] batch: no band to export (compute disabled or unavailable).")
 
                 y_target = self.get_fit_target()
                 total_peaks = np.zeros_like(self.x)
@@ -5833,6 +6159,8 @@ class PeakFitApp:
                 if unc_rows is not None:
                     unc_rows.extend(_dio.iter_uncertainty_rows(in_path, unc_norm))
 
+                if band_written:
+                    self.dlog(f"[DEBUG] batch: band CSV saved -> {band_csv_path}")
                 self.status_info(f"[Batch] Uncertainty: {label} for {in_path.name}.")
                 self._debug_snapshot(
                     "batch._export_uncertainty",

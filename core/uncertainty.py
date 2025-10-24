@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Optional as _Optional  # keep compatibility with older type-checkers
 
 try:  # numpy.typing is available in NumPy >= 1.20
     from numpy.typing import ArrayLike
@@ -592,8 +593,8 @@ def asymptotic_ci(
     alpha: float = 0.05,
     locked_mask: Optional[np.ndarray] = None,
     bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-    *,
-    xgrid: Optional[np.ndarray] = None,
+    *,  # plotting x-grid must be provided by caller to avoid misalignment
+    xgrid: _Optional[np.ndarray] = None,
     **_ignored: Any,
 ) -> UncertaintyResult:
     """Return asymptotic parameter statistics and a prediction band.
@@ -662,8 +663,8 @@ def asymptotic_ci(
         cond = float(s[0] / s[-1]) if s[-1] != 0 else float("inf")
         if cond > 1e8:  # pragma: no cover - warning path
             warnings.warn("Ill conditioned Jacobian", RuntimeWarning)
-        s_inv = np.array([1 / si if si > 1e-12 * s[0] else 0.0 for si in s])
-        JTJ_inv = (Vt.T * (s_inv ** 2)) @ Vt
+        s_inv = np.array([1.0 / si if si > 1e-12 * s[0] else 0.0 for si in s])
+        JTJ_inv = (Vt.T * s_inv) @ Vt
         cov_free = s2 * JTJ_inv
     else:
         cond = 0.0
@@ -689,17 +690,15 @@ def asymptotic_ci(
     band_lo = y0 - z * band_std
     band_hi = y0 + z * band_std
 
-    # Use the caller-provided x-grid when available to avoid plotting offset.
+    # Require a correct x-grid; otherwise disable the band so misalignment isn't hidden.
     x_arr: Optional[np.ndarray] = None
-    if xgrid is not None:
-        try:
-            x_arr = np.asarray(xgrid, float).reshape(-1)
-            if x_arr.size != y0.size:
-                x_arr = None
-        except Exception:
-            x_arr = None
-    if x_arr is None:
-        x_arr = np.arange(y0.size, dtype=float)
+    try:
+        if xgrid is not None:
+            candidate = np.asarray(xgrid, float).reshape(-1)
+            if candidate.size == y0.size:
+                x_arr = candidate
+    except Exception:
+        x_arr = None
 
     names = [f"p{i}" for i in range(theta.size)]
     stats = {
@@ -727,7 +726,14 @@ def asymptotic_ci(
 
     _add_percentile_aliases_inplace(stats)
 
-    band = (x_arr, band_lo, band_hi)
+    if x_arr is None:
+        warnings.warn(
+            "asymptotic_ci: xgrid missing or length mismatch; band disabled to avoid plot misalignment",
+            RuntimeWarning,
+        )
+        band = None
+    else:
+        band = (x_arr, band_lo, band_hi)
     diag: Dict[str, object] = {"alpha": alpha, "param_order": names}
     n_free = int(np.sum(free_mask))
     # Preferred key for downstream consumers; keep legacy alias for compatibility.
@@ -1392,9 +1398,10 @@ def bootstrap_ci(
         refit = _robust_refit
 
     Jf = J[:, free_mask] if (J.ndim == 2) else None
-    # Allow linearized fast path even when widths/etas are shared; the Jacobian
-    # already encodes ties. Only gate on the explicit allow_linear switch.
-    if not allow_linear:
+    # Respect the historical guard: tied parameters require full refits because the
+    # linearized shortcut assumed independent widths/etas. Only enable the fast path
+    # when sharing is disabled *and* the caller allows it explicitly.
+    if share_fwhm or share_eta or not allow_linear:
         Jf = None
     use_linearized_fast_path = bool(Jf is not None and Jf.size and np.sum(free_mask) > 0)
     if strict_refit or jitter_scale > 0:
