@@ -5,6 +5,8 @@ switch between ``numpy`` and ``cupy`` via an ``xp`` alias.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 try:  # optional CuPy support
@@ -14,6 +16,47 @@ except Exception:  # pragma: no cover - CuPy may be absent
 
 # alias; will be set to ``cp`` when GPU mode is enabled
 xp = np
+
+__all__ = [
+    "pv_sum",
+    "pv_sum_with_jac",
+    "pv_design_matrix",
+    "pv_area",
+    "pseudo_voigt",
+]
+
+
+def pseudo_voigt(
+    x,
+    height: float,
+    x0: float,
+    fwhm: float,
+    eta: float,
+    xp_module: Optional[object] = None,
+):
+    """
+    Canonical pseudo-Voigt: eta*L + (1-eta)*G, parameterized by FWHM.
+    - x: array-like (xp ndarray), same xp as module-level 'xp'
+    - xp_module: optional array module override; defaults to module 'xp'
+    - Clips eta to [0,1]; requires fwhm>0
+    Returns array same shape/dtype as x.
+    """
+
+    xp_local = xp_module or xp  # use module alias already present
+    if fwhm <= 0:
+        raise ValueError("pseudo_voigt: fwhm must be > 0")
+
+    x_arr = xp_local.asarray(x, dtype=float)
+    eta_c = xp_local.clip(eta, 0.0, 1.0)
+
+    sigma = fwhm / (2.0 * xp_local.sqrt(2.0 * xp_local.log(2.0)))
+    gamma = fwhm / 2.0
+    dx = x_arr - x0
+
+    gauss = xp_local.exp(-(dx * dx) / (2.0 * sigma * sigma))
+    lor = (gamma * gamma) / (dx * dx + gamma * gamma)
+    y = height * (eta_c * lor + (1.0 - eta_c) * gauss)
+    return y
 
 
 def pv_sum(x: np.ndarray, peaks: list, xp_module=xp) -> np.ndarray:

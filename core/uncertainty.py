@@ -756,6 +756,7 @@ def bootstrap_ci(
     *,
     predict_full=None,
     x_all: Optional[np.ndarray] = None,
+    x_eval: Optional[np.ndarray] = None,
     y_all: Optional[np.ndarray] = None,
     bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     param_names: Optional[Sequence[str]] = None,
@@ -905,13 +906,26 @@ def bootstrap_ci(
 
     x_src = fit.get("x_all", x_all)
     y_src = fit.get("y_all", y_all)
+    x_eval_src = x_eval if x_eval is not None else fit.get("x_eval", fit.get("x_fit"))
     if x_src is None or y_src is None:
         raise ValueError("x_all and y_all required for residual bootstrap")
-    x_all = np.atleast_1d(np.asarray(x_src, float))[:n]
+    x_all_arr = np.atleast_1d(np.asarray(x_src, float))
+    x_all = x_all_arr[:n]
     y_arr = np.atleast_1d(np.asarray(y_src, float))
     if y_arr.size != n:
         y_arr = y_arr[:n]
     y_all = y_arr if y_arr.size == n else None
+
+    x_eval_arr: Optional[np.ndarray]
+    if x_eval_src is not None:
+        try:
+            x_eval_arr = np.atleast_1d(np.asarray(x_eval_src, float))
+        except Exception:
+            x_eval_arr = None
+    else:
+        x_eval_arr = None
+    if x_eval_arr is None and x_all is not None:
+        x_eval_arr = np.asarray(x_all, float)
 
     # Canonical starting point for jitter (allow caller override via theta0)
     theta0 = np.asarray(fit.get("theta0", theta), float)
@@ -1791,7 +1805,7 @@ def bootstrap_ci(
                     band_hi = np.quantile(Y, 1 - alpha/2, axis=0)
                     band_backend = "numpy"
 
-                # Build band tuple safely, even if x_all is None or lengths differ
+                # Build band tuple safely, even if x grid is missing
                 if band_lo is not None and band_hi is not None:
                     try:
                         n = int(band_lo.shape[0])
@@ -1804,13 +1818,26 @@ def bootstrap_ci(
                         except Exception:
                             return None
 
-                    need_default_x = (
-                        x_all is None
-                        or (n is not None and _len(x_all) != n)
-                    )
-                    if need_default_x:
-                        x_all = np.arange(int(n or 0))
-                    band = (x_all, band_lo, band_hi)
+                    x_band = None
+                    if x_eval_arr is not None:
+                        try:
+                            x_band = np.asarray(x_eval_arr, float).reshape(-1)
+                        except Exception:
+                            x_band = None
+                    elif x_all is not None:
+                        try:
+                            x_band = np.asarray(x_all, float).reshape(-1)
+                        except Exception:
+                            x_band = None
+
+                    if x_band is not None and n is not None and x_band.shape[0] != n:
+                        raise ValueError(
+                            "bootstrap_ci: band length mismatch: "
+                            f"x={x_band.shape[0]} lo={_len(band_lo)} hi={_len(band_hi)}"
+                        )
+                    if x_band is None:
+                        x_band = np.arange(int(n or 0))
+                    band = (x_band, band_lo, band_hi)
                     band_gated = False
                     band_skip_reason = None
                     band_reason = None
