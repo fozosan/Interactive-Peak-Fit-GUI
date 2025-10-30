@@ -116,6 +116,8 @@ def predict_full(
         c, h, fw, eta = theta[4 * i : 4 * (i + 1)]
         total += models.pseudo_voigt(x, h, c, fw, eta)
     if mode == "add" and baseline is not None:
+        if len(baseline) != len(x):
+            raise ValueError(f"baseline length mismatch: x={len(x)} baseline={len(baseline)}")
         total = total + baseline
     return total
 
@@ -129,6 +131,7 @@ def run_batch(
     progress=None,
     log=None,
     abort_event: Optional[Any] = None,
+    abort_on_uncertainty_failure: bool = False,
 ) -> tuple[int, int]:
     """Run the peak fitting pipeline over matching files.
 
@@ -263,6 +266,7 @@ def run_batch(
 
     records = []
     unc_rows = []
+    uncertainty_failures = []
     ok = 0
     processed = 0
 
@@ -465,6 +469,7 @@ def run_batch(
             fh.write(fit_csv)
 
         unc_res = None
+        unc_error_msg = None
         if res["fit_ok"] and fitted and compute_uncertainty:
             try:
                 theta_hat = np.asarray(res["theta"], float)
@@ -560,17 +565,18 @@ def run_batch(
                     except Exception:
                         predict_full_fn = None
 
+                # Build predictor for Bootstrap; if not provided, bind it to the *fit* grid to match residuals/band.
                 if not callable(predict_full_fn):
-                    base_all = np.asarray(base_fit, float) if (
+                    base_fit_arr = np.asarray(base_fit, float) if (
                         add_mode and base_fit is not None
                     ) else None
 
                     def _predict_full_bootstrap(
                         th,
                         *,
-                        _x=x_all,
+                        _x=x_fit,
                         _peaks=peaks_obj,
-                        _base=base_all,
+                        _base=base_fit_arr,
                         _add=add_mode,
                     ):
                         total = np.zeros_like(_x, float)
@@ -637,8 +643,10 @@ def run_batch(
                         "residual_fn": residual_fn,
                         "predict_full": predict_full_fn,
                         "predict_fit": predict_fit_fn,
-                        "x_all": x_all,
-                        "y_all": y_all,
+                        "x_all": x_fit,
+                        "y_all": y_fit,
+                        "x_fit": x_fit,
+                        "y_fit": y_fit,
                         "baseline": base_fit,
                         "mode": mode,
                         "peaks": peaks_obj,
@@ -867,13 +875,15 @@ def run_batch(
                     with _tp_limits_ctx_for_config(config):
                         performance.apply_global_seed(seed_val, perf_seed_all)
                         try:
+                            # IMPORTANT: align everything to the fit grid so Y, residuals and band share the same length
                             unc_res = bootstrap_ci(
                                 theta=theta_hat,
                                 residual=residual_vec,
                                 jacobian=jac,
                                 predict_full=predict_full_fn,
-                                x_all=x_all,
-                                y_all=y_all,
+                                x_all=x_fit,
+                                y_all=y_fit,
+                                x_eval=x_fit,
                                 fit_ctx=fit_ctx_local,
                                 bounds=top_bounds if top_bounds is not None else bounds_exact,
                                 param_names=res.get("param_names"),
@@ -978,8 +988,14 @@ def run_batch(
                 msg = str(exc)
                 if "Unknown uncertainty method" in msg:
                     raise
+                err_msg = f"{Path(path).name}: uncertainty failed: {msg}"
+                logger.warning(err_msg)
                 if log:
-                    log(f"{Path(path).name}: uncertainty failed: {exc}")
+                    log(err_msg)
+                uncertainty_failures.append((Path(path).name, msg))
+                if abort_on_uncertainty_failure:
+                    raise
+                unc_error_msg = msg
                 unc_res = None
 
         if unc_res is not None:
@@ -1098,11 +1114,12 @@ def run_batch(
                 log(f"{Path(path).name}: uncertainty={method_lbl}")
 
         if expected_unc and unc_res is None:
-            msg = "Batch export requested uncertainty but none was computed"
-            logger.error(msg)
-            if log:
-                log(f"{Path(path).name}: {msg}")
-            raise RuntimeError(msg)
+            if unc_error_msg is None:
+                msg = "Batch export requested uncertainty but none was computed"
+                logger.error(msg)
+                if log:
+                    log(f"{Path(path).name}: {msg}")
+                raise RuntimeError(msg)
 
         trace_path = None
         if save_traces:
@@ -1124,6 +1141,16 @@ def run_batch(
         fh.write(peak_csv)
     if unc_rows:
         data_io.write_batch_uncertainty_long(out_dir, unc_rows)
+
+    if uncertainty_failures:
+        details = "; ".join(f"{name}: {msg}" for name, msg in uncertainty_failures[:5])
+        if len(uncertainty_failures) > 5:
+            details += f"; +{len(uncertainty_failures) - 5} more"
+        summary_msg = f"Uncertainty failed for {len(uncertainty_failures)} file(s)"
+        full_msg = f"{summary_msg}: {details}" if details else summary_msg
+        logger.warning(full_msg)
+        if log:
+            log(full_msg)
 
     return ok, processed
 
