@@ -193,11 +193,15 @@ def route_uncertainty(
 
     # --- BAYESIAN -----------------------------------------------------------
     if "bayes" in m or "mcmc" in m:
-        # Pull common MCMC settings (provide safe fallbacks).
-        n_walkers = ctx.get("bayes_walkers", None)
-        n_burn = int(ctx.get("bayes_burn", 2000))
-        n_steps = int(ctx.get("bayes_steps", 8000))
-        thin = int(ctx.get("bayes_thin", 1))
+        walkers_raw = unc._require_nonneg_int(ctx, "bayes_walkers")
+        n_walkers = None if walkers_raw == 0 else walkers_raw
+        n_burn = unc._require_nonneg_int(ctx, "bayes_burn")
+        n_steps = unc._require_positive_int(ctx, "bayes_steps")
+        thin = unc._require_positive_int(ctx, "bayes_thin")
+        ctx["bayes_walkers"] = walkers_raw
+        ctx["bayes_burn"] = n_burn
+        ctx["bayes_steps"] = n_steps
+        ctx["bayes_thin"] = thin
         prior_sigma = str(ctx.get("bayes_prior_sigma", "half_cauchy"))
 
         strategy = str(ctx.get("perf_parallel_strategy", "outer"))
