@@ -171,10 +171,6 @@ def run_batch(
     source = config.get("source", "template")
     reheight = bool(config.get("reheight", False))
     auto_max = int(config.get("auto_max", 5))
-    try:
-        bootstrap_n = int(config.get("bootstrap_n", 500) or 500)
-    except Exception:
-        bootstrap_n = 500
     cfg_perf = performance.get_parallel_config()
     performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
 
@@ -684,6 +680,8 @@ def run_batch(
                     "unc_use_gpu": bool(config.get("unc_use_gpu", False)),
                 })
 
+                n_boot: int | None = None
+
                 from core import fit_api as _fit_api
 
                 def _refit_wrapper(
@@ -838,11 +836,20 @@ def run_batch(
                 )
 
                 if str(unc_method_canon).lower() == "bootstrap":
+                    if "bootstrap_n" not in config:
+                        raise KeyError("Missing required knob: bootstrap_n")
+                    try:
+                        n_boot = int(config["bootstrap_n"])
+                    except Exception as exc:
+                        raise ValueError(
+                            f"Invalid bootstrap_n: {config['bootstrap_n']!r}"
+                        ) from exc
+                    if n_boot <= 0:
+                        raise ValueError(f"bootstrap_n must be > 0 (got {n_boot})")
                     bounds = res.get("bounds")
                     locked_mask = res.get("locked_mask")
                     alpha = float(config.get("unc_alpha", 0.05))
                     center_res = bool(config.get("unc_center_resid", True))
-                    n_boot = bootstrap_n
                     seed_val = perf_seed if perf_seed_all and (perf_seed is not None) else None
 
                     jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
@@ -924,34 +931,79 @@ def run_batch(
                             "alpha": diag.get("alpha", alpha),
                         }
                 else:
-                    w_cfg = int(config.get("bayes_walkers", 0) or 0)
-                    burn_cfg = int(config.get("bayes_burn", 1000) or 0)
-                    steps_cfg = int(config.get("bayes_steps", 4000) or 4000)
-                    thin_cfg = int(config.get("bayes_thin", 1) or 1)
-                    fit_ctx.update({
-                        "bayes_diagnostics": bool(
-                            config.get("bayes_diagnostics", config.get("bayes_diag", False))
-                        ),
-                        "unc_band_workers": band_workers_eff
-                        if band_workers_eff > 0
-                        else None,
-                        "bayes_band_enabled": bool(config.get("bayes_band_enabled", False)),
-                        "bayes_band_force": bool(config.get("bayes_band_force", False)),
-                        "bayes_band_max_draws": int(config.get("bayes_band_max_draws", 512) or 512),
-                        "bayes_diag_ess_min": float(config.get("bayes_diag_ess_min", 200.0)),
-                        "bayes_diag_rhat_max": float(config.get("bayes_diag_rhat_max", 1.05)),
-                        "bayes_diag_mcse_mean": float(
-                            config.get("bayes_diag_mcse_mean", float("inf"))
-                        ),
-                        "bayes_walkers": (w_cfg if w_cfg > 0 else None),
-                        "bayes_burn": max(0, burn_cfg),
-                        "bayes_steps": max(1, steps_cfg),
-                        "bayes_thin": max(1, thin_cfg),
-                        "bayes_prior_sigma": str(
-                            config.get("bayes_prior_sigma", "half_cauchy")
-                        ),
-                        "abort_event": abort_event,
-                    })
+                    if "bayes" in str(unc_method_canon).lower():
+                        try:
+                            walkers_cfg_raw = config["bayes_walkers"]
+                        except KeyError as exc:
+                            raise KeyError(
+                                "Missing required Bayesian knob: bayes_walkers"
+                            ) from exc
+                        if walkers_cfg_raw is None:
+                            raise ValueError("bayes_walkers must be ≥ 0 (got None)")
+                        try:
+                            walkers_cfg = int(walkers_cfg_raw)
+                        except Exception as exc:
+                            raise ValueError(
+                                f"Invalid bayes_walkers: {walkers_cfg_raw!r}"
+                            ) from exc
+                        if walkers_cfg < 0:
+                            raise ValueError(
+                                f"bayes_walkers must be ≥ 0 (got {walkers_cfg})"
+                            )
+                        try:
+                            burn_cfg = int(config["bayes_burn"])
+                            steps_cfg = int(config["bayes_steps"])
+                            thin_cfg = int(config["bayes_thin"])
+                        except KeyError as exc:
+                            raise KeyError(
+                                f"Missing required Bayesian knob: {exc.args[0]}"
+                            ) from exc
+                        except Exception as exc:
+                            raise ValueError(
+                                "Invalid Bayesian knobs in config: burn/steps/thin"
+                            ) from exc
+                        if burn_cfg < 0:
+                            raise ValueError(f"bayes_burn must be ≥ 0 (got {burn_cfg})")
+                        if steps_cfg <= 0:
+                            raise ValueError(f"bayes_steps must be > 0 (got {steps_cfg})")
+                        if thin_cfg <= 0:
+                            raise ValueError(f"bayes_thin must be > 0 (got {thin_cfg})")
+                        fit_ctx.update({
+                            "bayes_diagnostics": bool(
+                                config.get(
+                                    "bayes_diagnostics", config.get("bayes_diag", False)
+                                )
+                            ),
+                            "unc_band_workers": band_workers_eff
+                            if band_workers_eff > 0
+                            else None,
+                            "bayes_band_enabled": bool(
+                                config.get("bayes_band_enabled", False)
+                            ),
+                            "bayes_band_force": bool(config.get("bayes_band_force", False)),
+                            "bayes_band_max_draws": int(
+                                config.get("bayes_band_max_draws", 512) or 512
+                            ),
+                            "bayes_diag_ess_min": float(
+                                config.get("bayes_diag_ess_min", 200.0)
+                            ),
+                            "bayes_diag_rhat_max": float(
+                                config.get("bayes_diag_rhat_max", 1.05)
+                            ),
+                            "bayes_diag_mcse_mean": float(
+                                config.get("bayes_diag_mcse_mean", float("inf"))
+                            ),
+                            "bayes_walkers": (
+                                walkers_cfg if walkers_cfg is not None and walkers_cfg > 0 else None
+                            ),
+                            "bayes_burn": burn_cfg,
+                            "bayes_steps": steps_cfg,
+                            "bayes_thin": thin_cfg,
+                            "bayes_prior_sigma": str(
+                                config.get("bayes_prior_sigma", "half_cauchy")
+                            ),
+                            "abort_event": abort_event,
+                        })
                     seed_val = perf_seed if perf_seed_all and (perf_seed is not None) else None
                     workers_eff = int(unc_workers)
                     strategy = str(config.get("perf_parallel_strategy", "outer"))
@@ -982,7 +1034,7 @@ def run_batch(
                             y_all=y_all,
                             workers=(workers_eff if workers_eff > 0 else None),
                             seed=seed_val,
-                            n_boot=bootstrap_n,
+                            n_boot=(n_boot if n_boot is not None else 0),
                         )
             except Exception as exc:
                 msg = str(exc)
