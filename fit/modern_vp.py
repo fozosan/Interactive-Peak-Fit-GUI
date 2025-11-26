@@ -364,6 +364,7 @@ def iterate(state: dict):
 
     _, bounds = pack_theta_bounds(peaks, x, options)
 
+    # strict kw handling happens at the caller; do not forward unknown flags here
     theta, _cost1, cost0, info = step_engine.step_once(
         x,
         y,
