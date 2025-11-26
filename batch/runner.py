@@ -249,6 +249,20 @@ def run_batch(
         or "asymptotic"
     )
     unc_method_canon = data_io.canonical_unc_label(unc_choice)
+    bootstrap_n_cfg: int | None = None
+    if str(unc_method_canon).lower() == "bootstrap":
+        if "bootstrap_n" not in config:
+            raise KeyError("bootstrap_n missing in batch config")
+        try:
+            bootstrap_n_cfg = int(config["bootstrap_n"])
+        except Exception as exc:
+            raise ValueError(
+                f"invalid bootstrap_n: {config.get('bootstrap_n')!r}"
+            ) from exc
+        if bootstrap_n_cfg <= 0:
+            raise ValueError(
+                f"bootstrap_n must be > 0 (got {bootstrap_n_cfg})"
+            )
     perf_seed_all = bool(config.get("perf_seed_all", False))
     perf_seed = None
     if perf_seed_all:
@@ -836,16 +850,9 @@ def run_batch(
                 )
 
                 if str(unc_method_canon).lower() == "bootstrap":
-                    if "bootstrap_n" not in config:
-                        raise KeyError("Missing required knob: bootstrap_n")
-                    try:
-                        n_boot = int(config["bootstrap_n"])
-                    except Exception as exc:
-                        raise ValueError(
-                            f"Invalid bootstrap_n: {config['bootstrap_n']!r}"
-                        ) from exc
-                    if n_boot <= 0:
-                        raise ValueError(f"bootstrap_n must be > 0 (got {n_boot})")
+                    if bootstrap_n_cfg is None:
+                        raise KeyError("bootstrap_n missing in batch config")
+                    n_boot = int(bootstrap_n_cfg)
                     bounds = res.get("bounds")
                     locked_mask = res.get("locked_mask")
                     alpha = float(config.get("unc_alpha", 0.05))
