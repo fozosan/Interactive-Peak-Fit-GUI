@@ -4263,7 +4263,7 @@ class PeakFitApp:
             bayes_knobs = validate_unc_knobs(knobs_raw)
         except ValueError as exc:
             self.status_error(f"Bayesian settings invalid: {exc}")
-            return
+            raise
         try:
             self.bayes_walkers_var.set(bayes_knobs["walkers"])
             self.bayes_burn_var.set(bayes_knobs["burn"])
@@ -5299,11 +5299,7 @@ class PeakFitApp:
                 bayes_knobs = validate_unc_knobs(knobs_local)
             except ValueError as exc:
                 self.status_error(f"Bayesian settings invalid: {exc}")
-                return {
-                    "label": "Bayesian configuration error",
-                    "stats": [],
-                    "diagnostics": {"error": str(exc)},
-                }
+                raise
             walkers = bayes_knobs["walkers"]
             burn = bayes_knobs["burn"]
             steps = bayes_knobs["steps"]
