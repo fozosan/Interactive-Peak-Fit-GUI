@@ -2336,11 +2336,9 @@ def bayesian_ci(
                         sampler.random_state = np.random.RandomState(int(seed_effective))
                     except Exception:
                         pass
-            # Guardrails before sampling for very high dimension
-            if dim > 40:
-                n_burn = min(int(n_burn), 1000)
-                n_steps = min(int(n_steps), 4000)
-
+            # Caller fully controls n_burn and n_steps; we intentionally
+            # do not clamp them here based on dimensionality. Very large values
+            # may be slow but are treated as intentional.
             draws = []
             aborted = False
             # Smaller chunks improve abort responsiveness
