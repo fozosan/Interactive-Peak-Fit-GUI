@@ -5311,6 +5311,18 @@ class PeakFitApp:
                 self.bayes_thin_var.set(thin)
             except Exception:
                 pass
+            logger = getattr(self, "logger", None)
+            try:
+                if logger:
+                    logger.info(
+                        "Bayesian plan: walkers=%d burn=%d steps=%d thin=%d",
+                        walkers,
+                        burn,
+                        steps,
+                        thin,
+                    )
+            except Exception:
+                pass
             prior_sigma = str(
                 self.bayes_prior_var.get()
                 or self.cfg.get("bayes_prior_sigma", "half_cauchy")
