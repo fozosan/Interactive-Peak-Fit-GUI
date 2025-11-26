@@ -5,8 +5,14 @@ from core import fit_api, uncertainty
 def test_unc_asymptotic_nospikes(two_peak_data):
     res = fit_api.run_fit_consistent(**two_peak_data, return_jacobian=True)
     unc = uncertainty.asymptotic_ci(
-        res["theta"], res["residual_fn"], res["jacobian"], res["ymodel_fn"],
-        alpha=0.05, svd_rcond=1e-10, grad_mode="complex"
+        res["theta"],
+        res["residual_fn"],
+        res["jacobian"],
+        res["ymodel_fn"],
+        alpha=0.05,
+        svd_rcond=1e-10,
+        grad_mode="complex",
+        xgrid=two_peak_data["x"],
     )
     band = unc["band"]
     x, lo, hi = band["x"], band["lo"], band["hi"]

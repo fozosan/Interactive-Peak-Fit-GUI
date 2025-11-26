@@ -59,6 +59,45 @@ skip_if_no_display = pytest.mark.skipif(HEADLESS, reason="requires display")
 def close_to(a, b, rtol=5e-5, atol=5e-8):
     return np.allclose(a, b, rtol=rtol, atol=atol)
 
+
+def bayes_knobs(*, walkers=0, burn=1000, steps=4000, thin=1):
+    """
+    Canonical knobs for strict router:
+    - walkers: 0 means 'auto'
+    """
+    return {
+        "bayes_walkers": int(walkers),
+        "bayes_burn": int(burn),
+        "bayes_steps": int(steps),
+        "bayes_thin": int(thin),
+    }
+
+
+def bootstrap_cfg(n=200, jitter=0.0):
+    return {
+        "bootstrap_n": int(n),
+        "bootstrap_jitter": float(jitter),
+    }
+
+
+def ensure_unc_common(cfg: dict) -> dict:
+    """
+    Fill uncertainty flags used by GUI/Batch parity and bands/diagnostics.
+    Keeps tests explicit but DRY.
+    """
+    out = dict(cfg)
+    out.setdefault("bayes_diagnostics", False)
+    out.setdefault("bayes_band_enabled", False)
+    out.setdefault("bayes_band_force", False)
+    out.setdefault("bayes_band_max_draws", 512)
+    out.setdefault("bayes_diag_ess_min", 200.0)
+    out.setdefault("bayes_diag_rhat_max", 1.05)
+    out.setdefault("bayes_diag_mcse_mean", float("inf"))
+    out.setdefault("perf_parallel_strategy", "outer")
+    out.setdefault("perf_blas_threads", 0)
+    out.setdefault("unc_center_resid", True)
+    return out
+
 # helper to ensure CSVs have no blank lines
 
 @pytest.fixture

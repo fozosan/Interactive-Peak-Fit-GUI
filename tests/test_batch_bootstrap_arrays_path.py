@@ -1,6 +1,8 @@
 import numpy as np
 from pathlib import Path
 
+from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
+
 def test_batch_bootstrap_runs_with_arrays(tmp_path, monkeypatch):
     f = tmp_path / "toy.txt"
     f.write_text("0 0\n1 1\n2 0\n")
@@ -34,6 +36,9 @@ def test_batch_bootstrap_runs_with_arrays(tmp_path, monkeypatch):
         "solver": "classic",
         "unc_method": "bootstrap",
     }
+    cfg.update(ensure_unc_common({}))
+    cfg.update(bootstrap_cfg(n=48))
+    cfg.update(bayes_knobs())
     n_ok, total = run_batch([str(f)], cfg, compute_uncertainty=True)
     assert n_ok == total == 1
     stem = Path(f).stem

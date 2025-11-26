@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from batch import runner
 from core.peaks import Peak
+from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 
 
 def test_batch_wide_toggle(tmp_path):
@@ -27,6 +28,9 @@ def test_batch_wide_toggle(tmp_path):
         "perf_seed_all": False,
         "perf_max_workers": 0,
     }
+    cfg.update(ensure_unc_common({}))
+    cfg.update(bootstrap_cfg(n=72))
+    cfg.update(bayes_knobs())
 
     # off
     ok, _ = runner.run_batch(

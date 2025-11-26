@@ -6,6 +6,7 @@ import pandas as pd
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 from batch import runner
 from core.peaks import Peak
+from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 from ui.app import pseudo_voigt  # noqa: E402
 
 
@@ -40,6 +41,9 @@ def test_batch_output_dir(tmp_path):
         "output_dir": str(out_dir),
         "output_base": "batch",
     }
+    cfg.update(ensure_unc_common({}))
+    cfg.update(bootstrap_cfg(n=100))
+    cfg.update(bayes_knobs())
 
     runner.run([str(data_dir / "*.csv")], cfg)
 
