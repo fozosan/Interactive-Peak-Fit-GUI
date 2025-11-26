@@ -364,6 +364,7 @@ def iterate(state: dict):
 
     _, bounds = pack_theta_bounds(peaks, x, options)
 
+    # strict kw handling happens at the caller; do not forward unknown flags here
     theta, _cost1, cost0, info = step_engine.step_once(
         x,
         y,
@@ -379,6 +380,29 @@ def iterate(state: dict):
         max_backtracks=options.get("max_backtracks", 8),
         min_step_ratio=options.get("min_step_ratio", 1e-9),
     )
+
+    # Enforce bounds and sanitize per-peak parameters to avoid drift or NaNs.
+    try:
+        lo, hi = bounds if isinstance(bounds, (tuple, list)) else (None, None)
+    except Exception:
+        lo, hi = (None, None)
+    theta = np.asarray(theta, float).ravel()
+    if lo is not None and hi is not None:
+        try:
+            theta = np.clip(theta, np.asarray(lo, float), np.asarray(hi, float))
+        except Exception:
+            pass
+    for i in range(len(peaks)):
+        j = 4 * i
+        fw = float(theta[j + 2])
+        eta = float(theta[j + 3])
+        if not np.isfinite(fw) or fw <= 0:
+            fw = 1e-9
+        if not np.isfinite(eta):
+            eta = 0.5
+        eta = 0.0 if eta < 0.0 else (1.0 if eta > 1.0 else eta)
+        theta[j + 2] = fw
+        theta[j + 3] = eta
 
     # Re-solve heights via NNLS to mirror variable projection behaviour
     base_arr = baseline if baseline is not None else 0.0

@@ -3,6 +3,7 @@ import pytest
 import numpy as np
 from pathlib import Path
 from batch.runner import run_batch
+from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 
 
 def _fake_fit_ctx(x, y):
@@ -46,6 +47,9 @@ def test_unknown_unc_method_raises(tmp_path, monkeypatch):
         "solver": "classic",
         "unc_method": "totally-unknown-method",
     }
+    cfg.update(ensure_unc_common({}))
+    cfg.update(bootstrap_cfg(n=32))
+    cfg.update(bayes_knobs())
 
     with pytest.raises(ValueError):
         run_batch([str(f)], cfg, compute_uncertainty=True, unc_method=None, log=lambda m: None)

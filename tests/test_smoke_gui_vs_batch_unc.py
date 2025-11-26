@@ -8,6 +8,7 @@ from core import models, peaks, data_io, fit_api
 from core.residuals import build_residual
 from core.uncertainty import bootstrap_ci, finite_diff_jacobian
 from batch.runner import run_batch
+from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 
 
 def _write_xy(path: Path, x: np.ndarray, y: np.ndarray):
@@ -155,6 +156,9 @@ def test_bootstrap_gui_vs_batch_match(tmp_path):
             "source": "template",
         }
     )
+    cfg_batch.update(ensure_unc_common({}))
+    cfg_batch.update(bootstrap_cfg(n=cfg["bootstrap_n"]))
+    cfg_batch.update(bayes_knobs())
     os.environ.setdefault("SMOKE_MODE", "1")
     run_batch([str(fpath)], config=cfg_batch, compute_uncertainty=True, unc_method="Bootstrap")
     long_batch = str(base) + "_uncertainty.csv"
@@ -192,6 +196,9 @@ def test_asymptotic_gui_vs_batch_match(tmp_path):
             "source": "template",
         }
     )
+    cfg_batch.update(ensure_unc_common({}))
+    cfg_batch.update(bootstrap_cfg(n=cfg.get("bootstrap_n", 60)))
+    cfg_batch.update(bayes_knobs())
     os.environ.setdefault("SMOKE_MODE", "1")
     run_batch([str(fpath)], config=cfg_batch, compute_uncertainty=True, unc_method="Asymptotic")
     long_batch = str(base) + "_uncertainty.csv"

@@ -53,6 +53,7 @@ def test_asymptotic_uses_fd_when_no_jacobian(tmp_path, monkeypatch):
     # Execute batch with asymptotic to exercise FD path
     from batch.runner import run_batch
     from core import models
+    from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 
     monkeypatch.setattr(
         models, "pseudo_voigt", lambda x, h, c, fw, eta: np.zeros_like(x), raising=False
@@ -67,6 +68,9 @@ def test_asymptotic_uses_fd_when_no_jacobian(tmp_path, monkeypatch):
         "solver": "classic",
         "unc_method": "asymptotic",
     }
+    cfg.update(ensure_unc_common({}))
+    cfg.update(bootstrap_cfg(n=40))
+    cfg.update(bayes_knobs())
 
     n_ok, total = run_batch([str(f)], cfg, compute_uncertainty=True)
     n_fail = total - n_ok

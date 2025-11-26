@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 
 from batch.runner import run_batch
+from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 
 def _fake_fit_ctx(x, y):
     peak = types.SimpleNamespace(
@@ -52,6 +53,9 @@ def test_batch_uses_bayesian_when_configured(monkeypatch, tmp_path):
         "solver": "classic",
         "unc_method": "bayesian",
     }
+    cfg.update(ensure_unc_common({}))
+    cfg.update(bootstrap_cfg(n=64))
+    cfg.update(bayes_knobs())
 
     ok, processed = run_batch([str(f)], cfg, compute_uncertainty=True, unc_method=None, log=lambda m: None)
     assert ok == 1 and processed == 1

@@ -245,7 +245,12 @@ except Exception:
 # aliases used in export-parity logic
 from core.data_io import normalize_unc_result as _normalize_unc_result
 import core.uncertainty as core_uncertainty
-from ui.uncertainty_utils import method_display_to_key
+from ui.uncertainty_utils import (
+    method_display_to_key,
+    normalize_float,
+    normalize_int,
+    validate_unc_knobs,
+)
 try:
     from core.uncertainty import UncertaintyResult, NotAvailable
     from core.uncertainty import (
@@ -2503,9 +2508,10 @@ class PeakFitApp:
 
     def _safe_alpha(self):
         try:
-            a = float(self.alpha_var.get())
+            raw = self.alpha_var.get()
         except Exception:
-            a = 0.05
+            raw = None
+        a = normalize_float(raw, 0.05)
         a = min(0.49, max(1e-6, a))
         self.alpha_var.set(a)
         try:
@@ -2542,10 +2548,10 @@ class PeakFitApp:
 
     def _safe_bayes_walkers(self) -> int:
         try:
-            v = int(self.bayes_walkers_var.get() or 0)
+            raw = self.bayes_walkers_var.get()
         except Exception:
-            v = 0
-        v = max(0, v)
+            raw = None
+        v = max(0, normalize_int(raw, 0))
         # enforce minimal requirement if user sets a too-small positive number
         try:
             ndim = 4 * len(self.peaks)
@@ -2562,10 +2568,10 @@ class PeakFitApp:
 
     def _safe_bayes_burn(self) -> int:
         try:
-            v = int(self.bayes_burn_var.get() or 0)
+            raw = self.bayes_burn_var.get()
         except Exception:
-            v = 0
-        v = max(0, v)
+            raw = None
+        v = max(0, normalize_int(raw, 0))
         try:
             self.bayes_burn_var.set(v)
         except Exception:
@@ -2574,10 +2580,12 @@ class PeakFitApp:
 
     def _safe_bayes_steps(self) -> int:
         try:
-            v = int(self.bayes_steps_var.get() or 4000)
+            raw = self.bayes_steps_var.get()
         except Exception:
-            v = 4000
-        v = max(1, v)
+            raw = None
+        v = normalize_int(raw, 0)
+        if v < 0:
+            v = 0
         try:
             self.bayes_steps_var.set(v)
         except Exception:
@@ -2586,10 +2594,10 @@ class PeakFitApp:
 
     def _safe_bayes_thin(self) -> int:
         try:
-            v = int(self.bayes_thin_var.get() or 1)
+            raw = self.bayes_thin_var.get()
         except Exception:
-            v = 1
-        v = max(1, v)
+            raw = None
+        v = max(1, normalize_int(raw, 1))
         try:
             self.bayes_thin_var.set(v)
         except Exception:
@@ -2639,9 +2647,10 @@ class PeakFitApp:
 
     def _safe_jitter_pct(self):
         try:
-            v = float(self.bootstrap_jitter_var.get())
+            raw = self.bootstrap_jitter_var.get()
         except Exception:
-            v = 0.0
+            raw = None
+        v = normalize_float(raw, 0.0)
         v = min(50.0, max(0.0, v))
         self.bootstrap_jitter_var.set(v)
         try:
@@ -4244,6 +4253,25 @@ class PeakFitApp:
                 unc_workers_raw = 0
 
         boot_cfg = self._bootstrap_cfg_from_gui()
+        knobs_raw = {
+            "walkers": self._safe_bayes_walkers(),
+            "burn": self._safe_bayes_burn(),
+            "steps": self._safe_bayes_steps(),
+            "thin": self._safe_bayes_thin(),
+        }
+        try:
+            bayes_knobs = validate_unc_knobs(knobs_raw)
+        except ValueError as exc:
+            self.status_error(f"Bayesian settings invalid: {exc}")
+            return
+        try:
+            self.bayes_walkers_var.set(bayes_knobs["walkers"])
+            self.bayes_burn_var.set(bayes_knobs["burn"])
+            self.bayes_steps_var.set(bayes_knobs["steps"])
+            self.bayes_thin_var.set(bayes_knobs["thin"])
+        except Exception:
+            pass
+
         cfg = {
             "peaks": peaks_list,
             "solver": solver,
@@ -4280,10 +4308,10 @@ class PeakFitApp:
             "bayes_diag_ess_min": self._bayes_diag_ess_min_value(),
             "bayes_diag_rhat_max": self._bayes_diag_rhat_max_value(),
             "bayes_diag_mcse_mean": self._bayes_diag_mcse_value(),
-            "bayes_walkers": int(self._safe_bayes_walkers()),
-            "bayes_burn": int(self._safe_bayes_burn()),
-            "bayes_steps": int(self._safe_bayes_steps()),
-            "bayes_thin": int(self._safe_bayes_thin()),
+            "bayes_walkers": int(bayes_knobs["walkers"]),
+            "bayes_burn": int(bayes_knobs["burn"]),
+            "bayes_steps": int(bayes_knobs["steps"]),
+            "bayes_thin": int(bayes_knobs["thin"]),
             "bayes_prior_sigma": str(
                 self.bayes_prior_var.get()
                 or self.cfg.get("bayes_prior_sigma", "half_cauchy")
@@ -4927,10 +4955,6 @@ class PeakFitApp:
                     total = total + base_fit
                 return total
 
-            walkers = self._safe_bayes_walkers()
-            burn = self._safe_bayes_burn()
-            steps = self._safe_bayes_steps()
-            thin = self._safe_bayes_thin()
             prior_sigma = str(
                 self.bayes_prior_var.get()
                 or self.cfg.get("bayes_prior_sigma", "half_cauchy")
@@ -5265,6 +5289,44 @@ class PeakFitApp:
             burn = self._safe_bayes_burn()
             steps = self._safe_bayes_steps()
             thin = self._safe_bayes_thin()
+            knobs_local = {
+                "walkers": walkers,
+                "burn": burn,
+                "steps": steps,
+                "thin": thin,
+            }
+            try:
+                bayes_knobs = validate_unc_knobs(knobs_local)
+            except ValueError as exc:
+                self.status_error(f"Bayesian settings invalid: {exc}")
+                return {
+                    "label": "Bayesian configuration error",
+                    "stats": [],
+                    "diagnostics": {"error": str(exc)},
+                }
+            walkers = bayes_knobs["walkers"]
+            burn = bayes_knobs["burn"]
+            steps = bayes_knobs["steps"]
+            thin = bayes_knobs["thin"]
+            try:
+                self.bayes_walkers_var.set(walkers)
+                self.bayes_burn_var.set(burn)
+                self.bayes_steps_var.set(steps)
+                self.bayes_thin_var.set(thin)
+            except Exception:
+                pass
+            logger = getattr(self, "logger", None)
+            try:
+                if logger:
+                    logger.info(
+                        "Bayesian plan: walkers=%d burn=%d steps=%d thin=%d",
+                        walkers,
+                        burn,
+                        steps,
+                        thin,
+                    )
+            except Exception:
+                pass
             prior_sigma = str(
                 self.bayes_prior_var.get()
                 or self.cfg.get("bayes_prior_sigma", "half_cauchy")

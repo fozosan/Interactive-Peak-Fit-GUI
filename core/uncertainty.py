@@ -8,7 +8,7 @@ rather than ultimate statistical rigour.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from typing import Optional as _Optional  # keep compatibility with older type-checkers
 
 try:  # numpy.typing is available in NumPy >= 1.20
@@ -130,7 +130,32 @@ __all__ = [
     "BAND_SKIP_ABORTED",
 ]
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+log = logger  # backwards compatibility for older imports
+
+
+def _require_positive_int(cfg: Mapping[str, Any], key: str) -> int:
+    if key not in cfg:
+        raise KeyError(f"Missing required Bayesian knob: {key}")
+    try:
+        value = int(cfg[key])
+    except Exception as exc:
+        raise ValueError(f"Invalid integer for {key}: {cfg[key]!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{key} must be > 0 (got {value})")
+    return value
+
+
+def _require_nonneg_int(cfg: Mapping[str, Any], key: str) -> int:
+    if key not in cfg:
+        raise KeyError(f"Missing required Bayesian knob: {key}")
+    try:
+        value = int(cfg[key])
+    except Exception as exc:
+        raise ValueError(f"Invalid integer for {key}: {cfg[key]!r}") from exc
+    if value < 0:
+        raise ValueError(f"{key} must be ≥ 0 (got {value})")
+    return value
 
 BOOT_BAND_MIN_SAMPLES = 16
 # Minimum number of total MCMC draws required before attempting a tiny band
@@ -1000,7 +1025,14 @@ def bootstrap_ci(
 
     if not peaks_obj and not callable(user_refit):
         ymodel = predict_full if callable(predict_full) else (lambda _th: np.asarray(y_all, float))
-        res_asym = asymptotic_ci(theta, residual, J, ymodel, alpha=alpha)
+        res_asym = asymptotic_ci(
+            theta,
+            residual,
+            J,
+            ymodel,
+            alpha=alpha,
+            xgrid=x_all,
+        )
 
         band = res_asym.band if (return_band and predict_full is not None) else None
 
@@ -1987,11 +2019,25 @@ def _mcse_quantile(samples: np.ndarray, q: float, batches: int = 20) -> float:
 
 
 def bayesian_ci(
-    theta_hat: np.ndarray, *,
-    model=None, predict_full=None, x_all=None, y_all=None,
-    residual_fn=None, bounds=None, param_names=None, locked_mask=None,
-    fit_ctx=None, n_walkers=None, n_burn=2000, n_steps=8000, thin=1,
-    seed=None, workers: Optional[int] = None, return_band=True, prior_sigma="half_cauchy"
+    theta_hat: np.ndarray,
+    *,
+    model=None,
+    predict_full=None,
+    x_all=None,
+    y_all=None,
+    residual_fn=None,
+    bounds=None,
+    param_names=None,
+    locked_mask=None,
+    fit_ctx=None,
+    n_walkers=None,
+    n_burn=2000,
+    n_steps=8000,
+    thin=1,
+    seed=None,
+    workers: Optional[int] = None,
+    return_band=True,
+    prior_sigma="half_cauchy",
 ) -> UncertaintyResult:
     """
     Sample posterior of free θ and σ with emcee. Deterministic with seed.
@@ -2003,6 +2049,39 @@ def bayesian_ci(
         raise RuntimeError("Bayesian method requires emcee>=3") from e
 
     fit_ctx = dict(fit_ctx or {})
+
+    try:
+        n_burn = int(n_burn)
+    except Exception as exc:
+        raise ValueError(f"Invalid integer for n_burn: {n_burn!r}") from exc
+    if n_burn < 0:
+        raise ValueError(f"n_burn must be ≥ 0 (got {n_burn})")
+
+    try:
+        n_steps = int(n_steps)
+    except Exception as exc:
+        raise ValueError(f"Invalid integer for n_steps: {n_steps!r}") from exc
+    if n_steps <= 0:
+        raise ValueError(f"n_steps must be > 0 (got {n_steps})")
+
+    try:
+        thin = int(thin)
+    except Exception as exc:
+        raise ValueError(f"Invalid integer for thin: {thin!r}") from exc
+    if thin <= 0:
+        raise ValueError(f"thin must be > 0 (got {thin})")
+
+    walkers_cfg = n_walkers
+    if walkers_cfg is not None:
+        try:
+            walkers_cfg = int(walkers_cfg)
+        except Exception as exc:
+            raise ValueError(f"Invalid integer for n_walkers: {n_walkers!r}") from exc
+        if walkers_cfg < 0:
+            raise ValueError(f"n_walkers must be ≥ 0 (got {walkers_cfg})")
+        if walkers_cfg == 0:
+            walkers_cfg = None
+    n_walkers = walkers_cfg
     fit = fit_ctx
     # Normalize solver & any sharing hints (shared helper)
     _solver_name, _share_fwhm, _share_eta = _norm_solver_and_sharing(fit, {})
@@ -2078,6 +2157,16 @@ def bayesian_ci(
     bayes_band_enabled: bool = bool(fc.get("bayes_band_enabled", False))
     bayes_band_force: bool = bool(fc.get("bayes_band_force", False))
     bayes_band_max_draws: int = int(fc.get("bayes_band_max_draws", 512) or 512)
+    logger.info(
+        "[Bayes] config: walkers=%s burn=%s steps=%s thin=%s diag=%s band=%s band_force=%s",
+        "auto" if n_walkers is None else n_walkers,
+        n_burn,
+        n_steps,
+        thin,
+        diagnostics_enabled,
+        bayes_band_enabled,
+        bayes_band_force,
+    )
     # Surface settings into diagnostics for UI/debug logging.
     diag_perf["bayes_band_max_draws"] = int(bayes_band_max_draws)
     thr_ess_min = float(fc.get("bayes_diag_ess_min", 200.0))
@@ -2200,13 +2289,6 @@ def bayesian_ci(
         return lp + log_likelihood(th_f, log_sigma)
 
     dim = P_free + 1
-    # Sane defaults if caller passes 0/None
-    if n_burn is None or n_burn <= 0:
-        n_burn = 1000
-    if n_steps is None or n_steps <= 0:
-        n_steps = 4000
-    n_burn = int(n_burn)
-    n_steps = int(n_steps)
     if n_walkers is None:
         n_walkers = max(4 * dim, 16)
     rng = np.random.default_rng(seed_effective)
@@ -2264,13 +2346,13 @@ def bayesian_ci(
             # Smaller chunks improve abort responsiveness
             chunk = 100 if (fit_ctx and fit_ctx.get("abort_event")) else 200
             state = p0
-            total = n_burn + n_steps
+            total_steps = n_burn + n_steps
             done = 0
             next_pulse_at = 0
-            pulse_step = max(1, int(total // 20))
+            pulse_step = max(1, int(total_steps // 20))
             last_pulse_t = time.monotonic()
-            while done < total:
-                step = min(chunk, total - done)
+            while done < total_steps:
+                step = min(chunk, total_steps - done)
                 performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
                 state, lnp, _ = sampler.run_mcmc(
                     state, step, progress=False, skip_initial_state_check=True
@@ -2280,7 +2362,7 @@ def bayesian_ci(
                 if progress_cb is not None:
                     if done >= next_pulse_at or (time.monotonic() - last_pulse_t) > 0.5:
                         try:
-                            progress_cb(f"Bayesian MCMC: {done}/{total}")
+                            progress_cb(f"Bayesian MCMC: {done}/{total_steps}")
                         except Exception:
                             pass
                         last_pulse_t = time.monotonic()

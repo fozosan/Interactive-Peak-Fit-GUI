@@ -2,6 +2,7 @@ import sys, pathlib, numpy as np
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 from batch import runner
 from core.peaks import Peak
+from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 from ui.app import pseudo_voigt
 
 
@@ -27,6 +28,9 @@ def test_batch_toggle_respected(tmp_path):
         "output_dir":str(tmp_path),
         "output_base":"batch",
     }
+    cfg.update(ensure_unc_common({}))
+    cfg.update(bootstrap_cfg(n=80))
+    cfg.update(bayes_knobs())
 
     # OFF: no per-file unc files, no batch uncertainty
     ok, total = runner.run_batch([str(tmp_path / "f?.csv")], cfg, compute_uncertainty=False, unc_method="Asymptotic")

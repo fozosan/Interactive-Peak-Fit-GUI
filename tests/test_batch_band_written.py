@@ -1,6 +1,8 @@
 import numpy as np, pathlib
 import pandas as pd
 
+from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
+
 
 def test_batch_band_written(tmp_path):
     from batch import runner
@@ -32,6 +34,9 @@ def test_batch_band_written(tmp_path):
         "output_dir": str(tmp_path),
         "output_base": "batch",
     }
+    cfg.update(ensure_unc_common({}))
+    cfg.update(bootstrap_cfg(n=96))
+    cfg.update(bayes_knobs())
 
     ok, total = runner.run_batch([str(p)], cfg, compute_uncertainty=True, unc_method="Asymptotic")
     assert ok == 1 and total == 1

@@ -21,5 +21,6 @@ def test_modern_and_lmfit_stable():
         pass
     for name in solvers:
         res = orchestrator.run_fit_with_fallbacks(x, y, init, "subtract", None, {"solver": name})
+        assert res.solver == name
         assert np.allclose(res.theta, expected, atol=1e-12)
         assert res.cost < 1e-12

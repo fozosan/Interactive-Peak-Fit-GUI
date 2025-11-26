@@ -1,11 +1,40 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import Any, Callable, Dict, Optional
 import numpy as np
 
 from .data_io import canonical_unc_label
 from . import uncertainty as unc
+
+
+logger = logging.getLogger(__name__)
+log = logger
+
+
+def _require_positive_int(cfg: Dict[str, Any], key: str) -> int:
+    if key not in cfg:
+        raise KeyError(f"Missing required Bayesian knob: {key}")
+    try:
+        value = int(cfg[key])
+    except Exception as exc:
+        raise ValueError(f"Invalid integer for {key}: {cfg.get(key)!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{key} must be > 0 (got {value})")
+    return value
+
+
+def _require_nonneg_int(cfg: Dict[str, Any], key: str) -> int:
+    if key not in cfg:
+        raise KeyError(f"Missing required Bayesian knob: {key}")
+    try:
+        value = int(cfg[key])
+    except Exception as exc:
+        raise ValueError(f"Invalid integer for {key}: {cfg.get(key)!r}") from exc
+    if value < 0:
+        raise ValueError(f"{key} must be ≥ 0 (got {value})")
+    return value
 
 
 def _infer_alpha(ctx: Optional[Dict[str, Any]]) -> float:
@@ -148,6 +177,7 @@ def route_uncertainty(
             jacobian=jacobian,
             ymodel_fn=ymodel,
             alpha=alpha,
+            xgrid=ctx.get("x_all"),
         )
 
     # --- BOOTSTRAP ----------------------------------------------------------
@@ -193,11 +223,15 @@ def route_uncertainty(
 
     # --- BAYESIAN -----------------------------------------------------------
     if "bayes" in m or "mcmc" in m:
-        # Pull common MCMC settings (provide safe fallbacks).
-        n_walkers = ctx.get("bayes_walkers", None)
-        n_burn = int(ctx.get("bayes_burn", 2000))
-        n_steps = int(ctx.get("bayes_steps", 8000))
-        thin = int(ctx.get("bayes_thin", 1))
+        walkers_raw = _require_nonneg_int(ctx, "bayes_walkers")
+        n_walkers = None if walkers_raw == 0 else walkers_raw
+        n_burn = _require_nonneg_int(ctx, "bayes_burn")
+        n_steps = _require_positive_int(ctx, "bayes_steps")
+        thin = _require_positive_int(ctx, "bayes_thin")
+        ctx["bayes_walkers"] = walkers_raw
+        ctx["bayes_burn"] = n_burn
+        ctx["bayes_steps"] = n_steps
+        ctx["bayes_thin"] = thin
         prior_sigma = str(ctx.get("bayes_prior_sigma", "half_cauchy"))
 
         strategy = str(ctx.get("perf_parallel_strategy", "outer"))

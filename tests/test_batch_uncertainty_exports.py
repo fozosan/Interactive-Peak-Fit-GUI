@@ -5,6 +5,7 @@ import pytest
 
 from batch import runner
 from core.peaks import Peak
+from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 from ui.app import pseudo_voigt
 
 
@@ -35,6 +36,9 @@ def test_batch_uncertainty_exports(tmp_path, method):
         "output_dir": str(tmp_path),
         "output_base": "batch",
     }
+    cfg.update(ensure_unc_common({}))
+    cfg.update(bootstrap_cfg(n=120))
+    cfg.update(bayes_knobs())
 
     ok, total = runner.run_batch([str(p)], cfg, compute_uncertainty=True, unc_method=method)
     assert ok == 1 and total == 1
@@ -81,8 +85,9 @@ def test_batch_uncertainty_failure_does_not_abort(tmp_path, monkeypatch, caplog)
         "perf_max_workers": 1,
         "output_dir": str(tmp_path),
         "output_base": "batch",
-        "bootstrap_n": 8,
     }
+    cfg.update(ensure_unc_common({"bootstrap_n": 8}))
+    cfg.update(bayes_knobs())
 
     stats_entry = {
         "center": {

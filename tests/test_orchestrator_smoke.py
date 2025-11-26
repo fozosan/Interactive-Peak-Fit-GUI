@@ -27,6 +27,7 @@ def test_fallback_solvers_smoke():
     for name in solvers:
         init = [peaks.Peak(p.center + 0.2, p.height * 0.8, p.fwhm * 1.2, p.eta) for p in true]
         res = orchestrator.run_fit_with_fallbacks(x, y, init, "subtract", None, {"solver": name})
+        assert res.solver == name
         assert res.success
         assert np.isfinite(res.rmse)
         assert len(res.peaks_out) == len(true)
