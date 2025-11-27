@@ -421,6 +421,9 @@ DEFAULTS = {
     # Default solver backend
     "solver_choice": "modern_vp",
     "ui_eta": 0.5,
+    # Persisted UI prefs for FWHM caps
+    "ui_fwhm_cap_all": False,
+    "ui_fwhm_cap_value": 50.0,
     "ui_add_peaks_on_click": True,
     "unc_method": "asymptotic",
     "uncertainty": {"method": "asymptotic", "return_band": True},
@@ -1777,6 +1780,13 @@ class PeakFitApp:
         self.fwhm_cap_on  = tk.BooleanVar()
         # NEW: universal apply toggle
         self.fwhm_cap_all = tk.BooleanVar()
+        # Initialize from persisted config
+        try:
+            self.fwhm_cap_all.set(bool(self.cfg.get("ui_fwhm_cap_all", False)))
+            self.fwhm_cap_var.set(float(self.cfg.get("ui_fwhm_cap_value", 50.0)))
+        except Exception:
+            self.fwhm_cap_all.set(False)
+            self.fwhm_cap_var.set(50.0)
 
         e_center = ttk.Entry(edit, textvariable=self.center_var, width=10)
         e_height = ttk.Entry(edit, textvariable=self.height_var, width=10)
@@ -1807,8 +1817,10 @@ class PeakFitApp:
 
         for w in (e_center, e_height, e_fwhm):
             w.bind("<Return>", lambda _e: self.apply_edits())
-        # Enter on cap entry: apply to all if "All" is enabled, else edit selected
+        # Enter on cap entry: apply to all if "All" is enabled, else edit selected; persist to cfg
         self.ent_fwhm_cap.bind("<Return>", lambda _e: self._commit_cap_entry())
+        # Also persist on focus-out so value sticks even without toggling
+        self.ent_fwhm_cap.bind("<FocusOut>", lambda _e: self._sync_cap_config())
 
         # Interaction
         inter = ttk.Labelframe(right, text="Interaction"); inter.pack(fill=tk.X, pady=6)
@@ -4065,13 +4077,8 @@ class PeakFitApp:
                 return
             pk.fwhm_cap_enabled = cap_on
             pk.fwhm_cap_value = cap_val
-        # Mirror current options so uncertainty/batch paths see updated caps
-        try:
-            opts = self._solver_options()
-            self.cfg["solver_options"] = dict(opts)
-            save_config(self.cfg)
-        except Exception:
-            pass
+        # Mirror and persist current options + UI prefs so uncertainty/batch and next session see them
+        self._sync_cap_config()
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
 
@@ -4081,6 +4088,23 @@ class PeakFitApp:
             self.on_cap_toggle()
         else:
             self.apply_edits()
+        self._sync_cap_config()
+
+    def _sync_cap_config(self):
+        """Persist current cap UI prefs and options to the config file."""
+        try:
+            self.cfg["ui_fwhm_cap_all"] = bool(self.fwhm_cap_all.get())
+            # Be tolerant to bad entry content
+            try:
+                self.cfg["ui_fwhm_cap_value"] = float(self.fwhm_cap_var.get() or 50.0)
+            except Exception:
+                self.cfg["ui_fwhm_cap_value"] = 50.0
+            # Also mirror solver_options so downstream paths see updated width_caps
+            opts = self._solver_options()
+            self.cfg["solver_options"] = dict(opts)
+            save_config(self.cfg)
+        except Exception:
+            pass
 
     def add_peak_from_fields(self):
         try:
