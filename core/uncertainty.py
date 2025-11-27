@@ -957,15 +957,18 @@ def bootstrap_ci(
 
     # Baseline model prediction (prefer predict_full to avoid loss-mode mismatch)
     diag_notes: List[str] = []
+    # Require model predictions on the *fit window*; if provided but wrong-sized, fail loudly.
     y_hat = None
     if callable(predict_full):
+        y_hat_try = predict_full(theta)
         try:
-            y_hat = np.asarray(predict_full(theta), float)
+            y_hat_arr = np.asarray(y_hat_try, float).reshape(-1)
         except Exception as e:
             diag_notes.append(repr(e))
-            y_hat = None
-    if y_hat is not None:
-        y_hat = np.asarray(y_hat, float).reshape(-1)
+            y_hat_arr = None
+        else:
+            _validate_vector_length("predict_full", y_hat_arr, n)
+            y_hat = y_hat_arr
     if y_all is not None:
         y_all = np.asarray(y_all, float).reshape(-1)
 
@@ -978,9 +981,11 @@ def bootstrap_ci(
     )
 
     if y_hat is None:
-        base = y_all if y_all is not None else np.zeros_like(residual)
-        y_hat = np.asarray(base, float).reshape(-1) - r
-    _validate_vector_length("predict_full", y_hat, n)
+        # Without a valid predictor on the fit window, resampling weighted residuals
+        # produces biased synthetic data and unrealistic bands. Refuse silently falling back.
+        raise ValueError(
+            "bootstrap_ci requires predict_full defined on the fit window (len(x_all))."
+        )
     if y_all is None:
         y_all = (y_hat + r)
     else:
