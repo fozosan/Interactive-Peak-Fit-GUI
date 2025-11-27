@@ -6,6 +6,8 @@ from typing import Sequence, Tuple
 import numpy as np
 
 from core.bounds import make_bounds
+import logging
+log = logging.getLogger(__name__)
 
 
 class PeakLike:
@@ -85,6 +87,7 @@ def pack_theta_bounds(
     lb_list: list[float] = []
     ub_list: list[float] = []
 
+    caps = options.get("width_caps", None)
     for i, pk in enumerate(peaks):
         h_lo, c_lo, w_lo = lo_hw[3 * i : 3 * i + 3]
         h_hi, c_hi, w_hi = hi_hw[3 * i : 3 * i + 3]
@@ -114,6 +117,23 @@ def pack_theta_bounds(
             ub_list.append(w)
         else:
             lb_list.append(w_lo)
+            # Optional per-peak width cap
+            if isinstance(caps, (list, tuple)) and i < len(caps):
+                cap = caps[i]
+                if cap is not None:
+                    try:
+                        capf = float(cap)
+                        if np.isfinite(capf) and capf > 0:
+                            old = w_hi
+                            w_hi = min(w_hi, capf)
+                            if w_lo >= w_hi:
+                                w_lo = max(1e-9, min(w_lo, 0.999999 * w_hi))
+                            try:
+                                log.debug(f"[bounds] cap peak {i+1}: w_hi {old:.6g} → {w_hi:.6g}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             ub_list.append(w_hi)
 
         # bounds for eta

@@ -1,7 +1,7 @@
 """Simple SciPy curve_fit backend matching legacy v2.7 behaviour."""
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Sequence, Optional
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -18,13 +18,14 @@ def _pack(
     centers_in_window: bool,
     xmin: float,
     xmax: float,
+    width_caps: Optional[Sequence[float]] = None,
 ) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray], list[dict]]:
     """Flatten free parameters and construct simple bounds."""
     theta: list[float] = []
     lo: list[float] = []
     hi: list[float] = []
     struct: list[dict] = []
-    for pk in peaks:
+    for i, pk in enumerate(peaks):
         s: dict = {"eta": float(pk.eta)}
         # height always free
         s["ih"] = len(theta)
@@ -61,7 +62,11 @@ def _pack(
             s["iw"] = len(theta)
             theta.append(max(pk.fwhm, W_MIN))
             lo.append(W_MIN)
-            hi.append(np.inf)
+            # Apply optional per-peak cap when width is free
+            cap = None
+            if isinstance(width_caps, (list, tuple)):
+                cap = width_caps[i] if i < len(width_caps) else None
+            hi.append(float(cap) if (cap is not None and float(cap) > 0) else np.inf)
         struct.append(s)
     return np.asarray(theta, float), (np.asarray(lo, float), np.asarray(hi, float)), struct
 
@@ -135,7 +140,8 @@ def solve(x, y, peaks, mode, baseline, opts):
         y_target = y - (base if base is not None else 0.0)
         base_fit = None
     centers_flag = bool(opts.get("centers_in_window", True))
-    theta0, bounds, struct = _pack(peaks, centers_in_window=centers_flag, xmin=float(x.min()), xmax=float(x.max()))
+    caps = opts.get("width_caps")
+    theta0, bounds, struct = _pack(peaks, centers_in_window=centers_flag, xmin=float(x.min()), xmax=float(x.max()), width_caps=caps)
     theta0 = np.clip(theta0, bounds[0], bounds[1])
 
     def model_func(xdata, *t):
@@ -193,7 +199,8 @@ def prepare_state(x, y, peaks, mode, baseline, opts):
         y_target = y - (base if base is not None else 0.0)
         base_fit = None
     centers_flag = bool(opts.get("centers_in_window", True))
-    theta0, bounds, struct = _pack(peaks, centers_in_window=centers_flag, xmin=float(x.min()), xmax=float(x.max()))
+    caps = opts.get("width_caps")
+    theta0, bounds, struct = _pack(peaks, centers_in_window=centers_flag, xmin=float(x.min()), xmax=float(x.max()), width_caps=caps)
     theta0 = np.clip(theta0, bounds[0], bounds[1])
     resid = _build_residual(x, y_target, base_fit, struct)
     r0 = resid(theta0)
