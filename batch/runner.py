@@ -886,16 +886,10 @@ def run_batch(
                     fit_ctx_local = dict(fit_ctx)
                     fit_ctx_local["unc_boot_solver"] = str(boot_solver)
                     fit_ctx_local["solver"] = str(boot_solver)
-                    # Always force strict non-linear refits for bootstrap (matches GUI stability)
+                    # Force strict non-linear refits for bootstrap across all solvers.
+                    # This avoids linearized fallbacks (which distort bands on sharp peaks)
+                    # and aligns batch behavior with the GUI.
                     fit_ctx_local["strict_refit"] = True
-                    # Enable influence-aware, heteroscedastic-friendly bootstrap by default in batch
-                    # (can be overridden in config if needed)
-                    fit_ctx_local.setdefault("boot_studentize", True)
-                    fit_ctx_local.setdefault(
-                        "boot_resampling", str(config.get("boot_resampling", "wild")).lower()
-                    )
-                    if "boot_wild_weights" in config:
-                        fit_ctx_local["boot_wild_weights"] = str(config["boot_wild_weights"]).lower()
                     with _tp_limits_ctx_for_config(config):
                         performance.apply_global_seed(seed_val, perf_seed_all)
                         try:
