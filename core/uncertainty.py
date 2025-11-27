@@ -979,6 +979,12 @@ def bootstrap_ci(
         mode=str(fit.get("bootstrap_residual_mode", "raw")),
         center=bool(fit.get("center_residuals", True)),
     )
+    # ------------------------------------------------------------------
+    # New: leverage-based studentization & wild bootstrap controls
+    # ------------------------------------------------------------------
+    boot_resampling = str(fit.get("boot_resampling", "classic")).lower()  # "classic" | "wild"
+    boot_wild_weights = str(fit.get("boot_wild_weights", "rademacher")).lower()  # "rademacher" | "mammen" | "gaussian"
+    boot_studentize = bool(fit.get("boot_studentize", False))
 
     if y_hat is None:
         # Without a valid predictor on the fit window, resampling weighted residuals
@@ -1334,6 +1340,29 @@ def bootstrap_ci(
     locked_arr = _canon_locked_mask(locked_mask, P)
     locked_mask = locked_arr if locked_arr is not None else None
     free_mask = np.ones(P, bool) if locked_arr is None else ~locked_arr
+    n_free = int(np.sum(free_mask))
+
+    # Studentize residuals if requested: r_s = r / sqrt(1 - h_ii)
+    # Use leverage from the free-parameter hat matrix H = J_f (J_f^T J_f)^{-1} J_f^T
+    if boot_studentize and n_free > 0 and J.ndim == 2:
+        try:
+            Jf_hat = J[:, free_mask]
+            JTJ = Jf_hat.T @ Jf_hat
+            try:
+                U, s, Vt = np.linalg.svd(JTJ, full_matrices=False)
+            except np.linalg.LinAlgError:  # pragma: no cover
+                s = np.linalg.svd(JTJ, compute_uv=False)
+                U = Vt = np.eye(JTJ.shape[0])
+            s_inv = np.array([1.0 / si if si > 1e-12 * s[0] else 0.0 for si in s])
+            JTJ_inv = (Vt.T * s_inv) @ Vt
+            H_diag = np.sum(Jf_hat * (Jf_hat @ JTJ_inv), axis=1)  # diag without forming H
+            H_diag = np.clip(H_diag, 0.0, 0.999999)
+            r_s = r / np.sqrt(1.0 - H_diag)
+        except Exception as e:
+            diag_notes.append(f"studentize-failed:{type(e).__name__}:{e}")
+            r_s = r
+    else:
+        r_s = r
 
     # --- Normalize bounds (length-P, float) BEFORE any use ---
     bounds_provided = bounds is not None
@@ -1502,9 +1531,26 @@ def bootstrap_ci(
         nonlocal linear_fallbacks, linear_lambda
         nonlocal diag_failure
         rng_local = rng_streams[b]
-        # resample residuals
-        idx = rng_local.integers(0, n, size=n)
-        r_b = r[idx]
+        # Resample residuals
+        if boot_resampling == "wild":
+            # Wild bootstrap: w_i has mean 0, var 1; multiply residuals in-place
+            if boot_wild_weights == "mammen":
+                # Two-point Mammen distribution
+                rt5 = float(np.sqrt(5.0))
+                a = (rt5 - 1.0) / 2.0
+                b = (rt5 + 1.0) / 2.0
+                p = (rt5 + 1.0) / (2.0 * rt5)
+                u = rng_local.random(n)
+                w = np.where(u < p, -a, b)
+            elif boot_wild_weights == "gaussian":
+                w = rng_local.standard_normal(n)
+            else:  # rademacher
+                w = rng_local.choice([-1.0, 1.0], size=n)
+            r_b = r_s * w
+        else:
+            # Classic i.i.d. residual resampling with replacement
+            idx = rng_local.integers(0, n, size=n)
+            r_b = r_s[idx]
         y_b = (y_hat + r_b)
 
         # jitter start (free params only)
@@ -1691,6 +1737,9 @@ def bootstrap_ci(
             "refit_errors": list(refit_errors[:16]),
             "alpha": float(alpha),
         })
+        diag_failure_local["boot_resampling"] = boot_resampling
+        diag_failure_local["boot_wild_weights"] = boot_wild_weights if boot_resampling == "wild" else None
+        diag_failure_local["boot_studentize"] = bool(boot_studentize)
         diag_failure_local["bootstrap_mode"] = "linearized" if use_linearized_fast_path else "refit"
         diag_failure_local.setdefault("refit_errors", [])
         err = RuntimeError(
@@ -1921,6 +1970,10 @@ def bootstrap_ci(
         "refit_errors": list(refit_errors[:16]),
         "alpha": float(alpha),
     })
+    # Record new bootstrap details for transparency
+    diag["boot_resampling"] = boot_resampling
+    diag["boot_wild_weights"] = boot_wild_weights if boot_resampling == "wild" else None
+    diag["boot_studentize"] = bool(boot_studentize)
     if diag_notes:
         diag["notes"] = diag_notes
     # Merge any per-band diagnostics (e.g. workers_used, band_backend)
