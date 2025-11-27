@@ -1775,6 +1775,8 @@ class PeakFitApp:
         # NEW: width cap widgets
         self.fwhm_cap_var = tk.DoubleVar()
         self.fwhm_cap_on  = tk.BooleanVar()
+        # NEW: universal apply toggle
+        self.fwhm_cap_all = tk.BooleanVar()
 
         e_center = ttk.Entry(edit, textvariable=self.center_var, width=10)
         e_height = ttk.Entry(edit, textvariable=self.height_var, width=10)
@@ -1791,6 +1793,8 @@ class PeakFitApp:
         self.ent_fwhm_cap.grid(row=2, column=3, padx=2)
         ttk.Checkbutton(edit, text="Cap", variable=self.fwhm_cap_on,
                         command=self.on_cap_toggle).grid(row=2, column=4, sticky="w")
+        ttk.Checkbutton(edit, text="All", variable=self.fwhm_cap_all,
+                        command=self.on_cap_toggle).grid(row=2, column=5, sticky="w")
 
         ttk.Checkbutton(edit, text="Lock width",  variable=self.lockw_var, command=self.on_lock_toggle).grid(row=3, column=0, sticky="w", pady=2)
         ttk.Checkbutton(edit, text="Lock center", variable=self.lockc_var, command=self.on_lock_toggle).grid(row=3, column=1, sticky="w", pady=2)
@@ -1801,8 +1805,10 @@ class PeakFitApp:
         ttk.Button(btns, text="Delete selected", command=self.delete_selected).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Clear all", command=self.clear_peaks).pack(side=tk.LEFT, padx=4)
 
-        for w in (e_center, e_height, e_fwhm, self.ent_fwhm_cap):
+        for w in (e_center, e_height, e_fwhm):
             w.bind("<Return>", lambda _e: self.apply_edits())
+        # Enter on cap entry: apply to all if "All" is enabled, else edit selected
+        self.ent_fwhm_cap.bind("<Return>", lambda _e: self._commit_cap_entry())
 
         # Interaction
         inter = ttk.Labelframe(right, text="Interaction"); inter.pack(fill=tk.X, pady=6)
@@ -4031,23 +4037,35 @@ class PeakFitApp:
         self.refresh_plot()
 
     def on_cap_toggle(self):
-        """Persist per-peak FWHM cap immediately when the Cap checkbox changes."""
-        sel = self._selected_index()
-        if sel is None:
-            return
-        pk = self.peaks[sel]
-        if pk.lock_width:
-            self.fwhm_cap_on.set(False)
-            try:
-                self.ent_fwhm_cap.configure(state="disabled")
-            except Exception:
-                pass
-            return
+        """Persist FWHM cap immediately. If 'All' is on, apply to every peak."""
+        cap_on = bool(self.fwhm_cap_on.get())
         try:
-            pk.fwhm_cap_enabled = bool(self.fwhm_cap_on.get())
-            pk.fwhm_cap_value = float(self.fwhm_cap_var.get() or 50.0)
+            cap_val = float(self.fwhm_cap_var.get() or 50.0)
         except Exception:
-            pk.fwhm_cap_enabled = False
+            cap_val = 50.0
+        if bool(self.fwhm_cap_all.get()):
+            # Apply universally to all peaks (except those with locked width)
+            for pk_all in self.peaks:
+                if pk_all.lock_width:
+                    continue
+                pk_all.fwhm_cap_enabled = cap_on
+                pk_all.fwhm_cap_value = cap_val
+        else:
+            # Apply only to the selected peak
+            sel = self._selected_index()
+            if sel is None:
+                return
+            pk = self.peaks[sel]
+            if pk.lock_width:
+                self.fwhm_cap_on.set(False)
+                try:
+                    self.ent_fwhm_cap.configure(state="disabled")
+                except Exception:
+                    pass
+                return
+            pk.fwhm_cap_enabled = cap_on
+            pk.fwhm_cap_value = cap_val
+        # Mirror current options so uncertainty/batch paths see updated caps
         try:
             opts = self._solver_options()
             self.cfg["solver_options"] = dict(opts)
@@ -4056,6 +4074,13 @@ class PeakFitApp:
             pass
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
+
+    def _commit_cap_entry(self):
+        """Enter key in the cap entry: if 'All' is on, propagate to all; else edit selected."""
+        if bool(self.fwhm_cap_all.get()):
+            self.on_cap_toggle()
+        else:
+            self.apply_edits()
 
     def add_peak_from_fields(self):
         try:
