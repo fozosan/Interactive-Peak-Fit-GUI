@@ -393,6 +393,9 @@ class Peak:
     eta: float = 0.5
     lock_width: bool = False
     lock_center: bool = False
+    # Optional per-peak cap on FWHM when width is *not* locked
+    fwhm_cap_enabled: bool = False
+    fwhm_cap_value: float = 50.0
 
 
 # ---------- Config persistence ----------
@@ -1769,6 +1772,9 @@ class PeakFitApp:
         self.fwhm_var = tk.DoubleVar()
         self.lockw_var = tk.BooleanVar()
         self.lockc_var = tk.BooleanVar()
+        # NEW: width cap widgets
+        self.fwhm_cap_var = tk.DoubleVar()
+        self.fwhm_cap_on  = tk.BooleanVar()
 
         e_center = ttk.Entry(edit, textvariable=self.center_var, width=10)
         e_height = ttk.Entry(edit, textvariable=self.height_var, width=10)
@@ -1779,6 +1785,12 @@ class PeakFitApp:
         e_height.grid(row=1, column=1, padx=2)
         ttk.Label(edit, text="FWHM").grid(row=2, column=0, sticky="e")
         e_fwhm.grid(row=2, column=1, padx=2)
+        # NEW: “Max FWHM” + toggle (effective only when width is free)
+        ttk.Label(edit, text="Max FWHM").grid(row=2, column=2, sticky="e")
+        self.ent_fwhm_cap = ttk.Entry(edit, textvariable=self.fwhm_cap_var, width=10)
+        self.ent_fwhm_cap.grid(row=2, column=3, padx=2)
+        ttk.Checkbutton(edit, text="Cap", variable=self.fwhm_cap_on,
+                        command=self.on_cap_toggle).grid(row=2, column=4, sticky="w")
 
         ttk.Checkbutton(edit, text="Lock width",  variable=self.lockw_var, command=self.on_lock_toggle).grid(row=3, column=0, sticky="w", pady=2)
         ttk.Checkbutton(edit, text="Lock center", variable=self.lockc_var, command=self.on_lock_toggle).grid(row=3, column=1, sticky="w", pady=2)
@@ -1789,7 +1801,7 @@ class PeakFitApp:
         ttk.Button(btns, text="Delete selected", command=self.delete_selected).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Clear all", command=self.clear_peaks).pack(side=tk.LEFT, padx=4)
 
-        for w in (e_center, e_height, e_fwhm):
+        for w in (e_center, e_height, e_fwhm, self.ent_fwhm_cap):
             w.bind("<Return>", lambda _e: self.apply_edits())
 
         # Interaction
@@ -2317,6 +2329,12 @@ class PeakFitApp:
 
     def _solver_options(self, choice: Optional[str] = None) -> dict:
         solver = choice or self.solver_choice.get()
+        # Per-peak width caps (None where disabled/locked)
+        width_caps = [
+            (None if (p.lock_width or not bool(getattr(p, "fwhm_cap_enabled", False)))
+             else float(getattr(p, "fwhm_cap_value", float("inf"))))
+            for p in self.peaks
+        ]
         if solver in ("modern_vp", "modern_trf"):
             min_fwhm = 1e-6
             if self.modern_min_fwhm.get() and self.x is not None and self.x.size > 1:
@@ -2330,6 +2348,7 @@ class PeakFitApp:
                 "jitter_pct": float(self.modern_jitter.get()),
                 "centers_in_window": bool(self.modern_centers_window.get()),
                 "min_fwhm": float(min_fwhm),
+                "width_caps": width_caps,
             }
         if solver == "lmfit_vp":
             return {
@@ -2337,6 +2356,7 @@ class PeakFitApp:
                 "maxfev": int(self.lmfit_maxfev.get()),
                 "share_fwhm": bool(self.lmfit_share_fwhm.get()),
                 "share_eta": bool(self.lmfit_share_eta.get()),
+                "width_caps": width_caps,
             }
         return {
             "maxfev": int(self.classic_maxfev.get()),
@@ -2345,6 +2365,7 @@ class PeakFitApp:
             "fwhm_min_factor": float(self.classic_fwhm_min.get()),
             "fwhm_max_factor": float(self.classic_fwhm_max.get()),
             "height_factor": float(self.classic_height_factor.get()),
+            "width_caps": width_caps,
         }
 
     @log_action
@@ -3877,7 +3898,9 @@ class PeakFitApp:
     def serialize_peaks(self) -> list:
         return [
             {"center": float(p.center), "height": float(p.height), "fwhm": float(p.fwhm),
-             "eta": float(p.eta), "lock_width": bool(p.lock_width), "lock_center": bool(p.lock_center)}
+             "eta": float(p.eta), "lock_width": bool(p.lock_width), "lock_center": bool(p.lock_center),
+             "fwhm_cap_enabled": bool(getattr(p, "fwhm_cap_enabled", False)),
+             "fwhm_cap_value": float(getattr(p, "fwhm_cap_value", 50.0))}
             for p in self.peaks
         ]
 
@@ -3899,7 +3922,9 @@ class PeakFitApp:
                             fwhm=float(spk.get("fwhm", 5.0)),
                             eta=float(np.clip(spk.get("eta", 0.5), 0, 1)),
                             lock_width=bool(spk.get("lock_width", False)),
-                            lock_center=bool(spk.get("lock_center", False))))
+                            lock_center=bool(spk.get("lock_center", False)),
+                            fwhm_cap_enabled=bool(spk.get("fwhm_cap_enabled", False)),
+                            fwhm_cap_value=float(spk.get("fwhm_cap_value", 50.0))))
         new.sort(key=lambda p: p.center)
         self.peaks = new
         self.refresh_tree()
@@ -3976,6 +4001,17 @@ class PeakFitApp:
         self.fwhm_var.set(pk.fwhm)
         self.lockw_var.set(pk.lock_width)
         self.lockc_var.set(pk.lock_center)
+        # Populate cap widgets
+        try:
+            self.fwhm_cap_var.set(float(getattr(pk, "fwhm_cap_value", max(1.0, pk.fwhm*5))))
+            self.fwhm_cap_on.set(bool(getattr(pk, "fwhm_cap_enabled", False)))
+        except Exception:
+            self.fwhm_cap_var.set(50.0); self.fwhm_cap_on.set(False)
+        # Disable editing when width is locked
+        try:
+            self.ent_fwhm_cap.configure(state=("disabled" if pk.lock_width else "normal"))
+        except Exception:
+            pass
 
     def on_lock_toggle(self):
         sel = self._selected_index()
@@ -3984,6 +4020,40 @@ class PeakFitApp:
         pk = self.peaks[sel]
         pk.lock_width  = bool(self.lockw_var.get())
         pk.lock_center = bool(self.lockc_var.get())
+        # Keep cap toggle/UI consistent with lock state
+        if pk.lock_width:
+            self.fwhm_cap_on.set(False)
+        try:
+            self.ent_fwhm_cap.configure(state=("disabled" if pk.lock_width else "normal"))
+        except Exception:
+            pass
+        self.refresh_tree(keep_selection=True)
+        self.refresh_plot()
+
+    def on_cap_toggle(self):
+        """Persist per-peak FWHM cap immediately when the Cap checkbox changes."""
+        sel = self._selected_index()
+        if sel is None:
+            return
+        pk = self.peaks[sel]
+        if pk.lock_width:
+            self.fwhm_cap_on.set(False)
+            try:
+                self.ent_fwhm_cap.configure(state="disabled")
+            except Exception:
+                pass
+            return
+        try:
+            pk.fwhm_cap_enabled = bool(self.fwhm_cap_on.get())
+            pk.fwhm_cap_value = float(self.fwhm_cap_var.get() or 50.0)
+        except Exception:
+            pk.fwhm_cap_enabled = False
+        try:
+            opts = self._solver_options()
+            self.cfg["solver_options"] = dict(opts)
+            save_config(self.cfg)
+        except Exception:
+            pass
         self.refresh_tree(keep_selection=True)
         self.refresh_plot()
 
@@ -3996,7 +4066,9 @@ class PeakFitApp:
             messagebox.showwarning("Add Peak", "Center, Height, and FWHM must be numbers.")
             return
         pk = Peak(center=c, height=h, fwhm=w, eta=float(self.global_eta.get()),
-                  lock_center=bool(self.lockc_var.get()), lock_width=bool(self.lockw_var.get()))
+                  lock_center=bool(self.lockc_var.get()), lock_width=bool(self.lockw_var.get()),
+                  fwhm_cap_enabled=bool(self.fwhm_cap_on.get()),
+                  fwhm_cap_value=float(self.fwhm_cap_var.get() or 50.0))
         self.peaks.append(pk)
         self.peaks.sort(key=lambda p: p.center)
         self.refresh_tree()
@@ -4013,6 +4085,9 @@ class PeakFitApp:
             pk.fwhm   = max(float(self.fwhm_var.get()), 1e-6)
             pk.lock_width  = bool(self.lockw_var.get())
             pk.lock_center = bool(self.lockc_var.get())
+            if not pk.lock_width:
+                pk.fwhm_cap_enabled = bool(self.fwhm_cap_on.get())
+                pk.fwhm_cap_value   = float(self.fwhm_cap_var.get() or 50.0)
         except ValueError:
             messagebox.showwarning("Edit", "Invalid numeric value.")
             return
@@ -4100,6 +4175,12 @@ class PeakFitApp:
         options = self._solver_options()
         solver = self.solver_choice.get()
         options["solver"] = solver
+        # Keep solver_options mirrored in persistent cfg for uncertainty paths
+        try:
+            self.cfg["solver_options"] = dict(options)
+            save_config(self.cfg)
+        except Exception:
+            pass
 
         self.set_busy(True, "Stepping…")
         payload = {
@@ -4172,6 +4253,12 @@ class PeakFitApp:
         solver = self.solver_choice.get()
         options = self._solver_options()
         options["solver"] = solver
+        # Keep solver_options mirrored in persistent cfg for uncertainty paths
+        try:
+            self.cfg["solver_options"] = dict(options)
+            save_config(self.cfg)
+        except Exception:
+            pass
 
         def work():
             return orchestrator.run_fit_with_fallbacks(
@@ -4874,6 +4961,8 @@ class PeakFitApp:
                 "unc_band_workers": band_workers,
                 "unc_use_gpu": bool(getattr(self, "use_gpu_var", None) and self.use_gpu_var.get()),
                 "solver": boot_solver,
+                # Make caps/bounds derivable inside bootstrap via pack_theta_bounds
+                "solver_options": dict(self.cfg.get("solver_options", {})),
                 "strict_refit": True,
                 "bootstrap_jitter": jitter_frac,
                 "locked_mask": locked_mask,
@@ -5627,7 +5716,17 @@ class PeakFitApp:
                     yscale = 1.0
                 hi[1::4] = max(1.0, 1.5 * yscale)  # height cap
                 lo[2::4] = max(1e-3, float(self.classic_fwhm_min.get() if hasattr(self, "classic_fwhm_min") else 1e-2))
-                hi[2::4] = max(1.0, xhi - xlo)     # width ≤ window
+                # width ≤ window, then tighten by per-peak caps if present
+                hi[2::4] = max(1.0, xhi - xlo)
+                try:
+                    caps = (self.cfg.get("solver_options", {}) or {}).get("width_caps", []) or []
+                    for i_cap, cap in enumerate(caps):
+                        if cap is not None:
+                            ci = 4 * i_cap + 2
+                            if ci < hi.size and np.isfinite(cap) and cap > 0:
+                                hi[ci] = min(hi[ci], float(cap))
+                except Exception:
+                    pass
                 lo[3::4] = 0.0
                 hi[3::4] = 1.0                     # 0 ≤ eta ≤ 1
 

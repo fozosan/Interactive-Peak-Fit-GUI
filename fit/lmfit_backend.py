@@ -84,8 +84,11 @@ def solve(
         else:
             params.add(f"c{i}", value=p.center, vary=False)
         if not p.lock_width:
+            # Use per-parameter bounds derived by pack_theta_bounds (respects caps)
+            w_lo = float(bounds_full[0][4 * i + 2])
+            w_hi = float(bounds_full[1][4 * i + 2])
             params.add(
-                f"w{i}", value=max(p.fwhm, min_fwhm), min=min_fwhm, max=options["max_fwhm"], vary=True
+                f"w{i}", value=max(p.fwhm, min_fwhm), min=max(min_fwhm, w_lo), max=w_hi, vary=True
             )
         else:
             params.add(f"w{i}", value=max(p.fwhm, min_fwhm), vary=False)

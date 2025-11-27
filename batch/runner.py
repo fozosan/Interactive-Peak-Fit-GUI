@@ -166,6 +166,12 @@ def run_batch(
         peaks.Peak(**p) for p in config.get("peaks", [])
     ]
     solver_name = config.get("solver", "classic")
+    # If a generic "solver_options" block is provided, merge into the
+    # per-solver config so run_fit_consistent → pack_theta_bounds sees caps.
+    if "solver_options" in config:
+        cfg_opts = dict(config.get(solver_name, {}))
+        cfg_opts.update(dict(config.get("solver_options") or {}))
+        config[solver_name] = cfg_opts
     mode = config.get("mode", "add")
     base_cfg = config.get("baseline", {})
     save_traces = bool(config.get("save_traces", False))
@@ -663,6 +669,8 @@ def run_batch(
                         "peaks": peaks_obj,
                         # set solver once to the chosen bootstrap engine
                         "solver": boot_solver,
+                        # Make per-peak caps available to bootstrap's bounds derivation
+                        "solver_options": dict(config.get("solver_options", {})),
                         "bootstrap_jitter": jitter_frac,
                         "lmfit_share_fwhm": bool(config.get("lmfit_share_fwhm", False)),
                         "lmfit_share_eta": bool(config.get("lmfit_share_eta", False)),
@@ -738,6 +746,11 @@ def run_batch(
                     )
                     cfg["solver_choice"] = solver_choice_local
                     cfg["solver"] = solver_choice_local
+                    # Mirror generic solver_options into the active solver's cfg for refits
+                    if "solver_options" in config:
+                        _extra = dict(config.get(solver_choice_local, {}))
+                        _extra.update(dict(config.get("solver_options") or {}))
+                        cfg[solver_choice_local] = _extra
                     if solver_choice_local.lower() in ("lmfit_vp", "lmfit-vp", "lmfit"):
                         cfg["strict_refit"] = True
                         cfg["relabel_by_center"] = True

@@ -988,7 +988,7 @@ def bootstrap_ci(
 
     if y_hat is None:
         # Without a valid predictor on the fit window, resampling weighted residuals
-        # produces biased synthetic data and unrealistic bands. Refuse silently falling back.
+        # produces biased synthetic data and unrealistic bands. Be strict here.
         raise ValueError(
             "bootstrap_ci requires predict_full defined on the fit window (len(x_all))."
         )
