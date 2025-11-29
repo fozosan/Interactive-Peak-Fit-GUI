@@ -841,6 +841,18 @@ def _set_thread_limits(strategy: str, blas_threads):
     return
 
 
+def _to_float_or_none(val):
+    try:
+        if val is None:
+            return None
+        s = str(val).strip()
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
 # ---------- Main GUI ----------
 class PeakFitApp:
     # Local copy to normalize GUI jitter slider (percent → fraction)
@@ -2107,6 +2119,97 @@ class PeakFitApp:
             lambda _e: self._on_boot_solver_choice(),
         )
         r += 1
+        # ------------------------------------------------------------------
+        # Bootstrap residual resampling controls (user-driven; no code defaults)
+        # ------------------------------------------------------------------
+        ttk.Label(unc_frame, text="Resampling mode:").grid(row=r, column=0, sticky="e")
+        _resampling_init = self.cfg.get("boot_resampling")
+        self.boot_resampling_var = tk.StringVar(
+            value=(str(_resampling_init).lower() if _resampling_init is not None else "")
+        )
+        self.boot_resampling_menu = ttk.Combobox(
+            unc_frame,
+            textvariable=self.boot_resampling_var,
+            state="readonly",
+            values=("classic", "wild"),
+            width=12,
+        )
+        self.boot_resampling_menu.grid(row=r, column=1, sticky="w", padx=2)
+        self.boot_resampling_menu.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: [self._cfg_set("boot_resampling", self.boot_resampling_var.get()),
+                        self._update_bootstrap_modes_state()],
+        )
+        r += 1
+
+        ttk.Label(unc_frame, text="Wild weights:").grid(row=r, column=0, sticky="e")
+        _wild_init = self.cfg.get("boot_wild_weights")
+        self.boot_wild_weights_var = tk.StringVar(
+            value=(str(_wild_init).lower() if _wild_init is not None else "")
+        )
+        self.boot_wild_weights_menu = ttk.Combobox(
+            unc_frame,
+            textvariable=self.boot_wild_weights_var,
+            state="disabled",  # enabled only when mode == 'wild'
+            values=("rademacher", "mammen", "gaussian"),
+            width=12,
+        )
+        self.boot_wild_weights_menu.grid(row=r, column=1, sticky="w", padx=2)
+        self.boot_wild_weights_menu.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._cfg_set("boot_wild_weights", self.boot_wild_weights_var.get()),
+        )
+        r += 1
+
+        self.boot_studentize_var = tk.BooleanVar(
+            value=bool(self.cfg.get("boot_studentize"))
+        )
+        self.boot_studentize_chk = ttk.Checkbutton(
+            unc_frame,
+            text="Studentize residuals",
+            variable=self.boot_studentize_var,
+            command=lambda: self._cfg_set("boot_studentize", bool(self.boot_studentize_var.get())),
+        )
+        self.boot_studentize_chk.grid(row=r, column=0, columnspan=2, sticky="w", padx=2)
+        r += 1
+
+        # Existing clamp controls follow here (already added earlier)...
+        clamp_label = ttk.Label(unc_frame, text="Center clamp mode:")
+        clamp_label.grid(row=r, column=0, sticky="e")
+        _mode_init = self.cfg.get("boot_center_clamp_mode")
+        self.boot_center_clamp_mode = tk.StringVar(
+            value=(str(_mode_init) if _mode_init is not None else "none")
+        )
+        clamp_mode = ttk.Combobox(
+            unc_frame,
+            textvariable=self.boot_center_clamp_mode,
+            state="readonly",
+            values=("none", "abs", "frac_fwhm", "frac_bounds"),
+            width=12,
+        )
+        clamp_mode.grid(row=r, column=1, sticky="w", padx=2)
+        clamp_mode.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._cfg_set("boot_center_clamp_mode", self.boot_center_clamp_mode.get()),
+        )
+        r += 1
+        clamp_val_label = ttk.Label(unc_frame, text="Clamp value:")
+        clamp_val_label.grid(row=r, column=0, sticky="e")
+        _val_init = self.cfg.get("boot_center_clamp_value")
+        self.boot_center_clamp_value = tk.StringVar(
+            value=("" if _val_init is None else str(_val_init))
+        )
+        clamp_val_entry = ttk.Entry(unc_frame, textvariable=self.boot_center_clamp_value, width=10)
+        clamp_val_entry.grid(row=r, column=1, sticky="w", padx=2)
+        clamp_val_entry.bind(
+            "<FocusOut>",
+            lambda _e: self._cfg_set(
+                "boot_center_clamp_value", _to_float_or_none(self.boot_center_clamp_value.get())
+            ),
+        )
+        r += 1
+        # Set initial enable/disable for wild weights based on current mode
+        self._update_bootstrap_modes_state()
         ttk.Label(unc_frame, text="CI α").grid(row=r, column=0, sticky="e")
         _alpha_entry = ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6)
         _alpha_entry.grid(row=r, column=1, sticky="w")
@@ -3029,6 +3132,19 @@ class PeakFitApp:
             if key:
                 self._compute_pref[key] = val
                 self._persist_compute_prefs()
+        except Exception:
+            pass
+
+
+    def _update_bootstrap_modes_state(self):
+        """Enable/disable wild-weights control based on selected resampling mode."""
+        try:
+            mode = (self.boot_resampling_var.get() or "").strip().lower()
+        except Exception:
+            mode = ""
+        state = ("readonly" if mode == "wild" else "disabled")
+        try:
+            self.boot_wild_weights_menu.configure(state=state)
         except Exception:
             pass
 
@@ -5016,6 +5132,13 @@ class PeakFitApp:
                 "bootstrap_jitter": jitter_frac,
                 "locked_mask": locked_mask,
                 "theta0": np.asarray(theta, float),
+                # Residual resampling knobs (pass-through; None means disabled)
+                "boot_resampling": self.cfg.get("boot_resampling"),
+                "boot_wild_weights": self.cfg.get("boot_wild_weights"),
+                "boot_studentize": self.cfg.get("boot_studentize"),
+                # Center clamp knobs (user-driven; None → no clamp)
+                "boot_center_clamp_mode": self.cfg.get("boot_center_clamp_mode"),
+                "boot_center_clamp_value": self.cfg.get("boot_center_clamp_value"),
             }
             # helpful breadcrumb in logs for parity/debugging
             try:
@@ -5612,6 +5735,11 @@ class PeakFitApp:
                     "bootstrap_jitter": jitter_frac,
                     "unc_band_workers": band_workers,
                     "theta0": np.asarray(theta, float),
+                    "boot_resampling": self.cfg.get("boot_resampling"),
+                    "boot_wild_weights": self.cfg.get("boot_wild_weights"),
+                    "boot_studentize": self.cfg.get("boot_studentize"),
+                    "boot_center_clamp_mode": self.cfg.get("boot_center_clamp_mode"),
+                    "boot_center_clamp_value": self.cfg.get("boot_center_clamp_value"),
                 }
 
                 try:

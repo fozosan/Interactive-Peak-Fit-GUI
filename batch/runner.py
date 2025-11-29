@@ -901,14 +901,16 @@ def run_batch(
                     fit_ctx_local["solver"] = str(boot_solver)
                     # Always force strict non-linear refits for bootstrap (matches GUI stability)
                     fit_ctx_local["strict_refit"] = True
-                    # Enable influence-aware, heteroscedastic-friendly bootstrap by default in batch
-                    # (can be overridden in config if needed)
-                    fit_ctx_local.setdefault("boot_studentize", True)
-                    fit_ctx_local.setdefault(
-                        "boot_resampling", str(config.get("boot_resampling", "wild")).lower()
-                    )
+                    if "boot_studentize" in config:
+                        fit_ctx_local["boot_studentize"] = config.get("boot_studentize")
+                    if "boot_resampling" in config:
+                        fit_ctx_local["boot_resampling"] = config.get("boot_resampling")
                     if "boot_wild_weights" in config:
-                        fit_ctx_local["boot_wild_weights"] = str(config["boot_wild_weights"]).lower()
+                        fit_ctx_local["boot_wild_weights"] = config.get("boot_wild_weights")
+                    if "boot_center_clamp_mode" in config:
+                        fit_ctx_local["boot_center_clamp_mode"] = config.get("boot_center_clamp_mode")
+                    if "boot_center_clamp_value" in config:
+                        fit_ctx_local["boot_center_clamp_value"] = config.get("boot_center_clamp_value")
                     with _tp_limits_ctx_for_config(config):
                         performance.apply_global_seed(seed_val, perf_seed_all)
                         try:
