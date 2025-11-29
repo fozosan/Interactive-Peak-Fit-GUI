@@ -867,6 +867,18 @@ class PeakFitApp:
             v = 0.0
         return v if v <= 0.25 else 0.25
 
+    def _is_bootstrap_selected(self) -> bool:
+        try:
+            key = self._unc_selected_method_key()
+            return bool(key and str(key).lower() == "bootstrap")
+        except Exception:
+            return False
+
+    def _update_bootstrap_visibility(self):
+        if getattr(self, "_boot_opts_frame", None) is None:
+            return
+        (self._boot_opts_frame.grid if self._is_bootstrap_selected() else self._boot_opts_frame.grid_remove)()
+
     def dlog(self, msg):
         """Instance debug logger respecting the UI toggle."""
         try:
@@ -2120,97 +2132,105 @@ class PeakFitApp:
         )
         r += 1
         # ------------------------------------------------------------------
-        # Bootstrap residual resampling controls (user-driven; no code defaults)
+        # Bootstrap residual resampling controls (encapsulated in a frame;
+        # shown only when Bootstrap is the selected uncertainty method)
         # ------------------------------------------------------------------
         # These controls pass through cfg values as-is; None stays None (no stringification).
-        ttk.Label(unc_frame, text="Resampling mode:").grid(row=r, column=0, sticky="e")
+        self._boot_opts_frame = ttk.LabelFrame(unc_frame, text="Bootstrap options")
+        self._boot_opts_frame.grid(row=r, column=0, columnspan=4, sticky="we", pady=(4, 2))
+        r += 1
+
+        br = 0  # row inside _boot_opts_frame
+        ttk.Label(self._boot_opts_frame, text="Resampling mode:").grid(row=br, column=0, sticky="e")
         _resampling_init = self.cfg.get("boot_resampling")
         self.boot_resampling_var = tk.StringVar(
             value=(str(_resampling_init).lower() if _resampling_init is not None else "")
         )
         self.boot_resampling_menu = ttk.Combobox(
-            unc_frame,
+            self._boot_opts_frame,
             textvariable=self.boot_resampling_var,
             state="readonly",
             values=("classic", "wild"),
             width=12,
         )
-        self.boot_resampling_menu.grid(row=r, column=1, sticky="w", padx=2)
+        self.boot_resampling_menu.grid(row=br, column=1, sticky="w", padx=2)
         self.boot_resampling_menu.bind(
             "<<ComboboxSelected>>",
             lambda _e: [self._cfg_set("boot_resampling", self.boot_resampling_var.get()),
                         self._update_bootstrap_modes_state()],
         )
-        r += 1
+        br += 1
 
-        ttk.Label(unc_frame, text="Wild weights:").grid(row=r, column=0, sticky="e")
+        ttk.Label(self._boot_opts_frame, text="Wild weights:").grid(row=br, column=0, sticky="e")
         _wild_init = self.cfg.get("boot_wild_weights")
         self.boot_wild_weights_var = tk.StringVar(
             value=(str(_wild_init).lower() if _wild_init is not None else "")
         )
         self.boot_wild_weights_menu = ttk.Combobox(
-            unc_frame,
+            self._boot_opts_frame,
             textvariable=self.boot_wild_weights_var,
             state="disabled",  # enabled only when mode == 'wild'
             values=("rademacher", "mammen", "gaussian"),
             width=12,
         )
-        self.boot_wild_weights_menu.grid(row=r, column=1, sticky="w", padx=2)
+        self.boot_wild_weights_menu.grid(row=br, column=1, sticky="w", padx=2)
         self.boot_wild_weights_menu.bind(
             "<<ComboboxSelected>>",
             lambda _e: self._cfg_set("boot_wild_weights", self.boot_wild_weights_var.get()),
         )
-        r += 1
+        br += 1
 
         self.boot_studentize_var = tk.BooleanVar(
             value=bool(self.cfg.get("boot_studentize"))
         )
         self.boot_studentize_chk = ttk.Checkbutton(
-            unc_frame,
+            self._boot_opts_frame,
             text="Studentize residuals",
             variable=self.boot_studentize_var,
             command=lambda: self._cfg_set("boot_studentize", bool(self.boot_studentize_var.get())),
         )
-        self.boot_studentize_chk.grid(row=r, column=0, columnspan=2, sticky="w", padx=2)
-        r += 1
+        self.boot_studentize_chk.grid(row=br, column=0, columnspan=2, sticky="w", padx=2)
+        br += 1
 
-        # Existing clamp controls follow here (already added earlier)...
-        clamp_label = ttk.Label(unc_frame, text="Center clamp mode:")
-        clamp_label.grid(row=r, column=0, sticky="e")
+        # Clamp controls live inside the same frame
+        clamp_label = ttk.Label(self._boot_opts_frame, text="Center clamp mode:")
+        clamp_label.grid(row=br, column=0, sticky="e")
         _mode_init = self.cfg.get("boot_center_clamp_mode")
         self.boot_center_clamp_mode = tk.StringVar(
             value=(str(_mode_init) if _mode_init is not None else "none")
         )
         clamp_mode = ttk.Combobox(
-            unc_frame,
+            self._boot_opts_frame,
             textvariable=self.boot_center_clamp_mode,
             state="readonly",
             values=("none", "abs", "frac_fwhm", "frac_bounds"),
             width=12,
         )
-        clamp_mode.grid(row=r, column=1, sticky="w", padx=2)
+        clamp_mode.grid(row=br, column=1, sticky="w", padx=2)
         clamp_mode.bind(
             "<<ComboboxSelected>>",
             lambda _e: self._cfg_set("boot_center_clamp_mode", self.boot_center_clamp_mode.get()),
         )
-        r += 1
-        clamp_val_label = ttk.Label(unc_frame, text="Clamp value:")
-        clamp_val_label.grid(row=r, column=0, sticky="e")
+        br += 1
+        clamp_val_label = ttk.Label(self._boot_opts_frame, text="Clamp value:")
+        clamp_val_label.grid(row=br, column=0, sticky="e")
         _val_init = self.cfg.get("boot_center_clamp_value")
         self.boot_center_clamp_value = tk.StringVar(
             value=("" if _val_init is None else str(_val_init))
         )
-        clamp_val_entry = ttk.Entry(unc_frame, textvariable=self.boot_center_clamp_value, width=10)
-        clamp_val_entry.grid(row=r, column=1, sticky="w", padx=2)
+        clamp_val_entry = ttk.Entry(self._boot_opts_frame, textvariable=self.boot_center_clamp_value, width=10)
+        clamp_val_entry.grid(row=br, column=1, sticky="w", padx=2)
         clamp_val_entry.bind(
             "<FocusOut>",
             lambda _e: self._cfg_set(
                 "boot_center_clamp_value", _to_float_or_none(self.boot_center_clamp_value.get())
             ),
         )
-        r += 1
-        # Set initial enable/disable for wild weights based on current mode
+        # Set initial enable/disable and initial visibility
         self._update_bootstrap_modes_state()
+        self._update_bootstrap_visibility()
+
+        # continue placing generic (method-agnostic) controls below
         ttk.Label(unc_frame, text="CI α").grid(row=r, column=0, sticky="e")
         _alpha_entry = ttk.Entry(unc_frame, textvariable=self.alpha_var, width=6)
         _alpha_entry.grid(row=r, column=1, sticky="w")
@@ -3069,6 +3089,7 @@ class PeakFitApp:
                 (self._boot_ties_frame.grid if is_boot else self._boot_ties_frame.grid_remove)()
             except Exception:
                 pass
+            self._update_bootstrap_visibility()
             try:
                 (self._bayes_frame.grid if is_bayes else self._bayes_frame.grid_remove)()
             except Exception:
@@ -3135,6 +3156,7 @@ class PeakFitApp:
                 self._persist_compute_prefs()
         except Exception:
             pass
+        self._update_bootstrap_visibility()
 
 
     def _update_bootstrap_modes_state(self):
@@ -3148,6 +3170,8 @@ class PeakFitApp:
             self.boot_wild_weights_menu.configure(state=state)
         except Exception:
             pass
+
+        self._update_bootstrap_visibility()
 
 
     def _update_bootstrap_tie_widgets(self):

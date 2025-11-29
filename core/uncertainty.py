@@ -972,6 +972,18 @@ def bootstrap_ci(
     if y_all is not None:
         y_all = np.asarray(y_all, float).reshape(-1)
 
+    # Ensure prediction representation matches residual representation:
+    # use prediction + baseline on the fit window.
+    base_vec = None
+    if baseline is not None:
+        try:
+            base_vec = np.asarray(baseline, float).reshape(-1)
+            _validate_vector_length("baseline", base_vec, n)
+        except Exception:
+            base_vec = None
+    if y_hat is not None and base_vec is not None:
+        y_hat = (y_hat + base_vec).astype(float, copy=False)
+
     r = _build_residual_vector(
         residual=residual,
         y_all=None if y_all is None else np.asarray(y_all, float),
@@ -2089,6 +2101,8 @@ def bootstrap_ci(
     diag["boot_resampling"] = boot_resampling
     diag["boot_wild_weights"] = boot_wild_weights if boot_resampling == "wild" else None
     diag["boot_studentize"] = bool(boot_studentize)
+    # Document representation alignment for transparency
+    diag["prediction_includes_baseline"] = bool(base_vec is not None)
     # New: center clamp diagnostics
     diag["boot_center_clamp_mode"] = (
         boot_center_clamp_mode if boot_center_clamp_mode else "none"
