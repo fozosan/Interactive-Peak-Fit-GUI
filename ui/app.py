@@ -2122,6 +2122,7 @@ class PeakFitApp:
         # ------------------------------------------------------------------
         # Bootstrap residual resampling controls (user-driven; no code defaults)
         # ------------------------------------------------------------------
+        # These controls pass through cfg values as-is; None stays None (no stringification).
         ttk.Label(unc_frame, text="Resampling mode:").grid(row=r, column=0, sticky="e")
         _resampling_init = self.cfg.get("boot_resampling")
         self.boot_resampling_var = tk.StringVar(
