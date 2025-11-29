@@ -982,9 +982,34 @@ def bootstrap_ci(
     # ------------------------------------------------------------------
     # New: leverage-based studentization & wild bootstrap controls
     # ------------------------------------------------------------------
-    boot_resampling = str(fit.get("boot_resampling", "classic")).lower()  # "classic" | "wild"
-    boot_wild_weights = str(fit.get("boot_wild_weights", "rademacher")).lower()  # "rademacher" | "mammen" | "gaussian"
-    boot_studentize = bool(fit.get("boot_studentize", False))
+    _boot_resampling_raw = fit.get("boot_resampling", None)
+    boot_resampling = (
+        str(_boot_resampling_raw).lower() if _boot_resampling_raw is not None else None
+    )
+    _boot_wild_weights_raw = fit.get("boot_wild_weights", None)
+    boot_wild_weights = (
+        str(_boot_wild_weights_raw).lower()
+        if _boot_wild_weights_raw is not None
+        else None
+    )
+    def _as_bool(x):
+        if x is None:
+            return None
+        if isinstance(x, bool):
+            return x
+        s = str(x).strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off", ""):
+            return False
+        return bool(x)
+
+    _boot_studentize_raw = fit.get("boot_studentize", None)
+    boot_studentize = _as_bool(_boot_studentize_raw)
+    boot_center_clamp_mode = fit.get("boot_center_clamp_mode", None)
+    if isinstance(boot_center_clamp_mode, str):
+        boot_center_clamp_mode = boot_center_clamp_mode.lower()
+    boot_center_clamp_value = fit.get("boot_center_clamp_value", None)
 
     if y_hat is None:
         # Without a valid predictor on the fit window, resampling weighted residuals
@@ -1112,9 +1137,9 @@ def bootstrap_ci(
             return {k: v for k, v in kwargs.items() if k in param_names}
 
         lb_arr = ub_arr = None
-        if bounds is not None:
+        if bounds_active is not None:
             try:
-                lb_arr, ub_arr = bounds
+                lb_arr, ub_arr = bounds_active
             except Exception:
                 lb_arr = ub_arr = None
         if lb_arr is not None:
@@ -1231,7 +1256,7 @@ def bootstrap_ci(
                 "verbose": False,
                 "quick_and_dirty": False,
                 "locked_mask": locked_mask,
-                "bounds": bounds,
+                "bounds": bounds_active,
             }
             # NOTE(surgical): Respect user-provided fit range. Prefer fit_mask, fall back to legacy mask.
             _m = fit.get("fit_mask", fit.get("mask", None))
@@ -1240,8 +1265,7 @@ def bootstrap_ci(
                 if _m_arr.shape == x.shape:
                     optional["fit_mask"] = _m_arr
             for k, v in optional.items():
-                if k in params:
-                    call_base[k] = v
+                call_base[k] = v
             res_main = None
             try:
                 res_main = _fit_api.run_fit_consistent(**_filter_kwargs(call_base))
@@ -1278,7 +1302,7 @@ def bootstrap_ci(
             "mode": mode,
             "fit_mask": fit_mask_full,
             "locked_mask": locked_mask,
-            "bounds": bounds,
+            "bounds": bounds_active,
             "solver": _solver_name,
         }
         variants = [
@@ -1304,7 +1328,7 @@ def bootstrap_ci(
                 "cfg": cfg_legacy,
                 "theta_init": theta_arr,
                 "locked_mask": locked_mask,
-                "bounds": bounds,
+                "bounds": bounds_active,
                 "baseline": baseline,
                 "solver": _solver_name,
             }
@@ -1394,6 +1418,9 @@ def bootstrap_ci(
 
     lo = _norm_bounds_component(lo_raw, -np.inf)
     hi = _norm_bounds_component(hi_raw, np.inf)
+    lo_active = np.asarray(lo, float).copy()
+    hi_active = np.asarray(hi, float).copy()
+    bounds_active = (lo_active, hi_active) if bounds is not None else None
 
     def _raw_size_matches(raw) -> bool:
         if raw is None:
@@ -1421,14 +1448,93 @@ def bootstrap_ci(
     # --- Helper uses lo/hi and locked_mask; safe to define now ---
     def _apply_locks_bounds(th: np.ndarray) -> np.ndarray:
         th = np.asarray(th, float).copy()
-        th = np.clip(th, lo, hi)
+        th = np.clip(th, lo_active, hi_active)
         if locked_mask is not None:
             th[locked_mask] = theta[locked_mask]
         return th
 
+    def _infer_indices(which):
+        """
+        Infer parameter indices for "center" or "fwhm" by matching theta0 to peaks.
+        We examine offsets (0..3) with stride 4 and choose the best match.
+        """
+
+        if not peaks_obj:
+            return None
+        target = []
+        key = "center" if which == "center" else ("fwhm" if which == "fwhm" else None)
+        if key is None:
+            return None
+        for pk in peaks_obj:
+            v = getattr(pk, key, None)
+            if v is None and isinstance(pk, dict):
+                v = pk.get(key, None)
+            target.append(v)
+        if any(v is None for v in target):
+            return None
+        target = np.asarray(target, float)
+        cand = []
+        for off in range(4):
+            idx = np.arange(off, P, 4)
+            if idx.size != target.size:
+                continue
+            err = np.nanmean(np.abs(theta0[idx] - target))
+            cand.append((err, idx))
+        if not cand:
+            return None
+        cand.sort(key=lambda z: z[0])
+        return cand[0][1]
+
+    center_idx = _infer_indices("center")
+    fwhm_idx = _infer_indices("fwhm")
+
+    def _apply_center_clamp_bounds(center0, p_lo_in, p_hi_in):
+        """Return (lo, hi) after intersecting original bounds with a window around center0."""
+
+        if (
+            boot_center_clamp_mode in (None, "none")
+            or boot_center_clamp_value is None
+            or center_idx is None
+        ):
+            return p_lo_in, p_hi_in
+        lo_b = np.asarray(p_lo_in, float).copy()
+        hi_b = np.asarray(p_hi_in, float).copy()
+
+        if boot_center_clamp_mode == "abs":
+            half = np.full(center_idx.size, float(boot_center_clamp_value), dtype=float)
+        elif boot_center_clamp_mode == "frac_fwhm" and fwhm_idx is not None:
+            try:
+                val = float(boot_center_clamp_value)
+            except Exception:
+                return p_lo_in, p_hi_in
+            # Anchor clamp scale to the fitted reference parameters (theta0)
+            fwhm0 = theta0[fwhm_idx].copy()
+            half = np.maximum(1e-12, val * np.abs(fwhm0))
+        elif boot_center_clamp_mode == "frac_bounds":
+            try:
+                val = float(boot_center_clamp_value)
+            except Exception:
+                return p_lo_in, p_hi_in
+            span = (p_hi_in[center_idx] - p_lo_in[center_idx]) * 0.5
+            half = np.maximum(1e-12, val * np.abs(span))
+        else:
+            return p_lo_in, p_hi_in
+
+        for k, ci in enumerate(center_idx):
+            c0 = center0[k]
+            lo_ci = max(lo_b[ci], c0 - half[k])
+            hi_ci = min(hi_b[ci], c0 + half[k])
+            if hi_ci <= lo_ci:
+                mid = 0.5 * (c0 - half[k] + c0 + half[k])
+                lo_ci = mid - 1e-9
+                hi_ci = mid + 1e-9
+            lo_b[ci] = lo_ci
+            hi_b[ci] = hi_ci
+        return lo_b, hi_b
+
     if bounds is not None:
         try:
-            fit["bounds"] = bounds
+            fit["bounds"] = bounds_active
         except Exception:
             pass
 
@@ -1444,7 +1550,7 @@ def bootstrap_ci(
         def refit(theta_init, x, y):
             if _user_sig is not None:
                 for args in (
-                    (theta_init, locked_mask, bounds, x, y),
+                    (theta_init, locked_mask, bounds_active, x, y),
                     (theta_init, x, y),
                 ):
                     try:
@@ -1454,10 +1560,10 @@ def bootstrap_ci(
                     out_local = user_refit(*args)
                     break
                 else:
-                    out_local = user_refit(theta_init, locked_mask, bounds, x, y)
+                    out_local = user_refit(theta_init, locked_mask, bounds_active, x, y)
             else:
                 try:
-                    out_local = user_refit(theta_init, locked_mask, bounds, x, y)
+                    out_local = user_refit(theta_init, locked_mask, bounds_active, x, y)
                 except TypeError:
                     out_local = user_refit(theta_init, x, y)
 
@@ -1529,8 +1635,17 @@ def bootstrap_ci(
 
     def _one_draw(b: int):
         nonlocal linear_fallbacks, linear_lambda
-        nonlocal diag_failure
+        nonlocal diag_failure, lo_active, hi_active, bounds_active
         rng_local = rng_streams[b]
+        if center_idx is not None:
+            # Anchor clamp center to theta0 (same reference used to infer indices)
+            center0_now = theta0[center_idx]
+            lo_active, hi_active = _apply_center_clamp_bounds(center0_now, lo, hi)
+            bounds_active = (lo_active, hi_active) if bounds is not None else None
+        else:
+            lo_active = np.asarray(lo, float).copy()
+            hi_active = np.asarray(hi, float).copy()
+            bounds_active = (lo_active, hi_active) if bounds is not None else None
         # Resample residuals
         if boot_resampling == "wild":
             # Wild bootstrap: w_i has mean 0, var 1; multiply residuals in-place
@@ -1974,6 +2089,18 @@ def bootstrap_ci(
     diag["boot_resampling"] = boot_resampling
     diag["boot_wild_weights"] = boot_wild_weights if boot_resampling == "wild" else None
     diag["boot_studentize"] = bool(boot_studentize)
+    # New: center clamp diagnostics
+    diag["boot_center_clamp_mode"] = (
+        boot_center_clamp_mode if boot_center_clamp_mode else "none"
+    )
+    diag["boot_center_clamp_value"] = (
+        float(boot_center_clamp_value)
+        if (
+            boot_center_clamp_mode not in (None, "none")
+            and boot_center_clamp_value is not None
+        )
+        else None
+    )
     if diag_notes:
         diag["notes"] = diag_notes
     # Merge any per-band diagnostics (e.g. workers_used, band_backend)
