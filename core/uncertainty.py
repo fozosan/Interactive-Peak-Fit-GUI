@@ -958,6 +958,7 @@ def bootstrap_ci(
     # Baseline model prediction (prefer predict_full to avoid loss-mode mismatch)
     diag_notes: List[str] = []
     # Require model predictions on the *fit window*; if provided but wrong-sized, fail loudly.
+    y_hat_source = None
     y_hat = None
     if callable(predict_full):
         y_hat_try = predict_full(theta)
@@ -969,11 +970,26 @@ def bootstrap_ci(
         else:
             _validate_vector_length("predict_full", y_hat_arr, n)
             y_hat = y_hat_arr
+            y_hat_source = "predict_full"
     if y_all is not None:
         y_all = np.asarray(y_all, float).reshape(-1)
 
+    if y_hat is None and y_all is not None:
+        try:
+            # Reconstruct predictions from observed data and the provided residuals
+            y_hat_guess = np.asarray(y_all, float).reshape(-1) - np.asarray(residual, float).reshape(-1)
+            _validate_vector_length("y_all", y_hat_guess, n)
+        except Exception as e:
+            diag_notes.append(repr(e))
+            y_hat_guess = None
+        else:
+            y_hat = y_hat_guess
+            y_hat_source = "inferred"
+
     # Ensure prediction representation matches residual representation:
-    # use prediction + baseline on the fit window.
+    # use prediction + baseline on the fit window. Only adjust predictions produced by
+    # the explicit model to avoid double-counting baselines when they are inferred
+    # directly from y_all and residual vectors.
     base_vec = None
     if baseline is not None:
         try:
@@ -981,7 +997,7 @@ def bootstrap_ci(
             _validate_vector_length("baseline", base_vec, n)
         except Exception:
             base_vec = None
-    if y_hat is not None and base_vec is not None:
+    if y_hat is not None and base_vec is not None and y_hat_source == "predict_full":
         y_hat = (y_hat + base_vec).astype(float, copy=False)
 
     r = _build_residual_vector(
@@ -2102,7 +2118,7 @@ def bootstrap_ci(
     diag["boot_wild_weights"] = boot_wild_weights if boot_resampling == "wild" else None
     diag["boot_studentize"] = bool(boot_studentize)
     # Document representation alignment for transparency
-    diag["prediction_includes_baseline"] = bool(base_vec is not None)
+    diag["prediction_includes_baseline"] = bool(base_vec is not None and y_hat_source == "predict_full")
     # New: center clamp diagnostics
     diag["boot_center_clamp_mode"] = (
         boot_center_clamp_mode if boot_center_clamp_mode else "none"
