@@ -1985,7 +1985,7 @@ def bootstrap_ci(
             if progress_cb:
                 try:
                     progress_cb(
-                        f"Bootstrap band: using {n_used} resamples, workers={int(band_workers_effective or 0)}"
+                        f"Bootstrap band (mean): using {n_used} resamples, workers={int(band_workers_effective or 0)}"
                     )
                 except Exception:
                     pass
@@ -1993,6 +1993,7 @@ def bootstrap_ci(
             def _abort_requested() -> bool:
                 return bool(abort_evt is not None and getattr(abort_evt, "is_set", lambda: False)())
 
+            # NOTE: Band draws are pure model mean predictions; do NOT add residual noise here.
             Y_list: List[np.ndarray] = []
             try:
                 if band_workers and band_workers > 0:
@@ -2030,21 +2031,27 @@ def bootstrap_ci(
                             Y = cp.stack([y if isinstance(y, cp.ndarray) else cp.asarray(y) for y in Y_list], axis=0)
                         else:
                             Y = cp.asarray(np.stack(Y_list, axis=0))
-                        band_lo = cp.quantile(Y, float(alpha/2), axis=0)
-                        band_hi = cp.quantile(Y, float(1 - alpha/2), axis=0)
+                        qlo = float(100.0 * (alpha * 0.5))
+                        qhi = float(100.0 * (1.0 - alpha * 0.5))
+                        band_lo = cp.percentile(Y, qlo, axis=0)
+                        band_hi = cp.percentile(Y, qhi, axis=0)
                         band_lo = cp.asnumpy(band_lo)
                         band_hi = cp.asnumpy(band_hi)
                         band_backend = "cupy"
                     else:
                         Y = np.stack(Y_list, axis=0)
-                        band_lo = np.quantile(Y, alpha/2, axis=0)
-                        band_hi = np.quantile(Y, 1 - alpha/2, axis=0)
+                        qlo = 100.0 * (alpha * 0.5)
+                        qhi = 100.0 * (1.0 - alpha * 0.5)
+                        band_lo = np.percentile(Y, qlo, axis=0)
+                        band_hi = np.percentile(Y, qhi, axis=0)
                 except Exception:
                     if not Y_list:
                         raise RuntimeError("bootstrap_band_empty")
                     Y = np.stack(Y_list, axis=0)
-                    band_lo = np.quantile(Y, alpha/2, axis=0)
-                    band_hi = np.quantile(Y, 1 - alpha/2, axis=0)
+                    qlo = 100.0 * (alpha * 0.5)
+                    qhi = 100.0 * (1.0 - alpha * 0.5)
+                    band_lo = np.percentile(Y, qlo, axis=0)
+                    band_hi = np.percentile(Y, qhi, axis=0)
                     band_backend = "numpy"
 
                 # Build band tuple safely, even if x grid is missing
