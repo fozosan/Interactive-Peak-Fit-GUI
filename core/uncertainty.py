@@ -1002,8 +1002,8 @@ def bootstrap_ci(
             _validate_vector_length("baseline", base_vec, n)
         except Exception:
             base_vec = None
-    if y_hat is not None and base_vec is not None and y_hat_source == "predict_full":
-        y_hat = (y_hat + base_vec).astype(float, copy=False)
+    # predict_full already includes baseline in add-mode (see fit_api._make_predict_full_generic).
+    # Do not add baseline again; double-counting injects baseline texture into the resampled residuals.
 
     r = _build_residual_vector(
         residual=residual,
