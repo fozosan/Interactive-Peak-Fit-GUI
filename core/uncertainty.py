@@ -34,12 +34,17 @@ import pandas as pd
 
 def _norm_solver_and_sharing(fit: Dict, kw: Dict) -> Tuple[str, bool, bool]:
     """Normalize solver name and sharing flags in a single place."""
-    solver = str(
+    # Require an explicit solver; no silent fallback. Accept either the main key
+    # or the GUI/batch bootstrap alias.
+    raw = (
         (fit or {}).get("solver")
+        or (fit or {}).get("unc_boot_solver")
         or (fit or {}).get("solver_used")
         or kw.get("solver")
-        or "modern_trf"
-    ).lower()
+    )
+    if not raw:
+        raise KeyError("bootstrap solver missing in fit_ctx (expected 'solver' or 'unc_boot_solver').")
+    solver = str(raw).lower()
     # Generic share flags (solver-agnostic)
     share_fwhm = bool((fit or {}).get("share_fwhm", False))
     share_eta = bool((fit or {}).get("share_eta", False))
@@ -1137,6 +1142,8 @@ def bootstrap_ci(
         allows_var_kw = True
 
     def _mk_cfg():
+        # Build a cfg that mirrors the single-file GUI path. Crucially, forward
+        # the solver-specific options exactly as used during the original fit.
         cfg = {
             "solver": _solver_name,
             "mode": mode,
@@ -1145,6 +1152,12 @@ def bootstrap_ci(
         }
         if isinstance(fit, dict) and "no_solver_fallbacks" in fit:
             cfg["no_solver_fallbacks"] = bool(fit.get("no_solver_fallbacks"))
+        try:
+            solver_opts = dict((fit_ctx or {}).get("solver_options", {}) or {})
+        except Exception:
+            solver_opts = {}
+        if solver_opts:
+            cfg[_solver_name] = dict(solver_opts)
         if str(_solver_name).lower().startswith("lmfit"):
             # Only used if lmfit backend honors these flags
             cfg["lmfit_share_fwhm"] = share_fwhm

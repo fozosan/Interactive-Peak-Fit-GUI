@@ -640,8 +640,6 @@ def run_batch(
                     or "modern_vp"
                 )
                 boot_solver = str(boot_solver)
-                if boot_solver.lower() == "classic":
-                    boot_solver = "modern_vp"
                 has_lmfit = bool(res.get("has_lmfit", config.get("has_lmfit", False)))
                 if boot_solver.lower().startswith("lmfit") and not has_lmfit:
                     boot_solver = solver_choice
