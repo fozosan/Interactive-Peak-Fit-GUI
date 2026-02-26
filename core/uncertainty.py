@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from typing import Optional as _Optional  # keep compatibility with older type-checkers
 
+from . import array_utils
+
 try:  # numpy.typing is available in NumPy >= 1.20
     from numpy.typing import ArrayLike
 except Exception:  # pragma: no cover
@@ -65,12 +67,12 @@ def _build_residual_vector(
     """Prefer RAW residuals (y - y_hat) to avoid weighting artifacts; fallback safely."""
     mode = str(mode or "raw").lower()
     if mode == "raw" and (y_all is not None) and (y_hat is not None):
-        r = np.asarray(y_all, float).reshape(-1) - np.asarray(y_hat, float).reshape(-1)
+        r = array_utils.ensure_vector(y_all) - array_utils.ensure_vector(y_hat)
         if center:
             r = r - float(np.mean(r))
         return r
     # fallback to provided residuals (may be weighted upstream)
-    r = np.asarray(residual, float).reshape(-1).copy()
+    r = array_utils.ensure_vector(residual).copy()
     if center:
         r = r - float(np.mean(r))
     return r

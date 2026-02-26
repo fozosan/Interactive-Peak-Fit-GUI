@@ -10,6 +10,7 @@ from core.models import pv_sum_with_jac
 from infra import performance as perf
 from core.weights import noise_weights, robust_weights, combine_weights
 from core.peaks import Peak
+from core.param_utils import create_parameter_unpacker
 from .bounds import pack_theta_bounds
 from .utils import mad_sigma, robust_cost
 from . import step_engine
@@ -129,21 +130,12 @@ def solve(
     c0 = np.array([p.center for p in peaks], dtype=float)
     f0 = np.array([p.fwhm for p in peaks], dtype=float)
 
+    # Create unpacker using utility function
+    unpack = create_parameter_unpacker(c0, f0, mapping)
+
     theta = theta0.copy()
     lb, ub = bounds
     n = len(theta)
-
-    def unpack(t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        c = c0.copy()
-        f = f0.copy()
-        j = 0
-        for (pk_idx, kind) in mapping:
-            if kind == "c":
-                c[pk_idx] = t[j]
-            else:
-                f[pk_idx] = t[j]
-            j += 1
-        return c, f
 
     sigma = 1.0
     fs = f_scale_opt if f_scale_opt > 0 else 1.0

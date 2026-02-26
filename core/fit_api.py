@@ -24,6 +24,7 @@ from .weights import noise_weights
 from .residuals import build_residual, jacobian_fd, build_residual_jac
 from . import signals
 from .signals import polynomial_baseline
+from .param_utils import vp_unpack_centers_widths
 from fit import orchestrator, solve as fit_solve
 from fit.bounds import pack_theta_bounds
 from infra import performance
@@ -66,24 +67,7 @@ def _vp_design_columns(
     return np.column_stack(cols) if cols else np.zeros((len(x), 0), float)
 
 
-def _vp_unpack_cw(theta_nl: np.ndarray, struct: List[dict], peaks) -> (List[float], List[float]):
-    theta_nl = list(np.asarray(theta_nl, float).ravel())
-    c_list, w_list = [], []
-    tptr = 0
-    for s, pk in zip(struct, peaks):
-        if s.get("ic") is not None:
-            c = float(theta_nl[tptr])
-            tptr += 1
-        else:
-            c = float(s.get("c_fixed", pk.center))
-        if s.get("iw") is not None:
-            w = float(theta_nl[tptr])
-            tptr += 1
-        else:
-            w = float(s.get("w_fixed", pk.fwhm))
-        c_list.append(c)
-        w_list.append(w)
-    return c_list, w_list
+# _vp_unpack_cw is now handled by vp_unpack_centers_widths in param_utils
 
 
 def run_fit_consistent(
@@ -450,7 +434,7 @@ def run_fit_consistent(
                 "y_target_fit": np.asarray(y_target, float),
                 "wvec_fit": None if weights is None else np.asarray(weights, float),
                 "mask": np.asarray(mask, bool),
-                "vp_unpack_cw": lambda theta_nl, struct=struct, peaks=peaks_out: _vp_unpack_cw(theta_nl, struct, peaks),
+                "vp_unpack_cw": lambda theta_nl, struct=struct, peaks=peaks_out: vp_unpack_centers_widths(theta_nl, struct, peaks),
             }
         )
     result["fit_ctx"] = fit_ctx
