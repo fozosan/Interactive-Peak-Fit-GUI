@@ -1,2 +1,14 @@
 __pycache__/
 *.py[cod]
+
+# graphify — graph.json IS tracked (merge driver registered); cache and viewer are not
+**/graphify-out/cache/
+**/graphify-out/graph.html
+
+# Build artifact: the docx is compiled from the wiki markdown, never edited
+docs/*.docx
+
+# graphify — regenerated nightly by ~/scripts/graphify_refresh.sh.
+# graph.json IS tracked (a merge driver is registered for it); the
+# per-community wiki, the cache and the viewer are not.
+**/graphify-out/wiki/

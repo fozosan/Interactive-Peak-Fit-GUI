@@ -1,0 +1,11 @@
+graphify-out/graph.json merge=graphify
+
+# Developed on Windows, now checked out on Linux. Without this, every file with
+# CRLF endings shows as wholly modified — 214 of them did, reading as a 22,781
+# insertion / 22,525 deletion diff that was actually 4 real files.
+#
+# Normalise to LF in the repository; git checks out the platform's native
+# endings. To retire the existing churn in one commit:
+#     git add --renormalize .
+#     git commit -m "Normalise line endings to LF"
+* text=auto
