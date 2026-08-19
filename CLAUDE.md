@@ -29,13 +29,14 @@ Rules:
 
 <!-- CODE-WIKI:START — added by the Code Wiki setup. Delete from START to END to remove cleanly. -->
 
-> **Linux workstation only.** This directory syncs to the Windows machine through
-> OneDrive, but the Code Wiki does not: `~/.local/share/code-wiki/` and
-> `~/Obsidian/Code Wiki/` exist on the Linux box alone, and the vault is outside
-> OneDrive by design. If `python3 ~/.local/share/code-wiki/project_tag.py "$PWD"`
-> fails, you are on the other machine — ignore the graph and vault layers below and
-> work from this repo's own documentation and source, which do sync. Do not
-> recreate the vault here; there is one, on the other machine.
+> **Which machine am I on?** Run
+> `python3 ~/.local/share/code-wiki/project_tag.py "$PWD"`.
+> **It prints a tag** → the Linux workstation. Everything below applies; carry on.
+> **"No such file"** → Windows. This repo reached you over OneDrive sync but the
+> Code Wiki did not: the vault lives in `~/Obsidian`, outside OneDrive, and the
+> scripts are Linux-only. Skip every graph and vault step below and work from this
+> repo's own documentation, source and git history, which all did sync. Do not
+> build a vault here — one exists on the Linux box, and a second would diverge.
 
 ## Where to look first
 

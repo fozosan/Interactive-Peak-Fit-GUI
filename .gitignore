@@ -12,3 +12,6 @@ docs/*.docx
 # graph.json IS tracked (a merge driver is registered for it); the
 # per-community wiki, the cache and the viewer are not.
 **/graphify-out/wiki/
+
+# graphify post-commit hook writes a dated rebuild snapshot per commit day
+**/graphify-out/20*/
