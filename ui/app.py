@@ -1437,6 +1437,11 @@ class PeakFitApp:
             self._on_uncertainty_method_changed()
         except Exception:
             pass
+        # Performance apply scheduler/debounce infrastructure (for spam reduction).
+        # Defined before the traces below, which use it.
+        self._perf_apply_after_id: Optional[str] = None
+        self._perf_last_signature: Optional[tuple] = None
+        self._perf_pending_source: str = ""
         self.perf_numba = tk.BooleanVar(value=bool(self.cfg.get("perf_numba", False)))
         self.perf_gpu = tk.BooleanVar(value=bool(self.cfg.get("perf_gpu", False)))
         self.perf_cache_baseline = tk.BooleanVar(value=bool(self.cfg.get("perf_cache_baseline", True)))
@@ -1491,11 +1496,6 @@ class PeakFitApp:
         self._build_ui()
         self._new_figure()
         self._update_template_info()
-        # Performance apply scheduler/debounce infrastructure (for spam reduction)
-        self._perf_apply_after_id: Optional[int] = None
-        self._perf_last_signature: Optional[tuple] = None
-        self._perf_pending_source: str = ""
-
         self.request_apply_performance(source="startup", immediate=True, save_cfg=False)
 
         # Uncertainty job tracking / last log
@@ -6303,7 +6303,8 @@ class PeakFitApp:
         Args:
             source: Where this request came from (e.g., "trace:seed_var", "button:Apply")
             immediate: If True, run immediately and cancel any pending call
-            save_cfg: Whether to persist config changes on apply
+            save_cfg: Whether to persist the settings. A debounced request saves
+                them at once and leaves only the apply and its log line for later.
             force_log: Force logging of backend line even if unchanged
             
         Side-effects:
@@ -6323,11 +6324,16 @@ class PeakFitApp:
             self._apply_performance_now(source=source, save_cfg=save_cfg, force_log=force_log)
             return
         
+        # Save now: a window closed inside the debounce window must not lose the change
+        if save_cfg:
+            self._store_perf_settings()
+            save_config(self.cfg)
+
         # Debounce with 150ms window - multiple rapid calls collapse to one
         def _do_apply():
             self._perf_apply_after_id = None
             self._perf_pending_source = source
-            self._apply_performance_now(source=source, save_cfg=save_cfg, force_log=force_log)
+            self._apply_performance_now(source=source, save_cfg=False, force_log=force_log)
         
         self._perf_apply_after_id = self.root.after(150, _do_apply)
 
@@ -6377,27 +6383,8 @@ class PeakFitApp:
             force_log=force_log
         )
 
-    def _apply_performance_now(
-        self, 
-        source: str = "unknown", 
-        save_cfg: bool = True, 
-        force_log: bool = False
-    ) -> None:
-        """Internal core apply with logging dedupe logic."""
-        
-        # Compute signature for this call
-        new_signature = self._compute_perf_signature()
-        
-        # Check if effective state changed (for log dedupe)
-        sig_changed = (self._perf_last_signature is None or new_signature != self._perf_last_signature)
-        
-        # Only log if changed or forced, to reduce spam
-        should_log = force_log or sig_changed
-        
-        # Call the actual apply logic
-        performance.set_numba(bool(self.perf_numba.get()))
-        performance.set_gpu(bool(self.perf_gpu.get()))
-        performance.set_cache_baseline(bool(self.perf_cache_baseline.get()))
+    def _store_perf_settings(self) -> dict:
+        """Copy the performance settings from the widgets into self.cfg and return them."""
         try:
             seed_txt = str(self.seed_var.get()).strip()
         except Exception:
@@ -6408,9 +6395,6 @@ class PeakFitApp:
                 seed = int(seed_txt)
             except Exception:
                 seed = None
-        # apply_global_seed stores the seed and, if enabled, seeds RNGs globally.
-        # No need to call set_seed separately.
-        performance.apply_global_seed(seed, bool(self.perf_seed_all.get()))
         # Parse workers safely even if the Entry is blank while typing
         try:
             w_txt = str(self.perf_max_workers.get()).strip()
@@ -6428,25 +6412,49 @@ class PeakFitApp:
             unc_workers = int(float(unc_txt)) if unc_txt else 0
         except Exception:
             unc_workers = 0
+        settings = {
+            "perf_numba": bool(self.perf_numba.get()),
+            "perf_gpu": bool(self.perf_gpu.get()),
+            "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
+            "perf_seed_all": bool(self.perf_seed_all.get()),
+            "perf_seed": seed if seed is not None else "",
+            "perf_max_workers": workers,
+            "perf_unc_workers": unc_workers,
+            "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
+            "perf_blas_threads": int(self.perf_blas_threads.get()),
+            "log_debug_mode": bool(self.debug_mode_var.get()),
+        }
+        self.cfg.update(settings)
+        return settings
+
+    def _apply_performance_now(
+        self, 
+        source: str = "unknown", 
+        save_cfg: bool = True, 
+        force_log: bool = False
+    ) -> None:
+        """Internal core apply with logging dedupe logic."""
+        
+        # Call the actual apply logic
+        settings = self._store_perf_settings()
+        seed = settings["perf_seed"] if settings["perf_seed"] != "" else None
+        workers = settings["perf_max_workers"]
+        unc_workers = settings["perf_unc_workers"]
+        performance.set_numba(settings["perf_numba"])
+        performance.set_gpu(settings["perf_gpu"])
+        performance.set_cache_baseline(settings["perf_cache_baseline"])
+        # apply_global_seed stores the seed and, if enabled, seeds RNGs globally.
+        # No need to call set_seed separately.
+        performance.apply_global_seed(seed, settings["perf_seed_all"])
         performance.set_max_workers(workers)
         performance.set_unc_workers(unc_workers)
         performance.set_gpu_chunk(self.gpu_chunk_var.get())
-        self.cfg["perf_numba"] = bool(self.perf_numba.get())
-        self.cfg["perf_gpu"] = bool(self.perf_gpu.get())
-        self.cfg["perf_cache_baseline"] = bool(self.perf_cache_baseline.get())
-        self.cfg["perf_seed_all"] = bool(self.perf_seed_all.get())
-        self.cfg["perf_seed"] = seed if seed is not None else ""
-        self.cfg["perf_max_workers"] = workers
-        self.cfg["perf_unc_workers"] = unc_workers
-        self.cfg["perf_parallel_strategy"] = str(self.perf_parallel_strategy.get())
-        self.cfg["perf_blas_threads"] = int(self.perf_blas_threads.get())
-        self.cfg["log_debug_mode"] = bool(self.debug_mode_var.get())
 
         # Set env for child processes/futures
         import os
 
-        strategy = str(self.perf_parallel_strategy.get())
-        blas_threads = int(self.perf_blas_threads.get())
+        strategy = settings["perf_parallel_strategy"]
+        blas_threads = settings["perf_blas_threads"]
         if strategy == "outer":
             self._apply_thread_env("1", "1", "1")
         else:
@@ -6465,7 +6473,8 @@ class PeakFitApp:
         self.dlog(f"[DEBUG] threadpool_info_post={post_info}")
         libs = post_info
         self.dlog(f"threadpool_info={libs}")
-        save_config(self.cfg)
+        if save_cfg:
+            save_config(self.cfg)
         try:
             fit_req = int(self.perf_max_workers.get())
         except Exception:
@@ -6477,26 +6486,30 @@ class PeakFitApp:
         fit_eff = self._resolve_fit_workers()
         unc_eff = self._resolve_unc_workers()
         self.dlog("[DEBUG] apply_performance()")
-        if should_log:
-                    self.log(
-                            "Backend: %s | fit_workers_req=%s | fit_workers_eff=%s | unc_workers_req=%s | unc_workers_eff=%s | "
-                            "strategy=%s | MKL_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s OMP_NUM_THREADS=%s | seed_all=%s seed=%s"
-                            % (
-                                    performance.which_backend(),
-                                    fit_req,
-                                    fit_eff,
-                                    unc_req,
-                                    unc_eff,
-                                    strategy,
-                                    os.environ.get("MKL_NUM_THREADS", "-"),
-                                    os.environ.get("OPENBLAS_NUM_THREADS", "-"),
-                                    os.environ.get("OMP_NUM_THREADS", "-"),
-                                    bool(self.perf_seed_all.get()),
-                                    seed if seed is not None else "-",
-                            )
-                    )
+        # Log only if the applied state changed or the caller forces it, to reduce
+        # spam. The signature is taken after the apply, so it holds the new backend.
+        new_signature = self._compute_perf_signature()
+        if force_log or new_signature != self._perf_last_signature:
+            self.log(
+                "Backend: %s | fit_workers_req=%s | fit_workers_eff=%s | unc_workers_req=%s | unc_workers_eff=%s | "
+                "strategy=%s | MKL_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s OMP_NUM_THREADS=%s | seed_all=%s seed=%s"
+                % (
+                    performance.which_backend(),
+                    fit_req,
+                    fit_eff,
+                    unc_req,
+                    unc_eff,
+                    strategy,
+                    os.environ.get("MKL_NUM_THREADS", "-"),
+                    os.environ.get("OPENBLAS_NUM_THREADS", "-"),
+                    os.environ.get("OMP_NUM_THREADS", "-"),
+                    bool(self.perf_seed_all.get()),
+                    seed if seed is not None else "-",
+                )
+            )
         else:
             self.dlog("[DEBUG] apply_performance skipped - no signature change")
+        self._perf_last_signature = new_signature
         self.status_var.set("Performance options applied.")
 
     # minimize env toggling across older Python/BLAS/OpenMP combos
