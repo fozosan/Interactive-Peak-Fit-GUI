@@ -240,10 +240,49 @@ def build_help(opts: dict) -> str:
 
         Troubleshooting
         ---------------
-        • “Rank-deficient Jacobian” in uncertainty: some params are weakly identified. Lock them or narrow the window.
-        • “Ill-conditioning” warning: try TRF with x_scale (default), or VP; seed widths closer to visual FWHM.
-        • Single vs batch mismatch: ensure templates auto-apply and “baseline uses fit range” is ON (default). Our runner
+        • "Rank-deficient Jacobian" in uncertainty: some params are weakly identified. Lock them or narrow the window.
+        • "Ill-conditioning" warning: try TRF with x_scale (default), or VP; seed widths closer to visual FWHM.
+        • Single vs batch mismatch: ensure templates auto-apply and "baseline uses fit range" is ON (default). Our runner
           already deep-copies seeds and enforces locks/bounds.
+
+        Font Rendering on Linux (jagged text?)
+        --------------------------------------
+        If TKinter text looks jagged or poorly antialiased on Linux:
+
+        1) Check environment: Running over SSH/X11 forwarding? Remote X servers often disable smooth fonts.
+           Prefer native display or Wayland session when possible.
+
+        2) Verify Tk build has Xft support: Most conda-forge builds include it by default. System Python on some
+           distros may lack Xft, causing poor rendering regardless of settings.
+
+        3) Check fontconfig settings (user-local, not system-wide):
+           Create ~/.config/fontconfig/conf.d/99-font-rendering.conf with:
+           
+           <?xml version="1.0"?>
+           <fontconfig>
+             <match target="font">
+               <edit name="antialias" mode="assign"><bool>true</bool></edit>
+               <edit name="hinting" mode="assign"><bool>true</bool></edit>
+               <edit name="rgba" mode="assign"><const>rgb</const></edit>
+               <edit name="lcdfilter" mode="assign"><const>lcddefault</const></edit>
+             </match>
+           </fontconfig>
+
+        4) For X11, you can also set via ~/.Xresources:
+           
+           Xft.antialias: 1
+           Xft.hinting: 1
+           Xft.rgba: rgb
+           Xft.lcdfilter: lcddefault
+           Xft.dpi: 96
+
+           Then run: xrdb -merge ~/.Xresources and restart your session.
+
+        5) Install common fonts to improve availability:
+           sudo apt install fonts-noto fonts-liberation fonts-ubuntu (Debian/Ubuntu)
+           or equivalent for your distro.
+
+        6) Use conda-forge tk package if available; it typically includes Xft with good defaults.
 
         FAQ
         ---

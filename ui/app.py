@@ -215,6 +215,16 @@ import matplotlib.font_manager as fm
 from matplotlib.font_manager import FontProperties
 matplotlib.rcdefaults()
 matplotlib.rcParams["font.family"] = "Arial"
+# Use native fonts with better rendering on modern displays (no TeX dependency)
+matplotlib.rcParams["text.usetex"] = False
+# Higher DPI for export quality on modern displays
+matplotlib.rcParams["savefig.dpi"] = 150
+
+# Safe antialiasing rcParams guards - only set if keys exist in current matplotlib version
+for _key in ("text.antialiased", "lines.antialiased", "patch.antialiased"):
+    if _key in matplotlib.rcParams:
+        matplotlib.rcParams[_key] = True
+
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.widgets import SpanSelector
 
@@ -237,6 +247,7 @@ import traceback
 from scipy.signal import find_peaks
 
 from core import signals
+from ui.theme import apply_theme, log_theme_status, paint_icon
 # --- Canonical uncertainty label: delegate to data_io when available ---
 try:
     _canonical_unc_label = _dio.canonical_unc_label  # type: ignore[attr-defined]
@@ -438,6 +449,11 @@ DEFAULTS = {
     "perf_cache_baseline": True,
     "perf_seed_all": False,
     "perf_max_workers": 0,
+    # Font configuration defaults (added for font rendering improvements)
+    "ui_font_family": "auto",
+    "ui_font_size": 10,
+    "ui_mono_font_family": "auto",
+    "font_diagnostics": False,
 }
 
 LOG_MAX_LINES = 5000
@@ -1215,6 +1231,7 @@ class PeakFitApp:
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
 
         self._style = getattr(self, "_style", ttk.Style(self.root))
+        # Configure buttons with better text rendering (antialiasing support)
         self._style.configure("Danger.TButton", foreground="white", background="#c62828")
         self._style.map("Danger.TButton", background=[("active", "#b71c1c")])
         self._style.configure("Success.TButton", foreground="white", background="#2e7d32")
@@ -1228,8 +1245,12 @@ class PeakFitApp:
             self._bold_font = base.copy()
             self._bold_font.configure(weight="bold")
         except Exception:
-            self.default_font = tkfont.Font()
-            self._bold_font = tkfont.Font(weight="bold")
+            # Fallback to selected sans family or default size if font selection failed
+            from ui.fonts import _selected_sans, DEFAULT_UI_SIZE
+            fallback_family = _selected_sans if _selected_sans else "Helvetica"
+            self.default_font = tkfont.Font(family=fallback_family, size=DEFAULT_UI_SIZE)
+            self._bold_font = self.default_font.copy()
+            self._bold_font.configure(weight="bold")
 
         last_template = self.cfg.get("last_template_name", "")
 
@@ -1416,18 +1437,23 @@ class PeakFitApp:
             self._on_uncertainty_method_changed()
         except Exception:
             pass
+        # Performance apply scheduler/debounce infrastructure (for spam reduction).
+        # Defined before the traces below, which use it.
+        self._perf_apply_after_id: Optional[str] = None
+        self._perf_last_signature: Optional[tuple] = None
+        self._perf_pending_source: str = ""
         self.perf_numba = tk.BooleanVar(value=bool(self.cfg.get("perf_numba", False)))
         self.perf_gpu = tk.BooleanVar(value=bool(self.cfg.get("perf_gpu", False)))
         self.perf_cache_baseline = tk.BooleanVar(value=bool(self.cfg.get("perf_cache_baseline", True)))
         self.perf_seed_all = tk.BooleanVar(value=bool(self.cfg.get("perf_seed_all", False)))
         self.perf_max_workers = tk.IntVar(value=int(self.cfg.get("perf_max_workers", 0)))
         self.perf_unc_workers = tk.IntVar(value=int(self.cfg.get("perf_unc_workers", 0)))
-        self.perf_numba.trace_add("write", lambda *_: self.apply_performance())
-        self.perf_gpu.trace_add("write", lambda *_: self.apply_performance())
-        self.perf_cache_baseline.trace_add("write", lambda *_: self.apply_performance())
-        self.perf_seed_all.trace_add("write", lambda *_: self.apply_performance())
-        self.perf_max_workers.trace_add("write", lambda *_: self.apply_performance())
-        self.perf_unc_workers.trace_add("write", lambda *_: self.apply_performance())
+        self.perf_numba.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_numba"))
+        self.perf_gpu.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_gpu"))
+        self.perf_cache_baseline.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_cache_baseline"))
+        self.perf_seed_all.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_seed_all"))
+        self.perf_max_workers.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_max_workers"))
+        self.perf_unc_workers.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_unc_workers"))
         self.alpha_var = tk.DoubleVar(value=float(self.cfg.get("unc_alpha", 0.05)))
         self.center_resid_var = tk.BooleanVar(value=bool(self.cfg.get("unc_center_resid", True)))
         self.bootstrap_jitter_var = tk.DoubleVar(value=100.0 * float(self.cfg.get("bootstrap_jitter", 0.02)))
@@ -1463,14 +1489,14 @@ class PeakFitApp:
             value=("" if not np.isfinite(_mcse_cfg) else str(_mcse_cfg))
         )
         self.seed_var = tk.StringVar(value=str(self.cfg.get("perf_seed", "")))
-        self.seed_var.trace_add("write", lambda *_: self.apply_performance())
+        self.seed_var.trace_add("write", lambda *_: self.request_apply_performance(source="trace:seed_var"))
         self.gpu_chunk_var = tk.IntVar(value=262144)
 
         # UI
         self._build_ui()
         self._new_figure()
         self._update_template_info()
-        self.apply_performance()
+        self.request_apply_performance(source="startup", immediate=True, save_cfg=False)
 
         # Uncertainty job tracking / last log
         self._unc_job_id = 0
@@ -1609,15 +1635,16 @@ class PeakFitApp:
         fit_seg.pack(side=tk.LEFT)
         try:
             self.step_icon = tk.PhotoImage(data=STEP_ICON_B64)
+            # Draw the icon in the button text colour, so it also shows on a dark theme
+            paint_icon(self.step_icon, self._style.lookup("TButton", "foreground"))
             self.step_btn = ttk.Button(fit_seg, image=self.step_icon, command=self.step_once)
         except Exception:
             self.step_btn = ttk.Button(fit_seg, text="Step", command=self.step_once)
         self.step_btn.pack(side=tk.LEFT, padx=2)
         self.fit_btn = ttk.Button(fit_seg, text="Fit", command=self.fit)
         self.fit_btn.pack(side=tk.LEFT, padx=2)
-        # Restore classic ttk button with bold text
+        # Apply bold style for Fit button (configured via configure_ttk_styles in main())
         self._style = getattr(self, "_style", ttk.Style())
-        self._style.configure("Fit.TButton", font=("Segoe UI", 10, "bold"))
         self.fit_btn.configure(style="Fit.TButton")
 
         ttk.Separator(self.action_bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=3)
@@ -2370,7 +2397,7 @@ class PeakFitApp:
             text="Outer: many workers (BLAS=1)",
             value="outer",
             variable=self.perf_parallel_strategy,
-            command=self.apply_performance,
+            command=lambda: self.request_apply_performance(source="radio:strategy_outer", immediate=True, save_cfg=True),
         ).pack(anchor="w")
         row = ttk.Frame(par)
         row.pack(fill=tk.X)
@@ -2406,7 +2433,7 @@ class PeakFitApp:
         ).pack(side=tk.LEFT)
         ttk.Label(rowp, text="GPU chunk:").pack(side=tk.LEFT, padx=(8,0))
         ttk.Entry(rowp, width=7, textvariable=self.gpu_chunk_var).pack(side=tk.LEFT, padx=2)
-        ttk.Button(rowp, text="Apply", command=self.apply_performance).pack(side=tk.LEFT, padx=4)
+        ttk.Button(rowp, text="Apply", command=self._apply_performance_immediate).pack(side=tk.LEFT, padx=4)
 
         # Batch processing
         batch_box = ttk.Labelframe(right, text="Batch"); batch_box.pack(fill=tk.X, pady=4)
@@ -6263,11 +6290,103 @@ class PeakFitApp:
         self.status_info("Computing uncertainty…")
         self.run_in_thread(work, done)
 
-    @log_action
-    def apply_performance(self):
-        performance.set_numba(bool(self.perf_numba.get()))
-        performance.set_gpu(bool(self.perf_gpu.get()))
-        performance.set_cache_baseline(bool(self.perf_cache_baseline.get()))
+
+    # Performance apply scheduler (debounce for trace-driven calls to reduce log spam)
+    def request_apply_performance(
+        self, 
+        source: str = "unknown", 
+        immediate: bool = False, 
+        save_cfg: bool = True,
+        force_log: bool = False
+    ) -> None:
+        """
+        Request a performance apply with debounce for trace-driven calls.
+        
+        Args:
+            source: Where this request came from (e.g., "trace:seed_var", "button:Apply")
+            immediate: If True, run immediately and cancel any pending call
+            save_cfg: Whether to persist the settings. A debounced request saves
+                them at once and leaves only the apply and its log line for later.
+            force_log: Force logging of backend line even if unchanged
+            
+        Side-effects:
+            Schedules or executes apply_performance with appropriate parameters
+        """
+        
+        # Cancel any pending apply
+        if self._perf_apply_after_id is not None:
+            try:
+                self.root.after_cancel(self._perf_apply_after_id)
+            except Exception:
+                pass
+            self._perf_apply_after_id = None
+        
+        if immediate:
+            # Run now, no debounce
+            self._apply_performance_now(source=source, save_cfg=save_cfg, force_log=force_log)
+            return
+        
+        # Save now: a window closed inside the debounce window must not lose the change
+        if save_cfg:
+            self._store_perf_settings()
+            save_config(self.cfg)
+
+        # Debounce with 150ms window - multiple rapid calls collapse to one
+        def _do_apply():
+            self._perf_apply_after_id = None
+            self._perf_pending_source = source
+            self._apply_performance_now(source=source, save_cfg=False, force_log=force_log)
+        
+        self._perf_apply_after_id = self.root.after(150, _do_apply)
+
+    def _compute_perf_signature(self) -> tuple:
+        """Compute a signature for current performance state (for log dedupe)."""
+        try:
+            from infra import performance as perf_mod
+            
+            backend_name = perf_mod.which_backend()
+            fit_req = int(self.perf_max_workers.get()) if hasattr(self, "perf_max_workers") else 0
+            unc_req = int(self.perf_unc_workers.get()) if hasattr(self, "perf_unc_workers") else 0
+            strategy = str(self.perf_parallel_strategy.get()) if hasattr(self, "perf_parallel_strategy") else "outer"
+            
+            mkl_threads = os.environ.get("MKL_NUM_THREADS", "-")
+            openblas_threads = os.environ.get("OPENBLAS_NUM_THREADS", "-")
+            omp_threads = os.environ.get("OMP_NUM_THREADS", "-")
+            
+            seed_all = bool(self.perf_seed_all.get()) if hasattr(self, "perf_seed_all") else False
+            seed_val = None
+            try:
+                if seed_all and hasattr(self, "seed_var"):
+                    seed_txt = str(self.seed_var.get()).strip()
+                    seed_val = int(seed_txt) if seed_txt else 0
+            except Exception:
+                pass
+            
+            return (backend_name, fit_req, unc_req, strategy, mkl_threads, openblas_threads, omp_threads, seed_all, seed_val)
+        except Exception:
+            # Fallback signature on error
+            return ("error", 0, 0, "unknown", "-", "-", "-", False, None)
+
+    
+    def apply_performance(
+        self, 
+        source: str = "unknown", 
+        immediate: bool = True, 
+        save_cfg: bool = True,
+        force_log: bool = False
+    ) -> None:
+        """Public wrapper for backward compatibility."""
+        
+        # For explicit calls (buttons), use immediate=True; traces should call request_apply_performance directly
+        self.request_apply_performance(
+            source=source if not immediate else "explicit", 
+            immediate=immediate, 
+            save_cfg=save_cfg, 
+            force_log=force_log
+        )
+
+    def _store_perf_settings(self) -> dict:
+        """Copy the performance settings from the widgets into self.cfg and return them."""
         try:
             seed_txt = str(self.seed_var.get()).strip()
         except Exception:
@@ -6278,9 +6397,6 @@ class PeakFitApp:
                 seed = int(seed_txt)
             except Exception:
                 seed = None
-        # apply_global_seed stores the seed and, if enabled, seeds RNGs globally.
-        # No need to call set_seed separately.
-        performance.apply_global_seed(seed, bool(self.perf_seed_all.get()))
         # Parse workers safely even if the Entry is blank while typing
         try:
             w_txt = str(self.perf_max_workers.get()).strip()
@@ -6298,25 +6414,49 @@ class PeakFitApp:
             unc_workers = int(float(unc_txt)) if unc_txt else 0
         except Exception:
             unc_workers = 0
+        settings = {
+            "perf_numba": bool(self.perf_numba.get()),
+            "perf_gpu": bool(self.perf_gpu.get()),
+            "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
+            "perf_seed_all": bool(self.perf_seed_all.get()),
+            "perf_seed": seed if seed is not None else "",
+            "perf_max_workers": workers,
+            "perf_unc_workers": unc_workers,
+            "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
+            "perf_blas_threads": int(self.perf_blas_threads.get()),
+            "log_debug_mode": bool(self.debug_mode_var.get()),
+        }
+        self.cfg.update(settings)
+        return settings
+
+    def _apply_performance_now(
+        self, 
+        source: str = "unknown", 
+        save_cfg: bool = True, 
+        force_log: bool = False
+    ) -> None:
+        """Internal core apply with logging dedupe logic."""
+        
+        # Call the actual apply logic
+        settings = self._store_perf_settings()
+        seed = settings["perf_seed"] if settings["perf_seed"] != "" else None
+        workers = settings["perf_max_workers"]
+        unc_workers = settings["perf_unc_workers"]
+        performance.set_numba(settings["perf_numba"])
+        performance.set_gpu(settings["perf_gpu"])
+        performance.set_cache_baseline(settings["perf_cache_baseline"])
+        # apply_global_seed stores the seed and, if enabled, seeds RNGs globally.
+        # No need to call set_seed separately.
+        performance.apply_global_seed(seed, settings["perf_seed_all"])
         performance.set_max_workers(workers)
         performance.set_unc_workers(unc_workers)
         performance.set_gpu_chunk(self.gpu_chunk_var.get())
-        self.cfg["perf_numba"] = bool(self.perf_numba.get())
-        self.cfg["perf_gpu"] = bool(self.perf_gpu.get())
-        self.cfg["perf_cache_baseline"] = bool(self.perf_cache_baseline.get())
-        self.cfg["perf_seed_all"] = bool(self.perf_seed_all.get())
-        self.cfg["perf_seed"] = seed if seed is not None else ""
-        self.cfg["perf_max_workers"] = workers
-        self.cfg["perf_unc_workers"] = unc_workers
-        self.cfg["perf_parallel_strategy"] = str(self.perf_parallel_strategy.get())
-        self.cfg["perf_blas_threads"] = int(self.perf_blas_threads.get())
-        self.cfg["log_debug_mode"] = bool(self.debug_mode_var.get())
 
         # Set env for child processes/futures
         import os
 
-        strategy = str(self.perf_parallel_strategy.get())
-        blas_threads = int(self.perf_blas_threads.get())
+        strategy = settings["perf_parallel_strategy"]
+        blas_threads = settings["perf_blas_threads"]
         if strategy == "outer":
             self._apply_thread_env("1", "1", "1")
         else:
@@ -6335,7 +6475,8 @@ class PeakFitApp:
         self.dlog(f"[DEBUG] threadpool_info_post={post_info}")
         libs = post_info
         self.dlog(f"threadpool_info={libs}")
-        save_config(self.cfg)
+        if save_cfg:
+            save_config(self.cfg)
         try:
             fit_req = int(self.perf_max_workers.get())
         except Exception:
@@ -6347,23 +6488,30 @@ class PeakFitApp:
         fit_eff = self._resolve_fit_workers()
         unc_eff = self._resolve_unc_workers()
         self.dlog("[DEBUG] apply_performance()")
-        self.log(
-            "Backend: %s | fit_workers_req=%s | fit_workers_eff=%s | unc_workers_req=%s | unc_workers_eff=%s | "
-            "strategy=%s | MKL_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s OMP_NUM_THREADS=%s | seed_all=%s seed=%s"
-            % (
-                performance.which_backend(),
-                fit_req,
-                fit_eff,
-                unc_req,
-                unc_eff,
-                strategy,
-                os.environ.get("MKL_NUM_THREADS", "-"),
-                os.environ.get("OPENBLAS_NUM_THREADS", "-"),
-                os.environ.get("OMP_NUM_THREADS", "-"),
-                bool(self.perf_seed_all.get()),
-                seed if seed is not None else "-",
+        # Log only if the applied state changed or the caller forces it, to reduce
+        # spam. The signature is taken after the apply, so it holds the new backend.
+        new_signature = self._compute_perf_signature()
+        if force_log or new_signature != self._perf_last_signature:
+            self.log(
+                "Backend: %s | fit_workers_req=%s | fit_workers_eff=%s | unc_workers_req=%s | unc_workers_eff=%s | "
+                "strategy=%s | MKL_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s OMP_NUM_THREADS=%s | seed_all=%s seed=%s"
+                % (
+                    performance.which_backend(),
+                    fit_req,
+                    fit_eff,
+                    unc_req,
+                    unc_eff,
+                    strategy,
+                    os.environ.get("MKL_NUM_THREADS", "-"),
+                    os.environ.get("OPENBLAS_NUM_THREADS", "-"),
+                    os.environ.get("OMP_NUM_THREADS", "-"),
+                    bool(self.perf_seed_all.get()),
+                    seed if seed is not None else "-",
+                )
             )
-        )
+        else:
+            self.dlog("[DEBUG] apply_performance skipped - no signature change")
+        self._perf_last_signature = new_signature
         self.status_var.set("Performance options applied.")
 
     # minimize env toggling across older Python/BLAS/OpenMP combos
@@ -7103,8 +7251,61 @@ class PeakFitApp:
         txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
 
+
+
+    def _apply_performance_immediate(self) -> None:
+        """Helper for Apply button - always runs immediately with logging."""
+        self._apply_performance_now(source="button:Apply", save_cfg=True, force_log=True)
+
 def main():
+    import sys
+    
     root = tk.Tk()
+    
+    # Apply modern theme with graceful fallback to default Tkinter
+    theme_applied, theme_name = apply_theme(root)
+    log_theme_status(theme_applied, theme_name)
+    
+    # --- Font policy: configure before creating PeakFitApp ---
+    from ui.fonts import (pick_first_available_family, 
+                          configure_named_fonts, 
+                          configure_ttk_styles, 
+                          DEFAULT_UI_SIZE,
+                          SANS_CANDIDATES,
+                          MONO_CANDIDATES)
+    
+    _style = ttk.Style(root)
+    _cfg = load_config()
+    
+    # Diagnostics first, so they report the fonts before the policy changes them.
+    # Asked for by the --font-diagnostics flag or the font_diagnostics config key.
+    if "--font-diagnostics" in sys.argv or bool(_cfg.get("font_diagnostics", False)):
+        from ui.font_diagnostics import run_diagnostics as diag_run, show_visual_sample
+        diag_run(root, log_fn=print)
+        show_visual_sample(root)
+    
+    # Determine font families (respect config or use auto selection)
+    _sans_auto = _cfg.get("ui_font_family", "auto")
+    _mono_auto = _cfg.get("ui_mono_font_family", "auto")
+    
+    if _sans_auto == "auto":
+        _sans_selected = pick_first_available_family(root, SANS_CANDIDATES)
+    else:
+        _sans_selected = _sans_auto
+    
+    if _mono_auto == "auto":
+        _mono_selected = pick_first_available_family(root, MONO_CANDIDATES)
+    else:
+        _mono_selected = _mono_auto
+        
+    _size = int(_cfg.get("ui_font_size", DEFAULT_UI_SIZE))
+    
+    configure_named_fonts(root, sans_family=_sans_selected, 
+                         mono_family=_mono_selected, ui_size=_size)
+    configure_ttk_styles(_style, sans_family=_sans_selected, 
+                        mono_family=_mono_selected, ui_size=_size)
+    # --- END font policy ---
+    
     app = PeakFitApp(root)
     root.mainloop()
 
