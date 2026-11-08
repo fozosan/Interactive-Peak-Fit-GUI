@@ -234,16 +234,19 @@ def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
     """Load two-column numeric data from ``path``.
 
     The function accepts ``.txt``, ``.csv`` or ``.dat`` files containing two
-    numeric columns. Delimiters (comma, tab, semicolon or whitespace) are
-    autodetected and lines beginning with common comment prefixes (``#``, ``%``,
-    ``//``) or header strings are ignored.
+    numeric columns. A data row is a line that starts with two numbers; every
+    other line is ignored, so instrument metadata (``SizeX = 1``), column titles
+    and units may precede the data. Delimiters (comma, tab, semicolon or
+    whitespace) are autodetected, quotes around rows or fields are dropped, and
+    text after a comment prefix (``#``, ``%``, ``//``) is discarded. A data row
+    holding a third number is rejected as multi-column data.
     """
 
     xs, ys = [], []
     more_than_two = False
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
         for line in fh:
-            line = line.strip()
+            line = line.replace('"', " ").strip()
             if not line:
                 continue
             # strip out comments (full-line or inline)
@@ -256,6 +259,11 @@ def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
             if not line:
                 continue
             parts = re.split(r"[,\s;]+", line)
+            try:
+                x_val = float(parts[0])
+                y_val = float(parts[1])
+            except (IndexError, ValueError):
+                continue
             if len(parts) >= 3:
                 for token in parts[2:]:
                     if not token:
@@ -268,11 +276,6 @@ def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
                         continue
                 if more_than_two:
                     break
-            try:
-                x_val = float(parts[0])
-                y_val = float(parts[1])
-            except (IndexError, ValueError):
-                continue
             xs.append(x_val)
             ys.append(y_val)
 
@@ -1809,6 +1812,12 @@ def write_batch_uncertainty_csv(rows: Sequence[Mapping[str, Any]], path: Path) -
             writer.writerow(row)
 
 
+def _drop_csv_suffix(base_path: Union[str, Path]) -> Path:
+    """Drop a trailing ``.csv``; any other dot belongs to the name (``0.20sec``)."""
+    base = Path(base_path)
+    return base.with_suffix("") if base.suffix.lower() == ".csv" else base
+
+
 def write_uncertainty_csv_legacy(
     base_path: Union[str, Path],
     file_path: Union[str, Path],
@@ -1817,7 +1826,7 @@ def write_uncertainty_csv_legacy(
     """
     Write <base>_uncertainty.csv (long format).
     """
-    base = Path(base_path).with_suffix("")
+    base = _drop_csv_suffix(base_path)
     out_csv = base.with_name(base.name + "_uncertainty.csv")
     rows = iter_uncertainty_rows(file_path, unc_norm)
     header = [
@@ -1871,7 +1880,7 @@ def write_uncertainty_csvs(
       - always: <base>_uncertainty.csv   (long)
       - optional: <base>_uncertainty_wide.csv (wide)
     """
-    base_path = Path(base_path).with_suffix("")
+    base_path = _drop_csv_suffix(base_path)
     long_written = write_uncertainty_csv_legacy(base_path, file_path, unc_norm)
 
     method_name = str(unc_norm.get("label") or unc_norm.get("method") or "unknown")
