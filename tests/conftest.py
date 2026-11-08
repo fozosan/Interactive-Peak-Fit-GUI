@@ -1,11 +1,72 @@
+import atexit
 import os
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 
-import matplotlib
-import numpy as np
-import pandas as pd
-import pytest
+# Keep the suite away from the user's settings. ui.app sets
+# CONFIG_PATH = Path.home() / ".gl_peakfit_config.json" when it is imported, and
+# gl_decon_gui_batch.py does the same, so a test that saves a setting would write
+# the user's real file. Pytest imports this conftest before any test module, so
+# pointing HOME at a throwaway directory here, ahead of every other import, moves
+# those paths with it. Windows reads USERPROFILE instead of HOME.
+_TEST_HOME = Path(tempfile.mkdtemp(prefix="peakfit-tests-home-"))
+_TEST_CONFIG = _TEST_HOME / ".gl_peakfit_config.json"
+atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
+os.environ["HOME"] = os.environ["USERPROFILE"] = str(_TEST_HOME)
+
+from tkinter import filedialog, messagebox, simpledialog  # noqa: E402
+
+import matplotlib  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import pytest  # noqa: E402
+
+# Answer Tk dialogs without opening them. A real dialog waits for a click that
+# never comes in an unattended run: bare pytest hung in messagebox.showinfo inside
+# test_baseline_method_persistence. Message boxes return their default button, as
+# if Enter were pressed; the text prompt and the file pickers return what Cancel
+# returns. A test that needs another answer monkeypatches the function itself.
+_DIALOG_ANSWERS = [
+    (messagebox, ("showinfo", "showwarning", "showerror"), messagebox.OK),
+    (messagebox, ("askokcancel", "askyesno", "askyesnocancel", "askretrycancel"), True),
+    (messagebox, ("askquestion",), messagebox.YES),
+    (simpledialog, ("askstring",), None),
+    (filedialog, ("askopenfilename", "asksaveasfilename", "askdirectory"), ""),
+]
+
+
+def _answer(value):
+    return lambda *args, **kwargs: value
+
+
+def _answer_dialogs(set_attribute=setattr):
+    for module, names, value in _DIALOG_ANSWERS:
+        for name in names:
+            set_attribute(module, name, _answer(value))
+
+
+_answer_dialogs()
+
+
+@pytest.fixture(autouse=True)
+def _clean_slate(monkeypatch):
+    """Start every test with no saved settings and the stock dialog answers.
+
+    Otherwise what one test leaves behind reaches every later test in the run:
+    test_ui_classic_defaults saves the classic solver, the re-import in
+    test_config_migration_baseline_defaults points ui.app at that test's legacy
+    file, and test_single_export_wide_toggle replaces showinfo and
+    asksaveasfilename without monkeypatch.
+    """
+    _TEST_CONFIG.unlink(missing_ok=True)
+    for name in ("ui.app", "gl_decon_gui_batch"):
+        module = sys.modules.get(name)
+        if module is not None:
+            monkeypatch.setattr(module, "CONFIG_PATH", _TEST_CONFIG)
+    _answer_dialogs(monkeypatch.setattr)
+
 
 # Use non-interactive backend when headless
 HEADLESS = (os.environ.get("DISPLAY", "") == "" and os.name != "nt")
