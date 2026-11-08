@@ -152,7 +152,7 @@ def configure_named_fonts(
     # Configure optional fonts
     for name in optional_fonts:
         try:
-            font_obj = tkfont.nametofont(name)
+            font_obj = tkfont.nametofont(name, root=root)
             actual_props = font_obj.actual()
             
             if name == "TkSmallCaptionFont":
@@ -177,7 +177,8 @@ def _configure_named_font(
     """Helper to configure a single named font with error handling."""
     
     try:
-        font_obj = tkfont.nametofont(name)
+        # The font of this root, not of Tk's default root (the first one made)
+        font_obj = tkfont.nametofont(name, root=root)
         
         props = {}
         if family is not None:

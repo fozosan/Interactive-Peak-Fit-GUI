@@ -1,4 +1,5 @@
 """Tests for font configuration module."""
+import os
 import sys
 from unittest.mock import MagicMock, patch
 import pytest
@@ -109,7 +110,7 @@ class TestConfigureNamedFonts:
         # Mock nametofont to raise exception for some names
         call_count = [0]
         
-        def mock_nametofont(name):
+        def mock_nametofont(name, root=None):
             call_count[0] += 1
             if call_count[0] > 2:  # After first few calls, raise exception
                 raise tkfont.TclError("unknown font name")
@@ -168,6 +169,26 @@ class TestConfigureNamedFonts:
             
             # Should still call nametofont but not set family
             # (it will configure other properties)
+
+    @pytest.mark.skipif(
+        os.environ.get("DISPLAY", "") == "" and os.name != "nt", reason="requires display"
+    )
+    def test_configures_the_root_it_is_given(self):
+        """Tk's default root is the first one made, and an earlier test may leave one
+        alive. The named fonts of the root passed in must change, not the default's."""
+        import tkinter as tk
+        import tkinter.font as tkfont
+        from ui.fonts import configure_named_fonts
+
+        first, second = tk.Tk(), tk.Tk()
+        try:
+            configure_named_fonts(second, sans_family=None, mono_family=None, ui_size=13)
+            for name in ("TkDefaultFont", "TkTextFont", "TkFixedFont"):
+                assert tkfont.nametofont(name, root=second).cget("size") == 13
+            assert tkfont.nametofont("TkDefaultFont", root=first).cget("size") != 13
+        finally:
+            second.destroy()
+            first.destroy()
 
 
 class TestConfigureTtkStyles:
