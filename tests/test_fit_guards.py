@@ -35,6 +35,19 @@ ZERO_PEAKS = textwrap.dedent(
            "baseline": {"method": "als"}}
     res = fit_api.run_fit_consistent(x, no_peaks, [], cfg, np.full_like(x, 10.0), "add", window)
     print("direct", res["fit_ok"], res["skip_reason"], flush=True)
+
+    in_dir, out_dir = Path(sys.argv[1]), Path(sys.argv[2])
+    with_peaks = models.pv_sum(x, [Peak(40.0, 100.0, 5.0, 0.5), Peak(60.0, 80.0, 6.0, 0.5)]) + 10.0
+    np.savetxt(in_dir / "a_no_peaks.csv", np.column_stack([x, no_peaks]), delimiter=",")
+    np.savetxt(in_dir / "b_peaks.csv", np.column_stack([x, with_peaks]), delimiter=",")
+    batch_cfg = {
+        "peaks": [], "source": "auto", "auto_max": 5, "solver": "modern_vp",
+        "modern_vp": {"centers_in_window": True}, "mode": "add",
+        "baseline": {"method": "als", "lam": 1e5, "p": 0.001, "niter": 10, "thresh": 0.0},
+        "baseline_uses_fit_range": True, "fit_xmin": 20.0, "fit_xmax": 80.0,
+        "output_dir": str(out_dir), "output_base": "batch",
+    }
+    print("batch", runner.run_batch([str(in_dir / "*.csv")], batch_cfg, compute_uncertainty=False), flush=True)
     """
 )
 
@@ -50,6 +63,10 @@ def test_zero_peaks_exits_cleanly(tmp_path):
 
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "direct False no_peaks" in proc.stdout
+    assert "batch (1, 2)" in proc.stdout
+    with open(out_dir / "batch_files.csv", newline="", encoding="utf-8") as fh:
+        status = {r["file"]: r["status"] for r in csv.DictReader(fh)}
+    assert status == {"a_no_peaks.csv": "no_peaks", "b_peaks.csv": "ok"}
 
 
 def _two_peak_case():

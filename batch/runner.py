@@ -34,6 +34,53 @@ from infra import performance
 
 logger = logging.getLogger(__name__)
 
+# The per-file status table, <output_base>_files.csv, has one row per matched
+# file. Its status is one of:
+#   ok                  fitted, and the solver converged
+#   not_converged       the solver stopped without converging
+#   fit_error           the baseline or the fit raised an error
+#   skipped_format      not two-column numeric data
+#   skipped_unreadable  could not be opened (permissions, or a directory)
+#   skipped_no_points   the fit window has no more points than free parameters
+#   no_peaks            no peaks to fit, e.g. auto seeding found none
+#   not_processed       the batch stopped before this file
+STATUS_COLUMNS = (
+    "file",
+    "path",
+    "status",
+    "message",
+    "n_points_window",
+    "n_peaks",
+    "rmse",
+    "fit_ok",
+    "unc_method",
+    "unc_status",
+    "unc_message",
+)
+# Uncertainty outputs the batch writes for a spectrum, after its stem.
+_UNC_SUFFIXES = (
+    "_uncertainty.csv",
+    "_uncertainty_wide.csv",
+    "_uncertainty.txt",
+    "_uncertainty_band.csv",
+    "_band.csv",
+)
+
+
+def _one_line(text) -> str:
+    return " ".join(str(text).split())
+
+
+def _fit_failure_status(exc: Exception) -> str:
+    """Status for a file whose baseline or fit raised ``exc``."""
+
+    # The Classic solver runs scipy.optimize.curve_fit, which reports a fit that
+    # stops without converging by raising this; the other solvers return
+    # fit_ok=False instead.
+    if isinstance(exc, RuntimeError) and str(exc).startswith("Optimal parameters not found"):
+        return "not_converged"
+    return "fit_error"
+
 
 def _seed_peaks(config: dict, solver_name: str) -> List[peaks.Peak]:
     """Return the seed peaks in ``config["peaks"]``.
@@ -52,6 +99,35 @@ def _seed_peaks(config: dict, solver_name: str) -> List[peaks.Peak]:
         opts["width_caps"] = caps
         config[solver_name] = opts
     return peaks.deserialize(records)
+
+
+def _remove_stale_uncertainty(out_dir: Path, stem: str, inputs: set, log=None) -> None:
+    """Delete the uncertainty outputs an earlier run left for ``stem``.
+
+    Called whenever a file's fit is rewritten with uncertainty requested, so the
+    folder never pairs a new fit with an old uncertainty, even when the new
+    uncertainty fails. ``inputs`` holds this batch's input paths, normalised
+    with ``os.path.normcase(os.path.abspath(...))``; those are never touched.
+    """
+
+    for suffix in _UNC_SUFFIXES:
+        old = out_dir / f"{stem}{suffix}"
+        if os.path.normcase(os.path.abspath(old)) in inputs:
+            continue
+        try:
+            old.unlink(missing_ok=True)
+        except OSError as exc:
+            msg = f"could not remove stale {old.name}: {exc}"
+            logger.warning(msg)
+            if log:
+                log(msg)
+
+
+def _write_status_table(path: Path, rows: Sequence[dict]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=STATUS_COLUMNS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _tp_limits_ctx_for_config(config: dict):
@@ -167,6 +243,14 @@ def run_batch(
         for the output CSV, ``source`` (``current`` | ``template`` | ``auto``)
         selecting the peak seeds, ``reheight`` to refresh heights per spectrum
         and ``auto_max`` controlling the maximum auto-seeded peaks.
+
+    A file that cannot be read or fitted costs only that file. Every matched
+    file gets a row in ``<output_base>_files.csv`` (see ``STATUS_COLUMNS``),
+    which is written together with the peak summary even when the batch is
+    aborted or stopped by an error.
+
+    Returns ``(ok, n)``: the files whose fit converged and the files matched.
+    An abort returns ``{"aborted": True, ...}`` instead.
     """
 
     if os.environ.get("SMOKE_MODE") == "1":
@@ -263,7 +347,6 @@ def run_batch(
     )
     band_pref_bootstrap = bool(config.get("ui_band_pref_bootstrap", True)) or need_band
     compute_uncertainty = compute_uncertainty_flag
-    expected_unc = want_unc_config or (compute_uncertainty_flag and method_requested)
     # Choose uncertainty method: explicit arg > config aliases > default
     unc_choice = (
         unc_method_arg
@@ -273,6 +356,9 @@ def run_batch(
         or "asymptotic"
     )
     unc_method_canon = data_io.canonical_unc_label(unc_choice)
+    if compute_uncertainty and unc_method_canon == "unknown":
+        # A setting is wrong, not a file: stop before any file is fitted.
+        raise ValueError(f"Unknown uncertainty method: {unc_choice!r}")
     bootstrap_n_cfg: Optional[int] = None
     if str(unc_method_canon).lower() == "bootstrap":
         if "bootstrap_n" not in config:
@@ -301,16 +387,29 @@ def run_batch(
     records = []
     unc_rows = []
     uncertainty_failures = []
-    ok = 0
-    processed = 0
+    status_rows = [
+        {
+            **dict.fromkeys(STATUS_COLUMNS, ""),
+            "file": Path(path).name,
+            "path": str(path),
+            "status": "not_processed",
+        }
+        for path in files
+    ]
+    status_path = out_dir / f"{base_name}_files.csv"
+    inputs = {os.path.normcase(os.path.abspath(path)) for path in files}
 
-    for i, path in enumerate(files, 1):
-        if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
-            return {"aborted": True, "records": [], "reason": "user-abort"}
-        if progress:
-            progress(i, total, path)
+    def _process_file(path: str, entry: dict) -> None:
+        """Fit one file and write its outputs, recording the outcome in ``entry``."""
+
         try:
             x, y = data_io.load_xy(path)
+        except OSError as exc:
+            # Unreadable, or a directory whose name matched a pattern.
+            entry.update(status="skipped_unreadable", message=_one_line(exc))
+            if log:
+                log(f"{Path(path).name}: skipped (unreadable: {entry['message']})")
+            return
         except ValueError as exc:
             emsg = str(exc).lower()
             if (
@@ -318,16 +417,15 @@ def run_batch(
                 or "more than two" in emsg
                 or "unsupported column" in emsg
             ):
-                if log:
-                    log(
-                        f"{Path(path).name}: skipped (has >2 columns; mapping files not supported)"
-                    )
-                continue
-            if "could not parse" in emsg:
-                if log:
-                    log(f"{Path(path).name}: skipped (no two-column numeric data)")
-                continue
-            raise
+                reason = "has >2 columns; mapping files not supported"
+            elif "could not parse" in emsg:
+                reason = "no two-column numeric data"
+            else:
+                raise
+            entry.update(status="skipped_format", message=reason)
+            if log:
+                log(f"{Path(path).name}: skipped ({reason})")
+            return
         xmin = config.get("fit_xmin")
         xmax = config.get("fit_xmax")
         if xmin is not None and xmax is not None:
@@ -335,6 +433,7 @@ def run_batch(
             mask = (x >= lo) & (x <= hi)
         else:
             mask = np.ones_like(x, bool)
+        entry["n_points_window"] = int(np.count_nonzero(mask))
 
         method = str(base_cfg.get("method", "als")).lower()
         use_slice = bool(config.get("baseline_uses_fit_range", True))
@@ -377,6 +476,7 @@ def run_batch(
                 )
                 for p in base_template
             ]
+        entry["n_peaks"] = len(template)
 
         peaks_in = copy.deepcopy(template)
         seed = (
@@ -398,6 +498,14 @@ def run_batch(
             return_jacobian=True,
             return_predictors=True,
         )
+        if res.get("skip_reason") is not None:
+            entry.update(
+                status="no_peaks" if res["skip_reason"] == "no_peaks" else "skipped_no_points",
+                message=res.get("message", ""),
+            )
+            if log:
+                log(f"{Path(path).name}: skipped ({entry['message']})")
+            return
 
         fitted = res["peaks_out"]
         theta = np.asarray(res["theta"], dtype=float)  # noqa: F841 - for debugging
@@ -497,7 +605,6 @@ def run_batch(
             rec["baseline_method"] = baseline_method
             rec.update(als_fields)
             rec.update(poly_fields)
-            records.append(rec)
             local_records.append(rec)
 
         fit_csv = data_io.build_peak_table(local_records)
@@ -505,9 +612,28 @@ def run_batch(
             "w", encoding="utf-8", newline=""
         ) as fh:
             fh.write(fit_csv)
+        trace_path = None
+        if save_traces:
+            trace_csv = data_io.build_trace_table(x, y, baseline, fitted)
+            trace_path = out_dir / f"{Path(path).stem}_trace.csv"
+            with trace_path.open("w", encoding="utf-8", newline="") as fh:
+                fh.write(trace_csv)
+        records.extend(local_records)
+        entry.update(
+            status="ok" if res["fit_ok"] else "not_converged",
+            message=""
+            if res["fit_ok"]
+            else _one_line(res.get("message") or "the solver did not converge"),
+            n_peaks=len(fitted),
+            rmse=rmse,
+            fit_ok=bool(res["fit_ok"]),
+        )
 
+        # Uncertainty problems stay with this file: they are recorded in its
+        # status row and never stop the batch.
+        if compute_uncertainty:
+            _remove_stale_uncertainty(out_dir, Path(path).stem, inputs, log)
         unc_res = None
-        unc_error_msg = None
         if res["fit_ok"] and fitted and compute_uncertainty:
             try:
                 theta_hat = np.asarray(res["theta"], float)
@@ -536,8 +662,8 @@ def run_batch(
                     or []
                 )
                 base_fit = res.get("baseline")
-                mode = res.get("mode", "add")
-                add_mode = mode == "add"
+                fit_mode = res.get("mode", "add")
+                add_mode = fit_mode == "add"
 
                 rj = res.get("residual_jac")
                 residual_fn = res.get("residual_fn")
@@ -545,7 +671,7 @@ def run_batch(
                     residual_fn = lambda th: rj(th)[0]
                 if residual_fn is None:
                     residual_fn = build_residual(
-                        x_fit, y_fit, peaks_obj, mode, base_fit, "linear", None
+                        x_fit, y_fit, peaks_obj, fit_mode, base_fit, "linear", None
                     )
 
                 jac = res.get("jacobian")
@@ -684,7 +810,7 @@ def run_batch(
                         "x_fit": x_fit,
                         "y_fit": y_fit,
                         "baseline": base_fit,
-                        "mode": mode,
+                        "mode": fit_mode,
                         "peaks": peaks_obj,
                         # set solver once to the chosen bootstrap engine
                         "solver": boot_solver,
@@ -1086,163 +1212,180 @@ def run_batch(
                             seed=seed_val,
                             n_boot=(n_boot if n_boot is not None else 0),
                         )
+                if unc_res is None:
+                    raise RuntimeError("the uncertainty method returned no result")
+                stem = Path(path).stem
+
+                unc_norm = data_io.normalize_unc_result(unc_res)
+                method_lbl = data_io.canonical_unc_label(
+                    unc_norm.get("label") or unc_method_canon
+                )
+                unc_norm["label"] = method_lbl
+                unc_norm["rmse"] = rmse if math.isfinite(rmse) else 0.0
+                dof_raw = unc_norm.get("dof")
+                try:
+                    dof_val = float(dof_raw)
+                except Exception:
+                    dof_val = float("nan")
+                if not math.isfinite(dof_val):
+                    dof_val = float(res.get("dof", 1)) if isinstance(res, dict) else 1.0
+                unc_norm["dof"] = max(1, int(dof_val))
+
+                base_path = out_dir / stem
+                band = unc_norm.get("band") or unc_norm.get("prediction_band")
+                is_bootstrap = method_lbl.lower().startswith("bootstrap")
+
+                if is_bootstrap:
+                    data_io.write_uncertainty_csvs(
+                        base_path,
+                        path,
+                        unc_norm,
+                        write_wide=True,
+                    )
+                    txt_path = base_path.with_name(base_path.name + "_uncertainty.txt")
+                    solver_meta = res.get("solver_meta", {}) if isinstance(res, dict) else {}
+                    baseline_meta = res.get("baseline_meta", {}) if isinstance(res, dict) else {}
+                    perf_meta = res.get("perf_meta", {}) if isinstance(res, dict) else {}
+                    locks = res.get("locks", []) if isinstance(res, dict) else []
+                    try:
+                        data_io._write_unc_txt(txt_path, path, unc_norm, solver_meta, baseline_meta, perf_meta, locks)
+                    except Exception:
+                        data_io.write_uncertainty_txt(
+                            txt_path,
+                            unc_norm,
+                            peaks=fitted,
+                            method_label=method_lbl,
+                            file_path=path,
+                            solver_meta=solver_meta,
+                            baseline_meta=baseline_meta,
+                            perf_meta=perf_meta,
+                            locks=locks,
+                        )
+
+                    if band_pref_bootstrap and band is not None:
+                        if isinstance(band, (tuple, list)) and len(band) == 3:
+                            xb, lob, hib = band
+                            band_csv = base_path.with_name(base_path.name + "_band.csv")
+                            with band_csv.open("w", newline="", encoding="utf-8") as fh:
+                                writer = csv.writer(fh, lineterminator="\n")
+                                writer.writerow(["x", "ci_lo", "ci_hi"])
+                                for xi, lo, hi in zip(xb, lob, hib):
+                                    try:
+                                        xi_f = float(xi)
+                                        lo_f = float(lo)
+                                        hi_f = float(hi)
+                                    except Exception:
+                                        continue
+                                    if not (math.isfinite(xi_f) and math.isfinite(lo_f) and math.isfinite(hi_f)):
+                                        continue
+                                    writer.writerow([xi_f, lo_f, hi_f])
+                else:
+                    data_io.write_uncertainty_txt(
+                        out_dir / f"{stem}_uncertainty.txt",
+                        unc_norm,
+                        peaks=fitted,
+                        method_label=method_lbl,
+                        file_path=path,
+                    )
+
+                    data_io.write_uncertainty_csvs(
+                        base_path,
+                        path,
+                        unc_norm,
+                        write_wide=export_unc_wide,
+                    )
+
+                    if band is not None:
+                        xb, lob, hib = band
+                        band_csv = out_dir / f"{stem}_uncertainty_band.csv"
+                        with band_csv.open("w", newline="", encoding="utf-8") as fh:
+                            writer = csv.writer(fh, lineterminator="\n")
+                            ci_pct = 95
+                            try:
+                                alpha = float(
+                                    unc_norm.get(
+                                        "alpha",
+                                        unc_norm.get("diagnostics", {}).get("alpha", 0.05),
+                                    )
+                                )
+                                ci_pct = int(round(100 * (1.0 - alpha)))
+                            except Exception:
+                                pass
+                            writer.writerow(["x", f"y_lo{ci_pct}", f"y_hi{ci_pct}"])
+                            for xi, lo, hi in zip(xb, lob, hib):
+                                if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
+                                    continue
+                                writer.writerow([float(xi), float(lo), float(hi)])
+
+                unc_rows.extend(list(data_io.iter_uncertainty_rows(path, unc_norm)))
+                if log:
+                    log(f"{Path(path).name}: uncertainty={method_lbl}")
+                entry["unc_status"] = "ok"
             except Exception as exc:
                 msg = str(exc)
-                if "Unknown uncertainty method" in msg:
-                    raise
                 err_msg = f"{Path(path).name}: uncertainty failed: {msg}"
                 logger.warning(err_msg)
                 if log:
                     log(err_msg)
                 uncertainty_failures.append((Path(path).name, msg))
-                if abort_on_uncertainty_failure:
-                    raise
-                unc_error_msg = msg
-                unc_res = None
+                entry.update(unc_status="failed", unc_message=_one_line(msg))
+                # Drop whatever was written before the failure.
+                _remove_stale_uncertainty(out_dir, Path(path).stem, inputs, log)
 
-        if unc_res is not None:
-            stem = Path(path).stem
-
-            unc_norm = data_io.normalize_unc_result(unc_res)
-            method_lbl = data_io.canonical_unc_label(
-                unc_norm.get("label") or unc_method_canon
-            )
-            unc_norm["label"] = method_lbl
-            unc_norm["rmse"] = rmse if math.isfinite(rmse) else 0.0
-            dof_raw = unc_norm.get("dof")
-            try:
-                dof_val = float(dof_raw)
-            except Exception:
-                dof_val = float("nan")
-            if not math.isfinite(dof_val):
-                dof_val = float(res.get("dof", 1)) if isinstance(res, dict) else 1.0
-            unc_norm["dof"] = max(1, int(dof_val))
-
-            base_path = out_dir / stem
-            band = unc_norm.get("band") or unc_norm.get("prediction_band")
-            is_bootstrap = method_lbl.lower().startswith("bootstrap")
-
-            if is_bootstrap:
-                data_io.write_uncertainty_csvs(
-                    base_path,
-                    path,
-                    unc_norm,
-                    write_wide=True,
-                )
-                txt_path = base_path.with_name(base_path.name + "_uncertainty.txt")
-                solver_meta = res.get("solver_meta", {}) if isinstance(res, dict) else {}
-                baseline_meta = res.get("baseline_meta", {}) if isinstance(res, dict) else {}
-                perf_meta = res.get("perf_meta", {}) if isinstance(res, dict) else {}
-                locks = res.get("locks", []) if isinstance(res, dict) else []
-                try:
-                    data_io._write_unc_txt(txt_path, path, unc_norm, solver_meta, baseline_meta, perf_meta, locks)
-                except Exception:
-                    data_io.write_uncertainty_txt(
-                        txt_path,
-                        unc_norm,
-                        peaks=fitted,
-                        method_label=method_lbl,
-                        file_path=path,
-                        solver_meta=solver_meta,
-                        baseline_meta=baseline_meta,
-                        perf_meta=perf_meta,
-                        locks=locks,
-                    )
-
-                if band_pref_bootstrap and band is not None:
-                    if isinstance(band, (tuple, list)) and len(band) == 3:
-                        xb, lob, hib = band
-                        band_csv = base_path.with_name(base_path.name + "_band.csv")
-                        with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                            writer = csv.writer(fh, lineterminator="\n")
-                            writer.writerow(["x", "ci_lo", "ci_hi"])
-                            for xi, lo, hi in zip(xb, lob, hib):
-                                if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
-                                    return {"aborted": True, "records": [], "reason": "user-abort"}
-                                try:
-                                    xi_f = float(xi)
-                                    lo_f = float(lo)
-                                    hi_f = float(hi)
-                                except Exception:
-                                    continue
-                                if not (math.isfinite(xi_f) and math.isfinite(lo_f) and math.isfinite(hi_f)):
-                                    continue
-                                writer.writerow([xi_f, lo_f, hi_f])
-            else:
-                data_io.write_uncertainty_txt(
-                    out_dir / f"{stem}_uncertainty.txt",
-                    unc_norm,
-                    peaks=fitted,
-                    method_label=method_lbl,
-                    file_path=path,
-                )
-
-                data_io.write_uncertainty_csvs(
-                    base_path,
-                    path,
-                    unc_norm,
-                    write_wide=export_unc_wide,
-                )
-
-                if band is not None:
-                    xb, lob, hib = band
-                    band_csv = out_dir / f"{stem}_uncertainty_band.csv"
-                    with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                        writer = csv.writer(fh, lineterminator="\n")
-                        ci_pct = 95
-                        try:
-                            alpha = float(
-                                unc_norm.get(
-                                    "alpha",
-                                    unc_norm.get("diagnostics", {}).get("alpha", 0.05),
-                                )
-                            )
-                            ci_pct = int(round(100 * (1.0 - alpha)))
-                        except Exception:
-                            pass
-                        writer.writerow(["x", f"y_lo{ci_pct}", f"y_hi{ci_pct}"])
-                        for xi, lo, hi in zip(xb, lob, hib):
-                            if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
-                                return {"aborted": True, "records": [], "reason": "user-abort"}
-                            if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
-                                continue
-                            writer.writerow([float(xi), float(lo), float(hi)])
-
-            for row in data_io.iter_uncertainty_rows(path, unc_norm):
-                if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
-                    return {"aborted": True, "records": [], "reason": "user-abort"}
-                unc_rows.append(row)
-            if log:
-                log(f"{Path(path).name}: uncertainty={method_lbl}")
-
-        if expected_unc and unc_res is None:
-            if unc_error_msg is None:
-                msg = "Batch export requested uncertainty but none was computed"
-                logger.error(msg)
-                if log:
-                    log(f"{Path(path).name}: {msg}")
-                raise RuntimeError(msg)
-
-        trace_path = None
-        if save_traces:
-            trace_csv = data_io.build_trace_table(x, y, baseline, fitted)
-            trace_path = out_dir / f"{Path(path).stem}_trace.csv"
-            with trace_path.open("w", encoding="utf-8", newline="") as fh:
-                fh.write(trace_csv)
         if log:
             msg = f"{Path(path).name}: {'ok' if res['fit_ok'] else 'fail'} rmse={rmse:.3g}"
             if trace_path:
                 msg += f" {trace_path}"
             log(msg)
-        if res["fit_ok"]:
-            ok += 1
-        processed = i
 
-    peak_csv = data_io.build_peak_table(records)
-    with peak_output.open("w", encoding="utf-8", newline="") as fh:
-        fh.write(peak_csv)
-    if unc_rows:
-        data_io.write_batch_uncertainty_long(out_dir, unc_rows)
+    ok = 0
+    aborted = False
+    try:
+        for i, (path, entry) in enumerate(zip(files, status_rows), 1):
+            if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
+                aborted = True
+                break
+            if progress:
+                progress(i, total, path)
+            try:
+                _process_file(path, entry)
+            except Exception as exc:
+                entry.update(
+                    status=_fit_failure_status(exc),
+                    message=_one_line(f"{type(exc).__name__}: {exc}"),
+                    rmse="",
+                    fit_ok=False,
+                )
+                err_msg = f"{Path(path).name}: {entry['status']}: {entry['message']}"
+                logger.warning(err_msg)
+                if log:
+                    log(err_msg)
+            if compute_uncertainty:
+                entry["unc_method"] = unc_method_canon
+                if not entry["unc_status"]:
+                    entry["unc_status"] = "skipped"
+                    entry["unc_message"] = (
+                        "the fit did not converge"
+                        if entry["status"] == "not_converged"
+                        else "no fit"
+                    )
+            if entry["status"] == "ok":
+                ok += 1
+            if abort_on_uncertainty_failure and entry["unc_status"] == "failed":
+                raise RuntimeError(
+                    f"{entry['file']}: uncertainty failed: {entry['unc_message']}"
+                )
+    finally:
+        # Written whatever happened above: an abort or an error leaves a
+        # partial summary and a status row for every matched file.
+        _write_status_table(status_path, status_rows)
+        peak_csv = data_io.build_peak_table(records)
+        with peak_output.open("w", encoding="utf-8", newline="") as fh:
+            fh.write(peak_csv)
+        if unc_rows:
+            data_io.write_batch_uncertainty_long(out_dir, unc_rows)
+    if log:
+        log(f"file status table: {status_path}")
 
     if uncertainty_failures:
         details = "; ".join(f"{name}: {msg}" for name, msg in uncertainty_failures[:5])
@@ -1254,7 +1397,9 @@ def run_batch(
         if log:
             log(full_msg)
 
-    return ok, processed
+    if aborted:
+        return {"aborted": True, "records": [], "reason": "user-abort"}
+    return ok, total
 
 
 def run_from_dir(
