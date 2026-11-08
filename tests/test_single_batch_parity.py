@@ -27,7 +27,7 @@ def test_single_batch_parity(tmp_path):
 
     fpath = tmp_path / "spec.csv"
     np.savetxt(fpath, np.column_stack([x, y]), delimiter=",")
-    seed = abs(hash(str(fpath.resolve()))) & 0xFFFFFFFF
+    seed = runner._file_seed(fpath, None)  # the seed the batch derives for this file
 
     for use_range in (False, True):
         baseline = _build_baseline(x, y, mask, use_range)
