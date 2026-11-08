@@ -18,7 +18,7 @@ from pathlib import Path
 from math import isnan
 import pandas as pd
 
-from .uncertainty import UncertaintyResult
+from .uncertainty import UncertaintyResult, _z_value
 
 
 # --- helpers for robust export (Bayesian-safe) -------------------------------
@@ -141,6 +141,7 @@ def _normalize_param_stats(stats: dict | Sequence[dict]) -> tuple[list[dict], di
                 )
                 lo_mcse = _to_series(blk.get("ci_lo_mcse"))
                 hi_mcse = _to_series(blk.get("ci_hi_mcse"))
+                flags = _to_series(blk.get("flags"))
                 # include MCSE vector lengths to avoid truncation when they differ
                 n = max(
                     len(rows), len(est), len(sd), len(lo), len(hi),
@@ -163,6 +164,9 @@ def _normalize_param_stats(stats: dict | Sequence[dict]) -> tuple[list[dict], di
                     )
                     rec[f"{name}_ci_hi_mcse"] = (
                         _opt_float(hi_mcse[idx]) if idx < len(hi_mcse) else rec.get(f"{name}_ci_hi_mcse")
+                    )
+                    rec[f"{name}_flags"] = (
+                        str(flags[idx] or "") if idx < len(flags) else rec.get(f"{name}_flags", "")
                     )
             stats_seq = []
         else:
@@ -192,6 +196,7 @@ def _normalize_param_stats(stats: dict | Sequence[dict]) -> tuple[list[dict], di
                 rec[f"{name}_p97_5"] = _opt_float(hi)
                 rec[f"{name}_ci_lo_mcse"] = _opt_float(lo_mcse)
                 rec[f"{name}_ci_hi_mcse"] = _opt_float(hi_mcse)
+                rec[f"{name}_flags"] = str(blk.get("flags") or "")
             rows.append(rec)
 
     if isinstance(stats, Mapping):
@@ -224,8 +229,75 @@ def _normalize_param_stats(stats: dict | Sequence[dict]) -> tuple[list[dict], di
 
     return rows, wide
 
-# 95% normal quantile used when p2_5/p97_5 are absent but stderr exists
-_Z = 1.96
+def _alpha_of(unc: Mapping[str, Any] | None) -> float:
+    """The confidence level's alpha a result was computed at (0.05 when unstated)."""
+    m = unc if isinstance(unc, Mapping) else {}
+    for val in (m.get("alpha"), _as_mapping(m.get("diagnostics")).get("alpha")):
+        try:
+            a = float(val)
+        except Exception:
+            continue
+        if 0.0 < a < 1.0:
+            return a
+    return 0.05
+
+
+def ci_level_text(alpha: Any) -> str:
+    """Confidence level in percent, as labels print it: 0.05 -> "95", 0.1 -> "90"."""
+    try:
+        a = float(alpha)
+    except Exception:
+        a = 0.05
+    return f"{100.0 * (1.0 - a):g}"
+
+
+def _quantile_names(alpha: float) -> tuple[str, str]:
+    """Names of the interval's quantile columns: ("p2_5", "p97_5") at alpha 0.05."""
+    lo = f"{100.0 * alpha / 2.0:g}".replace(".", "_")
+    hi = f"{100.0 * (1.0 - alpha / 2.0):g}".replace(".", "_")
+    return f"p{lo}", f"p{hi}"
+
+
+def _cell(x: Any) -> Any:
+    """A CSV cell: the number, or blank when it is missing or not finite."""
+    v = _to_float(x)
+    return v if math.isfinite(v) else ""
+
+
+def _dof_cell(x: Any) -> Any:
+    """Degrees of freedom: a positive count, else blank (dof <= 0 has no meaning)."""
+    v = _to_float(x)
+    return int(v) if math.isfinite(v) and v > 0 else ""
+
+
+def _flag_ci_bounds(stats_tbl: Sequence[Mapping[str, Any]], bounds: Any) -> None:
+    """Mark each interval that reaches a parameter bound (``flags`` = "ci_at_bound").
+
+    ``bounds`` are the fit's (lo, hi), four per peak; a row's ``index`` is its
+    peak's 1-based position in them.
+    """
+    try:
+        lo_all = np.asarray(bounds[0], float).ravel()
+        hi_all = np.asarray(bounds[1], float).ravel()
+    except Exception:
+        return
+    for row in stats_tbl:
+        try:
+            base = 4 * (int(row.get("index", 0)) - 1)
+        except Exception:
+            continue
+        for off, pname in enumerate(("center", "height", "fwhm", "eta")):
+            blk = row.get(pname)
+            j = base + off
+            if not isinstance(blk, dict) or not (0 <= j < lo_all.size == hi_all.size):
+                continue
+            lo_b, hi_b = lo_all[j], hi_all[j]
+            ci_lo = _to_float(blk.get("p2_5", blk.get("ci_lo")))
+            ci_hi = _to_float(blk.get("p97_5", blk.get("ci_hi")))
+            at_lo = math.isfinite(lo_b) and math.isfinite(ci_lo) and ci_lo <= lo_b + 1e-9 * max(1.0, abs(lo_b))
+            at_hi = math.isfinite(hi_b) and math.isfinite(ci_hi) and ci_hi >= hi_b - 1e-9 * max(1.0, abs(hi_b))
+            blk["flags"] = "ci_at_bound" if (at_lo or at_hi) else ""
+
 # Conversion from Gaussian sigma to FWHM
 _FWHM_SIGMA = 2.0 * math.sqrt(2.0 * math.log(2.0))
 
@@ -558,7 +630,9 @@ def _as_mapping(obj: Any) -> Mapping[str, Any]:
     return {"value": obj}
 
 
-def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+def _extract_stats_table(unc_map: Mapping[str, Any], z: float) -> List[Mapping[str, Any]]:
+    """Rows of per-peak statistics; an interval missing but for its standard
+    error is rebuilt as est +- z * sd, z from the result's alpha."""
     roots = ["stats", "parameters", "param_stats", "params"]
     rows = None
     for k in roots:
@@ -698,7 +772,7 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                     ):
                         try:
                             e = float(est); s = float(sd)
-                            lo, hi = e - _Z * s, e + _Z * s
+                            lo, hi = e - z * s, e + z * s
                         except Exception:
                             pass
 
@@ -709,9 +783,9 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                         try:
                             e = float(est); s = float(sd)
                             if p2_5 is None or np.isnan(_to_float(p2_5)):
-                                p2_5 = e - _Z * s
+                                p2_5 = e - z * s
                             if p97_5 is None or np.isnan(_to_float(p97_5)):
-                                p97_5 = e + _Z * s
+                                p97_5 = e + z * s
                         except Exception:
                             pass
 
@@ -754,7 +828,7 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                         ):
                             try:
                                 e = float(est); s = float(sd)
-                                lo, hi = e - _Z * s, e + _Z * s
+                                lo, hi = e - z * s, e + z * s
                             except Exception:
                                 pass
 
@@ -765,9 +839,9 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                             try:
                                 e = float(est); s = float(sd)
                                 if p2_5 is None or np.isnan(_to_float(p2_5)):
-                                    p2_5 = e - _Z * s
+                                    p2_5 = e - z * s
                                 if p97_5 is None or np.isnan(_to_float(p97_5)):
-                                    p97_5 = e + _Z * s
+                                    p97_5 = e + z * s
                             except Exception:
                                 pass
                         row[pname] = {
@@ -818,7 +892,7 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
             ):
                 try:
                     e = float(est); s = float(sd)
-                    lo, hi = e - _Z * s, e + _Z * s
+                    lo, hi = e - z * s, e + z * s
                 except Exception:
                     pass
             if (
@@ -828,9 +902,9 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                 try:
                     e = float(est); s = float(sd)
                     if p2_5 is None or np.isnan(_to_float(p2_5)):
-                        p2_5 = e - _Z * s
+                        p2_5 = e - z * s
                     if p97_5 is None or np.isnan(_to_float(p97_5)):
-                        p97_5 = e + _Z * s
+                        p97_5 = e + z * s
                 except Exception:
                     pass
             blk[pname] = {
@@ -942,7 +1016,7 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                 try:
                     e = float(est)
                     s = float(sd)
-                    ci_lo, ci_hi = e - _Z * s, e + _Z * s
+                    ci_lo, ci_hi = e - z * s, e + z * s
                 except Exception:
                     pass
 
@@ -953,9 +1027,9 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                 try:
                     e = float(est); s = float(sd)
                     if p2_5 is None or np.isnan(_to_float(p2_5)):
-                        p2_5 = e - _Z * s
+                        p2_5 = e - z * s
                     if p97_5 is None or np.isnan(_to_float(p97_5)):
-                        p97_5 = e + _Z * s
+                        p97_5 = e + z * s
                 except Exception:
                     pass
 
@@ -1084,7 +1158,7 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                 try:
                     e = float(est)
                     s = float(sd)
-                    lo, hi = e - _Z * s, e + _Z * s
+                    lo, hi = e - z * s, e + z * s
                 except Exception:
                     pass
             if (
@@ -1094,9 +1168,9 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
                 try:
                     e = float(est); s = float(sd)
                     if p2_5 is None or np.isnan(_to_float(p2_5)):
-                        p2_5 = e - _Z * s
+                        p2_5 = e - z * s
                     if p97_5 is None or np.isnan(_to_float(p97_5)):
-                        p97_5 = e + _Z * s
+                        p97_5 = e + z * s
                 except Exception:
                     pass
             return {
@@ -1120,21 +1194,11 @@ def _extract_stats_table(unc_map: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     return norm_rows
 
 
-def _finite(x: Any, default: float = 0.0) -> float:
-    try:
-        v = float(x)
-        if math.isfinite(v):
-            return v
-    except Exception:
-        pass
-    return float(default)
-
-
-def _synth_q(val: float, sd: float) -> tuple[float, float]:
-    # If sd==0, both quantiles collapse to value
-    if not math.isfinite(sd) or sd <= 0.0:
-        return val, val
-    return (val - _Z * sd, val + _Z * sd)
+def _synth_q(val: float, sd: float, z: float) -> tuple[float, float]:
+    """An interval rebuilt from the standard error; missing when either is."""
+    if not (math.isfinite(val) and math.isfinite(sd)):
+        return float("nan"), float("nan")
+    return (val - z * sd, val + z * sd)
 
 
 def _to_float(x: Any) -> float:
@@ -1157,8 +1221,8 @@ def _to_float(x: Any) -> float:
 
 def _stats_to_param_blocks(stats_tbl: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, List[float]]]:
     """Return canonical param-wise blocks from a row-oriented stats table."""
-    blocks: Dict[str, Dict[str, List[float]]] = {
-        pname: {k: [] for k in ("est", "sd", "ci_lo", "ci_hi", "p2_5", "p97_5")}
+    blocks: Dict[str, Dict[str, List[Any]]] = {
+        pname: {k: [] for k in ("est", "sd", "ci_lo", "ci_hi", "p2_5", "p97_5", "flags")}
         for pname in ("center", "height", "fwhm", "eta")
     }
     for row in stats_tbl:
@@ -1166,6 +1230,7 @@ def _stats_to_param_blocks(stats_tbl: Sequence[Mapping[str, Any]]) -> Dict[str, 
             blk = _as_mapping(row.get(pname))
             for key in ("est", "sd", "ci_lo", "ci_hi", "p2_5", "p97_5"):
                 blocks[pname][key].append(_to_float(blk.get(key)))
+            blocks[pname]["flags"].append(str(blk.get("flags") or ""))
     return blocks
 
 def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
@@ -1215,14 +1280,16 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
         m_for_table.pop("params", None)
     if posterior_map.get("samples") is not None and len(posterior_map) <= 1:
         m_for_table.pop("posterior", None)
-    stats_tbl = _extract_stats_table(m_for_table)
+    alpha = _alpha_of(m)
+    z = _z_value(alpha)
+    stats_tbl = _extract_stats_table(m_for_table, z)
     if not stats_tbl and samples is not None:
         arr = np.asarray(samples, float)
         if arr.ndim == 2 and arr.size:
             mean = arr.mean(axis=0)
             sd = arr.std(axis=0, ddof=1)
-            ci_lo = mean - _Z * sd
-            ci_hi = mean + _Z * sd
+            ci_lo = mean - z * sd
+            ci_hi = mean + z * sd
             stats_tbl = []
             n_peaks = mean.size // 4
             for i in range(n_peaks):
@@ -1288,8 +1355,8 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
             mean = np.asarray(mean_vec, float)
             sd = np.asarray(std_vec, float)
             if mean.shape == sd.shape and mean.ndim == 1 and mean.size:
-                ci_lo = mean - _Z * sd
-                ci_hi = mean + _Z * sd
+                ci_lo = mean - z * sd
+                ci_hi = mean + z * sd
                 stats_tbl = []
                 n_peaks = mean.size // 4
                 for i in range(n_peaks):
@@ -1335,10 +1402,15 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
         dof_val = m.get("d.o.f.")
     if dof_val is None:
         dof_val = m.get("degrees_of_freedom")
+    if dof_val is None:
+        dof_val = diag.get("dof")
+    if stats_tbl and diag.get("param_bounds") is not None:
+        _flag_ci_bounds(stats_tbl, diag.get("param_bounds"))
 
     out = {
         "label": canon,
         "method": method,
+        "alpha": alpha,
         "rmse": _to_float(m.get("rmse")),
         "dof": _to_float(dof_val),
         "backend": str(m.get("backend") or diag.get("backend") or m.get("engine") or ""),
@@ -1500,6 +1572,7 @@ def _iter_param_rows(
         for pname in ("center","height","fwhm","eta"):
             p = _as_mapping(row.get(pname))
             yield {
+                "flags": str(p.get("flags") or ""),
                 "file": fname,
                 "peak": peak_idx,
                 "param": pname,
@@ -1529,7 +1602,8 @@ def _format_unc_text(
     locks: Sequence[Mapping[str, bool]],
 ) -> str:
     """
-    Return v2.7-style human-readable text with ± and 95% CI, marking (fixed) when locked.
+    Return v2.7-style human-readable text with ± and the CI at the result's
+    confidence level, marking (fixed) when locked. A missing statistic is n/a.
     """
     # Keep legacy label EXACT on the "Uncertainty method:" line
     canon_label = _canonical_unc_label(unc_norm.get("label") or unc_norm.get("method") or "unknown")
@@ -1546,6 +1620,7 @@ def _format_unc_text(
             return "n/a"
 
     lines = [f"Uncertainty method: {canon_label}"]
+    level = ci_level_text(_alpha_of(unc_norm))
 
     stats_source = (
         unc_norm.get("param_stats")
@@ -1578,12 +1653,7 @@ def _format_unc_text(
 
         def fmt_param(name: str, locked: bool):
             est, sd, lo, hi = _values(name)
-            # If SD missing but we have CI, estimate SD from CI width for display so we can emit ±
-            if (sd is None or np.isnan(_to_float(sd))) and not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
-                try:
-                    sd = float(hi - lo) / (2.0 * _Z)
-                except Exception:
-                    pass
+            at_bound = ", at a parameter bound" if use_norm and row.get(f"{name}_flags") else ""
             if locked:
                 lines.append(f"  {name:<7}= {fmt(est)} (fixed)")
             else:
@@ -1595,7 +1665,9 @@ def _format_unc_text(
                     lines.append(f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}")
                 else:
                     # have CI; show both ± and CI
-                    lines.append(f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}   (95% CI: [{fmt(lo)}, {fmt(hi)}])")
+                    lines.append(
+                        f"  {name:<7}= {fmt(est)} ± {fmt(sd,3)}   ({level}% CI: [{fmt(lo)}, {fmt(hi)}]{at_bound})"
+                    )
 
         # locks: same order as UI (center, height, fwhm, eta) default False if not provided
         lock_row = (_as_mapping(locks[i-1]) if i-1 < len(locks) else {})
@@ -1606,42 +1678,39 @@ def _format_unc_text(
 
         # --- NEW: p-indexed legacy summary lines (satisfies tests looking for "p0:", ... and "±") ---
         # p0->center, p1->height, p2->fwhm, p3->eta
-        def pick_est_sd(name: str, locked_flag: bool) -> Tuple[str, str]:
-            est, sd, lo, hi = _values(name)
-            if (sd is None or np.isnan(_to_float(sd))) and not (np.isnan(_to_float(lo)) or np.isnan(_to_float(hi))):
-                # don't synthesize SD from CI when the parameter is locked
-                if not locked_flag:
-                    try:
-                        sd = float(hi - lo) / (2.0 * _Z)
-                    except Exception:
-                        pass
-            if locked_flag:
-                sd = 0.0
-            return fmt(est), fmt(sd, 3)
+        def pick_est_sd(name: str, locked_flag: bool) -> str:
+            est, sd, _lo, _hi = _values(name)
+            return f"{fmt(est)} (fixed)" if locked_flag else f"{fmt(est)} ± {fmt(sd, 3)}"
 
-        c_est, c_sd = pick_est_sd("center", bool(lock_row.get("center", False)))
-        h_est, h_sd = pick_est_sd("height", False)
-        w_est, w_sd = pick_est_sd("fwhm", bool(lock_row.get("fwhm", False)))
-        e_est, e_sd = pick_est_sd("eta",  bool(lock_row.get("eta", False)))
-        lines.append(f"  p0: {c_est} ± {c_sd}")
-        lines.append(f"  p1: {h_est} ± {h_sd}")
-        lines.append(f"  p2: {w_est} ± {w_sd}")
-        lines.append(f"  p3: {e_est} ± {e_sd}")
+        lines.append(f"  p0: {pick_est_sd('center', bool(lock_row.get('center', False)))}")
+        lines.append(f"  p1: {pick_est_sd('height', False)}")
+        lines.append(f"  p2: {pick_est_sd('fwhm', bool(lock_row.get('fwhm', False)))}")
+        lines.append(f"  p3: {pick_est_sd('eta', bool(lock_row.get('eta', False)))}")
     return "\n".join(lines)
 
 
-def _write_unc_csv(csv_path: Union[str, "Path"], rows: Iterable[Mapping[str, Any]]) -> None:
-    """Write rows with no blank lines and stable header ordering."""
+def _write_unc_csv(
+    csv_path: Union[str, "Path"], rows: Iterable[Mapping[str, Any]], alpha: float = 0.05
+) -> None:
+    """Write rows with no blank lines and stable header ordering; missing values blank."""
     csv_path = Path(csv_path)
+    q_lo, q_hi = _quantile_names(alpha)
     header = [
         "file","peak","param","value","stderr","ci_lo","ci_hi",
-        "method","rmse","dof","p2_5","p97_5","backend","n_draws","n_boot","ess","rhat"
+        "method","rmse","dof",q_lo,q_hi,"backend","n_draws","n_boot","ess","rhat","flags"
     ]
+    numeric = {"value", "stderr", "ci_lo", "ci_hi", "rmse", "ess", "rhat"}
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in header})
+            out = {k: r.get(k, "") for k in header}
+            for k in numeric:
+                out[k] = _cell(r.get(k))
+            out["dof"] = _dof_cell(r.get("dof"))
+            out[q_lo] = _cell(r.get("p2_5"))
+            out[q_hi] = _cell(r.get("p97_5"))
+            w.writerow(out)
 
 
 def _write_unc_txt(
@@ -1736,14 +1805,18 @@ def iter_uncertainty_rows(
     unc_norm: Mapping[str, Any],
 ) -> List[dict]:
     """
-    Build long-format rows with guaranteed canonical labels and p2_5/p97_5.
-    Columns: file, peak, param, value, stderr, p2_5, p97_5, method, rmse, dof.
-    If quantiles are missing but stderr is present, synthesize via ±1.96*stderr.
+    Build long-format rows with guaranteed canonical labels.
+    Columns: file, peak, param, value, stderr, p2_5, p97_5, method, rmse, dof,
+    flags, alpha. ``p2_5``/``p97_5`` hold the interval at the result's alpha
+    (the writers name the columns by it). If the interval is missing but the
+    standard error is present, it is rebuilt as value +- z(alpha) * stderr.
     """
     fname = Path(file_path).name if file_path else ""
     method = str(unc_norm.get("label") or unc_norm.get("method") or "unknown")
     rmse = unc_norm.get("rmse", float("nan"))
     dof = unc_norm.get("dof", float("nan"))
+    alpha = _alpha_of(unc_norm)
+    z = _z_value(alpha)
 
     rows: List[dict] = []
     stats_source = (
@@ -1764,11 +1837,8 @@ def iter_uncertainty_rows(
             sd = _to_float(rec.get(f"{param}_sd"))
             qlo = _to_float(rec.get(f"{param}_p2_5"))
             qhi = _to_float(rec.get(f"{param}_p97_5"))
-            if (isnan(qlo) or isnan(qhi)) and not isnan(est) and not isnan(sd):
-                try:
-                    qlo, qhi = est - _Z * sd, est + _Z * sd
-                except Exception:
-                    pass
+            if isnan(qlo) or isnan(qhi):
+                qlo, qhi = _synth_q(est, sd, z)
             rows.append(
                 {
                     "file": fname,
@@ -1781,6 +1851,8 @@ def iter_uncertainty_rows(
                     "method": method,
                     "rmse": rmse,
                     "dof": dof,
+                    "flags": str(rec.get(f"{param}_flags") or ""),
+                    "alpha": alpha,
                 }
             )
     return rows
@@ -1829,41 +1901,33 @@ def write_uncertainty_csv_legacy(
     base = _drop_csv_suffix(base_path)
     out_csv = base.with_name(base.name + "_uncertainty.csv")
     rows = iter_uncertainty_rows(file_path, unc_norm)
+    # The quantile columns are named by the confidence level: p2_5/p97_5 at 95 %.
+    q_lo, q_hi = _quantile_names(_alpha_of(unc_norm))
     header = [
         "file","peak","param","value","stderr",
-        "p2_5","p97_5","ci_lo","ci_hi","method","rmse","dof"
+        q_lo,q_hi,"ci_lo","ci_hi","method","rmse","dof","flags"
     ]
     with out_csv.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
         w.writeheader()
         for r in rows:
-            val = _finite(r.get("value"), 0.0)
-            sd  = _finite(r.get("stderr"), 0.0)
-            qlo = r.get("p2_5"); qhi = r.get("p97_5")
-            if not (isinstance(qlo, (int, float)) and math.isfinite(float(qlo))) or \
-               not (isinstance(qhi, (int, float)) and math.isfinite(float(qhi))):
-                qlo2 = r.get("ci_lo"); qhi2 = r.get("ci_hi")
-                if qlo2 is None or qhi2 is None:
-                    qlo, qhi = _synth_q(val, sd)
-                else:
-                    qlo = _finite(qlo2, val); qhi = _finite(qhi2, val)
-            else:
-                qlo = _finite(qlo, val); qhi = _finite(qhi, val)
-            rmse = _finite(r.get("rmse"), 0.0)
-            dof  = max(1, int(_finite(r.get("dof"), 1.0)))
+            # A missing statistic is a blank cell, never 0.0.
+            qlo = _cell(r.get("p2_5"))
+            qhi = _cell(r.get("p97_5"))
             w.writerow({
                 "file": r.get("file", ""),
                 "peak": r.get("peak", ""),
                 "param": r.get("param", ""),
-                "value": val,
-                "stderr": sd,
-                "p2_5": qlo,
-                "p97_5": qhi,
+                "value": _cell(r.get("value")),
+                "stderr": _cell(r.get("stderr")),
+                q_lo: qlo,
+                q_hi: qhi,
                 "ci_lo": qlo,
                 "ci_hi": qhi,
                 "method": r.get("method", ""),
-                "rmse": rmse,
-                "dof": dof,
+                "rmse": _cell(r.get("rmse")),
+                "dof": _dof_cell(r.get("dof")),
+                "flags": r.get("flags", ""),
             })
     return out_csv
 
@@ -1884,8 +1948,9 @@ def write_uncertainty_csvs(
     long_written = write_uncertainty_csv_legacy(base_path, file_path, unc_norm)
 
     method_name = str(unc_norm.get("label") or unc_norm.get("method") or "unknown")
-    rmse_val = _finite(unc_norm.get("rmse"), 0.0)
-    dof_val = max(1, int(_finite(unc_norm.get("dof"), 1.0)))
+    rmse_val = _cell(unc_norm.get("rmse"))
+    dof_val = _dof_cell(unc_norm.get("dof"))
+    z = _z_value(_alpha_of(unc_norm))
 
     wide_written = None
     if write_wide:
@@ -1931,21 +1996,16 @@ def write_uncertainty_csvs(
                         "dof": dof_val,
                     }
                     for param in ("center", "height", "fwhm", "eta"):
-                        val = _finite(rec.get(f"{param}_est"), 0.0)
-                        sd = _finite(rec.get(f"{param}_sd"), 0.0)
-                        qlo_raw = rec.get(f"{param}_p2_5")
-                        qhi_raw = rec.get(f"{param}_p97_5")
-                        qlo_val = _to_float(qlo_raw)
-                        qhi_val = _to_float(qhi_raw)
+                        val = _to_float(rec.get(f"{param}_est"))
+                        sd = _to_float(rec.get(f"{param}_sd"))
+                        qlo_val = _to_float(rec.get(f"{param}_p2_5"))
+                        qhi_val = _to_float(rec.get(f"{param}_p97_5"))
                         if not (math.isfinite(qlo_val) and math.isfinite(qhi_val)):
-                            qlo_val, qhi_val = _synth_q(val, sd)
-                        else:
-                            qlo_val = _finite(qlo_val, val)
-                            qhi_val = _finite(qhi_val, val)
-                        row_out[param] = val
-                        row_out[f"{param}_stderr"] = sd
-                        row_out[f"{param}_ci_lo"] = qlo_val
-                        row_out[f"{param}_ci_hi"] = qhi_val
+                            qlo_val, qhi_val = _synth_q(val, sd, z)
+                        row_out[param] = _cell(val)
+                        row_out[f"{param}_stderr"] = _cell(sd)
+                        row_out[f"{param}_ci_lo"] = _cell(qlo_val)
+                        row_out[f"{param}_ci_hi"] = _cell(qhi_val)
                         lo_mcse_val = rec.get(f"{param}_ci_lo_mcse")
                         hi_mcse_val = rec.get(f"{param}_ci_hi_mcse")
                         lo_mcse = _to_float(lo_mcse_val)
@@ -1984,40 +2044,26 @@ def write_batch_uncertainty_long(
     Input rows may carry either p2_5/p97_5 or ci_lo/ci_hi; we map to p2_5/p97_5.
     """
     out_dir = Path(out_dir)
+    alphas = {round(float(r.get("alpha", 0.05)), 12) for r in rows}
+    if len(alphas) > 1:
+        raise ValueError(f"uncertainty rows hold different confidence levels: {sorted(alphas)}")
+    alpha = alphas.pop() if alphas else 0.05
+    z = _z_value(alpha)
+    # The quantile columns are named by the confidence level: p2_5/p97_5 at 95 %.
+    q_lo, q_hi = _quantile_names(alpha)
     header = [
-        "file","peak","param","value","stderr","p2_5","p97_5","method","rmse","dof"
+        "file","peak","param","value","stderr",q_lo,q_hi,"method","rmse","dof","flags"
     ]
 
     def _pick_quantiles(r: dict) -> tuple[float, float]:
-        """
-        Accept either legacy p2_5/p97_5 or unified ci_lo/ci_hi; synthesize from
-        value±Z*stderr if neither present.
-        """
-        val = _to_float(r.get("value"))
-        sd  = _to_float(r.get("stderr"))
-        # Prefer unified names if already present
-        qlo = _to_float(r.get("ci_lo"))
-        qhi = _to_float(r.get("ci_hi"))
-        if math.isnan(qlo) or math.isnan(qhi):
-            # Try legacy names
-            qlo = _to_float(r.get("p2_5"))
-            qhi = _to_float(r.get("p97_5"))
-        if (math.isnan(qlo) or math.isnan(qhi)) and math.isfinite(val) and math.isfinite(sd):
-            qlo, qhi = val - _Z * sd, val + _Z * sd
-        return qlo, qhi
-
-    def _pick_quantiles(r: dict) -> tuple[float, float]:
-        # Accept either legacy or unified field names; synthesize if needed.
-        val = _to_float(r.get("value"))
-        sd  = _to_float(r.get("stderr"))
+        # Accept either legacy or unified field names; rebuild from stderr if needed.
         qlo = _to_float(r.get("p2_5"))
         qhi = _to_float(r.get("p97_5"))
         if math.isnan(qlo) or math.isnan(qhi):
-            # try unified names
             qlo = _to_float(r.get("ci_lo"))
             qhi = _to_float(r.get("ci_hi"))
-        if (math.isnan(qlo) or math.isnan(qhi)) and math.isfinite(val) and math.isfinite(sd):
-            qlo, qhi = val - _Z * sd, val + _Z * sd
+        if math.isnan(qlo) or math.isnan(qhi):
+            qlo, qhi = _synth_q(_to_float(r.get("value")), _to_float(r.get("stderr")), z)
         return qlo, qhi
 
     def _write(path: Path):
@@ -2025,24 +2071,20 @@ def write_batch_uncertainty_long(
             w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n", extrasaction="ignore")
             w.writeheader()
             for r in rows:
-                val = _finite(r.get("value"), 0.0)
-                sd  = _finite(r.get("stderr"), 0.0)
+                # A missing statistic is a blank cell, never 0.0.
                 qlo, qhi = _pick_quantiles(r)
-                qlo = _finite(qlo, val)
-                qhi = _finite(qhi, val)
-                rmse = _finite(r.get("rmse"), 0.0)
-                dof  = max(1, int(_finite(r.get("dof"), 1.0)))
                 w.writerow({
                     "file": r.get("file", ""),
                     "peak": r.get("peak", ""),
                     "param": r.get("param", ""),
-                    "value": val,
-                    "stderr": sd,
-                    "p2_5": qlo,
-                    "p97_5": qhi,
+                    "value": _cell(r.get("value")),
+                    "stderr": _cell(r.get("stderr")),
+                    q_lo: _cell(qlo),
+                    q_hi: _cell(qhi),
                     "method": r.get("method", ""),
-                    "rmse": rmse,
-                    "dof": dof,
+                    "rmse": _cell(r.get("rmse")),
+                    "dof": _dof_cell(r.get("dof")),
+                    "flags": r.get("flags", ""),
                 })
 
     long_path = out_dir / "batch_uncertainty_long.csv"
@@ -2089,16 +2131,17 @@ def write_uncertainty_csv(
     unc = _normalize_unc_result(unc_res)
     res_obj = _ensure_result(unc_res)
     fname = str(file_path)
+    q_lo, q_hi = _quantile_names(_alpha_of(unc))
     row: Dict[str, Any] = {
         "file": fname,
         "method": unc.get("label", "unknown"),
-        "rmse": _to_float(unc.get("rmse")),
-        "dof": _to_float(unc.get("dof")),
+        "rmse": _cell(unc.get("rmse")),
+        "dof": _dof_cell(unc.get("dof")),
         "backend": unc.get("backend", ""),
-        "n_draws": _to_float(unc.get("n_draws")),
-        "n_boot": _to_float(unc.get("n_boot")),
-        "ess": _to_float(unc.get("ess")),
-        "rhat": _to_float(unc.get("rhat")),
+        "n_draws": _cell(unc.get("n_draws")),
+        "n_boot": _cell(unc.get("n_boot")),
+        "ess": _cell(unc.get("ess")),
+        "rhat": _cell(unc.get("rhat")),
     }
 
     header = [
@@ -2136,12 +2179,12 @@ def write_uncertainty_csv(
             continue
         row.update(
             {
-                name: _to_float(est_raw or p.get("mean") or p.get("value")),
-                f"{name}_sd": _to_float(sd_raw),
-                f"{name}_ci_lo": _to_float(lo_pct if lo_pct is not None else p.get("ci_lo")),
-                f"{name}_ci_hi": _to_float(hi_pct if hi_pct is not None else p.get("ci_hi")),
-                f"{name}_p2_5": _to_float(lo_pct),
-                f"{name}_p97_5": _to_float(hi_pct),
+                name: _cell(est_raw if est_raw is not None else (p.get("mean") or p.get("value"))),
+                f"{name}_sd": _cell(sd_raw),
+                f"{name}_ci_lo": _cell(lo_pct if lo_pct is not None else p.get("ci_lo")),
+                f"{name}_ci_hi": _cell(hi_pct if hi_pct is not None else p.get("ci_hi")),
+                f"{name}_{q_lo}": _cell(lo_pct),
+                f"{name}_{q_hi}": _cell(hi_pct),
             }
         )
         header.extend(
@@ -2150,8 +2193,8 @@ def write_uncertainty_csv(
                 f"{name}_sd",
                 f"{name}_ci_lo",
                 f"{name}_ci_hi",
-                f"{name}_p2_5",
-                f"{name}_p97_5",
+                f"{name}_{q_lo}",
+                f"{name}_{q_hi}",
             ]
         )
 
@@ -2223,6 +2266,6 @@ def export_uncertainty_pair(
 ) -> None:
     unc = _normalize_unc_result(unc_res)
     rows = list(_iter_param_rows(file_path, unc))
-    _write_unc_csv(out_csv, rows)
+    _write_unc_csv(out_csv, rows, _alpha_of(unc))
     _write_unc_txt(out_txt, file_path, unc, solver_meta or {}, baseline_meta or {}, perf_meta or {}, locks or [])
 

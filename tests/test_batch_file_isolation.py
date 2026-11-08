@@ -20,7 +20,7 @@ from fit import classic
 from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 
 STATUS_COLUMNS = [
-    "file", "path", "status", "message", "n_points_window", "n_peaks",
+    "file", "path", "status", "flags", "message", "n_points_window", "n_peaks",
     "rmse", "fit_ok", "unc_method", "unc_status", "unc_message",
 ]
 TRUE_PEAKS = [Peak(40.0, 100.0, 5.0, 0.5), Peak(60.0, 80.0, 6.0, 0.5)]
@@ -199,7 +199,7 @@ def test_the_status_table_has_the_documented_columns(tmp_path):
         header = next(csv.reader(fh))
     assert header == STATUS_COLUMNS
     (row,) = _rows(out_dir / "batch_files.csv")
-    assert row["status"] == "ok" and row["fit_ok"] == "True"
+    assert row["status"] == "ok" and row["fit_ok"] == "True" and row["flags"] == ""
     assert row["path"] == str(in_dir / "a.csv")
     assert int(row["n_points_window"]) == 121 and int(row["n_peaks"]) == 2
     assert float(row["rmse"]) < 1.0

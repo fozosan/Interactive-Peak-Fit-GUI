@@ -44,7 +44,9 @@ def test_bootstrap_refit_seed_repro(monkeypatch):
 
     for k in res1.stats:
         for fld in ("est", "sd", "p2.5", "p97.5"):
-            assert res1.stats[k][fld] == pytest.approx(res2.stats[k][fld])
+            assert res1.stats[k][fld] == pytest.approx(res2.stats[k][fld], nan_ok=True)
 
-    assert res1.stats["p0"]["sd"] == pytest.approx(0.0, abs=1e-12)
+    # The locked centre is not estimated: no standard error, no interval.
+    assert np.isnan(res1.stats["p0"]["sd"]) and np.isnan(res1.stats["p0"]["p2.5"])
+    assert res1.stats["p0"]["est"] == theta[0]
     assert res1.band is not None

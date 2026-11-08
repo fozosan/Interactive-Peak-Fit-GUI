@@ -206,6 +206,8 @@ def test_asymptotic_gui_vs_batch_match(tmp_path):
     rows = _read_long_csv(Path(long_batch))
     assert len(rows) >= 4
     for r in rows:
-        for k in ("value", "stderr", "p2_5", "p97_5"):
-            assert math.isfinite(float(r[k]))
+        assert math.isfinite(float(r["value"]))
+        for k in ("stderr", "p2_5", "p97_5"):
+            # eta is locked (no solver fits it), so it has no error or interval
+            assert math.isfinite(float(r[k])) == (r["param"] != "eta")
 

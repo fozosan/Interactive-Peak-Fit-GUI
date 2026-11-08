@@ -45,5 +45,7 @@ def test_jitter_changes_diagnostics_and_draws():
 
     keys = set(baseline.stats.keys()) & set(jittered.stats.keys())
     assert keys
-    diffs = [abs(baseline.stats[k]["est"] - jittered.stats[k]["est"]) for k in keys]
+    # The estimate is the fit either way; the jittered starts show in the spread.
+    assert all(baseline.stats[k]["est"] == jittered.stats[k]["est"] for k in keys)
+    diffs = [abs(baseline.stats[k]["sd"] - jittered.stats[k]["sd"]) for k in keys]
     assert any(d > 1e-8 for d in diffs)

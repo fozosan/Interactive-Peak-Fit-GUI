@@ -140,7 +140,13 @@ def solve(
     sigma = 1.0
     fs = f_scale_opt if f_scale_opt > 0 else 1.0
 
+    # Converged only when the parameters stop moving. Running out of
+    # evaluations, or a failed step, is reported as such: the batch status and
+    # the bootstrap's failure count rely on it.
+    converged = False
+    message = f"stopped at maxfev={maxfev} before the step converged"
     backtracked = False
+    nfev = 0
     for nfev in range(1, maxfev + 1):
         c, f = unpack(theta)
         pk_iter = [Peak(c[i], 1.0, f[i], peaks[i].eta) for i in range(len(peaks))]
@@ -200,11 +206,13 @@ def solve(
 
         # Gauss-Newton step with scaling
         if J.size == 0:
+            message = "no data to fit"
             break
         J_scaled = J / x_scale
         try:
             step_scaled = np.linalg.lstsq(J_scaled, -r, rcond=None)[0]
-        except np.linalg.LinAlgError:
+        except np.linalg.LinAlgError as exc:
+            message = f"least-squares step failed: {exc}"
             break
         step = step_scaled * x_scale
 
@@ -246,9 +254,15 @@ def solve(
             cost_new = robust_cost(r_new, loss, fs)
             bt = True
 
+        moved = theta_new - theta
         theta = theta_new
         backtracked = backtracked or bt
-        if np.linalg.norm(step) <= 1e-8 * (1 + np.linalg.norm(theta)):
+        # Judge the move actually made: on a bound the Gauss-Newton step keeps
+        # pointing outside while the clipped parameters no longer change, and a
+        # fit resting on its bound has converged (the bound is a flag).
+        if np.linalg.norm(moved) <= 1e-8 * (1 + np.linalg.norm(theta)):
+            converged = True
+            message = f"converged after {nfev} iterations"
             break
 
     # final solve with accepted parameters
@@ -316,9 +330,9 @@ def solve(
             cov = None
 
     return SolveResult(
-        ok=True,
+        ok=bool(converged),
         theta=theta_full,
-        message="vp",
+        message=message,
         cost=cost,
         jac=J,
         cov=cov,

@@ -2,9 +2,12 @@ import csv, math
 from core import data_io
 
 
-def _all_finite(row, keys):
+def _finite_or_blank(row, keys):
+    """Every cell is a finite number or blank: never "nan", never a made-up 0.0."""
     for k in keys:
         v = row.get(k, "")
+        if v == "":
+            continue
         try:
             f = float(v)
         except Exception:
@@ -47,5 +50,8 @@ def test_batch_summary_no_nan(tmp_path):
             out_rows = list(rdr)
         assert out_rows, f"{p.name} empty"
         for r in out_rows:
-            assert _all_finite(r, ["value", "stderr", "p2_5", "p97_5", "rmse", "dof"])
-
+            assert _finite_or_blank(r, ["value", "stderr", "p2_5", "p97_5", "rmse", "dof"])
+            assert r["dof"] == ""  # dof <= 0 has no meaning
+        centre, height = out_rows
+        assert centre["value"] == centre["stderr"] == centre["rmse"] == centre["p2_5"] == ""
+        assert float(height["p2_5"]) == float(height["p97_5"]) == 3.0

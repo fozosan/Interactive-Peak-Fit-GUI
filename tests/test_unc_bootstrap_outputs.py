@@ -43,7 +43,8 @@ def test_unc_bootstrap_outputs(two_peak_data, tmp_path, monkeypatch):
         for pname in ("center", "height", "fwhm", "eta"):
             p = row[pname]
             assert math.isfinite(p.get("est", float("nan")))
-            assert math.isfinite(p.get("sd", float("nan")))
+            # eta is locked (no solver fits it), so it has no standard error
+            assert math.isfinite(p.get("sd", float("nan"))) == (pname != "eta")
     data_io.write_uncertainty_csvs(base, "", unc_norm, write_wide=True)
     basedir = Path(tmp_path)
     stem = "out"
@@ -63,4 +64,4 @@ def test_unc_bootstrap_outputs(two_peak_data, tmp_path, monkeypatch):
 
     res2 = uncertainty.bootstrap_ci(**args)
     assert np.allclose(res1["param_mean"], res2["param_mean"])
-    assert np.allclose(res1["param_std"], res2["param_std"])
+    assert np.allclose(res1["param_std"], res2["param_std"], equal_nan=True)

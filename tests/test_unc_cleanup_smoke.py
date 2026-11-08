@@ -112,7 +112,7 @@ def test_bootstrap_passes_bounds_and_locks(monkeypatch):
         kwargs.update(extra)
         captured["kwargs"] = kwargs
         theta_init = np.asarray(theta_init if theta_init is not None else np.zeros_like(theta), float)
-        return {"theta": theta_init}
+        return {"theta": theta_init, "fit_ok": True}
 
     fit_api_module = importlib.import_module("core.fit_api")
     monkeypatch.setattr(fit_api_module, "run_fit_consistent", _rfc, raising=True)
@@ -169,7 +169,7 @@ def test_bootstrap_theta_init_is_clipped_to_bounds(monkeypatch):
             _, (lb_arr, ub_arr) = pack_theta_bounds(peaks_in, x_arr, {})
         assert np.all(th >= lb_arr - 1e-12) and np.all(th <= ub_arr + 1e-12), "theta_init not inside bounds"
         captured["called"] = True
-        return {"theta": th}
+        return {"theta": th, "fit_ok": True}
 
     class DummyRNG:
         def integers(self, low, high=None, size=None):
@@ -233,7 +233,7 @@ def test_bootstrap_disables_solver_fallbacks_by_default(monkeypatch):
             seen_cfg.append({})
         if "peaks_in" not in kwargs and "peaks" not in kwargs:
             raise TypeError("missing peaks_in")
-        return {"theta": np.asarray([1.0, 1.0, 1.0, 0.5], float)}
+        return {"theta": np.asarray([1.0, 1.0, 1.0, 0.5], float), "fit_ok": True}
 
     monkeypatch.setattr(fit_api, "run_fit_consistent", _rfc, raising=True)
 

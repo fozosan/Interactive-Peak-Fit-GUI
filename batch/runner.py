@@ -45,10 +45,14 @@ logger = logging.getLogger(__name__)
 #   skipped_no_points   the fit window has no more points than free parameters
 #   no_peaks            no peaks to fit, e.g. auto seeding found none
 #   not_processed       the batch stopped before this file
+# Its flags are advice, never a veto (";"-separated):
+#   bound_hit           a fitted parameter sits on its bound (named in message)
+#   ci_at_bound         an uncertainty interval reaches a parameter bound
 STATUS_COLUMNS = (
     "file",
     "path",
     "status",
+    "flags",
     "message",
     "n_points_window",
     "n_peaks",
@@ -166,8 +170,13 @@ def _file_seed(path: str, base_seed: Optional[int]) -> int:
     return zlib.crc32(Path(path).name.encode("utf-8"), int(base_seed or 0) & 0xFFFFFFFF)
 
 
-def _norm_jitter(v, default=0.02):
-    """Normalize bootstrap jitter to a fractional value."""
+def _norm_jitter(v, default=0.0):
+    """Normalize bootstrap jitter to a fractional value.
+
+    The default is no jitter: every refit starts at the fit. A start jitter
+    scales with each parameter's absolute value, so 2 % moves a centre at
+    383 cm-1 by 7.7 cm-1 and the refits land in other minima.
+    """
 
     try:
         f = float(v)
@@ -626,11 +635,13 @@ def run_batch(
             with trace_path.open("w", encoding="utf-8", newline="") as fh:
                 fh.write(trace_csv)
         records.extend(local_records)
+        notes = [] if res["fit_ok"] else [res.get("message") or "the solver did not converge"]
+        if res.get("bound_hit"):
+            notes.append("at bound: " + ", ".join(res["bound_hit"]))
         entry.update(
             status="ok" if res["fit_ok"] else "not_converged",
-            message=""
-            if res["fit_ok"]
-            else _one_line(res.get("message") or "the solver did not converge"),
+            flags=";".join(res.get("flags") or []),
+            message=_one_line("; ".join(notes)),
             n_peaks=len(fitted),
             rmse=rmse,
             fit_ok=bool(res["fit_ok"]),
@@ -644,33 +655,21 @@ def run_batch(
         if res["fit_ok"] and fitted and compute_uncertainty:
             try:
                 theta_hat = np.asarray(res["theta"], float)
-                x_all = res.get("x")
-                if x_all is None:
-                    x_all = x
-                x_all = np.asarray(x_all, float)
-
-                y_all = res.get("y")
-                if y_all is None:
-                    y_all = y
-                y_all = np.asarray(y_all, float)
-
-                x_fit = res.get("x_fit")
-                if x_fit is None:
-                    x_fit = x_all
-                x_fit = np.asarray(x_fit, float)
-
-                y_fit = res.get("y_fit")
-                if y_fit is None:
-                    y_fit = y_all
-                y_fit = np.asarray(y_fit, float)
                 peaks_obj = (
                     res.get("peaks_out")
                     or res.get("peaks")
                     or []
                 )
-                base_fit = res.get("baseline")
-                fit_mode = res.get("mode", "add")
+                fit_mode = res.get("mode", mode)
                 add_mode = fit_mode == "add"
+                # Every method sees what the fit saw: the points in the fit
+                # window, in the data space of the fitted model. In add mode
+                # that is y with the baseline in the model; in subtract mode it
+                # is y minus the baseline, with the peaks alone as the model.
+                x_fit = np.asarray(x[mask], float)
+                base_window = np.asarray(baseline[mask], float)
+                y_fit = np.asarray(y[mask] if add_mode else y[mask] - base_window, float)
+                base_fit = base_window if add_mode else np.zeros_like(base_window)
 
                 rj = res.get("residual_jac")
                 residual_fn = res.get("residual_fn")
@@ -678,7 +677,7 @@ def run_batch(
                     residual_fn = lambda th: rj(th)[0]
                 if residual_fn is None:
                     residual_fn = build_residual(
-                        x_fit, y_fit, peaks_obj, fit_mode, base_fit, "linear", None
+                        x_fit, y_fit, peaks_obj, "add", base_fit, "linear", None
                     )
 
                 jac = res.get("jacobian")
@@ -692,7 +691,8 @@ def run_batch(
                     residual_vec = residual_fn(theta_hat)
                 residual_vec = np.asarray(residual_vec, float)
 
-                # Predictor: prefer solver-provided fit-window function; otherwise build locally on x_fit.
+                # One predictor on the fit window serves every method and band:
+                # the fit's own, or the same model built here.
                 predict_fit_fn = res.get("predict_fit")
 
                 def _predict_fit_local(
@@ -701,7 +701,6 @@ def run_batch(
                     _x=x_fit,
                     _peaks=peaks_obj,
                     _base=base_fit,
-                    _add=add_mode,
                 ):
                     total = np.zeros_like(_x, float)
                     t = np.asarray(th, float).ravel()
@@ -709,9 +708,7 @@ def run_batch(
                         j = 4 * i
                         c, h, fw, eta = t[j : j + 4]
                         total += models.pseudo_voigt(_x, h, c, fw, eta)
-                    if _add and _base is not None:
-                        total = total + _base
-                    return total
+                    return total + _base
 
                 if not callable(predict_fit_fn):
                     predict_fit_fn = _predict_fit_local
@@ -724,43 +721,7 @@ def run_batch(
                             predict_fit_fn = _predict_fit_local
                     except Exception:
                         predict_fit_fn = _predict_fit_local
-
-                predict_full_fn = res.get("predict_full")
-                if callable(predict_full_fn):
-                    try:
-                        _probe_full = np.asarray(
-                            predict_full_fn(np.asarray(theta_hat, float)), float
-                        ).reshape(-1)
-                        if int(_probe_full.size) != int(x_all.size):
-                            raise ValueError("predict_full size mismatch")
-                    except Exception:
-                        predict_full_fn = None
-
-                # Build predictor for Bootstrap; if not provided, bind it to the *fit* grid to match residuals/band.
-                if not callable(predict_full_fn):
-                    base_fit_arr = np.asarray(base_fit, float) if (
-                        add_mode and base_fit is not None
-                    ) else None
-
-                    def _predict_full_bootstrap(
-                        th,
-                        *,
-                        _x=x_fit,
-                        _peaks=peaks_obj,
-                        _base=base_fit_arr,
-                        _add=add_mode,
-                    ):
-                        total = np.zeros_like(_x, float)
-                        t = np.asarray(th, float).ravel()
-                        for i in range(len(_peaks)):
-                            j = 4 * i
-                            c, h, fw, eta = t[j : j + 4]
-                            total += models.pseudo_voigt(_x, h, c, fw, eta)
-                        if _add and _base is not None:
-                            total = total + _base
-                        return total
-
-                    predict_full_fn = _predict_full_bootstrap
+                predict_full_fn = predict_fit_fn
 
                 fit_ctx = dict(res.get("fit_ctx") or {})
                 solver_choice = (
@@ -798,7 +759,7 @@ def run_batch(
                 if boot_solver.lower().startswith("lmfit") and not has_lmfit:
                     boot_solver = solver_choice
 
-                jitter_frac = _norm_jitter(config.get("bootstrap_jitter", 0.02))
+                jitter_frac = _norm_jitter(config.get("bootstrap_jitter", 0.0))
                 centers_ref = [float(p.center) for p in peaks_obj] if peaks_obj else []
                 # Make the chosen bootstrap solver visible to inner refits.
                 fit_ctx["unc_boot_solver"] = str(boot_solver)
@@ -831,6 +792,8 @@ def run_batch(
                         # Parity with GUI: never use linearized fallback path
                         "allow_linear_fallback": False,
                         "strict_refit": True,
+                        # Every method reports at the configured confidence level.
+                        "alpha": float(config.get("unc_alpha", 0.05)),
                     }
                 )
                 try:
@@ -858,158 +821,39 @@ def run_batch(
                 # keep 3.9-compatible typing
                 n_boot: Optional[int] = None
 
-                from core import fit_api as _fit_api
+                # Refits use the file's own solver options and the window's
+                # baseline, and start from the start bootstrap_ci hands over.
+                refit_cfg = copy.deepcopy(config)
+                refit_cfg["solver_choice"] = refit_cfg["solver"] = boot_solver
+                if "solver_options" in config:
+                    _extra = dict(config.get(boot_solver, {}))
+                    _extra.update(dict(config.get("solver_options") or {}))
+                    refit_cfg[boot_solver] = _extra
 
-                def _refit_wrapper(
-                    theta_init,
-                    locked_mask,
-                    bounds,
-                    x,
-                    y,
-                    res=res,
-                    config=config,
-                ):
-                    peaks_in = copy.deepcopy(
-                        res.get("peaks_out") or res.get("peaks") or []
-                    )
-                    cfg = copy.deepcopy(config)
-                    fit_mask = np.ones_like(x, bool)
+                def _refit_wrapper(theta_init, locked_mask, bounds, x, y):
+                    """One refit. It counts only if the solver converged; an
+                    exception is a failed draw, recorded by bootstrap_ci."""
 
-                    # Inject jittered theta into a copy of peaks so run_fit_consistent uses it as p0
-                    peaks_start = copy.deepcopy(peaks_in)
-                    try:
-                        if peaks_start and 4 * len(peaks_start) == int(np.asarray(theta_init).size):
-                            t = np.asarray(theta_init, float).ravel()
-                            for i, pk in enumerate(peaks_start):
-                                j = 4 * i
-                                pk.center = float(t[j + 0])
-                                pk.height = float(t[j + 1])
-                                pk.fwhm = float(t[j + 2])
-                                pk.eta = float(t[j + 3])
-                    except Exception:
-                        # Fall back to original peaks_in if anything goes sideways
-                        peaks_start = peaks_in
-
-                    # Ensure the refit uses the requested bootstrap solver (both keys for safety)
-                    solver_choice_local = str(fit_ctx.get("unc_boot_solver", "")) or str(
-                        config.get("unc_boot_solver")
-                        or config.get("solver_choice")
-                        or "modern_vp"
-                    )
-                    cfg["solver_choice"] = solver_choice_local
-                    cfg["solver"] = solver_choice_local
-                    # Mirror generic solver_options into the active solver's cfg for refits
-                    if "solver_options" in config:
-                        _extra = dict(config.get(solver_choice_local, {}))
-                        _extra.update(dict(config.get("solver_options") or {}))
-                        cfg[solver_choice_local] = _extra
-                    if solver_choice_local.lower() in ("lmfit_vp", "lmfit-vp", "lmfit"):
-                        cfg["strict_refit"] = True
-                        cfg["relabel_by_center"] = True
-                    else:
-                        cfg.pop("strict_refit", None)
-                        cfg["relabel_by_center"] = True
-
-                    # Single call; consider it success only if theta is finite and sized correctly.
+                    t = np.asarray(theta_init, float).ravel()
+                    peaks_start = copy.deepcopy(peaks_obj)
+                    for i, pk in enumerate(peaks_start):
+                        pk.center, pk.height, pk.fwhm, pk.eta = (float(v) for v in t[4 * i : 4 * i + 4])
                     # The refit's restarts are seeded like the file's own fit, so a
                     # seeded batch gives the same bootstrap on every run.
-                    try:
-                        out = _fit_api.run_fit_consistent(
-                            x,
-                            y,
-                            peaks_start,
-                            cfg,
-                            baseline=res.get("baseline"),
-                            mode=res.get("mode", "add"),
-                            fit_mask=fit_mask,
-                            rng_seed=seed,
-                            theta_init=np.asarray(theta_init, float),
-                            locked_mask=locked_mask,
-                            bounds=bounds,
-                        )
-                    except TypeError:
-                        try:
-                            out = _fit_api.run_fit_consistent(
-                                x,
-                                y,
-                                peaks_start,
-                                cfg,
-                                baseline=res.get("baseline"),
-                                mode=res.get("mode", "add"),
-                                fit_mask=fit_mask,
-                                rng_seed=seed,
-                            )
-                        except TypeError:
-                            try:
-                                out = _fit_api.run_fit_consistent(x, y, peaks_start, cfg)
-                            except Exception:
-                                th_fallback = np.asarray(theta_init, float)
-                                return th_fallback, np.all(np.isfinite(th_fallback))
-                        except Exception:
-                            th_fallback = np.asarray(theta_init, float)
-                            return th_fallback, np.all(np.isfinite(th_fallback))
-                    except Exception:
-                        th_fallback = np.asarray(theta_init, float)
-                        return th_fallback, np.all(np.isfinite(th_fallback))
-
-                    # Normalize and validate output
-                    try:
-                        if isinstance(out, dict):
-                            theta_candidate = out.get("theta")
-                            if theta_candidate is None:
-                                for key in ("theta_out", "params", "theta_best"):
-                                    theta_candidate = out.get(key)
-                                    if theta_candidate is not None:
-                                        break
-                            if theta_candidate is None:
-                                theta_candidate = theta_init
-                            theta_out = np.asarray(theta_candidate, float).ravel()
-                            ok_flag = out.get("fit_ok")
-                            if ok_flag is None:
-                                ok_flag = out.get("ok")
-                            if ok_flag is None:
-                                ok_flag = out.get("success")
-                            if ok_flag is None:
-                                ok_flag = out.get("converged", True)
-                        else:
-                            theta_out = np.asarray(out, float).ravel()
-                            ok_flag = True
-                        theta_init_flat = np.asarray(theta_init, float).ravel()
-                        theta_out_flat = np.asarray(theta_out, float).ravel()
-                        if theta_out_flat.size >= theta_init_flat.size:
-                            theta_use = theta_out_flat[: theta_init_flat.size]
-                            size_ok = True
-                        else:
-                            theta_use = theta_init_flat
-                            size_ok = False
-                            try:
-                                logger.debug(
-                                    "bootstrap refit size mismatch: out=%d init=%d", theta_out_flat.size, theta_init_flat.size
-                                )
-                            except Exception:
-                                pass
-                        if size_ok:
-                            theta_use = np.where(
-                                np.isfinite(theta_use),
-                                theta_use,
-                                theta_init_flat,
-                            )
-                        ok = size_ok and np.all(np.isfinite(theta_use))
-                        if not ok:
-                            try:
-                                logger.debug(
-                                    "bootstrap refit bad theta: ok_flag=%r size_out=%d size_init=%d theta=%s",
-                                    ok_flag,
-                                    theta_out_flat.size,
-                                    theta_init_flat.size,
-                                    theta_out_flat,
-                                )
-                            except Exception:
-                                pass
-                        return theta_use, ok
-                    except Exception:
-                        th_fallback = np.asarray(theta_init, float)
-                        return th_fallback, np.all(np.isfinite(th_fallback))
+                    out = fit_api.run_fit_consistent(
+                        x,
+                        y,
+                        peaks_start,
+                        refit_cfg,
+                        base_fit,
+                        fit_mode,
+                        np.ones_like(x, bool),
+                        rng_seed=seed,
+                    )
+                    theta_out = np.asarray(out.get("theta"), float).ravel()
+                    if theta_out.size != t.size:
+                        return t, False
+                    return theta_out, bool(out.get("fit_ok")) and bool(np.all(np.isfinite(theta_out)))
 
                 fit_ctx.update({"refit": _refit_wrapper})
 
@@ -1217,8 +1061,8 @@ def run_batch(
                             jacobian=jac,
                             model_eval=predict_fit_fn,
                             fit_ctx=fit_ctx,
-                            x_all=x_all,
-                            y_all=y_all,
+                            x_all=x_fit,
+                            y_all=y_fit,
                             workers=(workers_eff if workers_eff > 0 else None),
                             seed=seed_val,
                             n_boot=(n_boot if n_boot is not None else 0),
@@ -1232,15 +1076,28 @@ def run_batch(
                     unc_norm.get("label") or unc_method_canon
                 )
                 unc_norm["label"] = method_lbl
-                unc_norm["rmse"] = rmse if math.isfinite(rmse) else 0.0
-                dof_raw = unc_norm.get("dof")
+                # Missing statistics stay missing (NaN), and the writers leave
+                # them blank: a NaN rmse is not 0, and dof <= 0 is not 1.
+                unc_norm["rmse"] = rmse
                 try:
-                    dof_val = float(dof_raw)
+                    dof_val = float(unc_norm.get("dof"))
                 except Exception:
                     dof_val = float("nan")
                 if not math.isfinite(dof_val):
-                    dof_val = float(res.get("dof", 1)) if isinstance(res, dict) else 1.0
-                unc_norm["dof"] = max(1, int(dof_val))
+                    try:
+                        dof_val = float(res.get("dof", float("nan")))
+                    except Exception:
+                        dof_val = float("nan")
+                unc_norm["dof"] = int(dof_val) if math.isfinite(dof_val) and dof_val > 0 else float("nan")
+                lm = res.get("locked_mask")
+                locks = (
+                    [
+                        dict(zip(("center", "height", "fwhm", "eta"), map(bool, lm[4 * i : 4 * i + 4])))
+                        for i in range(len(lm) // 4)
+                    ]
+                    if lm is not None
+                    else []
+                )
 
                 base_path = out_dir / stem
                 band = unc_norm.get("band") or unc_norm.get("prediction_band")
@@ -1257,7 +1114,6 @@ def run_batch(
                     solver_meta = res.get("solver_meta", {}) if isinstance(res, dict) else {}
                     baseline_meta = res.get("baseline_meta", {}) if isinstance(res, dict) else {}
                     perf_meta = res.get("perf_meta", {}) if isinstance(res, dict) else {}
-                    locks = res.get("locks", []) if isinstance(res, dict) else []
                     try:
                         data_io._write_unc_txt(txt_path, path, unc_norm, solver_meta, baseline_meta, perf_meta, locks)
                     except Exception:
@@ -1297,6 +1153,7 @@ def run_batch(
                         peaks=fitted,
                         method_label=method_lbl,
                         file_path=path,
+                        locks=locks,
                     )
 
                     data_io.write_uncertainty_csvs(
@@ -1311,27 +1168,28 @@ def run_batch(
                         band_csv = out_dir / f"{stem}_uncertainty_band.csv"
                         with band_csv.open("w", newline="", encoding="utf-8") as fh:
                             writer = csv.writer(fh, lineterminator="\n")
-                            ci_pct = 95
-                            try:
-                                alpha = float(
-                                    unc_norm.get(
-                                        "alpha",
-                                        unc_norm.get("diagnostics", {}).get("alpha", 0.05),
-                                    )
-                                )
-                                ci_pct = int(round(100 * (1.0 - alpha)))
-                            except Exception:
-                                pass
-                            writer.writerow(["x", f"y_lo{ci_pct}", f"y_hi{ci_pct}"])
+                            level = data_io.ci_level_text(unc_norm.get("alpha", 0.05))
+                            writer.writerow(["x", f"y_lo{level}", f"y_hi{level}"])
                             for xi, lo, hi in zip(xb, lob, hib):
                                 if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
                                     continue
                                 writer.writerow([float(xi), float(lo), float(hi)])
 
-                unc_rows.extend(list(data_io.iter_uncertainty_rows(path, unc_norm)))
+                file_rows = list(data_io.iter_uncertainty_rows(path, unc_norm))
+                unc_rows.extend(file_rows)
                 if log:
                     log(f"{Path(path).name}: uncertainty={method_lbl}")
                 entry["unc_status"] = "ok"
+                if any(r.get("flags") for r in file_rows):
+                    entry["flags"] = ";".join(f for f in (entry["flags"], "ci_at_bound") if f)
+                unc_diag = (
+                    unc_res.get("diagnostics") if isinstance(unc_res, dict) else getattr(unc_res, "diagnostics", None)
+                ) or {}
+                n_fail = int(unc_diag.get("n_fail") or 0)
+                if n_fail:
+                    entry["unc_message"] = (
+                        f"{n_fail} of {int(unc_diag.get('n_boot') or 0)} bootstrap refits failed and were left out"
+                    )
             except Exception as exc:
                 msg = str(exc)
                 err_msg = f"{Path(path).name}: uncertainty failed: {msg}"
