@@ -19,8 +19,9 @@ def test_long_csv_has_both_ci_and_quantiles(tmp_path):
         rows = list(csv.DictReader(fh))
     assert rows and {"p2_5", "p97_5", "ci_lo", "ci_hi"} <= rows[0].keys()
     r = rows[0]
-    expected_lo = 10.0 - data_io._Z * 2.0
-    expected_hi = 10.0 + data_io._Z * 2.0
+    z = 1.959963984540054  # the 97.5 % normal quantile, from alpha 0.05
+    expected_lo = 10.0 - z * 2.0
+    expected_hi = 10.0 + z * 2.0
     assert float(r["p2_5"]) == pytest.approx(expected_lo)
     assert float(r["p97_5"]) == pytest.approx(expected_hi)
     assert float(r["ci_lo"]) == pytest.approx(expected_lo)

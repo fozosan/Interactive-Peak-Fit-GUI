@@ -2,9 +2,12 @@ import csv, math, pathlib
 from core import data_io
 
 
-def _all_finite(row, keys):
+def _finite_or_blank(row, keys):
+    """Every cell is a finite number or blank: never "nan", never a made-up 0.0."""
     for k in keys:
         v = row.get(k, "")
+        if v == "":
+            continue
         try:
             f = float(v)
         except Exception:
@@ -15,7 +18,7 @@ def _all_finite(row, keys):
 
 
 def test_uncertainty_csvs_no_nan(tmp_path):
-    # minimal normalized result with non-finite inputs that must be sanitized
+    # minimal normalized result with non-finite inputs: they are written blank
     unc_norm = {
         "label": "Asymptotic",
         "method": "Asymptotic",
@@ -28,36 +31,27 @@ def test_uncertainty_csvs_no_nan(tmp_path):
         ],
     }
     base = tmp_path / "s"
-    long_csv, wide_csv = data_io.write_uncertainty_csvs(base, "file.csv", unc_norm, write_wide=True)
+    long_csv, wide_csv = data_io.write_uncertainty_csvs(
+        base, "file.csv", data_io.normalize_unc_result(unc_norm), write_wide=True
+    )
 
-    # long CSV: check all required numeric fields are finite
     with open(long_csv, newline="", encoding="utf-8") as fh:
-        rdr = csv.DictReader(fh)
-        rows = list(rdr)
+        rows = list(csv.DictReader(fh))
     assert rows, "long CSV empty"
     for r in rows:
-        assert _all_finite(r, ["value", "stderr", "p2_5", "p97_5", "rmse", "dof"])
+        assert _finite_or_blank(r, ["value", "stderr", "p2_5", "p97_5", "rmse", "dof"])
+        # a NaN rmse and dof 0 are missing, not 0.0 and 1
+        assert r["rmse"] == "" and r["dof"] == ""
+    by = {r["param"]: r for r in rows}
+    assert by["center"]["value"] == by["center"]["stderr"] == by["center"]["p2_5"] == ""
+    assert float(by["height"]["value"]) == 2.0 and by["height"]["stderr"] == ""
+    # a zero standard error is a value: the interval collapses onto the estimate
+    assert float(by["fwhm"]["stderr"]) == 0.0 and float(by["fwhm"]["p2_5"]) == 0.5
 
-    # wide CSV: check *_ci_lo/_ci_hi and values are finite where present
     if wide_csv:
         with open(wide_csv, newline="", encoding="utf-8") as fh:
             rdr = csv.DictReader(fh)
             rows = list(rdr)
         assert rows, "wide CSV empty"
-        num_cols = [
-            c
-            for c in rdr.fieldnames
-            if c
-            and (c.endswith("_ci_lo") or c.endswith("_ci_hi") or c in ("center", "height", "fwhm", "eta"))
-        ]
         for r in rows:
-            for c in num_cols:
-                if r.get(c, "") == "":
-                    # allow eta if not present in stats
-                    continue
-                try:
-                    f = float(r[c])
-                except Exception:
-                    assert False, f"non-numeric in wide CSV: {c}={r[c]!r}"
-                assert math.isfinite(f), f"non-finite in wide CSV: {c}={r[c]!r}"
-
+            assert _finite_or_blank(r, rdr.fieldnames[3:])

@@ -57,6 +57,17 @@ def _make_predict_full_generic(
     return predict_full
 
 
+def _params_on_bounds(theta, lo, hi, locked, names) -> List[str]:
+    """Names of the free parameters that sit on a bound of the fit."""
+
+    theta = np.asarray(theta, float)
+    lo = np.asarray(lo, float)
+    hi = np.asarray(hi, float)
+    on_lo = theta <= lo + 1e-6 * np.maximum(1.0, np.abs(lo))
+    on_hi = theta >= hi - 1e-6 * np.maximum(1.0, np.abs(hi))
+    return [n for n, hit, fixed in zip(names, on_lo | on_hi, locked) if hit and not fixed]
+
+
 def _vp_design_columns(
     x: np.ndarray,
     c_list: List[float],
@@ -391,19 +402,31 @@ def run_fit_consistent(
     locked: list[bool] = []
     for i, pk in enumerate(peaks_out):
         names.extend([f"center{i+1}", f"height{i+1}", f"fwhm{i+1}", f"eta{i+1}"])
-        locked.extend([pk.lock_center, False, pk.lock_width, False])
+        # No solver fits eta: it stays at its start value, so it is locked too.
+        locked.extend([pk.lock_center, False, pk.lock_width, True])
+    locked_mask = np.array(locked, bool)
+    n_free = int(np.count_nonzero(~locked_mask))
+    # A free parameter on its bound is a flag, not a failure: the fit is kept.
+    bound_hit = _params_on_bounds(theta, lo, hi, locked_mask, names)
+    result.update(
+        {
+            "param_names": names,
+            "locked_mask": locked_mask,
+            "flags": ["bound_hit"] if bound_hit else [],
+            "bound_hit": bound_hit,
+        }
+    )
 
     if return_jacobian:
         r0 = resid_fn(theta)
         J = jacobian_fd(resid_fn, theta)
-        dof = max(r0.size - theta.size, 1)
+        # Degrees of freedom count the fitted parameters only; none are left at <= 0.
+        dof = r0.size - n_free if r0.size > n_free else float("nan")
 
         result.update(
             {
                 "jacobian": J,
                 "residual": r0,
-                "param_names": names,
-                "locked_mask": np.array(locked, bool),
                 "bounds": (lo, hi),
                 "mask_fit": mask,
                 "rss": float(np.dot(r0, r0)),

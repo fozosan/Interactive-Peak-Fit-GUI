@@ -171,12 +171,16 @@ def route_uncertainty(
             ymodel = lambda th: residual_fn(th) * 0.0  # dummy; band will be ignored
         else:
             ymodel = model_eval
+        # The fit's lock mask says which parameters were estimated (eta never
+        # is), and its bounds limit the intervals, as in the other methods.
         return unc.asymptotic_ci(
             theta_hat=theta_hat,
             residual=residual_fn,
             jacobian=jacobian,
             ymodel_fn=ymodel,
             alpha=alpha,
+            locked_mask=ctx.get("locked_mask"),
+            bounds=ctx.get("bounds"),
             xgrid=ctx.get("x_all"),
         )
 

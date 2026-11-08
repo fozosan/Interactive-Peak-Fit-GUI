@@ -488,13 +488,29 @@ def _param_df(theta: np.ndarray, std: np.ndarray, lo: np.ndarray, hi: np.ndarray
 def _spawn_rng_streams(seed: Optional[int], n: int):
     """
     Deterministic per-draw RNGs independent of worker count/scheduling.
+
+    Every stream is a seeded ``np.random.default_rng``. Without a seed the
+    streams start from seed 0, so the same data always give the same bootstrap.
     """
-    if seed is None:
-        ss = np.random.SeedSequence()
-    else:
-        ss = np.random.SeedSequence(int(seed))
-    children = ss.spawn(int(n))
-    return [np.random.Generator(np.random.PCG64(s)) for s in children]
+    children = np.random.SeedSequence(0 if seed is None else int(seed)).spawn(int(n))
+    return [np.random.default_rng(s) for s in children]
+
+
+def _locked_vector(mask, P: int) -> np.ndarray:
+    """A lock mask as P booleans: per parameter, or per peak (all four locked)."""
+    if mask is None:
+        return np.zeros(P, bool)
+    lm = np.asarray(mask, bool).ravel()
+    if lm.size == P:
+        return lm
+    if P % 4 == 0 and lm.size == P // 4:
+        return np.repeat(lm, 4)
+    return np.zeros(P, bool)
+
+
+def _bounds_diag(lo: np.ndarray, hi: np.ndarray) -> List[List[float]]:
+    """Parameter bounds as stored in diagnostics, for the writers' CI flags."""
+    return [np.asarray(lo, float).tolist(), np.asarray(hi, float).tolist()]
 
 
 # ---------------------------------------------------------------------------
@@ -679,11 +695,13 @@ def asymptotic_ci(
 
     m = int(J.shape[0])
     n_free = int(np.sum(free_mask))
-    dof = max(m - n_free, 1)
+    dof = m - n_free
 
     Jf = J[:, free_mask] if n_free > 0 else J[:, :0]
     rss = float(np.dot(r, r))
-    s2 = rss / dof
+    # With no residual degrees of freedom there is no noise estimate: every
+    # standard error is NaN, which the writers leave blank.
+    s2 = rss / dof if dof > 0 else float("nan")
 
     if n_free > 0:
         JTJ = Jf.T @ Jf
@@ -706,7 +724,8 @@ def asymptotic_ci(
     if n_free > 0:
         cov[np.ix_(free_mask, free_mask)] = cov_free
 
-    std = np.zeros(P)
+    # A locked parameter is not estimated, so it has no standard error.
+    std = np.full(P, np.nan)
     if n_free > 0:
         std[free_mask] = np.sqrt(np.maximum(np.diag(cov_free), 0.0))
     z = _z_value(alpha)
@@ -766,7 +785,13 @@ def asymptotic_ci(
         band = None
     else:
         band = (x_arr, band_lo, band_hi)
-    diag: Dict[str, object] = {"alpha": alpha, "param_order": names}
+    diag: Dict[str, object] = {
+        "alpha": alpha,
+        "param_order": names,
+        "dof": dof if dof > 0 else float("nan"),
+    }
+    if bounds is not None:
+        diag["param_bounds"] = _bounds_diag(lo, hi)
     n_free = int(np.sum(free_mask))
     # Preferred key for downstream consumers; keep legacy alias for compatibility.
     diag.setdefault("n_free_params", n_free)
@@ -1271,6 +1296,15 @@ def bootstrap_ci(
 
         attempt_errors: List[str] = []
 
+        def _judged(res_fit):
+            # A call that gives no finite theta did not take these arguments:
+            # the next call form is tried. One that does is the refit, and it
+            # counts only if its solver converged; if not, the draw fails.
+            th_fit = np.asarray(res_fit.get("theta", theta_arr), float)
+            if not np.all(np.isfinite(th_fit)):
+                return None
+            return th_fit, bool(res_fit.get("fit_ok", False))
+
         fit_mask_full = np.ones_like(x, dtype=bool)
         if _sig:
             params = set(_sig.parameters.keys())
@@ -1315,10 +1349,9 @@ def bootstrap_ci(
             except Exception as exc:
                 attempt_errors.append(f"{type(exc).__name__}: {exc}")
                 res_main = None
-            if res_main is not None:
-                th_main = np.asarray(res_main.get("theta", theta_arr), float)
-                if np.all(np.isfinite(th_main)):
-                    return th_main, True
+            judged = _judged(res_main) if res_main is not None else None
+            if judged is not None:
+                return judged
 
             call_with_theta = dict(call_base)
             call_with_theta["theta_init"] = theta_arr
@@ -1329,10 +1362,9 @@ def bootstrap_ci(
             except Exception as exc:
                 attempt_errors.append(f"{type(exc).__name__}: {exc}")
                 res_theta = None
-            if res_theta is not None:
-                th_theta = np.asarray(res_theta.get("theta", theta_arr), float)
-                if np.all(np.isfinite(th_theta)):
-                    return th_theta, True
+            judged = _judged(res_theta) if res_theta is not None else None
+            if judged is not None:
+                return judged
 
         # LEGACY fallback: (x, y, cfg_with_peaks_dicts, ...)
         from .data_io import peaks_to_dicts
@@ -1359,10 +1391,9 @@ def bootstrap_ci(
             except Exception as exc:
                 attempt_errors.append(f"{type(exc).__name__}: {exc}")
                 res_main = None
-            if res_main is not None:
-                th_main = np.asarray(res_main.get("theta", theta_arr), float)
-                if np.all(np.isfinite(th_main)):
-                    return th_main, True
+            judged = _judged(res_main) if res_main is not None else None
+            if judged is not None:
+                return judged
 
         if param_names is None or "theta_init" in param_names or allows_var_kw:
             kwargs_final = {
@@ -1384,10 +1415,9 @@ def bootstrap_ci(
             except Exception as exc:
                 attempt_errors.append(f"{type(exc).__name__}: {exc}")
             else:
-                th = np.asarray(res.get("theta", theta_arr), float)
-                ok = np.all(np.isfinite(th))
-                if ok:
-                    return th, True
+                judged = _judged(res)
+                if judged is not None:
+                    return judged
 
         if attempt_errors:
             raise RuntimeError(attempt_errors[-1])
@@ -1612,10 +1642,10 @@ def bootstrap_ci(
 
             out = out_local
             if isinstance(out, dict):
+                # Only a refit that says it converged counts, strict or not.
                 th_dict = out.get("theta", theta_init)
                 th_new = _apply_locks_bounds(th_dict)
-                ok_flag = bool(out.get("fit_ok", True)) and np.all(np.isfinite(th_new))
-                return th_new, ok_flag or (not strict_refit and np.all(np.isfinite(th_new)))
+                return th_new, bool(out.get("fit_ok", False)) and bool(np.all(np.isfinite(th_new)))
             if isinstance(out, tuple) and len(out) == 2:
                 th_new, ok = out
                 th_new = _apply_locks_bounds(th_new)
@@ -1909,13 +1939,16 @@ def bootstrap_ci(
         raise err
 
     T = np.vstack(T_list)
-    mean = T.mean(axis=0)
-    sd = T.std(axis=0, ddof=1)
+    # The estimate is the fit, and the standard error the spread of the draws
+    # about it. A locked parameter is not estimated: no spread, no interval.
+    sd = np.sqrt(np.mean((T - theta) ** 2, axis=0))
     qlo = np.quantile(T, alpha/2, axis=0)
     qhi = np.quantile(T, 1 - alpha/2, axis=0)
+    fixed = _locked_vector(locked_mask, P)
+    sd[fixed] = qlo[fixed] = qhi[fixed] = np.nan
 
     names = param_names or [f"p{i}" for i in range(P)]
-    stats = {names[i]: {"est": float(mean[i]), "sd": float(sd[i]), "p2.5": float(qlo[i]), "p97.5": float(qhi[i])}
+    stats = {names[i]: {"est": float(theta[i]), "sd": float(sd[i]), "p2.5": float(qlo[i]), "p97.5": float(qhi[i])}
              for i in range(P)}
 
     # % of successful thetas hitting bounds (diagnose degeneracy)
@@ -2141,6 +2174,8 @@ def bootstrap_ci(
     diag["boot_resampling"] = boot_resampling
     diag["boot_wild_weights"] = boot_wild_weights if boot_resampling == "wild" else None
     diag["boot_studentize"] = bool(boot_studentize)
+    if bounds is not None:
+        diag["param_bounds"] = _bounds_diag(lo, hi)
     # Document representation alignment for transparency
     diag["prediction_includes_baseline"] = bool(base_vec is not None and y_hat_source == "predict_full")
     # New: center clamp diagnostics
@@ -2433,7 +2468,10 @@ def bayesian_ci(
         bounds = fit_ctx.get("bounds")
     if locked_mask is None and fit_ctx and "locked_mask" in fit_ctx:
         locked_mask = fit_ctx.get("locked_mask")
-    locked_eff = locked_mask.copy() if locked_mask is not None else np.zeros(theta_hat.size, bool)
+    # Locked parameters (eta, which no solver fits, and any user lock) are not
+    # sampled, and get no spread or interval in the statistics below.
+    fixed = _locked_vector(locked_mask, theta_hat.size)
+    locked_eff = fixed.copy()
     tie_groups: list[tuple[int, list[int]]] = []
     if share_fwhm:
         idx = [4 * i + 2 for i in range(theta_hat.size // 4)]
@@ -2696,6 +2734,12 @@ def bayesian_ci(
             return float(np.nanstd(a, ddof=0))
         return float(np.nanstd(a, ddof=1))
 
+    def _blank_fixed(st: Dict[str, Any]) -> Dict[str, Any]:
+        for key in ("sd", "p2.5", "p97.5", "p2_5", "p97_5", "ci_lo_mcse", "ci_hi_mcse"):
+            if key in st:
+                st[key] = float("nan")
+        return st
+
     P = int(T_full.shape[1])
     n_pk = P // 4 if P >= 4 else 0
 
@@ -2722,6 +2766,8 @@ def bayesian_ci(
                 sds.append(nan)
                 lo2.append(nan)
                 hi97.append(nan)
+            if fixed[4 * i + offset]:
+                sds[-1] = lo2[-1] = hi97[-1] = float("nan")
         return {
             "est": vals,
             "sd": sds,
@@ -2803,6 +2849,8 @@ def bayesian_ci(
         hi_mcse = _mcse_quantile(draws_flat, alpha_hi)
         stats_flat["ci_lo_mcse"] = float(lo_mcse)
         stats_flat["ci_hi_mcse"] = float(hi_mcse)
+        if fixed[idx]:
+            _blank_fixed(stats_flat)
         param_stats[default_names[idx]] = stats_flat
         if idx < len(custom_names):
             key = str(custom_names[idx])
@@ -2950,6 +2998,9 @@ def bayesian_ci(
                     "fwhm": _one_param_stats(_safe_col(i_fwhm)),
                     "eta": _one_param_stats(_safe_col(i_eta)),
                 }
+                for _k, _col in (("center", i_center), ("height", i_height), ("fwhm", i_fwhm), ("eta", i_eta)):
+                    if 0 <= _col < fixed.size and fixed[_col]:
+                        _blank_fixed(row[_k])
                 # If a field ended with NaN, backfill from vector blocks (same index) when present.
                 for _k in ("center", "height", "fwhm", "eta"):
                     blk = base_param_stats.get(_k) if isinstance(base_param_stats, dict) else None
@@ -3008,6 +3059,8 @@ def bayesian_ci(
                     lo_list: List[float] = []
                     hi_list: List[float] = []
                     for i in range(int(n_pk)):
+                        if fixed[4 * i + offset]:
+                            continue
                         draws_i = T_full[:, 4 * i + offset]
                         lo_list.append(float(_mcse_quantile(draws_i, alpha_lo)))
                         hi_list.append(float(_mcse_quantile(draws_i, alpha_hi)))
@@ -3053,8 +3106,11 @@ def bayesian_ci(
         "band_gated": False,
         "band_forced": False,
         "diagnostics_enabled": bool(diagnostics_enabled),
+        "alpha": float(alpha),
         # Fill band worker diagnostics after band logic for consistency.
     })
+    if bounds is not None:
+        diag["param_bounds"] = _bounds_diag(lo, hi)
     if ci_mcse_diag_for_log:
         diag["ci_mcse"] = ci_mcse_diag_for_log
     # Record backend used for the Bayesian path too.

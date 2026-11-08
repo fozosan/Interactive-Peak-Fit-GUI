@@ -36,10 +36,13 @@ def test_bootstrap_basic(two_peak_data, rng, monkeypatch):
 
     res1 = uncertainty.bootstrap_ci(**args)
     assert res1.band is not None
-    assert np.all(np.isfinite(res1["param_std"]))
-    assert np.all(res1["param_std"] >= 0)
-    assert np.any(res1["param_std"] > 0)
+    # The fit locks eta, which no solver fits: it has no standard error.
+    free = ~np.asarray(fit["locked_mask"], bool)
+    assert np.all(np.isfinite(res1["param_std"][free]))
+    assert np.all(np.isnan(res1["param_std"][~free]))
+    assert np.all(res1["param_std"][free] >= 0)
+    assert np.any(res1["param_std"][free] > 0)
 
     res2 = uncertainty.bootstrap_ci(**args)
     assert np.allclose(res1["param_mean"], res2["param_mean"])
-    assert np.allclose(res1["param_std"], res2["param_std"])
+    assert np.allclose(res1["param_std"], res2["param_std"], equal_nan=True)
