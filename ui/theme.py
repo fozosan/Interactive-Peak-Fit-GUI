@@ -66,6 +66,22 @@ def apply_theme(root) -> Tuple[bool, str]:
     return False, "default (Tkinter)"
 
 
+def paint_icon(image, color) -> None:
+    """
+    Paint every opaque pixel of a one-colour icon in ``color``.
+
+    Pass the theme's button text colour, so the icon reads like the button
+    labels on a dark theme and a light one alike (black on the default theme).
+    """
+    color = str(color or "")
+    if not color:
+        return
+    for y in range(image.height()):
+        for x in range(image.width()):
+            if not image.transparency_get(x, y):
+                image.put(color, (x, y))
+
+
 def log_theme_status(theme_applied: bool, theme_name: str) -> None:
     """
     Log the theme application status to stdout.

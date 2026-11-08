@@ -247,7 +247,7 @@ import traceback
 from scipy.signal import find_peaks
 
 from core import signals
-from ui.theme import apply_theme, log_theme_status
+from ui.theme import apply_theme, log_theme_status, paint_icon
 # --- Canonical uncertainty label: delegate to data_io when available ---
 try:
     _canonical_unc_label = _dio.canonical_unc_label  # type: ignore[attr-defined]
@@ -1635,6 +1635,8 @@ class PeakFitApp:
         fit_seg.pack(side=tk.LEFT)
         try:
             self.step_icon = tk.PhotoImage(data=STEP_ICON_B64)
+            # Draw the icon in the button text colour, so it also shows on a dark theme
+            paint_icon(self.step_icon, self._style.lookup("TButton", "foreground"))
             self.step_btn = ttk.Button(fit_seg, image=self.step_icon, command=self.step_once)
         except Exception:
             self.step_btn = ttk.Button(fit_seg, text="Step", command=self.step_once)
