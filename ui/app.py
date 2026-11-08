@@ -1503,6 +1503,7 @@ class PeakFitApp:
         self._unc_running = False
         self._last_unc_log = None
 
+        self._debug_snapshot("init")
 
     # --- Debug API ----------------------------------------------------------
     def _is_debug(self) -> bool:
@@ -1637,7 +1638,7 @@ class PeakFitApp:
             self.step_btn = ttk.Button(fit_seg, image=self.step_icon, command=self.step_once)
         except Exception:
             self.step_btn = ttk.Button(fit_seg, text="Step", command=self.step_once)
-            self.step_btn.pack(side=tk.LEFT, padx=2)
+        self.step_btn.pack(side=tk.LEFT, padx=2)
         self.fit_btn = ttk.Button(fit_seg, text="Fit", command=self.fit)
         self.fit_btn.pack(side=tk.LEFT, padx=2)
         # Apply bold style for Fit button (configured via configure_ttk_styles in main())
