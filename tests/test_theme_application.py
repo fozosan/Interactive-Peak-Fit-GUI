@@ -11,6 +11,7 @@ Tests ensure that:
 
 import sys
 import tkinter as tk
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 import pytest
 
@@ -152,7 +153,8 @@ class TestRequirementsUpdated:
     
     def test_requirements_file_updated(self):
         """Verify requirements.txt includes theme packages as optional."""
-        with open("requirements.txt", "r") as f:
+        requirements = Path(__file__).resolve().parents[1] / "requirements.txt"
+        with open(requirements, "r") as f:
             content = f.read()
             # Check that theme packages are mentioned
             assert "sv-ttk" in content or "ttkthemes" in content
@@ -186,6 +188,41 @@ class TestThemeNonFatal:
             log_theme_status(False, "default")
         except Exception as e:
             pytest.fail(f"log_theme_status raised unexpected exception: {e}")
+
+
+class TestThemeTakesEffect:
+    """The theme apply_theme() reports is the one widgets get."""
+
+    def test_classic_widgets_built_after_apply_theme_are_dark(self):
+        """sv-ttk recolours classic Tk widgets on <<ThemeChanged>>, which Tk sends when idle.
+
+        main() builds the app right after apply_theme(), and matplotlib picks black or
+        light toolbar icons from the button background at that moment. If the palette
+        lands later, the toolbar keeps black icons on a dark background.
+        """
+        pytest.importorskip("sv_ttk")
+        from ui.theme import apply_theme
+        root = tk.Tk()
+        try:
+            applied, name = apply_theme(root)
+            assert applied and "sv-ttk" in name
+            button = tk.Button(root)
+            assert max(root.winfo_rgb(button.cget("background"))) < 65535 / 2
+        finally:
+            root.destroy()
+
+    def test_ttkthemes_arc_applies_when_sv_ttk_is_missing(self):
+        pytest.importorskip("ttkthemes")
+        from tkinter import ttk
+        from ui.theme import apply_theme
+        root = tk.Tk()
+        try:
+            with patch.dict(sys.modules, {"sv_ttk": None}):
+                result = apply_theme(root)
+            assert result == (True, "ttkthemes (Arc)")
+            assert ttk.Style(root).theme_use() == "arc"
+        finally:
+            root.destroy()
 
 
 class TestThemeIntegrationWithApp:

@@ -35,22 +35,27 @@ def apply_theme(root) -> Tuple[bool, str]:
     # Priority 1: Try sv-ttk (Microsoft Fluent Design)
     try:
         import sv_ttk
-        sv_ttk.set_theme("dark")
+        sv_ttk.set_theme("dark", root)
+        # sv-ttk recolours classic Tk widgets on <<ThemeChanged>>, which Tk sends
+        # when idle and drops for a root that has no window yet. Deliver it now, so
+        # the widgets the app builds next start with the dark palette: the
+        # matplotlib toolbar picks black or light icons from its button background
+        # when it is created.
+        root.winfo_id()  # creates the root's window without mapping it
+        root.event_generate("<<ThemeChanged>>")
         return True, "sv-ttk (Fluent Dark)"
     except ImportError:
         pass  # sv-ttk not installed, try next
     except Exception as e:
         print(f"[WARNING] Failed to apply sv-ttk theme: {e}", file=sys.stderr)
-    
+
     # Priority 2: Try ttkthemes with Arc theme
     try:
-        from ttkthemes import ThemedTk
-        # If we're here, sv-ttk failed, so we need to apply Arc to the existing root
-        # Note: ThemedTk wraps root creation, so we use a different approach
-        # We'll set the theme style on the existing root via ttk.Style
-        from tkinter import ttk
-        style = ttk.Style()
-        style.theme_use("arc")
+        from ttkthemes import ThemedStyle
+        # If we're here, sv-ttk failed, so we need to apply Arc to the existing root.
+        # ThemedStyle loads the ttkthemes packages into this root's interpreter;
+        # a plain ttk.Style cannot find "arc".
+        ThemedStyle(root).set_theme("arc")
         return True, "ttkthemes (Arc)"
     except ImportError:
         pass  # ttkthemes not installed
