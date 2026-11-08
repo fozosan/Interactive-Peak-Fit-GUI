@@ -1822,7 +1822,9 @@ def bootstrap_ci(
     jitter_reason_last = None
     jitter_rms_last = 0.0
 
-    if draw_workers > 0:
+    # One worker runs the draws in this thread: a one-thread pool is sequential
+    # anyway, and costs a task per draw.
+    if draw_workers > 1:
         with ThreadPoolExecutor(max_workers=draw_workers) as ex:
             futs = {ex.submit(_one_draw, int(b)): int(b) for b in range(int(n_boot))}
             done_cnt = 0
@@ -2547,7 +2549,9 @@ def bayesian_ci(
         w = max(0, min(int(val_workers or 0), os.cpu_count() or 1))
     except Exception:
         w = 0
-    pool = ThreadPoolExecutor(max_workers=w) if w > 0 else None
+    # As for bootstrap draws: one worker means no pool, so emcee evaluates the
+    # walkers in this thread instead of one pool task per walker and step.
+    pool = ThreadPoolExecutor(max_workers=w) if w > 1 else None
     sampler = None
     limit = 1 if strategy == "outer" else (blas_threads if blas_threads > 0 else None)
     performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)

@@ -47,7 +47,7 @@ def test_batch_single_parity(mode, loss, weight, restarts, tmp_path):
 
     fpath = tmp_path / "spec.csv"
     np.savetxt(fpath, np.column_stack([x, y_raw]), delimiter=",")
-    seed = abs(hash(str(fpath.resolve()))) & 0xFFFFFFFF
+    seed = runner._file_seed(fpath, None)  # the seed the batch derives for this file
 
     res_single = fit_api.run_fit_consistent(
         x,

@@ -16,6 +16,7 @@ from typing import Optional
 import csv
 import os
 import copy
+import zlib
 import numpy as np
 import math
 import logging
@@ -153,6 +154,16 @@ def _tp_limits_ctx_for_config(config: dict):
         except Exception:
             return nullcontext()
     return nullcontext()
+
+
+def _file_seed(path: str, base_seed: Optional[int]) -> int:
+    """Seed for one file's fit restarts: the same on every run and machine.
+
+    CRC-32 of the file name, started from the base seed. Python's ``hash()``,
+    used before, is salted per process, so the seeds changed on every run.
+    """
+
+    return zlib.crc32(Path(path).name.encode("utf-8"), int(base_seed or 0) & 0xFFFFFFFF)
 
 
 def _norm_jitter(v, default=0.02):
@@ -479,11 +490,7 @@ def run_batch(
         entry["n_peaks"] = len(template)
 
         peaks_in = copy.deepcopy(template)
-        seed = (
-            abs(hash(str(Path(path).resolve()))) & 0xFFFFFFFF
-            if config.get("perf_seed_all", False)
-            else None
-        )
+        seed = _file_seed(path, perf_seed) if perf_seed_all else None
         res = fit_api.run_fit_consistent(
             x,
             y,
@@ -903,7 +910,9 @@ def run_batch(
                         cfg.pop("strict_refit", None)
                         cfg["relabel_by_center"] = True
 
-                    # Single call; consider it success only if theta is finite and sized correctly
+                    # Single call; consider it success only if theta is finite and sized correctly.
+                    # The refit's restarts are seeded like the file's own fit, so a
+                    # seeded batch gives the same bootstrap on every run.
                     try:
                         out = _fit_api.run_fit_consistent(
                             x,
@@ -913,6 +922,7 @@ def run_batch(
                             baseline=res.get("baseline"),
                             mode=res.get("mode", "add"),
                             fit_mask=fit_mask,
+                            rng_seed=seed,
                             theta_init=np.asarray(theta_init, float),
                             locked_mask=locked_mask,
                             bounds=bounds,
@@ -927,6 +937,7 @@ def run_batch(
                                 baseline=res.get("baseline"),
                                 mode=res.get("mode", "add"),
                                 fit_mask=fit_mask,
+                                rng_seed=seed,
                             )
                         except TypeError:
                             try:

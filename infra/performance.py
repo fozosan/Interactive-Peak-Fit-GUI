@@ -13,7 +13,7 @@ summation order deterministic by stacking components and using ``np.sum``.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import math
 import os
@@ -39,9 +39,8 @@ except Exception:  # pragma: no cover - cupy not available
     _CUPY_OK = False
 
 try:  # pragma: no cover - optional import
-    from threadpoolctl import ThreadpoolController, threadpool_limits
+    from threadpoolctl import threadpool_limits
 except Exception:  # pragma: no cover - threadpoolctl not available
-    ThreadpoolController = None  # type: ignore
     threadpool_limits = None  # type: ignore
 
 
@@ -174,7 +173,7 @@ def set_max_workers(n: int) -> None:
 
 
 def set_unc_workers(n: int) -> None:
-    """Set uncertainty worker cap (0 ⇒ auto)."""
+    """Set uncertainty worker cap (0 ⇒ auto, which runs sequentially)."""
 
     global _UNC_WORKERS
     _UNC_WORKERS = max(0, int(n))
@@ -226,66 +225,20 @@ def apply_global_seed(seed: Optional[int], enable: bool) -> None:
             pass
 
 
-@contextmanager
 def blas_single_thread_ctx():
     """Limit BLAS/OpenMP libraries to a single thread within the context."""
 
-    env_keys = ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")
-    prev_env = {k: os.environ.get(k) for k in env_keys}
-    controller = None
-    blas_cm = None
-    try:
-        if ThreadpoolController is not None:  # pragma: no branch - optional
-            try:
-                controller = ThreadpoolController()
-                controller.limit(limits=1)
-            except Exception:
-                controller = None
-        else:
-            note_tpctl_absence_once()
-        if threadpool_limits is not None:
-            try:
-                blas_cm = threadpool_limits(limits=1, user_api="blas")
-            except Exception:
-                blas_cm = None
-        else:
-            note_tpctl_absence_once()
-        for key in env_keys:
-            os.environ[key] = "1"
-        if blas_cm is not None:
-            try:
-                with blas_cm:
-                    openmp_cm = None
-                    if threadpool_limits is not None:
-                        try:
-                            openmp_cm = threadpool_limits(limits=1, user_api="openmp")
-                        except Exception:
-                            openmp_cm = None
-                    if openmp_cm is not None:
-                        try:
-                            with openmp_cm:
-                                yield
-                        except Exception:
-                            yield
-                    else:
-                        yield
-            except Exception:
-                yield
-        else:
-            yield
-    finally:
-        for key, value in prev_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+    return blas_limit_ctx(1)
 
 
 @contextmanager
 def blas_limit_ctx(threads: Optional[int]):
     """Limit BLAS/OpenMP threadpools within the scope.
 
-    None or <=0 ⇒ no clamp (leave libraries as-is).
+    None or <=0 ⇒ no clamp (leave libraries as-is). On exit the pools return
+    to their previous sizes, and the thread env vars, which are also set for
+    the scope, to their previous values. An exception raised inside the scope
+    propagates unchanged.
     """
 
     try:
@@ -297,57 +250,28 @@ def blas_limit_ctx(threads: Optional[int]):
         yield
         return
 
+    limiter = nullcontext()
+    if threadpool_limits is None:
+        note_tpctl_absence_once()
+    else:
+        try:
+            limiter = threadpool_limits(limits=t)
+        except Exception:
+            pass
+
     env_keys = ("MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")
-    prev_env = {k: os.environ.get(k) for k in env_keys}
-    controller = None
-    blas_cm = None
-    try:
-        if ThreadpoolController is not None:  # pragma: no branch - optional
-            try:
-                controller = ThreadpoolController()
-                controller.limit(limits=threads)
-            except Exception:
-                controller = None
-        else:
-            note_tpctl_absence_once()
-        if threadpool_limits is not None:
-            try:
-                blas_cm = threadpool_limits(limits=threads, user_api="blas")
-            except Exception:
-                blas_cm = None
-        else:
-            note_tpctl_absence_once()
-        for key in env_keys:
-            os.environ[key] = str(threads)
-        if blas_cm is not None:
-            try:
-                with blas_cm:
-                    openmp_cm = None
-                    if threadpool_limits is not None:
-                        try:
-                            openmp_cm = threadpool_limits(
-                                limits=threads, user_api="openmp"
-                            )
-                        except Exception:
-                            openmp_cm = None
-                    if openmp_cm is not None:
-                        try:
-                            with openmp_cm:
-                                yield
-                        except Exception:
-                            yield
-                    else:
-                        yield
-            except Exception:
-                yield
-        else:
+    with limiter:
+        prev_env = {k: os.environ.get(k) for k in env_keys}
+        try:
+            for key in env_keys:
+                os.environ[key] = str(t)
             yield
-    finally:
-        for key, value in prev_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        finally:
+            for key, value in prev_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 @dataclass(frozen=True)
@@ -361,7 +285,10 @@ class ParallelConfig:
 def get_parallel_config() -> ParallelConfig:
     return ParallelConfig(
         fit_workers=_resolve_workers(_MAX_WORKERS),
-        unc_workers=_resolve_workers(_UNC_WORKERS),
+        # Uncertainty "auto" (0) is one worker, i.e. sequential. The draws hold
+        # the GIL, so thread pools never sped them up, and one thread per CPU
+        # was the slowest setting measured.
+        unc_workers=max(1, _UNC_WORKERS),
         seed_all=_SEED_ALL,
         seed_value=_SEED,
     )
