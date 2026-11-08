@@ -115,6 +115,44 @@ def run_fit_consistent(
     if mask.shape != x.shape:
         raise ValueError("fit_mask shape mismatch")
 
+    # Refuse fits the data cannot support before any solver runs. With no peaks,
+    # Modern VP hands scipy.optimize.nnls a matrix with no columns and the
+    # interpreter aborts. With no more points than free parameters, a solver
+    # still reports success, though no degree of freedom is left to judge the
+    # fit. No solver fits eta, so each peak has a height plus its centre and
+    # width unless they are locked.
+    seeds = list(peaks_in or [])
+    n_points = int(np.count_nonzero(mask))
+    n_free = sum(1 + (not pk.lock_center) + (not pk.lock_width) for pk in seeds)
+    skip_reason = None
+    if not seeds:
+        skip_reason, message = "no_peaks", "no peaks to fit"
+    elif n_points <= n_free:
+        skip_reason = "too_few_points"
+        message = (
+            f"{n_points} points in the fit window for {n_free} free parameters"
+            if n_points
+            else "no points in the fit window"
+        )
+    if skip_reason is not None:
+        return {
+            "fit_ok": False,
+            "skip_reason": skip_reason,
+            "message": message,
+            "peaks_out": [
+                Peak(pk.center, pk.height, pk.fwhm, pk.eta, pk.lock_center, pk.lock_width)
+                for pk in seeds
+            ],
+            "theta": np.array(
+                [v for pk in seeds for v in (pk.center, pk.height, pk.fwhm, pk.eta)], float
+            ),
+            "rmse": float("nan"),
+            "mask_len": n_points,
+            "x": x,
+            "baseline": baseline,
+            "mode": mode,
+        }
+
     base_cfg = (cfg.get("baseline") or {})
     method = str(base_cfg.get("method", "als")).strip().lower()
     uses_fit_range = bool(cfg.get("baseline_uses_fit_range", True))
@@ -345,6 +383,8 @@ def run_fit_consistent(
         "jitter_pct": jitter_pct,
         "clipped_after_solve": clipped_after,
         "fit_ok": bool(best_res.success if best_res is not None else False),
+        "skip_reason": None,
+        "message": str(getattr(best_res, "message", "") or ""),
     }
 
     names: list[str] = []
