@@ -48,6 +48,11 @@ logger = logging.getLogger(__name__)
 # Its flags are advice, never a veto (";"-separated):
 #   bound_hit           a fitted parameter sits on its bound (named in message)
 #   ci_at_bound         an uncertainty interval reaches a parameter bound
+# The noise_* columns record the spectrum's noise model, var_i = s0^2 + g * S_i
+# with S_i the fitted signal above the baseline, which weighted the fit: s0, g,
+# the n points it was estimated from and how (fit_residuals_d4: from the 4th
+# differences of a first fit's residuals, core.noise_model). Blank when no model
+# was estimated (noise_model "none").
 STATUS_COLUMNS = (
     "file",
     "path",
@@ -58,6 +63,10 @@ STATUS_COLUMNS = (
     "n_peaks",
     "rmse",
     "fit_ok",
+    "noise_s0",
+    "noise_g",
+    "noise_n",
+    "noise_method",
     "unc_method",
     "unc_status",
     "unc_message",
@@ -293,6 +302,11 @@ def run_batch(
         cfg_opts.update(dict(config.get("solver_options") or {}))
         config[solver_name] = cfg_opts
     base_template = _seed_peaks(config, solver_name)
+    # Batch fits weight every spectrum by its own noise model unless the config
+    # says noise_model "none" (decision D1). The GUI's core default is "none".
+    fit_config = dict(config)
+    fit_config.setdefault("noise_model", "per_spectrum")
+    fit_api._noise_model_choice(fit_config)  # a wrong setting stops the batch here
     mode = config.get("mode", "add")
     base_cfg = config.get("baseline", {})
     save_traces = bool(config.get("save_traces", False))
@@ -504,7 +518,7 @@ def run_batch(
             x,
             y,
             peaks_in,
-            config,
+            fit_config,
             baseline,
             mode,
             mask,
@@ -526,6 +540,15 @@ def run_batch(
         fitted = res["peaks_out"]
         theta = np.asarray(res["theta"], dtype=float)  # noqa: F841 - for debugging
         rmse = float(res["rmse"])
+        noise_info = res.get("noise_model")
+        noise_sigma = res.get("noise_sigma")
+        if noise_info:
+            entry.update(
+                noise_s0=float(noise_info["s0"]),
+                noise_g=float(noise_info["g"]),
+                noise_n=int(noise_info["n"]),
+                noise_method=str(noise_info["method"]),
+            )
         if os.environ.get("IPF_SHADOW") == "1":
             x_fit = x[mask]
             y_fit = (y if mode == "add" else y - baseline)[mask]
@@ -579,7 +602,11 @@ def run_batch(
                 "fit_xmax": fit_hi,
                 "solver_choice": solver_name,
                 "solver_loss": config.get("solver_loss", np.nan),
-                "solver_weight": config.get("solver_weight", np.nan),
+                "solver_weight": (
+                    "noise_model"
+                    if noise_info and noise_sigma is not None
+                    else config.get("solver_weight", np.nan)
+                ),
                 "solver_fscale": config.get("solver_fscale", np.nan),
                 "solver_maxfev": config.get("solver_maxfev", np.nan),
                 "solver_restarts": config.get("solver_restarts", np.nan),
@@ -724,6 +751,8 @@ def run_batch(
                 predict_full_fn = predict_fit_fn
 
                 fit_ctx = dict(res.get("fit_ctx") or {})
+                # Every method takes the sigma_i that weighted the fit.
+                fit_ctx["noise_sigma"] = noise_sigma
                 solver_choice = (
                     config.get("solver_choice")
                     or config.get("solver")
@@ -823,8 +852,12 @@ def run_batch(
 
                 # Refits use the file's own solver options and the window's
                 # baseline, and start from the start bootstrap_ci hands over.
-                refit_cfg = copy.deepcopy(config)
+                refit_cfg = copy.deepcopy(fit_config)
                 refit_cfg["solver_choice"] = refit_cfg["solver"] = boot_solver
+                # Refits are weighted by the fit's sigma_i, never re-estimated.
+                refit_cfg["noise_model"] = "none"
+                if noise_sigma is not None:
+                    refit_cfg["noise_sigma"] = noise_sigma
                 if "solver_options" in config:
                     _extra = dict(config.get(boot_solver, {}))
                     _extra.update(dict(config.get("solver_options") or {}))
@@ -1076,6 +1109,7 @@ def run_batch(
                     unc_norm.get("label") or unc_method_canon
                 )
                 unc_norm["label"] = method_lbl
+                unc_norm["noise_model"] = noise_info
                 # Missing statistics stay missing (NaN), and the writers leave
                 # them blank: a NaN rmse is not 0, and dof <= 0 is not 1.
                 unc_norm["rmse"] = rmse

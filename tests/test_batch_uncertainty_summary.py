@@ -66,5 +66,9 @@ def test_batch_uncertainty_summary(tmp_path):
         "rmse",
         "dof",
         "flags",
+        "noise_s0",
+        "noise_g",
+        "noise_n",
+        "noise_method",
     }
     assert len(unc_df) == 2 * 1 * 4

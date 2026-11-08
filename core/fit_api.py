@@ -21,6 +21,7 @@ except Exception:  # fallback when data_io lacks pseudo_voigt
 from .peaks import Peak
 from . import models
 from .weights import noise_weights
+from . import noise_model
 from .residuals import build_residual, jacobian_fd, build_residual_jac
 from . import signals
 from .signals import polynomial_baseline
@@ -80,6 +81,45 @@ def _vp_design_columns(
 
 # _vp_unpack_cw is now handled by vp_unpack_centers_widths in param_utils
 
+# cfg["noise_model"]: "none" fits every point with the same weight (the core
+# default); "per_spectrum" estimates var_i = s0^2 + g * S_i from a first fit's
+# residuals and refits with weights 1 / sigma_i (game plan 1.5, decision D1).
+NOISE_MODELS = ("none", "per_spectrum")
+
+
+def _noise_model_choice(cfg: dict) -> str:
+    raw = (cfg or {}).get("noise_model", "none")
+    if raw is None or raw is False:
+        return "none"
+    if raw is True:
+        return "per_spectrum"
+    choice = str(raw).strip().lower()
+    if choice in ("", "none", "off"):
+        return "none"
+    if choice not in NOISE_MODELS:
+        raise ValueError(f"Unknown noise_model {raw!r}; expected one of {NOISE_MODELS}")
+    return choice
+
+
+def _fixed_noise_sigma(cfg: dict, x: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+    """``cfg["noise_sigma"]`` on the fit window: one sigma per point of ``x`` or
+    of the window, positive and finite. None when not given."""
+
+    raw = (cfg or {}).get("noise_sigma")
+    if raw is None:
+        return None
+    sigma = np.asarray(raw, float).reshape(-1)
+    if sigma.size == x.size:
+        sigma = sigma[mask]
+    elif sigma.size != int(np.count_nonzero(mask)):
+        raise ValueError(
+            f"noise_sigma has {sigma.size} values for {x.size} points ({int(np.count_nonzero(mask))} in the window)"
+        )
+    if not np.all(np.isfinite(sigma) & (sigma > 0.0)):
+        raise ValueError("noise_sigma must be positive and finite")
+    return sigma
+
+
 
 def run_fit_consistent(
     x: np.ndarray,
@@ -96,6 +136,21 @@ def run_fit_consistent(
     return_predictors: bool = False,
 ) -> dict:
     """Run a fit mirroring the single-file GUI path.
+
+    Noise model (game plan 1.5, decision D1), from ``cfg``:
+
+    - ``cfg["noise_model"]``: ``"none"`` (the default) fits every point with
+      the same weight; ``"per_spectrum"`` fits once, estimates var_i = s0^2 +
+      g * S_i from that fit's residuals (``core.noise_model``, S_i its signal
+      above the baseline) and refits once from there with weights 1 / sigma_i.
+    - ``cfg["noise_sigma"]``: fixed sigma_i, one per point of ``x`` or of the
+      window; the fit is weighted by them and nothing is estimated (the
+      bootstrap refits pass the fit's own).
+
+    The result's ``noise_model`` holds the estimate's provenance (s0, g, n,
+    method) or None, and ``noise_sigma`` the sigma_i on the fit window that
+    weighted the fit, or None. Residual, Jacobian and rmse stay unweighted;
+    the uncertainty methods take ``noise_sigma`` to weight them.
 
     Parameters
     ----------
@@ -125,6 +180,7 @@ def run_fit_consistent(
     mask = np.asarray(fit_mask, bool)
     if mask.shape != x.shape:
         raise ValueError("fit_mask shape mismatch")
+    noise_choice = _noise_model_choice(cfg)
 
     # Refuse fits the data cannot support before any solver runs. With no peaks,
     # Modern VP hands scipy.optimize.nnls a matrix with no columns and the
@@ -162,6 +218,8 @@ def run_fit_consistent(
             "x": x,
             "baseline": baseline,
             "mode": mode,
+            "noise_model": None,
+            "noise_sigma": None,
         }
 
     base_cfg = (cfg.get("baseline") or {})
@@ -236,48 +294,28 @@ def run_fit_consistent(
     base_seed = rng_seed if perf_seed else None
 
     y_target = y_fit - (base_fit if base_fit is not None else 0.0)
+    # Fixed per-point sigma (the bootstrap refits pass the fit's) weights the
+    # fit as given; otherwise the configured weights, which a per-spectrum
+    # noise model replaces below.
+    sigma_fit = _fixed_noise_sigma(cfg, x, mask)
+    if sigma_fit is not None:
+        opts["weights"] = 1.0 / sigma_fit
     weights = noise_weights(y_target, opts.get("weights", "none"))
 
-    best_res = None
-    best_theta = None
-    best_rmse = np.inf
-    for r in range(max(1, restarts)):
-        seed = (base_seed + r) if base_seed is not None else None
-        rng = np.random.default_rng(seed)
-        theta_start = p0.copy()
-        if jitter_pct:
-            for i, pk in enumerate(peaks0):
-                if not pk.lock_center:
-                    theta_start[4 * i] += (
-                        theta_start[4 * i + 2]
-                        * (jitter_pct / 100.0)
-                        * rng.standard_normal()
-                    )
-                theta_start[4 * i + 1] *= 1.0 + (jitter_pct / 100.0) * rng.standard_normal()
-                if not pk.lock_width:
-                    theta_start[4 * i + 2] *= 1.0 + (
-                        jitter_pct / 100.0
-                    ) * rng.standard_normal()
-            theta_start = np.clip(theta_start, lo, hi)
+    y_solver = y_target if mode == "subtract" else y_fit
+    base_solver = None if mode == "subtract" else base_fit
+    # respect strict disabling of solver fallbacks when requested
+    _no_fb = bool((cfg or {}).get("no_solver_fallbacks", False))
+    cfg_config = None
+    if isinstance(cfg, dict):
+        cfg_config = cfg.get("config")
+    if not _no_fb and isinstance(cfg_config, dict):
+        try:
+            _no_fb = bool(cfg_config.get("no_solver_fallbacks", False))
+        except Exception:
+            _no_fb = _no_fb
 
-        peaks_start = []
-        for i, pk in enumerate(peaks0):
-            c, h, w, e = theta_start[4 * i : 4 * (i + 1)]
-            peaks_start.append(Peak(c, h, w, e, pk.lock_center, pk.lock_width))
-
-        y_solver = y_target if mode == "subtract" else y_fit
-        base_solver = None if mode == "subtract" else base_fit
-        # respect strict disabling of solver fallbacks when requested
-        _no_fb = bool((cfg or {}).get("no_solver_fallbacks", False))
-        cfg_config = None
-        if isinstance(cfg, dict):
-            cfg_config = cfg.get("config")
-        if not _no_fb and isinstance(cfg_config, dict):
-            try:
-                _no_fb = bool(cfg_config.get("no_solver_fallbacks", False))
-            except Exception:
-                _no_fb = _no_fb
-
+    def _run_solver(peaks_start, run_opts):
         if _no_fb:
             res = None
             # Prefer orchestrator.step_once when available and signature-compatible.
@@ -297,34 +335,105 @@ def run_fit_consistent(
                 )
                 if not expects_state:
                     try:
-                        res = step_once(x_fit, y_solver, peaks_start, mode, base_solver, opts)
+                        res = step_once(x_fit, y_solver, peaks_start, mode, base_solver, run_opts)
                     except TypeError:
                         res = None
             if res is None:
-                res = fit_solve(x_fit, y_solver, peaks_start, mode, base_solver, opts)
-        else:
-            res = orchestrator.run_fit_with_fallbacks(
-                x_fit, y_solver, peaks_start, mode, base_solver, opts
-            )
-        theta = np.asarray(res.theta, float)
-        resid_fn = build_residual(x_fit, y_fit, res.peaks_out, mode, base_fit, "linear", None)
-        rmse = float(np.sqrt(np.mean(resid_fn(theta) ** 2))) if theta.size else float("nan")
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_theta = theta.copy()
-            best_res = res
+                res = fit_solve(x_fit, y_solver, peaks_start, mode, base_solver, run_opts)
+            return res
+        return orchestrator.run_fit_with_fallbacks(
+            x_fit, y_solver, peaks_start, mode, base_solver, run_opts
+        )
 
-    theta = best_theta if best_theta is not None else p0.copy()
-    clipped = np.clip(theta, lo, hi)
-    clipped_after = bool(np.any(np.abs(clipped - theta) > 1e-12))
-    theta = clipped
-    for i, pk in enumerate(peaks0):
-        if pk.lock_center:
-            theta[4 * i] = p0[4 * i]
-        if pk.lock_width:
-            theta[4 * i + 2] = p0[4 * i + 2]
+    def _solve(theta_seed, run_opts, n_restarts, jitter):
+        """Best of ``n_restarts`` solves started at ``theta_seed`` (each start
+        jittered by ``jitter`` percent), judged by the fit's own weighted
+        residuals."""
 
-    assert np.all(theta >= lo - 1e-12) and np.all(theta <= hi + 1e-12)
+        w_run = noise_weights(y_target, run_opts.get("weights", "none"))
+        best_res = None
+        best_theta = None
+        best_cost = np.inf
+        for r in range(max(1, n_restarts)):
+            seed = (base_seed + r) if base_seed is not None else None
+            rng = np.random.default_rng(seed)
+            theta_start = np.asarray(theta_seed, float).copy()
+            if jitter:
+                for i, pk in enumerate(peaks0):
+                    if not pk.lock_center:
+                        theta_start[4 * i] += (
+                            theta_start[4 * i + 2]
+                            * (jitter / 100.0)
+                            * rng.standard_normal()
+                        )
+                    theta_start[4 * i + 1] *= 1.0 + (jitter / 100.0) * rng.standard_normal()
+                    if not pk.lock_width:
+                        theta_start[4 * i + 2] *= 1.0 + (
+                            jitter / 100.0
+                        ) * rng.standard_normal()
+                theta_start = np.clip(theta_start, lo, hi)
+
+            peaks_start = []
+            for i, pk in enumerate(peaks0):
+                c, h, w, e = theta_start[4 * i : 4 * (i + 1)]
+                peaks_start.append(Peak(c, h, w, e, pk.lock_center, pk.lock_width))
+
+            res = _run_solver(peaks_start, run_opts)
+            theta = np.asarray(res.theta, float)
+            resid_fn = build_residual(x_fit, y_fit, res.peaks_out, mode, base_fit, "linear", w_run)
+            cost = float(np.mean(resid_fn(theta) ** 2)) if theta.size else float("nan")
+            if cost < best_cost:
+                best_cost = cost
+                best_theta = theta.copy()
+                best_res = res
+        return best_res, best_theta
+
+    def _finalize(theta_raw):
+        """Clip to the bounds and hold locked centres and widths at their seeds."""
+
+        theta = np.asarray(theta_raw if theta_raw is not None else p0, float).copy()
+        clipped = np.clip(theta, lo, hi)
+        moved = bool(np.any(np.abs(clipped - theta) > 1e-12))
+        theta = clipped
+        for i, pk in enumerate(peaks0):
+            if pk.lock_center:
+                theta[4 * i] = p0[4 * i]
+            if pk.lock_width:
+                theta[4 * i + 2] = p0[4 * i + 2]
+        assert np.all(theta >= lo - 1e-12) and np.all(theta <= hi + 1e-12)
+        return theta, moved
+
+    def _peaks_at(theta):
+        return [
+            Peak(*theta[4 * i : 4 * (i + 1)], pk.lock_center, pk.lock_width)
+            for i, pk in enumerate(peaks0)
+        ]
+
+    # Every solver packs height, centre and width; eta stays where it starts.
+    free_mask = np.array(
+        [f for pk in peaks0 for f in (not pk.lock_center, True, not pk.lock_width, False)], bool
+    )
+
+    best_res, best_theta = _solve(p0, opts, restarts, jitter_pct)
+
+    noise = None
+    if sigma_fit is None and noise_choice == "per_spectrum" and best_theta is not None:
+        # var_i = s0^2 + g S_i from this fit's residuals, S_i its signal above the
+        # baseline; then one refit weighted by 1 / sigma_i, started at this fit.
+        theta1, _moved = _finalize(best_theta)
+        resid1 = build_residual(x_fit, y_fit, _peaks_at(theta1), mode, base_fit, "linear", None)
+        signal1 = performance.eval_total(
+            x_fit, [(h, c, w, e) for c, h, w, e in theta1.reshape(-1, 4)]
+        )
+        jac1 = jacobian_fd(resid1, theta1)[:, free_mask]
+        noise = noise_model.estimate_noise_model(resid1(theta1), signal1, jac1)
+        if noise is not None and noise.usable:
+            sigma_fit = noise.sigma(signal1)
+            opts["weights"] = 1.0 / sigma_fit
+            weights = noise_weights(y_target, opts["weights"])
+            best_res, best_theta = _solve(theta1, opts, 1, 0.0)
+
+    theta, clipped_after = _finalize(best_theta)
 
     peaks_out: List[Peak] = []
     for i, pk in enumerate(peaks0):
@@ -396,6 +505,11 @@ def run_fit_consistent(
         "fit_ok": bool(best_res.success if best_res is not None else False),
         "skip_reason": None,
         "message": str(getattr(best_res, "message", "") or ""),
+        # The noise model's provenance (s0, g, n, method) when one was estimated,
+        # and the sigma_i on the fit window that weighted the fit (None: unweighted
+        # by a noise model). The uncertainty methods take the same sigma_i.
+        "noise_model": noise.as_dict() if noise is not None else None,
+        "noise_sigma": None if sigma_fit is None else np.asarray(sigma_fit, float),
     }
 
     names: list[str] = []

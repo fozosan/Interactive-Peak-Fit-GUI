@@ -508,6 +508,18 @@ def _locked_vector(mask, P: int) -> np.ndarray:
     return np.zeros(P, bool)
 
 
+def _point_sigma(sigma: Any, n: int) -> Optional[np.ndarray]:
+    """The noise model's sigma_i as n positive floats, or None (unweighted)."""
+    if sigma is None:
+        return None
+    s = np.asarray(sigma, float).reshape(-1)
+    if s.size != int(n):
+        raise ValueError(f"noise sigma has {s.size} values for {int(n)} points")
+    if not np.all(np.isfinite(s) & (s > 0.0)):
+        raise ValueError("noise sigma must be positive and finite")
+    return s
+
+
 def _bounds_diag(lo: np.ndarray, hi: np.ndarray) -> List[List[float]]:
     """Parameter bounds as stored in diagnostics, for the writers' CI flags."""
     return [np.asarray(lo, float).tolist(), np.asarray(hi, float).tolist()]
@@ -643,6 +655,7 @@ def asymptotic_ci(
     bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     *,  # plotting x-grid must be provided by caller to avoid misalignment
     xgrid: _Optional[np.ndarray] = None,
+    sigma: _Optional[ArrayLike] = None,
     **_ignored: Any,
 ) -> UncertaintyResult:
     """Return asymptotic parameter statistics and a prediction band.
@@ -650,6 +663,11 @@ def asymptotic_ci(
     ``residual`` and ``jacobian`` may be arrays already evaluated at
     ``theta_hat`` or callables accepting a parameter vector.  Extra keyword
     arguments are ignored for backwards compatibility.
+
+    ``sigma`` holds the noise model's sigma_i at each point, the sigma that
+    weighted the fit. The covariance is then the weighted one,
+    (J_w^T J_w)^-1 x RSS_w / dof with J_w = J / sigma and r_w = r / sigma; with
+    ``sigma`` None, or constant, it is the unweighted s^2 (J^T J)^-1.
     """
 
     theta = np.asarray(theta_hat, float)
@@ -692,6 +710,11 @@ def asymptotic_ci(
 
     r = residual(theta) if callable(residual) else np.asarray(residual, float)
     J = jacobian(theta) if callable(jacobian) else np.asarray(jacobian, float)
+    # The weighted fit's covariance: every row in units of its own sigma_i.
+    point_sigma = _point_sigma(sigma, np.asarray(r).size)
+    if point_sigma is not None:
+        r = np.asarray(r, float).reshape(-1) / point_sigma
+        J = np.asarray(J, float) / point_sigma[:, None]
 
     m = int(J.shape[0])
     n_free = int(np.sum(free_mask))
@@ -789,6 +812,7 @@ def asymptotic_ci(
         "alpha": alpha,
         "param_order": names,
         "dof": dof if dof > 0 else float("nan"),
+        "noise_weighted": point_sigma is not None,
     }
     if bounds is not None:
         diag["param_bounds"] = _bounds_diag(lo, hi)
@@ -826,9 +850,21 @@ def bootstrap_ci(
     center_residuals: bool = True,
     return_band: bool = False,
     jitter: Optional[float] = None,
+    sigma: Optional[ArrayLike] = None,
 ) -> UncertaintyResult:
     """
     Residual bootstrap with robust refitting and clear diagnostics.
+
+    ``sigma`` (or ``fit_ctx["noise_sigma"]``) holds the noise model's sigma_i,
+    the sigma that weighted the fit. The residuals are then standardised,
+    e_i = r_i / sigma_i, centred, and resampled i.i.d.; each draw puts
+    sigma_i * e* back at point i, and the refits are weighted by the same sigma_i.
+    The standardised residuals of a correct noise model are exchangeable, so
+    resampling pools all points. A wild bootstrap would keep each residual at its
+    point instead, and the few points that carry a narrow line's height have
+    leverage near 1, so their residuals are shrunk and the wild intervals come
+    out too narrow (review 2026-11-07: height coverage 61 to 64 %). With sigma
+    None, or constant, this is the plain residual bootstrap.
 
     Notes
     -----
@@ -1032,13 +1068,21 @@ def bootstrap_ci(
     # predict_full already includes baseline in add-mode (see fit_api._make_predict_full_generic).
     # Do not add baseline again; double-counting injects baseline texture into the resampled residuals.
 
-    r = _build_residual_vector(
+    # The noise model's sigma_i (None: one sigma for every point). Residuals
+    # are standardised and centred in that form, e = r / sigma, and put back in
+    # data units at the point each draw lands on.
+    point_sigma = _point_sigma(sigma if sigma is not None else fit.get("noise_sigma"), n)
+    noise_scale = point_sigma if point_sigma is not None else np.ones(n)
+    e_std = _build_residual_vector(
         residual=residual,
         y_all=None if y_all is None else np.asarray(y_all, float),
         y_hat=None if y_hat is None else np.asarray(y_hat, float),
         mode=str(fit.get("bootstrap_residual_mode", "raw")),
-        center=bool(fit.get("center_residuals", True)),
-    )
+        center=False,
+    ) / noise_scale
+    if bool(fit.get("center_residuals", True)):
+        e_std = e_std - float(np.mean(e_std))
+    r = noise_scale * e_std
     # ------------------------------------------------------------------
     # New: leverage-based studentization & wild bootstrap controls
     # ------------------------------------------------------------------
@@ -1185,6 +1229,9 @@ def bootstrap_ci(
             solver_opts = {}
         if solver_opts:
             cfg[_solver_name] = dict(solver_opts)
+        if point_sigma is not None:
+            # Refits are weighted by the fit's sigma_i, never re-estimated.
+            cfg["noise_sigma"] = point_sigma
         if str(_solver_name).lower().startswith("lmfit"):
             # Only used if lmfit backend honors these flags
             cfg["lmfit_share_fwhm"] = share_fwhm
@@ -1441,9 +1488,11 @@ def bootstrap_ci(
 
     # Studentize residuals if requested: r_s = r / sqrt(1 - h_ii)
     # Use leverage from the free-parameter hat matrix H = J_f (J_f^T J_f)^{-1} J_f^T
+    # The Jacobian in the same standardised units as the residuals.
+    J_std = J / noise_scale[:, None] if (point_sigma is not None and J.ndim == 2) else J
     if boot_studentize and n_free > 0 and J.ndim == 2:
         try:
-            Jf_hat = J[:, free_mask]
+            Jf_hat = J_std[:, free_mask]
             JTJ = Jf_hat.T @ Jf_hat
             try:
                 U, s, Vt = np.linalg.svd(JTJ, full_matrices=False)
@@ -1454,12 +1503,13 @@ def bootstrap_ci(
             JTJ_inv = (Vt.T * s_inv) @ Vt
             H_diag = np.sum(Jf_hat * (Jf_hat @ JTJ_inv), axis=1)  # diag without forming H
             H_diag = np.clip(H_diag, 0.0, 0.999999)
-            r_s = r / np.sqrt(1.0 - H_diag)
+            e_s = e_std / np.sqrt(1.0 - H_diag)
         except Exception as e:
             diag_notes.append(f"studentize-failed:{type(e).__name__}:{e}")
-            r_s = r
+            e_s = e_std
     else:
-        r_s = r
+        e_s = e_std
+    r_s = noise_scale * e_s
 
     # --- Normalize bounds (length-P, float) BEFORE any use ---
     bounds_provided = bounds is not None
@@ -1656,7 +1706,7 @@ def bootstrap_ci(
     else:
         refit = _robust_refit
 
-    Jf = J[:, free_mask] if (J.ndim == 2) else None
+    Jf = J_std[:, free_mask] if (J.ndim == 2) else None
     # Respect the historical guard: tied parameters require full refits because the
     # linearized shortcut assumed independent widths/etas. Only enable the fast path
     # when sharing is disabled *and* the caller allows it explicitly.
@@ -1736,9 +1786,10 @@ def bootstrap_ci(
                 w = rng_local.choice([-1.0, 1.0], size=n)
             r_b = r_s * w
         else:
-            # Classic i.i.d. residual resampling with replacement
+            # i.i.d. resampling with replacement of the standardised residuals,
+            # each rescaled by the sigma of the point it lands on
             idx = rng_local.integers(0, n, size=n)
-            r_b = r_s[idx]
+            r_b = noise_scale * e_s[idx]
         y_b = (y_hat + r_b)
 
         # jitter start (free params only)
@@ -1795,7 +1846,7 @@ def bootstrap_ci(
             theta_lin = theta0.copy()
             step = None
             try:
-                rhs = np.asarray(r_b, float).reshape(-1)
+                rhs = np.asarray(r_b, float).reshape(-1) / noise_scale
                 step_free, *_ = np.linalg.lstsq(Jf, rhs, rcond=None)
                 step = np.zeros_like(theta_lin)
                 step[free_mask] = step_free
@@ -1930,6 +1981,7 @@ def bootstrap_ci(
         diag_failure_local["boot_resampling"] = boot_resampling
         diag_failure_local["boot_wild_weights"] = boot_wild_weights if boot_resampling == "wild" else None
         diag_failure_local["boot_studentize"] = bool(boot_studentize)
+        diag_failure_local["noise_weighted"] = point_sigma is not None
         diag_failure_local["bootstrap_mode"] = "linearized" if use_linearized_fast_path else "refit"
         diag_failure_local.setdefault("refit_errors", [])
         err = RuntimeError(
@@ -2174,6 +2226,7 @@ def bootstrap_ci(
     diag["boot_resampling"] = boot_resampling
     diag["boot_wild_weights"] = boot_wild_weights if boot_resampling == "wild" else None
     diag["boot_studentize"] = bool(boot_studentize)
+    diag["noise_weighted"] = point_sigma is not None
     if bounds is not None:
         diag["param_bounds"] = _bounds_diag(lo, hi)
     # Document representation alignment for transparency
@@ -2312,10 +2365,17 @@ def bayesian_ci(
     workers: Optional[int] = None,
     return_band=True,
     prior_sigma="half_cauchy",
+    sigma=None,
 ) -> UncertaintyResult:
     """
     Sample posterior of free θ and σ with emcee. Deterministic with seed.
     Returns posterior stats and optional posterior predictive band.
+
+    ``sigma`` (or ``fit_ctx["noise_sigma"]``) holds the noise model's sigma_i,
+    the sigma that weighted the fit. The likelihood is then Gaussian with sd
+    k * sigma_i at point i, and the sampled scale k takes the place of the single
+    sigma (its prior scale is the RMS of r_i / sigma_i). With sigma None, or
+    constant, this is the single-sigma likelihood as before.
     """
     try:
         import emcee
@@ -2506,6 +2566,12 @@ def bayesian_ci(
     x_all = np.asarray(x_all, float)
     y_all = np.asarray(y_all, float)
     n = y_all.size
+    # Residuals in units of the noise model's sigma_i (None: one sigma for all).
+    point_sigma = _point_sigma(sigma if sigma is not None else fit_ctx.get("noise_sigma"), n)
+    inv_sigma = None if point_sigma is None else 1.0 / point_sigma
+    log_sigma_sum = 0.0 if point_sigma is None else float(np.sum(np.log(point_sigma)))
+    # With sigma_i the sampled "sigma" is the dimensionless scale k.
+    diag_perf["noise_weighted"] = point_sigma is not None
 
     lo = np.full(theta_hat.size, -np.inf)
     hi = np.full(theta_hat.size,  np.inf)
@@ -2516,6 +2582,8 @@ def bayesian_ci(
     lo_f = lo[free_idx]; hi_f = hi[free_idx]
 
     resid0 = y_all - pred(theta_hat)
+    if inv_sigma is not None:
+        resid0 = resid0 * inv_sigma
     rmse = float(np.sqrt(np.mean(resid0**2))) if resid0.size else 1.0
     if not math.isfinite(rmse) or rmse <= 0: rmse = 1.0
 
@@ -2556,7 +2624,9 @@ def bayesian_ci(
         sigma = np.exp(log_sigma)
         if not np.isfinite(sigma) or sigma <= 0: return -np.inf
         r = y_all - mu
-        return -0.5*np.sum((r/sigma)**2) - n*np.log(sigma) - 0.5*n*math.log(2*math.pi)
+        if inv_sigma is not None:
+            r = r * inv_sigma
+        return -0.5*np.sum((r/sigma)**2) - n*np.log(sigma) - log_sigma_sum - 0.5*n*math.log(2*math.pi)
 
     def log_prob(z):
         th_f = z[:-1]

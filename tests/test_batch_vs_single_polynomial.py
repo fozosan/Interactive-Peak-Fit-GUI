@@ -45,6 +45,9 @@ def test_batch_vs_single_polynomial(tmp_path):
         "output_base": "batch",
         "save_traces": False,
         "perf_seed_all": True,
+        # Batch weights by a per-spectrum noise model by default, the core does
+        # not: this parity is for the unweighted fit.
+        "noise_model": "none",
     }
     runner.run([str(fpath)], cfg_batch)
 
