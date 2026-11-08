@@ -7258,9 +7258,6 @@ class PeakFitApp:
 def main():
     import sys
     
-    # Check for --font-diagnostics flag before creating root
-    run_diagnostics = "--font-diagnostics" in sys.argv
-    
     root = tk.Tk()
     
     # Apply modern theme with graceful fallback to default Tkinter
@@ -7274,56 +7271,37 @@ def main():
                           DEFAULT_UI_SIZE,
                           SANS_CANDIDATES,
                           MONO_CANDIDATES)
-    from tkinter import ttk
     
     _style = ttk.Style(root)
     _cfg = load_config()
     
-    # Determine font families (respect config or use auto selection)
-    if run_diagnostics:
+    # Diagnostics first, so they report the fonts before the policy changes them.
+    # Asked for by the --font-diagnostics flag or the font_diagnostics config key.
+    if "--font-diagnostics" in sys.argv or bool(_cfg.get("font_diagnostics", False)):
         from ui.font_diagnostics import run_diagnostics as diag_run, show_visual_sample
-        diag_results = diag_run(root, log_fn=print)
+        diag_run(root, log_fn=print)
         show_visual_sample(root)
-        
-        _sans_auto = _cfg.get("ui_font_family", "auto")
-        _mono_auto = _cfg.get("ui_mono_font_family", "auto")
-        
-        if _sans_auto == "auto":
-            _sans_selected = pick_first_available_family(root, SANS_CANDIDATES)
-        else:
-            _sans_selected = _sans_auto
-        
-        if _mono_auto == "auto":
-            _mono_selected = pick_first_available_family(root, MONO_CANDIDATES)
-        else:
-            _mono_selected = _mono_auto
-            
-        _size = int(_cfg.get("ui_font_size", DEFAULT_UI_SIZE))
-        
-        configure_named_fonts(root, sans_family=_sans_selected, 
-                             mono_family=_mono_selected, ui_size=_size)
-        configure_ttk_styles(_style, sans_family=_sans_selected, 
-                            mono_family=_mono_selected, ui_size=_size)
+    
+    # Determine font families (respect config or use auto selection)
+    _sans_auto = _cfg.get("ui_font_family", "auto")
+    _mono_auto = _cfg.get("ui_mono_font_family", "auto")
+    
+    if _sans_auto == "auto":
+        _sans_selected = pick_first_available_family(root, SANS_CANDIDATES)
     else:
-        _sans_auto = _cfg.get("ui_font_family", "auto")
-        _mono_auto = _cfg.get("ui_mono_font_family", "auto")
+        _sans_selected = _sans_auto
+    
+    if _mono_auto == "auto":
+        _mono_selected = pick_first_available_family(root, MONO_CANDIDATES)
+    else:
+        _mono_selected = _mono_auto
         
-        if _sans_auto == "auto":
-            _sans_selected = pick_first_available_family(root, SANS_CANDIDATES)
-        else:
-            _sans_selected = _sans_auto
-        
-        if _mono_auto == "auto":
-            _mono_selected = pick_first_available_family(root, MONO_CANDIDATES)
-        else:
-            _mono_selected = _mono_auto
-            
-        _size = int(_cfg.get("ui_font_size", DEFAULT_UI_SIZE))
-        
-        configure_named_fonts(root, sans_family=_sans_selected, 
-                             mono_family=_mono_selected, ui_size=_size)
-        configure_ttk_styles(_style, sans_family=_sans_selected, 
-                            mono_family=_mono_selected, ui_size=_size)
+    _size = int(_cfg.get("ui_font_size", DEFAULT_UI_SIZE))
+    
+    configure_named_fonts(root, sans_family=_sans_selected, 
+                         mono_family=_mono_selected, ui_size=_size)
+    configure_ttk_styles(_style, sans_family=_sans_selected, 
+                        mono_family=_mono_selected, ui_size=_size)
     # --- END font policy ---
     
     app = PeakFitApp(root)

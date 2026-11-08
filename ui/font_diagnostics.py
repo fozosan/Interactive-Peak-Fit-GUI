@@ -153,6 +153,7 @@ def run_diagnostics(root: tk.Tk, *, log_fn: Callable[[str], None] = print) -> Di
         _log(f"Failed to read TkDefaultFont: {e}", log_fn)
     
     # Available font families (count and check candidates)
+    all_families, found_sans, found_mono = [], [], []
     try:
         all_families = tkfont.families(root)
         results["num_families"] = len(all_families)
@@ -202,9 +203,7 @@ def run_diagnostics(root: tk.Tk, *, log_fn: Callable[[str], None] = print) -> Di
     
     # --- Summary & recommendations ---
     _log("\n=== SUMMARY ===", log_fn)
-    
-    all_jagged = len(found_sans) == 0 and len(found_mono) == 0
-    
+
     if results.get("is_remote_x"):
         _log("- Running over remote X: font rendering depends on X server settings", log_fn)
         _log("  Consider using ssh -X (may be slow) or local display", log_fn)
@@ -263,11 +262,13 @@ def _add_font_sample(parent: tk.Frame, family_name: str, text_1: str, text_2: st
     """Helper to add a font sample label with resolved family info."""
     
     try:
-        # Try TkDefaultFont first (special case - no explicit family)
-        if family_name == "TkDefaultFont":
+        # Try TkDefaultFont first (special case - no explicit family; the caller
+        # labels it "TkDefaultFont (system default)")
+        if family_name.startswith("TkDefaultFont"):
             font_obj = tkfont.nametofont("TkDefaultFont")
             actual_family = font_obj.actual().get("family", "unknown")
             size = font_obj.actual().get("size", 10)
+            resolved_as_asked = True
         else:
             # Try to create font with this family, fallback gracefully
             try:
@@ -279,6 +280,7 @@ def _add_font_sample(parent: tk.Frame, family_name: str, text_1: str, text_2: st
                 font_obj = tkfont.Font(size=10)
                 actual_family = "NOT FOUND"
                 size = 10
+            resolved_as_asked = actual_family == family_name
         
         label_frame = tk.Frame(parent)
         label_frame.pack(fill=tk.X, pady=2)
@@ -295,7 +297,7 @@ def _add_font_sample(parent: tk.Frame, family_name: str, text_1: str, text_2: st
             label_frame,
             text=f"[resolved: {actual_family}]",
             font=("Helvetica", 8),
-            fg="blue" if actual_family == family_name else "red"
+            fg="blue" if resolved_as_asked else "red"
         )
         resolved_label.pack(side=tk.RIGHT)
         
