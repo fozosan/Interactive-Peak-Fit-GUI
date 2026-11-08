@@ -238,7 +238,7 @@ def build_help(opts: dict) -> str:
         Bayesian CI (emcee):
             Posterior over free params; report mean/SD/95% CI; check ESS and R-hat; predictive band from posterior draws.
 
-Troubleshooting
+        Troubleshooting
         ---------------
         • "Rank-deficient Jacobian" in uncertainty: some params are weakly identified. Lock them or narrow the window.
         • "Ill-conditioning" warning: try TRF with x_scale (default), or VP; seed widths closer to visual FWHM.
