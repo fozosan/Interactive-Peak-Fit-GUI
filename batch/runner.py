@@ -35,6 +35,25 @@ from infra import performance
 logger = logging.getLogger(__name__)
 
 
+def _seed_peaks(config: dict, solver_name: str) -> List[peaks.Peak]:
+    """Return the seed peaks in ``config["peaks"]``.
+
+    The GUI sends its own peak dicts for Current and Template seeds. Their FWHM
+    caps reach the solvers as ``width_caps``: when the options for
+    ``solver_name`` hold no cap, the peaks' own caps are written there.
+    """
+
+    records = list(config.get("peaks") or [])
+    caps = peaks.width_caps(records)
+    opts = dict(config.get(solver_name) or {})
+    if any(c is not None for c in caps) and not any(
+        c is not None for c in (opts.get("width_caps") or [])
+    ):
+        opts["width_caps"] = caps
+        config[solver_name] = opts
+    return peaks.deserialize(records)
+
+
 def _tp_limits_ctx_for_config(config: dict):
     """
     Robust BLAS/threadpool limiter for batch path.
@@ -162,9 +181,6 @@ def run_batch(
         raise FileNotFoundError("no files matched patterns")
     total = len(files)
 
-    base_template: Sequence[peaks.Peak] = [
-        peaks.Peak(**p) for p in config.get("peaks", [])
-    ]
     solver_name = config.get("solver", "classic")
     # If a generic "solver_options" block is provided, merge into the
     # per-solver config so run_fit_consistent → pack_theta_bounds sees caps.
@@ -172,6 +188,7 @@ def run_batch(
         cfg_opts = dict(config.get(solver_name, {}))
         cfg_opts.update(dict(config.get("solver_options") or {}))
         config[solver_name] = cfg_opts
+    base_template = _seed_peaks(config, solver_name)
     mode = config.get("mode", "add")
     base_cfg = config.get("baseline", {})
     save_traces = bool(config.get("save_traces", False))
