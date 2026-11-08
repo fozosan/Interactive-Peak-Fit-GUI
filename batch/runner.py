@@ -306,6 +306,10 @@ def run_batch(
                         f"{Path(path).name}: skipped (has >2 columns; mapping files not supported)"
                     )
                 continue
+            if "could not parse" in emsg:
+                if log:
+                    log(f"{Path(path).name}: skipped (no two-column numeric data)")
+                continue
             raise
         xmin = config.get("fit_xmin")
         xmax = config.get("fit_xmax")
