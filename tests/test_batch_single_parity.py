@@ -43,6 +43,9 @@ def test_batch_single_parity(mode, loss, weight, restarts, tmp_path):
         "solver_jitter_pct": 10,
         "baseline": {"lam": 1e5, "p": 0.001, "niter": 10, "thresh": 0.0},
         "perf_seed_all": True,
+        # Batch weights by a per-spectrum noise model by default and the core
+        # does not; this parity is for the unweighted fit, so both are told.
+        "noise_model": "none",
     }
 
     fpath = tmp_path / "spec.csv"

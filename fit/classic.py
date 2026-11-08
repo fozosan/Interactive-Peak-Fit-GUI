@@ -7,6 +7,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 
 from core.peaks import Peak
+from core.weights import noise_weights
 from infra import performance as perf
 
 W_MIN = 1e-6  # minimal physical FWHM
@@ -129,7 +130,11 @@ def _build_residual(
 
 
 def solve(x, y, peaks, mode, baseline, opts):
-    """Full curve_fit solution using unweighted residuals."""
+    """Full curve_fit solution.
+
+    Unweighted, unless ``opts["weights"]`` holds per-point weights (1 / sigma_i
+    of a noise model): curve_fit then gets ``sigma = 1 / w``.
+    """
     x = np.asarray(x, float)
     y = np.asarray(y, float)
     base = np.asarray(baseline, float) if baseline is not None else None
@@ -139,6 +144,12 @@ def solve(x, y, peaks, mode, baseline, opts):
     else:
         y_target = y - (base if base is not None else 0.0)
         base_fit = None
+    weights = opts.get("weights")
+    point_sigma = None
+    if weights is not None and not isinstance(weights, str):
+        w = noise_weights(y_target, weights)
+        with np.errstate(divide="ignore"):
+            point_sigma = np.where(w > 0, 1.0 / w, np.inf)
     centers_flag = bool(opts.get("centers_in_window", True))
     caps = opts.get("width_caps")
     theta0, bounds, struct = _pack(peaks, centers_in_window=centers_flag, xmin=float(x.min()), xmax=float(x.max()), width_caps=caps)
@@ -161,7 +172,9 @@ def solve(x, y, peaks, mode, baseline, opts):
         return model
 
     maxfev = int(opts.get("maxfev", 20000))
-    popt, _ = curve_fit(model_func, x, y_target, p0=theta0, bounds=bounds, maxfev=maxfev)
+    popt, _ = curve_fit(
+        model_func, x, y_target, p0=theta0, bounds=bounds, maxfev=maxfev, sigma=point_sigma
+    )
     popt = np.clip(popt, bounds[0], bounds[1])
     resid_fun = _build_residual(x, y_target, base_fit, struct)
     resid_final = resid_fun(popt)

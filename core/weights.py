@@ -5,10 +5,18 @@ def noise_weights(y, mode):
     r"""Return element-wise noise weights for ``y``.
 
     ``mode`` may be ``"none"`` (``None`` is returned), ``"poisson```` for
-    :math:`1/\sqrt{|y|}` or ``"inv_y"`` for :math:`1/|y|`.  Any non-finite
-    results are set to ``0`` to keep subsequent calculations stable.
+    :math:`1/\sqrt{|y|}` or ``"inv_y"`` for :math:`1/|y|`, or an array of
+    per-point weights, one per element of ``y`` (1 / sigma_i of a noise model),
+    returned as given.  Any non-finite results are set to ``0`` to keep
+    subsequent calculations stable.
     """
 
+    if mode is not None and not isinstance(mode, str):
+        w = np.array(mode, dtype=float).reshape(-1)
+        if w.size != np.size(y):
+            raise ValueError(f"{w.size} weights for {np.size(y)} points")
+        w[~np.isfinite(w)] = 0.0
+        return w
     if mode == "none":
         return None
     y = np.asarray(y, float)

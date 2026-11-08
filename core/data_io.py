@@ -270,6 +270,42 @@ def _dof_cell(x: Any) -> Any:
     return int(v) if math.isfinite(v) and v > 0 else ""
 
 
+# The spectrum's noise model, var_i = s0^2 + g * S_i, as recorded with its
+# uncertainty: s0, g, the n points it was estimated from and the method. Blank
+# when the fit had no noise model.
+NOISE_COLUMNS = ("noise_s0", "noise_g", "noise_n", "noise_method")
+
+
+def _noise_cells(unc_norm: Mapping[str, Any] | None) -> Dict[str, Any]:
+    nm = _as_mapping((unc_norm or {}).get("noise_model"))
+    if not nm:
+        return {col: "" for col in NOISE_COLUMNS}
+    try:
+        n_pts: Any = int(nm.get("n"))
+    except Exception:
+        n_pts = ""
+    return {
+        "noise_s0": _cell(nm.get("s0")),
+        "noise_g": _cell(nm.get("g")),
+        "noise_n": n_pts,
+        "noise_method": str(nm.get("method") or ""),
+    }
+
+
+def _noise_text(unc_norm: Mapping[str, Any] | None) -> Optional[str]:
+    nm = _as_mapping((unc_norm or {}).get("noise_model"))
+    if not nm:
+        return None
+    try:
+        return (
+            "Noise model: var = s0^2 + g*S (S = fitted signal above the baseline); "
+            f"s0 = {float(nm.get('s0')):.6g}, g = {float(nm.get('g')):.6g}, "
+            f"n = {int(nm.get('n'))} points, method = {nm.get('method')}"
+        )
+    except Exception:
+        return None
+
+
 def _flag_ci_bounds(stats_tbl: Sequence[Mapping[str, Any]], bounds: Any) -> None:
     """Mark each interval that reaches a parameter bound (``flags`` = "ci_at_bound").
 
@@ -1419,6 +1455,7 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
         "ess": _to_float(m.get("ess")),
         "rhat": _to_float(m.get("rhat")),
         "band": band,
+        "noise_model": m.get("noise_model") or diag.get("noise_model"),
     }
 
     if stats_tbl:
@@ -1620,6 +1657,9 @@ def _format_unc_text(
             return "n/a"
 
     lines = [f"Uncertainty method: {canon_label}"]
+    noise_line = _noise_text(unc_norm)
+    if noise_line:
+        lines.append(noise_line)
     level = ci_level_text(_alpha_of(unc_norm))
 
     stats_source = (
@@ -1817,6 +1857,7 @@ def iter_uncertainty_rows(
     dof = unc_norm.get("dof", float("nan"))
     alpha = _alpha_of(unc_norm)
     z = _z_value(alpha)
+    noise = _noise_cells(unc_norm)
 
     rows: List[dict] = []
     stats_source = (
@@ -1853,6 +1894,7 @@ def iter_uncertainty_rows(
                     "dof": dof,
                     "flags": str(rec.get(f"{param}_flags") or ""),
                     "alpha": alpha,
+                    **noise,
                 }
             )
     return rows
@@ -1905,7 +1947,7 @@ def write_uncertainty_csv_legacy(
     q_lo, q_hi = _quantile_names(_alpha_of(unc_norm))
     header = [
         "file","peak","param","value","stderr",
-        q_lo,q_hi,"ci_lo","ci_hi","method","rmse","dof","flags"
+        q_lo,q_hi,"ci_lo","ci_hi","method","rmse","dof","flags",*NOISE_COLUMNS,
     ]
     with out_csv.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
@@ -1928,6 +1970,7 @@ def write_uncertainty_csv_legacy(
                 "rmse": _cell(r.get("rmse")),
                 "dof": _dof_cell(r.get("dof")),
                 "flags": r.get("flags", ""),
+                **{col: r.get(col, "") for col in NOISE_COLUMNS},
             })
     return out_csv
 
@@ -1980,6 +2023,8 @@ def write_uncertainty_csvs(
                 "fwhm_ci_lo_mcse","fwhm_ci_hi_mcse",
                 "eta_ci_lo_mcse","eta_ci_hi_mcse",
             ])
+            header.extend(NOISE_COLUMNS)
+            noise = _noise_cells(unc_norm)
             extra_cols = [k for k in wide_map.keys() if k not in header]
             extra_cols.sort()
             header.extend(extra_cols)
@@ -1994,6 +2039,7 @@ def write_uncertainty_csvs(
                         "method": method_name,
                         "rmse": rmse_val,
                         "dof": dof_val,
+                        **noise,
                     }
                     for param in ("center", "height", "fwhm", "eta"):
                         val = _to_float(rec.get(f"{param}_est"))
@@ -2052,7 +2098,7 @@ def write_batch_uncertainty_long(
     # The quantile columns are named by the confidence level: p2_5/p97_5 at 95 %.
     q_lo, q_hi = _quantile_names(alpha)
     header = [
-        "file","peak","param","value","stderr",q_lo,q_hi,"method","rmse","dof","flags"
+        "file","peak","param","value","stderr",q_lo,q_hi,"method","rmse","dof","flags",*NOISE_COLUMNS,
     ]
 
     def _pick_quantiles(r: dict) -> tuple[float, float]:
@@ -2085,6 +2131,7 @@ def write_batch_uncertainty_long(
                     "rmse": _cell(r.get("rmse")),
                     "dof": _dof_cell(r.get("dof")),
                     "flags": r.get("flags", ""),
+                    **{col: r.get(col, "") for col in NOISE_COLUMNS},
                 })
 
     long_path = out_dir / "batch_uncertainty_long.csv"

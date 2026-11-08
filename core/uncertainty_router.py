@@ -173,6 +173,7 @@ def route_uncertainty(
             ymodel = model_eval
         # The fit's lock mask says which parameters were estimated (eta never
         # is), and its bounds limit the intervals, as in the other methods.
+        # Every method takes the sigma_i that weighted the fit (noise_sigma).
         return unc.asymptotic_ci(
             theta_hat=theta_hat,
             residual=residual_fn,
@@ -182,6 +183,7 @@ def route_uncertainty(
             locked_mask=ctx.get("locked_mask"),
             bounds=ctx.get("bounds"),
             xgrid=ctx.get("x_all"),
+            sigma=ctx.get("noise_sigma"),
         )
 
     # --- BOOTSTRAP ----------------------------------------------------------
@@ -223,6 +225,7 @@ def route_uncertainty(
             alpha=alpha,
             center_residuals=bool(ctx.get("unc_center_resid", True)),
             return_band=True,
+            sigma=ctx.get("noise_sigma"),
         )
 
     # --- BAYESIAN -----------------------------------------------------------
@@ -270,6 +273,7 @@ def route_uncertainty(
             workers=workers,
             return_band=True,
             prior_sigma=prior_sigma,
+            sigma=ctx.get("noise_sigma"),
         )
 
     raise ValueError(f"Unknown uncertainty method: '{method}' -> '{canon}'")
