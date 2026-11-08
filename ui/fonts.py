@@ -42,9 +42,9 @@ MONO_CANDIDATES = [
 # Default UI font size (matches existing app defaults)
 DEFAULT_UI_SIZE: int = 10
 
-# Module-level cache for selected fonts across roots
-# Keyed by id(root) to avoid repeated lookups
-_font_cache: Dict[int, Any] = {}
+# Module-level cache of lookups, keyed by (id(root), candidates) so the sans
+# and mono lookups on one root each keep their own answer
+_font_cache: Dict[Any, Optional[str]] = {}
 
 
 def pick_first_available_family(
@@ -63,35 +63,33 @@ def pick_first_available_family(
         Tk's casing, or None if no candidates are available.
         
     Note:
-        This function caches results per root window to avoid repeated calls
-        to tkfont.families(), which can be slow.
+        This function caches results per root window and candidate list to
+        avoid repeated calls to tkfont.families(), which can be slow.
     """
-    
-    # Check cache first (keyed by root id for multiple roots)
-    root_id = id(root)
-    if root_id in _font_cache:
-        cached_result = _font_cache[root_id]
-        if isinstance(cached_result, dict):
-            return cached_result.get("result")
-    
+
+    # Check cache first (keyed by root id and candidate list)
+    key = (id(root), tuple(candidates))
+    if key in _font_cache:
+        return _font_cache[key]
+
     # Get available families (case-insensitive matching)
     try:
         all_families = tkfont.families(root)
-        
+
         for candidate in candidates:
             for available in all_families:
                 if available.lower() == candidate.lower():
                     result = available  # preserve Tk's casing
-                    _font_cache[root_id] = {"result": result, "candidates_checked": candidates}
+                    _font_cache[key] = result
                     return result
-        
+
         # No match found
-        _font_cache[root_id] = {"result": None, "candidates_checked": candidates}
+        _font_cache[key] = None
         return None
-        
+
     except Exception:
         # If enumeration fails, cache None to avoid repeated failures
-        _font_cache[root_id] = {"result": None, "candidates_checked": candidates}
+        _font_cache[key] = None
         return None
 
 

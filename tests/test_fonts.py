@@ -8,6 +8,15 @@ import matplotlib
 matplotlib.use("Agg")
 
 
+@pytest.fixture(autouse=True)
+def _empty_font_cache():
+    """Start each test with no cached lookups, whatever ran before it."""
+    from ui.fonts import _font_cache
+    _font_cache.clear()
+    yield
+    _font_cache.clear()
+
+
 class TestPickFirstAvailableFamily:
     """Test pick_first_available_family function."""
     
@@ -72,6 +81,20 @@ class TestPickFirstAvailableFamily:
                 ["Noto Sans", "DejaVu Sans", "Arial"]
             )
             assert result == "Arial"  # Ubuntu not in families list
+
+    def test_sans_and_mono_lookups_on_one_root_stay_apart(self):
+        """main() looks up a sans family and then a mono family on the same root.
+
+        The mono lookup must not get the cached sans answer, or TkFixedFont (the
+        log and the Help window) is set to a proportional font.
+        """
+        from ui.fonts import pick_first_available_family, SANS_CANDIDATES, MONO_CANDIDATES
+
+        mock_root = MagicMock()
+
+        with patch("tkinter.font.families", return_value=["DejaVu Sans", "DejaVu Sans Mono"]):
+            assert pick_first_available_family(mock_root, SANS_CANDIDATES) == "DejaVu Sans"
+            assert pick_first_available_family(mock_root, MONO_CANDIDATES) == "DejaVu Sans Mono"
 
 
 class TestConfigureNamedFonts:
