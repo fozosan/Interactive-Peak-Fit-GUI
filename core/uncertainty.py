@@ -1934,6 +1934,8 @@ def bootstrap_ci(
                     try:
                         if abort_evt.is_set():
                             aborted = True
+                            # The draws not started yet are dropped, not run to the end.
+                            ex.shutdown(wait=False, cancel_futures=True)
                             break
                     except Exception:
                         pass

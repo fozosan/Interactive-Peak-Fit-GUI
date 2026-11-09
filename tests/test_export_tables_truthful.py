@@ -5,8 +5,9 @@
 - fit_ok comes from the fit: an export before any fit, or of peaks edited since,
   says False;
 - inputs that share a stem (a.csv and a.txt) get separate outputs;
-- a rewrite of a spectrum's fit table removes the uncertainty files it does not
-  write, so a folder never pairs a new fit with an old uncertainty;
+- a rewrite of a spectrum's fit table never deletes a file the app cannot tell
+  is its own (test_outputs_keep_files_they_did_not_write has the rule), and with
+  uncertainty off it deletes nothing;
 - a typed export name keeps its dots: only a trailing .csv is dropped, so
   MoS2_0.5mW does not become MoS2_0;
 - batch honours Use baseline: off means no baseline at all.
@@ -107,7 +108,8 @@ def test_inputs_that_share_a_stem_get_separate_outputs(tmp_path):
     assert not (out / "a_fit.csv").exists()
 
 
-def test_a_rewritten_fit_removes_the_uncertainty_it_does_not_write(tmp_path, spectrum):
+def test_a_rewritten_fit_with_uncertainty_off_deletes_nothing(tmp_path, spectrum):
+    # #254 deleted all five, the user's spec_band.csv among them.
     path, _, _ = spectrum
     out = tmp_path / "out"
     out.mkdir()
@@ -117,7 +119,7 @@ def test_a_rewritten_fit_removes_the_uncertainty_it_does_not_write(tmp_path, spe
         (out / name).write_text("from an earlier fit\n")
     runner.run_batch([str(path)], _config(out), compute_uncertainty=False)
     assert (out / "spec_fit.csv").exists()
-    assert [n for n in old if (out / n).exists()] == []
+    assert [n for n in old if (out / n).read_text() != "from an earlier fit\n"] == []
 
 
 def test_batch_honours_use_baseline_off(tmp_path, spectrum):
@@ -214,7 +216,8 @@ def test_a_typed_dotted_batch_summary_name_keeps_its_dots(gui, tmp_path, spectru
 
 
 @gui_only
-def test_an_export_removes_the_uncertainty_files_it_does_not_write(gui, tmp_path, spectrum):
+def test_an_export_keeps_the_files_it_cannot_tell_are_its_own(gui, tmp_path, spectrum):
+    # #254 deleted both; neither is in the format the app writes.
     path, _, _ = spectrum
     _open_and_seed(gui, path)
     gui.fit()
@@ -223,5 +226,5 @@ def test_an_export_removes_the_uncertainty_files_it_does_not_write(gui, tmp_path
     gui.app.cfg["export_unc_wide"] = False
     gui.export(tmp_path / "spec.csv")
     assert (tmp_path / "spec_uncertainty.csv").exists()
-    assert not (tmp_path / "spec_uncertainty_wide.csv").exists()
-    assert not (tmp_path / "spec_band.csv").exists()
+    assert (tmp_path / "spec_uncertainty_wide.csv").read_text() == "from an earlier export\n"
+    assert (tmp_path / "spec_band.csv").read_text() == "from an earlier export\n"

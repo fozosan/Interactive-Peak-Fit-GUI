@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 #   skipped_no_points   the fit window has no more points than free parameters
 #   no_peaks            no peaks to fit, e.g. auto seeding found none
 #   not_processed       the batch stopped before this file
+# Its unc_status, with uncertainty on, is ok, failed, skipped (no converged fit),
+# or aborted (the user aborted the run during this file's uncertainty: no result).
 # Its flags are advice, never a veto (";"-separated):
 #   bound_hit           a fitted parameter sits on its bound (named in message)
 #   ci_at_bound         an uncertainty interval reaches a parameter bound
@@ -450,12 +452,14 @@ def run_batch(
             rmse_shadow = float(np.sqrt(np.mean(r * r))) if r.size else float("nan")
             if abs(rmse_shadow - rmse) > 1e-8 and log:
                 log(f"shadow rmse diff {rmse_shadow - rmse}")
-        # One row builder and one writer for the GUI's Export and batch (2.1). The
-        # rewrite drops this stem's uncertainty files from an earlier fit first.
+        # One row builder and one writer for the GUI's Export and batch (2.1). An
+        # earlier run's uncertainty files are dealt with once this file's own
+        # uncertainty is written, below.
         base_path = out_dir / stem
         local_records = pipeline.peak_records(Path(path).name, res, config, x)
         pipeline.write_spectrum(
-            base_path, path, x=x, y_raw=y, fit=res, settings=config, trace=save_traces, keep=inputs, log=log
+            base_path, path, x=x, y_raw=y, fit=res, settings=config, trace=save_traces, keep=inputs, log=log,
+            retire_stale=False,
         )
         trace_path = base_path.with_name(base_path.name + "_trace.csv") if save_traces else None
         records.extend(local_records)
@@ -474,6 +478,7 @@ def run_batch(
         # Uncertainty problems stay with this file: they are recorded in its
         # status row and never stop the batch.
         unc_res = None
+        unc_written = []
         if res["fit_ok"] and fitted and compute_uncertainty:
             try:
                 # The one uncertainty context, shared with the GUI (game plan 2.1).
@@ -487,7 +492,7 @@ def run_batch(
                 # dof; one set of files for every method, as the GUI writes them.
                 unc_norm = pipeline.finish_uncertainty(unc_res, res, config, unc_method_canon)
                 method_lbl = unc_norm["label"]
-                pipeline.write_uncertainty(base_path, path, unc_norm, res, config)
+                unc_written = pipeline.write_uncertainty(base_path, path, unc_norm, res, config)
 
                 file_rows = list(data_io.iter_uncertainty_rows(path, unc_norm))
                 unc_rows.extend(file_rows)
@@ -513,6 +518,11 @@ def run_batch(
                         if ratio is not None and math.isfinite(float(ratio))
                         else "the MCMC autocorrelation time could not be estimated: run more bayes_steps"
                     )
+            except pipeline.UncertaintyAborted as exc:
+                # No result, and none written: the batch stops before the next file.
+                entry.update(unc_status="aborted", unc_message=_one_line(str(exc)))
+                if log:
+                    log(f"{Path(path).name}: uncertainty aborted")
             except Exception as exc:
                 msg = str(exc)
                 err_msg = f"{Path(path).name}: uncertainty failed: {msg}"
@@ -521,8 +531,10 @@ def run_batch(
                     log(err_msg)
                 uncertainty_failures.append((Path(path).name, msg))
                 entry.update(unc_status="failed", unc_message=_one_line(msg))
-                # Drop whatever was written before the failure.
-                pipeline.remove_uncertainty_files(base_path, keep=inputs, log=log)
+                # write_uncertainty took back any file it had half written.
+        # An earlier run's uncertainty files that this one did not replace: with
+        # uncertainty on, those the app wrote go; with it off, nothing is deleted.
+        pipeline.retire_stale_uncertainty(base_path, unc_written, keep=inputs, log=log, remove=bool(compute_uncertainty))
 
         if log:
             msg = f"{Path(path).name}: {'ok' if res['fit_ok'] else 'fail'} rmse={rmse:.3g}"
