@@ -10,52 +10,47 @@ from core.peaks import Peak
 from core.weights import noise_weights
 from core.baseline_model import joint_from_options
 from infra import performance as perf
+from .bounds import pack_theta_bounds
 
 W_MIN = 1e-6  # minimal physical FWHM
 
 
 def _pack(
     peaks: Sequence[Peak],
-    *,
-    centers_in_window: bool,
-    xmin: float,
-    xmax: float,
-    width_caps: Optional[Sequence[float]] = None,
+    x: np.ndarray,
+    opts: dict,
 ) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray], list[dict]]:
-    """Flatten free parameters and construct simple bounds."""
+    """Flatten the free parameters, with the bounds every solver fits within.
+
+    The bounds are fit.bounds.pack_theta_bounds's for these options, as for the
+    Modern and LMFIT solvers, and the ones run_fit_consistent reports: the Classic
+    solver once kept its own (FWHM unbounded above), and its result was clipped
+    after the solve, onto a bound it had never seen.
+    """
+    _, (lo_full, hi_full) = pack_theta_bounds(peaks, x, opts)
     theta: list[float] = []
     lo: list[float] = []
     hi: list[float] = []
     struct: list[dict] = []
     for i, pk in enumerate(peaks):
+        c_lo, h_lo, w_lo = lo_full[4 * i : 4 * i + 3]
+        c_hi, h_hi, w_hi = hi_full[4 * i : 4 * i + 3]
         s: dict = {"eta": float(pk.eta)}
         # height always free
         s["ih"] = len(theta)
         theta.append(max(pk.height, 0.0))
-        lo.append(0.0)
-        hi.append(np.inf)
+        lo.append(h_lo)
+        hi.append(h_hi)
         # centre
         if pk.lock_center:
             s["ic"] = None
-            c0 = pk.center
-            if centers_in_window:
-                c0 = float(np.clip(c0, xmin, xmax))
-                s["c_lo"] = xmin
-                s["c_hi"] = xmax
-            s["c_fixed"] = c0
+            s["c_fixed"] = float(pk.center)
         else:
             s["ic"] = len(theta)
-            c0 = pk.center
-            if centers_in_window:
-                c0 = float(np.clip(c0, xmin, xmax))
-                lo.append(xmin)
-                hi.append(xmax)
-                s["c_lo"] = xmin
-                s["c_hi"] = xmax
-            else:
-                lo.append(-np.inf)
-                hi.append(np.inf)
-            theta.append(c0)
+            s["c_lo"], s["c_hi"] = float(c_lo), float(c_hi)
+            theta.append(float(pk.center))
+            lo.append(c_lo)
+            hi.append(c_hi)
         # width
         if pk.lock_width:
             s["iw"] = None
@@ -63,12 +58,8 @@ def _pack(
         else:
             s["iw"] = len(theta)
             theta.append(max(pk.fwhm, W_MIN))
-            lo.append(W_MIN)
-            # Apply optional per-peak cap when width is free
-            cap = None
-            if isinstance(width_caps, (list, tuple)):
-                cap = width_caps[i] if i < len(width_caps) else None
-            hi.append(float(cap) if (cap is not None and float(cap) > 0) else np.inf)
+            lo.append(w_lo)
+            hi.append(w_hi)
         struct.append(s)
     return np.asarray(theta, float), (np.asarray(lo, float), np.asarray(hi, float)), struct
 
@@ -154,9 +145,7 @@ def solve(x, y, peaks, mode, baseline, opts):
         w = noise_weights(y_target, weights)
         with np.errstate(divide="ignore"):
             point_sigma = np.where(w > 0, 1.0 / w, np.inf)
-    centers_flag = bool(opts.get("centers_in_window", True))
-    caps = opts.get("width_caps")
-    theta0, bounds, struct = _pack(peaks, centers_in_window=centers_flag, xmin=float(x.min()), xmax=float(x.max()), width_caps=caps)
+    theta0, bounds, struct = _pack(peaks, x, opts)
     theta0 = np.clip(theta0, bounds[0], bounds[1])
     B = joint_from_options(opts, x.size)
     p_peaks = theta0.size
@@ -235,9 +224,7 @@ def prepare_state(x, y, peaks, mode, baseline, opts):
     else:
         y_target = y - (base if base is not None else 0.0)
         base_fit = None
-    centers_flag = bool(opts.get("centers_in_window", True))
-    caps = opts.get("width_caps")
-    theta0, bounds, struct = _pack(peaks, centers_in_window=centers_flag, xmin=float(x.min()), xmax=float(x.max()), width_caps=caps)
+    theta0, bounds, struct = _pack(peaks, x, opts)
     theta0 = np.clip(theta0, bounds[0], bounds[1])
     resid = _build_residual(x, y_target, base_fit, struct)
     r0 = resid(theta0)

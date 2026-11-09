@@ -137,7 +137,9 @@ def peak_records(file_name: str, fit: Mapping[str, Any], settings: Mapping[str, 
     ``fit`` is ``run_fit_consistent``'s result (or :func:`unfitted`) and
     ``settings`` the settings it ran with. Everything a row says about the fit
     comes from the fit: ``fit_ok``, the solver options it ran with, its
-    restarts, and the bounds it held the parameters to (blank when no fit ran).
+    restarts, the bounds it held the parameters to (blank when no fit ran), and
+    which of the peak's parameters ended on one (``bound_hit``: its value is the
+    bound, not a free estimate).
     """
 
     fitted = list(fit.get("peaks_out") or [])
@@ -146,6 +148,8 @@ def peak_records(file_name: str, fit: Mapping[str, Any], settings: Mapping[str, 
     opts = dict(fit.get("solver_options") or {})
     bounds = fit.get("bounds")
     lo, hi = (None, None) if bounds is None else (np.asarray(bounds[0], float), np.asarray(bounds[1], float))
+    hits = set(fit.get("bound_hit") or [])
+    baseline_fit = baseline_fit_label(fit, settings)
     x = np.asarray(x, float)
     base_cfg = dict(settings.get("baseline") or {})
     method = str(base_cfg.get("method", "als")).lower()
@@ -200,8 +204,10 @@ def peak_records(file_name: str, fit: Mapping[str, Any], settings: Mapping[str, 
                 "bounds_fwhm_lo": bound(lo, i, 2),
                 "bounds_height_lo": bound(lo, i, 1),
                 "bounds_height_hi": bound(hi, i, 1),
+                "bounds_fwhm_hi": bound(hi, i, 2),
+                "bound_hit": ";".join(n for n in ("center", "height", "fwhm") if f"{n}{i + 1}" in hits),
                 "x_scale": np.nan,
-                "baseline_fit": fit.get("baseline_fit", ""),
+                "baseline_fit": baseline_fit,
                 "baseline_order": fit.get("baseline_order") if joint else "",
                 "baseline_method": method,
                 **(
@@ -237,9 +243,19 @@ def locks(fit: Mapping[str, Any]) -> List[dict]:
     return [dict(zip(("center", "height", "fwhm", "eta"), map(bool, lm[4 * i : 4 * i + 4]))) for i in range(lm.size // 4)]
 
 
+def baseline_fit_label(fit: Mapping[str, Any], settings: Mapping[str, Any]) -> str:
+    """How a fit treated the baseline: "joint", "fixed", or "none" with Use baseline off."""
+
+    if not bool(settings.get("use_baseline", True)):
+        return "none"
+    return str(fit.get("baseline_fit") or "")
+
+
 def _baseline_record(fit: Mapping[str, Any], settings: Mapping[str, Any]) -> dict:
     """How the fit treated the baseline, as the uncertainty writers record it."""
 
+    if baseline_fit_label(fit, settings) == "none":
+        return {"fit": "none"}
     jb = fit.get("joint_baseline")
     if jb is None:
         return {"fit": "fixed", "method": str((settings.get("baseline") or {}).get("method", "als")).lower()}
@@ -485,7 +501,11 @@ def uncertainty_workers(settings: Mapping[str, Any]) -> tuple:
     return workers, band_workers
 
 
-def bootstrap_band_wanted(settings: Mapping[str, Any]) -> bool:
+def band_wanted(settings: Mapping[str, Any]) -> bool:
+    """Whether a method computes a band: the GUI's Compute band of the selected
+    method (ui_band_pref_bootstrap, a name from when only the bootstrap asked),
+    or a batch config's export/uncertainty band options."""
+
     export_cfg = dict(settings.get("export", {}) or {})
     unc_section = dict(settings.get("uncertainty", {}) or {})
     need_band = bool(export_cfg.get("include_band", False)) or bool(unc_section.get("return_band", False))
@@ -577,6 +597,7 @@ def compute_uncertainty(
     file_seed: Optional[int] = None,
     abort_event=None,
     log=None,
+    progress=None,
 ):
     """One uncertainty method on one fit: the context the GUI and batch share.
 
@@ -589,7 +610,9 @@ def compute_uncertainty(
     the window's points, the fit's baseline, its locks, bounds and noise weights.
     Returns the method's result, raw (see :func:`finish_uncertainty`). A run that
     ``abort_event`` stopped has no result: it raises :class:`UncertaintyAborted`,
-    never returns the draws made so far.
+    never returns the draws made so far. ``progress`` takes the bootstrap's and
+    the Bayesian sampler's progress lines ("Bootstrap: 40/200"). Without a band
+    wanted (:func:`band_wanted`: the GUI's Compute band) no method returns one.
     """
 
     res = fit
@@ -609,7 +632,7 @@ def compute_uncertainty(
     seed = file_seed
     cfg_perf = performance.get_parallel_config()
     unc_workers, unc_band_workers = uncertainty_workers(settings)
-    band_pref_bootstrap = bootstrap_band_wanted(settings)
+    band_on = band_wanted(settings)
     perf_seed_all, perf_seed = seed_settings(settings)
     bootstrap_n_cfg = bootstrap_draws(settings) if str(unc_method_canon).lower() == "bootstrap" else None
     _tp_limits_ctx_for_config = threadpool_limits_for
@@ -712,6 +735,8 @@ def compute_uncertainty(
     fit_ctx = dict(res.get("fit_ctx") or {})
     # Every method takes the sigma_i that weighted the fit.
     fit_ctx["noise_sigma"] = noise_sigma
+    if progress is not None:
+        fit_ctx["progress_cb"] = progress
     if joint_pb is not None:
         fit_ctx["baseline_basis"] = joint_pb["basis"]
         fit_ctx["param_names"] = param_names_unc
@@ -936,7 +961,7 @@ def compute_uncertainty(
                     workers=workers_arg,
                     alpha=alpha,
                     center_residuals=center_res,
-                    return_band=band_pref_bootstrap,
+                    return_band=band_on,
                     jitter=jitter_frac,
                 )
             except Exception as _e:
@@ -968,8 +993,6 @@ def compute_uncertainty(
                 "band": unc_res.band,
                 "alpha": diag.get("alpha", alpha),
             }
-        if not band_pref_bootstrap and isinstance(unc_res, dict):
-            unc_res["band"] = None  # a band only when one was asked for
     else:
         if "bayes" in str(unc_method_canon).lower():
             try:
@@ -1017,10 +1040,10 @@ def compute_uncertainty(
                 "unc_band_workers": band_workers_eff
                 if band_workers_eff > 0
                 else None,
-                "bayes_band_enabled": bool(
+                "bayes_band_enabled": band_on and bool(
                     config.get("bayes_band_enabled", False)
                 ),
-                "bayes_band_force": bool(config.get("bayes_band_force", False)),
+                "bayes_band_force": band_on and bool(config.get("bayes_band_force", False)),
                 "bayes_band_max_draws": int(
                     config.get("bayes_band_max_draws", 512) or 512
                 ),
@@ -1080,6 +1103,13 @@ def compute_uncertainty(
     if _aborted(abort_event) or bool(diag.get("aborted")):
         # The draws made before the abort are not the method's result.
         raise UncertaintyAborted("the run was aborted: no result")
+    if not band_on:
+        # A band only when one was asked for, whatever the method (the asymptotic
+        # one costs nothing, so it was always made).
+        if isinstance(unc_res, dict):
+            unc_res["band"] = None
+        elif hasattr(unc_res, "band"):
+            unc_res.band = None
     return unc_res
 
 

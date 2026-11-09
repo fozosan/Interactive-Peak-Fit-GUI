@@ -55,8 +55,8 @@ logger = logging.getLogger(__name__)
 # was estimated (noise_model "none").
 # baseline_fit says how the fit treated the baseline: "joint", fitted with the
 # peaks as Legendre columns of order baseline_order over the fit window (the
-# batch default, decision D2), or "fixed", held at the ALS or polynomial
-# baseline (baseline_order blank). Blank when no fit ran.
+# batch default, decision D2), "fixed", held at the ALS or polynomial baseline
+# (baseline_order blank), or "none" with use_baseline off. Blank when no fit ran.
 STATUS_COLUMNS = (
     "file",
     "path",
@@ -430,7 +430,7 @@ def run_batch(
         mode_used = res.get("mode", mode)
         joint_fit = res.get("joint_baseline") is not None
         entry.update(
-            baseline_fit=res.get("baseline_fit", "fixed"),
+            baseline_fit=pipeline.baseline_fit_label(res, config),
             baseline_order=res.get("baseline_order") if joint_fit else "",
         )
         noise_info = res.get("noise_model")

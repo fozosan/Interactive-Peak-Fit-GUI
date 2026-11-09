@@ -452,19 +452,21 @@ def run_fit_consistent(
         return best_res, best_theta
 
     def _finalize(theta_raw):
-        """Clip to the bounds and hold locked centres and widths at their seeds."""
+        """The solver's parameters, with locked centres and widths at their seeds.
+
+        Never clipped: every solver fits within (lo, hi), so a value outside them
+        is the solver's fault, and is reported (see "outside_bounds") instead of
+        being moved onto the bound, where the other parameters would no longer
+        be its best fit. Returns theta and which values lie outside."""
 
         theta = np.asarray(theta_raw if theta_raw is not None else p0, float).copy()
-        clipped = np.clip(theta, lo, hi)
-        moved = bool(np.any(np.abs(clipped - theta) > 1e-12))
-        theta = clipped
         for i, pk in enumerate(peaks0):
             if pk.lock_center:
                 theta[4 * i] = p0[4 * i]
             if pk.lock_width:
                 theta[4 * i + 2] = p0[4 * i + 2]
-        assert np.all(theta >= lo - 1e-12) and np.all(theta <= hi + 1e-12)
-        return theta, moved
+        tol = 1e-9 * np.maximum(1.0, np.maximum(np.abs(lo), np.abs(hi)))
+        return theta, (theta < lo - tol) | (theta > hi + tol)
 
     def _peaks_at(theta):
         return [
@@ -483,7 +485,7 @@ def run_fit_consistent(
     if sigma_fit is None and noise_choice == "per_spectrum" and best_theta is not None:
         # var_i = s0^2 + g S_i from this fit's residuals, S_i its signal above the
         # baseline; then one refit weighted by 1 / sigma_i, started at this fit.
-        theta1, _moved = _finalize(best_theta)
+        theta1, _outside = _finalize(best_theta)
         resid1 = build_residual(x_fit, y_fit, _peaks_at(theta1), mode, _fit_baseline(best_res), "linear", None)
         signal1 = performance.eval_total(
             x_fit, [(h, c, w, e) for c, h, w, e in theta1.reshape(-1, 4)]
@@ -503,7 +505,7 @@ def run_fit_consistent(
             weights = noise_weights(y_target, opts["weights"])
             best_res, best_theta = _solve(theta1, opts, 1, 0.0)
 
-    theta, clipped_after = _finalize(best_theta)
+    theta, outside = _finalize(best_theta)
 
     baseline_coef = None
     if joint:
@@ -557,7 +559,7 @@ def run_fit_consistent(
         xmin = float(x_fit[0]) if x_fit.size else float("nan")
         xmax = float(x_fit[-1]) if x_fit.size else float("nan")
         print(
-            "mask_len=%d window=[%g,%g] bounds=(%g,%g) p0_head=%s p0_tail=%s restarts=%d jitter_pct=%g rmse=%g clipped=%s"
+            "mask_len=%d window=[%g,%g] bounds=(%g,%g) p0_head=%s p0_tail=%s restarts=%d jitter_pct=%g rmse=%g outside_bounds=%s"
             % (
                 mask.sum(),
                 xmin,
@@ -569,7 +571,7 @@ def run_fit_consistent(
                 restarts,
                 jitter_pct,
                 rmse,
-                clipped_after,
+                int(np.count_nonzero(outside)),
             )
         )
 
@@ -584,7 +586,6 @@ def run_fit_consistent(
         "restarts_used": restarts,
         "jitter_pct": jitter_pct,
         "solver_options": solver_used_opts,
-        "clipped_after_solve": clipped_after,
         "fit_ok": bool(best_res.success if best_res is not None else False),
         "skip_reason": None,
         "message": str(getattr(best_res, "message", "") or ""),
@@ -611,14 +612,21 @@ def run_fit_consistent(
     n_free = int(np.count_nonzero(~locked_mask))
     # A free parameter on its bound is a flag, not a failure: the fit is kept.
     bound_hit = _params_on_bounds(theta, lo, hi, locked_mask, names)
+    outside_bounds = [n for n, out in zip(names, outside) if out]
     result.update(
         {
             "param_names": names,
             "locked_mask": locked_mask,
             "flags": ["bound_hit"] if bound_hit else [],
             "bound_hit": bound_hit,
+            "outside_bounds": outside_bounds,
         }
     )
+    if outside_bounds:
+        result["fit_ok"] = False
+        result["message"] = (
+            f"the {solver_name} solver returned values outside the fit's bounds: {', '.join(outside_bounds)}"
+        )
 
     if return_jacobian:
         r0 = resid_fn(theta)
