@@ -1998,6 +1998,44 @@ def write_batch_uncertainty_csv(rows: Sequence[Mapping[str, Any]], path: Path) -
             writer.writerow(row)
 
 
+# The uncertainty files the app writes for a spectrum, after its output stem, and
+# the first line each has started with since 2025-08, whatever the method, the
+# level or the version (one band also had a y_fit column). A file of one of these
+# names is the app's own output only when its first line matches.
+UNCERTAINTY_SUFFIXES = (
+    "_uncertainty.csv",
+    "_uncertainty_wide.csv",
+    "_uncertainty.txt",
+    "_uncertainty_band.csv",
+)
+_OWN_FIRST_LINE = {
+    "_uncertainty.csv": re.compile(r"file,peak,param,value,stderr,"),
+    "_uncertainty_wide.csv": re.compile(r"file,peak,method,rmse,dof,center,center_stderr,"),
+    "_uncertainty.txt": re.compile(r"Uncertainty method: \S"),
+    "_uncertainty_band.csv": re.compile(r"x,(y_fit,)?y_lo[0-9.]+,y_hi[0-9.]+$"),
+}
+
+
+def is_own_uncertainty_file(path: Union[str, Path]) -> bool:
+    """Whether ``path`` is an uncertainty file this app wrote, judged by its first line.
+
+    Export and batch delete an earlier fit's uncertainty file only when this says
+    so: a file of the same name that the user made, edited past its first line's
+    shape, or that cannot be read is never theirs to delete.
+    """
+
+    path = Path(path)
+    pattern = next((pat for sfx, pat in _OWN_FIRST_LINE.items() if path.name.endswith(sfx)), None)
+    if pattern is None:
+        return False
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            first = fh.readline(4096)
+    except (OSError, UnicodeDecodeError):
+        return False
+    return pattern.match(first.lstrip("﻿").rstrip("\r\n")) is not None
+
+
 def _drop_csv_suffix(base_path: Union[str, Path]) -> Path:
     """Drop a trailing ``.csv``; any other dot belongs to the name (``0.20sec``)."""
     base = Path(base_path)

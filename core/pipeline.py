@@ -8,8 +8,8 @@ module:
 
 - :func:`peak_records` is the one row builder of ``<base>_fit.csv``;
 - :func:`write_spectrum` writes a spectrum's fit table, its trace and its
-  uncertainty files, and removes the uncertainty files of an earlier fit that
-  this one does not write;
+  uncertainty files, and retires the uncertainty files of an earlier fit that
+  this one does not write (:func:`retire_stale_uncertainty`);
 - :func:`finish_uncertainty` turns an uncertainty method's result into what the
   writers and batch's summary take;
 - :func:`output_stems` names each batch input's outputs, keeping inputs that
@@ -42,16 +42,14 @@ from .uncertainty_router import route_uncertainty
 
 logger = logging.getLogger(__name__)
 
-# The uncertainty files a spectrum can have, after its output stem. "_band.csv"
-# is the name batch gave the bootstrap band before every method's band became
-# "_uncertainty_band.csv"; an old one is removed with the rest.
-UNCERTAINTY_SUFFIXES = (
-    "_uncertainty.csv",
-    "_uncertainty_wide.csv",
-    "_uncertainty.txt",
-    "_uncertainty_band.csv",
-    "_band.csv",
-)
+# The uncertainty files a spectrum can have, after its output stem. Nothing else
+# under a stem is ever deleted: "_band.csv", the name an older batch gave the
+# bootstrap band, is no output of the app now and may be the user's own file.
+UNCERTAINTY_SUFFIXES = data_io.UNCERTAINTY_SUFFIXES
+
+
+class UncertaintyAborted(RuntimeError):
+    """The user aborted the uncertainty run: there is no result, not a partial one."""
 
 
 def file_seed(path, base_seed: Optional[int]) -> int:
@@ -317,26 +315,42 @@ def finish_uncertainty(unc_res: Any, fit: Mapping[str, Any], settings: Mapping[s
     return unc_norm
 
 
-def remove_uncertainty_files(base, keep: Iterable[str] = (), log=None) -> None:
-    """Delete the uncertainty files under ``base``, which an earlier fit left.
+def retire_stale_uncertainty(base, written: Iterable = (), keep: Iterable[str] = (), log=None,
+                             remove: bool = True) -> List[Path]:
+    """Deal with the uncertainty files under ``base`` that this export did not write.
 
-    ``keep`` holds paths never to touch (a batch's inputs), normalised with
-    ``os.path.normcase(os.path.abspath(...))``.
+    They are an earlier fit's, and would pass for this fit's. Such a file is
+    deleted only when ``remove`` and its first line shows it is this app's own
+    output (:func:`core.data_io.is_own_uncertainty_file`); any other one is left,
+    and ``log`` says so. ``written`` holds the files this export wrote, and
+    ``keep`` paths never to touch (a batch's inputs), both normalised with
+    ``os.path.normcase(os.path.abspath(...))``. Returns the files deleted.
     """
 
+    def norm(p) -> str:
+        return os.path.normcase(os.path.abspath(p))
+
     base = Path(base)
-    keep = set(keep)
+    skip = {norm(p) for p in written} | set(keep)
+    removed: List[Path] = []
     for suffix in UNCERTAINTY_SUFFIXES:
         old = base.with_name(base.name + suffix)
-        if os.path.normcase(os.path.abspath(old)) in keep:
+        if norm(old) in skip or not old.is_file():
             continue
-        try:
-            old.unlink(missing_ok=True)
-        except OSError as exc:
-            msg = f"could not remove stale {old.name}: {exc}"
-            logger.warning(msg)
-            if log:
-                log(msg)
+        if not (remove and data_io.is_own_uncertainty_file(old)):
+            why = "it is not this app's output" if remove else "uncertainty is off, so nothing is deleted"
+            msg = f"left {old.name} ({why}): it does not describe this fit"
+        else:
+            try:
+                old.unlink()
+                removed.append(old)
+                msg = f"removed {old.name}: an earlier fit's uncertainty, which this export does not replace"
+            except OSError as exc:
+                msg = f"could not remove the stale {old.name}: {exc}"
+        logger.info(msg)
+        if log:
+            log(msg)
+    return removed
 
 
 def _band(unc_norm: Mapping[str, Any]):
@@ -355,33 +369,54 @@ def write_uncertainty(base, file_path, unc_norm: Mapping[str, Any], fit: Mapping
     method gave a band: one set of files for every method and both paths."""
 
     base = Path(base)
-    long_csv, wide_csv = data_io.write_uncertainty_csvs(
-        base, file_path, unc_norm, write_wide=bool(settings.get("export_unc_wide", False))
-    )
-    written = [Path(long_csv)] + ([Path(wide_csv)] if wide_csv else [])
-    txt = base.with_name(base.name + "_uncertainty.txt")
-    data_io.write_uncertainty_txt(
-        txt,
-        unc_norm,
-        peaks=fit.get("peaks_out"),
-        method_label=unc_norm.get("label", ""),
-        file_path=file_path,
-        locks=locks(fit),
-    )
-    written.append(txt)
-    band = _band(unc_norm)
-    if band is not None:
-        band_csv = base.with_name(base.name + "_uncertainty_band.csv")
-        level = data_io.ci_level_text(unc_norm.get("alpha", 0.05))
-        with band_csv.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh, lineterminator="\n")
-            writer.writerow(["x", f"y_lo{level}", f"y_hi{level}"])
-            for xi, lo, hi in zip(*band):
-                xi, lo, hi = float(xi), float(lo), float(hi)
-                if math.isfinite(xi) and math.isfinite(lo) and math.isfinite(hi):
-                    writer.writerow([xi, lo, hi])
-        written.append(band_csv)
+    targets = [base.with_name(base.name + suffix) for suffix in UNCERTAINTY_SUFFIXES]
+    before = {p: _stamp(p) for p in targets}
+    try:
+        long_csv, wide_csv = data_io.write_uncertainty_csvs(
+            base, file_path, unc_norm, write_wide=bool(settings.get("export_unc_wide", False))
+        )
+        written = [Path(long_csv)] + ([Path(wide_csv)] if wide_csv else [])
+        txt = base.with_name(base.name + "_uncertainty.txt")
+        data_io.write_uncertainty_txt(
+            txt,
+            unc_norm,
+            peaks=fit.get("peaks_out"),
+            method_label=unc_norm.get("label", ""),
+            file_path=file_path,
+            locks=locks(fit),
+        )
+        written.append(txt)
+        band = _band(unc_norm)
+        if band is not None:
+            band_csv = base.with_name(base.name + "_uncertainty_band.csv")
+            level = data_io.ci_level_text(unc_norm.get("alpha", 0.05))
+            with band_csv.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh, lineterminator="\n")
+                writer.writerow(["x", f"y_lo{level}", f"y_hi{level}"])
+                for xi, lo, hi in zip(*band):
+                    xi, lo, hi = float(xi), float(lo), float(hi)
+                    if math.isfinite(xi) and math.isfinite(lo) and math.isfinite(hi):
+                        writer.writerow([xi, lo, hi])
+            written.append(band_csv)
+    except Exception:
+        # A half-written set is no result: take back what this call wrote (the
+        # files it changed), and only those.
+        for p in targets:
+            stamp = _stamp(p)
+            if stamp is not None and stamp != before[p]:
+                p.unlink(missing_ok=True)
+        raise
     return written
+
+
+def _stamp(path: Path):
+    """What tells a file this call wrote from the one that was there: None when absent."""
+
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def write_spectrum(
@@ -396,15 +431,16 @@ def write_spectrum(
     trace: bool = True,
     keep: Iterable[str] = (),
     log=None,
+    retire_stale: bool = True,
 ) -> List[Path]:
     """Write one spectrum's files under ``base`` (the path the suffixes follow).
 
     ``<base>_fit.csv`` from :func:`peak_records`; ``<base>_trace.csv`` when
     ``trace``, with the baseline the fit used; and the uncertainty files of
-    ``unc_norm`` (from :func:`finish_uncertainty`). The uncertainty files of an
-    earlier fit go first, so the folder never pairs this fit with another
-    fit's uncertainty, even when ``unc_norm`` is None. Returns the paths
-    written.
+    ``unc_norm`` (from :func:`finish_uncertainty`). Then, when ``retire_stale``,
+    the uncertainty files of an earlier fit that this export did not write are
+    retired (:func:`retire_stale_uncertainty`), so the folder does not pair this
+    fit with another fit's uncertainty. Returns the paths written.
     """
 
     base = Path(base)
@@ -417,9 +453,10 @@ def write_spectrum(
         with trace_csv.open("w", encoding="utf-8", newline="") as fh:
             fh.write(data_io.build_trace_table(x, y_raw, fit.get("baseline"), fit.get("peaks_out") or []))
         written.append(trace_csv)
-    remove_uncertainty_files(base, keep=keep, log=log)
-    if unc_norm is not None:
-        written.extend(write_uncertainty(base, file_path, unc_norm, fit, settings))
+    unc_written = write_uncertainty(base, file_path, unc_norm, fit, settings) if unc_norm is not None else []
+    written.extend(unc_written)
+    if retire_stale:
+        retire_stale_uncertainty(base, unc_written, keep=keep, log=log)
     return written
 
 
@@ -550,7 +587,9 @@ def compute_uncertainty(
     refits reuse (default: ``settings``), and ``file_seed`` the seed of the fit's
     own restarts, which the refits reuse too. Every method sees what the fit saw:
     the window's points, the fit's baseline, its locks, bounds and noise weights.
-    Returns the method's result, raw (see :func:`finish_uncertainty`).
+    Returns the method's result, raw (see :func:`finish_uncertainty`). A run that
+    ``abort_event`` stopped has no result: it raises :class:`UncertaintyAborted`,
+    never returns the draws made so far.
     """
 
     res = fit
@@ -901,6 +940,8 @@ def compute_uncertainty(
                     jitter=jitter_frac,
                 )
             except Exception as _e:
+                if _aborted(abort_event):
+                    raise UncertaintyAborted("the run was aborted: no result") from _e
                 ctx = (
                     f" (solver={boot_solver}, jitter={jitter_frac:.3f}, "
                     f"workers={workers_arg}, band_workers={unc_band_workers})"
@@ -1035,4 +1076,15 @@ def compute_uncertainty(
                 seed=seed_val,
                 n_boot=(n_boot if n_boot is not None else 0),
             )
+    diag = (unc_res.get("diagnostics") if isinstance(unc_res, dict) else getattr(unc_res, "diagnostics", None)) or {}
+    if _aborted(abort_event) or bool(diag.get("aborted")):
+        # The draws made before the abort are not the method's result.
+        raise UncertaintyAborted("the run was aborted: no result")
     return unc_res
+
+
+def _aborted(abort_event) -> bool:
+    try:
+        return bool(abort_event is not None and abort_event.is_set())
+    except Exception:
+        return False

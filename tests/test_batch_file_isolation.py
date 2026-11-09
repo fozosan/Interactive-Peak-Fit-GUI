@@ -248,7 +248,9 @@ def test_an_abort_writes_a_partial_summary(tmp_path):
 
 def test_stale_uncertainty_files_are_removed_when_uncertainty_now_fails(tmp_path, monkeypatch):
     # A rerun into the same folder whose uncertainty fails used to leave the
-    # previous run's files in place, looking current.
+    # previous run's files in place, looking current. Only the app's own files
+    # go: one the app did not write (here a_uncertainty_wide.csv) stays, and so
+    # does a_band.csv, which is no output of the app now.
     in_dir, out_dir = tmp_path / "in", tmp_path / "out"
     in_dir.mkdir()
     _write(in_dir / "a.csv", *_spectrum())
@@ -268,6 +270,7 @@ def test_stale_uncertainty_files_are_removed_when_uncertainty_now_fails(tmp_path
     (row,) = _rows(out_dir / "batch_files.csv")
     assert (row["status"], row["unc_status"]) == ("ok", "failed")
     assert "synthetic uncertainty failure" in row["unc_message"]
-    for suffix in ("_uncertainty.csv", "_uncertainty_wide.csv", "_uncertainty.txt",
-                   "_uncertainty_band.csv", "_band.csv"):
+    for suffix in ("_uncertainty.csv", "_uncertainty.txt", "_uncertainty_band.csv"):
         assert not (out_dir / f"a{suffix}").exists(), suffix
+    for suffix in ("_uncertainty_wide.csv", "_band.csv"):
+        assert (out_dir / f"a{suffix}").read_text() == "old\n", suffix

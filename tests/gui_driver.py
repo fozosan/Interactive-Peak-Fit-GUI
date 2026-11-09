@@ -120,7 +120,7 @@ class Driver:
         )
         self._raise_on_error("Fit", start)
 
-    UNC_OUTCOMES = ("Computed ", "Uncertainty failed", "Uncertainty not computed")
+    UNC_OUTCOMES = ("Computed ", "Uncertainty failed", "Uncertainty not computed", "Uncertainty aborted")
 
     def run_uncertainty(self) -> str:
         """Press Run in the Uncertainty panel; return the log line that ends it."""

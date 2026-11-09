@@ -1097,6 +1097,10 @@ class PeakFitApp:
         self._tk_thread = threading.current_thread()
         self._ui_calls = queue.SimpleQueue()
         self._log_lock = threading.Lock()
+        # The abort event of each running Run, Export and Run Batch (see _job_begin);
+        # closing the window waits for them (see _on_close).
+        self._jobs: set = set()
+        self._closing = False
         self.cfg = cfg if cfg is not None else load_config()
         self.cfg.setdefault("baseline_uses_fit_range", True)
         self.cfg.setdefault("ui_show_uncertainty_band", False)
@@ -1181,6 +1185,7 @@ class PeakFitApp:
                 pass
         save_config(self.cfg)
         self.root.title("Interactive Peak Fit (pseudo-Voigt)")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._style = getattr(self, "_style", ttk.Style(self.root))
         # Configure buttons with better text rendering (antialiasing support)
@@ -1375,7 +1380,6 @@ class PeakFitApp:
         self._last_unc_locks: List[Dict[str, bool]] = []
 
         self.current_file: Optional[Path] = None
-        self._abort_evt = threading.Event()
 
         # Uncertainty and performance controls
         unc_cfg = unc_section_cfg.get("method", self.cfg.get("unc_method", "asymptotic"))
@@ -3094,11 +3098,59 @@ class PeakFitApp:
 
     def on_abort_clicked(self):
         try:
-            self._abort_evt.set()
+            for evt in list(self._jobs):
+                evt.set()
             self._progress_end()
             self.status_warn("Aborting…")
         except Exception:
             pass
+
+    # --- Jobs the Abort button stops: Run, Export and Run Batch ------------------
+    def _job_begin(self) -> threading.Event:
+        """A new job's own abort event. Abort sets every running job's; the button
+        stays enabled while any job runs, so a job that ends never disarms another."""
+
+        evt = threading.Event()
+        self._jobs.add(evt)
+        self.abort_btn.config(state=tk.NORMAL)
+        return evt
+
+    def _job_end(self, evt: threading.Event) -> None:
+        self._jobs.discard(evt)
+        if self._jobs:
+            return
+        try:
+            self.abort_btn.config(state=tk.DISABLED)
+        except tk.TclError:
+            pass
+        if self._closing:
+            self.root.after(0, self.root.destroy)
+
+    def _ending(self, evt: threading.Event, done):
+        """``done`` for run_in_thread, then the end of the job ``evt``, whatever ``done`` does."""
+
+        def finish(result, error):
+            try:
+                done(result, error)
+            finally:
+                self._job_end(evt)
+
+        return finish
+
+    def _on_close(self):
+        """Close the window, after the running jobs stop.
+
+        A job's worker thread dies with the app: an Export closed mid-write left
+        half its files. So the jobs are aborted first, and the window goes when
+        the last one has finished (an aborted Export writes its fit and trace).
+        A second close does not wait."""
+
+        if not self._jobs or self._closing:
+            self.root.destroy()
+            return
+        self._closing = True
+        self.on_abort_clicked()
+        self.status_warn("Closing once the running job has stopped…")
 
     def _toggle_legend_action(self):
         self.show_legend_var.set(not self.show_legend_var.get())
@@ -4356,10 +4408,6 @@ class PeakFitApp:
 
         self.step_btn.config(state=tk.DISABLED)
         self.set_busy(True, "Fitting…")
-        try:
-            self._abort_evt.clear()
-        except Exception:
-            pass
         self.run_in_thread(work, done)
 
     def run_batch(self):
@@ -4457,6 +4505,7 @@ class PeakFitApp:
         self.log("Starting batch…")
         # Helpful visibility when debugging batch behavior:
         self.log(f"Batch: compute_uncertainty={compute_unc} | method={unc_method}")
+        abort_evt = self._job_begin()
 
         def work():
             def prog(i, total, path):
@@ -4469,15 +4518,12 @@ class PeakFitApp:
                 unc_method=unc_method,
                 progress=prog,
                 log=self.log_threadsafe,
-                abort_event=self._abort_evt,
+                abort_event=abort_evt,
             )
 
         def done(res, err):
-            self.abort_btn.config(state=tk.DISABLED)
-            try:
-                self._abort_evt.clear()
-            except Exception:
-                pass
+            if self._closing:
+                return
             if err or res is None:
                 self.set_busy(False, "Batch failed.")
                 if err:
@@ -4493,10 +4539,8 @@ class PeakFitApp:
             self.log(f"Batch done: {ok}/{total} succeeded.")
             messagebox.showinfo("Batch", f"Summary saved:\n{fit_path}")
 
-        self._abort_evt.clear()
-        self.abort_btn.config(state=tk.NORMAL)
         self.set_busy(True, "Batch running…")
-        self.run_in_thread(work, done)
+        self.run_in_thread(work, self._ending(abort_evt, done))
 
     # --- BEGIN: local helper for canonical method labels ---
     def _unc_method_label(self, info: dict) -> str:
@@ -4563,18 +4607,19 @@ class PeakFitApp:
             return False
         return True
 
-    def _compute_uncertainty(self, rec: dict, settings: dict):
+    def _compute_uncertainty(self, rec: dict, settings: dict, abort_event=None):
         """The uncertainty of the fit ``rec``, on a worker thread: no Tk calls here.
 
         Batch's context, unchanged: the window's points, the fit's baseline, locks,
         bounds and noise weights, and refits with the fit's own settings and seed.
-        Returns the method's raw result and the finished one the writers take."""
+        Returns the method's raw result and the finished one the writers take; a run
+        that ``abort_event`` stopped raises pipeline.UncertaintyAborted instead."""
 
         method = settings["unc_method"]
         raw = pipeline.compute_uncertainty(
             rec["result"], rec["x"], rec["y"], rec["mask"], settings, method,
             fit_config=rec["settings"], file_seed=rec.get("rng_seed"),
-            abort_event=self._abort_evt, log=self.log_threadsafe,
+            abort_event=abort_event, log=self.log_threadsafe,
         )
         return raw, pipeline.finish_uncertainty(raw, rec["result"], rec["settings"], method)
 
@@ -4692,17 +4737,20 @@ class PeakFitApp:
             return
         self._unc_job_id += 1
         job_id = self._unc_job_id
+        abort_evt = self._job_begin()
 
         def work():
-            return self._compute_uncertainty(rec, settings)
+            return self._compute_uncertainty(rec, settings, abort_evt)
 
         def done(result, error):
             self._progress_end("uncertainty")
-            if job_id != self._unc_job_id:
-                return  # a newer run replaced this one
+            if job_id != self._unc_job_id or self._closing:
+                return  # a newer run replaced this one, or the window is closing
             self._unc_running = False
-            self.abort_btn.config(state=tk.DISABLED)
-            self._abort_evt.clear()
+            if isinstance(error, pipeline.UncertaintyAborted):
+                # Nothing is shown or kept: the draws made so far are no result.
+                self.status_warn("Uncertainty aborted: no result was kept.")
+                return
             if error is not None:
                 self.status_error(f"Uncertainty failed: {self._uncertainty_error_text(error)}")
                 return
@@ -4710,11 +4758,9 @@ class PeakFitApp:
             self._show_uncertainty(rec, settings, raw, unc_norm)
 
         self._unc_running = True
-        self._abort_evt.clear()
-        self.abort_btn.config(state=tk.NORMAL)
         self._progress_begin("uncertainty")
         self.status_info("Computing uncertainty…")
-        self.run_in_thread(work, done)
+        self.run_in_thread(work, self._ending(abort_evt, done))
 
 
     # Performance apply scheduler (debounce for trace-driven calls to reduce log spam)
@@ -4963,13 +5009,14 @@ class PeakFitApp:
         source = str(self.current_file or "")
         keep = {os.path.normcase(os.path.abspath(source))} if source else set()
         x, y_raw = self.x, self.y_raw
+        abort_evt = self._job_begin()
 
         def work():
             # A worker thread: the uncertainty, then the files, and no Tk calls.
             unc, computed, unc_error = cached, None, None
             if blocker is None and cached is None:
                 try:
-                    computed = self._compute_uncertainty(rec, settings)
+                    computed = self._compute_uncertainty(rec, settings, abort_evt)
                     unc = computed[1]
                 except Exception as exc:
                     unc_error = exc
@@ -4983,18 +5030,19 @@ class PeakFitApp:
 
         def done(result, error):
             self._export_running = False
-            self.abort_btn.config(state=tk.DISABLED)
-            self._abort_evt.clear()
             self.set_busy(False, "Export done." if error is None else "Export failed.")
             if error is not None:
                 self.log(f"Export failed: {error}", level="ERROR")
-                messagebox.showerror("Export", f"Export failed:\n{error}")
+                if not self._closing:
+                    messagebox.showerror("Export", f"Export failed:\n{error}")
                 return
             written, unc, computed, unc_error = result
-            if computed is not None and self._current_fit() is rec:
+            if computed is not None and self._current_fit() is rec and not self._closing:
                 self._show_uncertainty(rec, settings, computed[0], computed[1])
             if blocker is not None:
                 self.status_warn(f"Uncertainty not computed: {blocker}")
+            elif isinstance(unc_error, pipeline.UncertaintyAborted):
+                self.status_warn("Uncertainty not exported: the run was aborted. Wrote the fit and the trace only.")
             elif unc_error is not None:
                 self.status_warn(f"Uncertainty export failed: {self._uncertainty_error_text(unc_error)}")
             else:
@@ -5006,13 +5054,12 @@ class PeakFitApp:
             saved_lines = [str(p) for p in written]
             for p in saved_lines:
                 self.log(f"Export: wrote {p}")
-            messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved_lines))
+            if not self._closing:
+                messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved_lines))
 
         self._export_running = True
-        self._abort_evt.clear()
-        self.abort_btn.config(state=tk.NORMAL)
         self.set_busy(True, "Exporting…")
-        self.run_in_thread(work, done)
+        self.run_in_thread(work, self._ending(abort_evt, done))
 
 
     # ----- Plot -----
