@@ -16,6 +16,19 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 
+def new_root(monkeypatch):
+    """A Tk root that is also the default root, as the app's one root is.
+
+    A Tk variable made without a master belongs to the default root. A root an
+    earlier test left alive (test_defaults_persist fails before destroying its
+    own) would otherwise hold the app's variables, which this root's widgets
+    then never see, and keep root.mainloop() running after this window closes.
+    """
+
+    monkeypatch.setattr(tk, "_default_root", None)  # put back after the test, whatever it was
+    return tk.Tk()  # the default root, as there is none now
+
+
 class Driver:
     def __init__(self, app, monkeypatch):
         self.app = app

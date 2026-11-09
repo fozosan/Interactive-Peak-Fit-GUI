@@ -19,7 +19,7 @@ import pytest
 
 from batch import runner
 from core import data_io, pipeline
-from tests.gui_driver import Driver
+from tests.gui_driver import Driver, new_root
 from tests.synthetic_raman import TEMPLATE, WINDOW, mos2_spectrum, write_spectrum
 from tests.test_batch_file_isolation import _config, _spectrum, _write
 
@@ -128,7 +128,7 @@ def gui(monkeypatch, tmp_path):
     tk = pytest.importorskip("tkinter")
     from ui import app as ui_app
 
-    root = tk.Tk()
+    root = new_root(monkeypatch)
     app = ui_app.PeakFitApp(root)
     driver = Driver(app, monkeypatch)
     path = tmp_path / "spec.csv"

@@ -27,7 +27,7 @@ from batch import runner
 from core import fit_api, pipeline
 from core.peaks import Peak
 from tests.conftest import bayes_knobs
-from tests.gui_driver import Driver
+from tests.gui_driver import Driver, new_root
 from tests.synthetic_raman import TEMPLATE, WINDOW, mos2_spectrum, write_spectrum
 from tests.test_batch_file_isolation import _config, _spectrum, _write
 
@@ -136,7 +136,7 @@ def gui(monkeypatch, tmp_path):
     tk = pytest.importorskip("tkinter")
     from ui import app as ui_app
 
-    root = tk.Tk()
+    root = new_root(monkeypatch)
     app = ui_app.PeakFitApp(root)
     driver = Driver(app, monkeypatch)
     path = tmp_path / "spec.csv"
@@ -161,7 +161,11 @@ def gui(monkeypatch, tmp_path):
 def _slow_bootstrap(gui, monkeypatch, n=2000):
     """A bootstrap of many slow refits: it runs until the test aborts it."""
 
-    gui.app._unc_boot_radio.invoke()
+    radio = gui.app._unc_boot_radio
+    radio.invoke()
+    assert gui.app._unc_selected_method_key() == "bootstrap", (
+        gui.app.unc_method.get(), radio.state(), radio.cget("value"), str(radio.cget("state"))
+    )
     gui.app.boot_n_var.set(n)
     real = fit_api.run_fit_consistent
 
@@ -227,7 +231,13 @@ def test_closing_the_window_during_an_export_waits_for_its_files(gui, monkeypatc
         return written
 
     monkeypatch.setattr(pipeline, "write_spectrum", write)
-    root.bind("<Destroy>", lambda e: events.append("destroy") if str(e.widget) == "." else None, add="+")
+
+    def destroyed(event):
+        if str(event.widget) == ".":
+            events.append("destroy")
+            root.quit()
+
+    root.bind("<Destroy>", destroyed, add="+")
 
     def close():  # what the window manager's close button runs (Tk's own default: destroy)
         root.tk.call(root.protocol("WM_DELETE_WINDOW"))
@@ -235,7 +245,7 @@ def test_closing_the_window_during_an_export_waits_for_its_files(gui, monkeypatc
     gui.save_answers.append(str(out / "C.csv"))
     gui.click("Export")
     root.after(500, close)
-    root.mainloop()  # until the window is gone
+    root.mainloop()  # until the window is gone (see destroyed)
 
     t0 = time.monotonic()
     old_event = getattr(gui.app, "_abort_evt", None)
