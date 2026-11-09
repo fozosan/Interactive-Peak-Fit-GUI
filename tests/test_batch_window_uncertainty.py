@@ -35,6 +35,9 @@ def _config(out_dir, mode="add"):
         "perf_seed_all": True,
         "perf_seed": 3,
         "perf_unc_workers": 1,
+        # Subtract mode takes a fixed baseline off the data; a joint baseline (the
+        # batch default) is part of the model, which is then fitted in add mode.
+        "baseline_fit": "fixed" if mode == "subtract" else "joint",
     }
 
 

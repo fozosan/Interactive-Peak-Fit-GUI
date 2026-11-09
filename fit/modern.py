@@ -8,6 +8,7 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from core.residuals import build_residual_jac
+from core.baseline_model import joint_from_options
 from infra import performance as perf
 from core.weights import noise_weights
 from core.peaks import Peak
@@ -16,7 +17,7 @@ from .utils import mad_sigma, robust_cost
 from . import step_engine
 
 
-class SolveResult(TypedDict):
+class SolveResult(TypedDict, total=False):
     ok: bool
     theta: np.ndarray
     message: str
@@ -24,6 +25,8 @@ class SolveResult(TypedDict):
     jac: Optional[np.ndarray]
     cov: Optional[np.ndarray]
     meta: dict
+    # the joint baseline's coefficients, when options["baseline_basis"] is given
+    baseline_coef: Optional[np.ndarray]
 
 
 def _to_solver_vectors(theta0: np.ndarray, bounds, peaks, fwhm_min: float):
@@ -94,6 +97,12 @@ def solve(
     dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
     fwhm_min = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
 
+    # Joint baseline (game plan 1.6): its coefficients are extra parameters,
+    # after the peaks' in the solver vector, with the columns as their Jacobian.
+    B = joint_from_options(options, x.size)
+    Bw = None if B is None else (B * weights[:, None] if weights is not None else B)
+    m = 0 if B is None else B.shape[1]
+
     all_locked = all(p.lock_center and p.lock_width for p in peaks)
     if all_locked:
         unit_peaks = [(1.0, p.center, p.fwhm, p.eta) for p in peaks]
@@ -104,8 +113,10 @@ def solve(
         else:
             Aw = A
             yw = y_target
-        h, *_ = np.linalg.lstsq(Aw, yw, rcond=None)
-        model = A @ h
+        Mw = Aw if Bw is None else np.hstack([Aw, Bw])
+        sol, *_ = np.linalg.lstsq(Mw, yw, rcond=None)
+        h = sol[: A.shape[1]]
+        model = A @ h if B is None else A @ h + B @ sol[A.shape[1]:]
         r = model - y_target
         if weights is not None:
             r = r * weights
@@ -122,6 +133,7 @@ def solve(
             jac=jac,
             cov=None,
             meta={"nfev": 1},
+            baseline_coef=None if B is None else sol[A.shape[1]:],
         )
 
     theta0, bounds, x_scale, indices = _to_solver_vectors(theta0_full, bounds_full, peaks, fwhm_min)
@@ -133,6 +145,21 @@ def solve(
     resid_jac = build_residual_jac(
         x, y, peaks, mode, baseline, weights
     )
+    if B is not None:
+        p_peaks = theta0.size
+        resid_jac_peaks = resid_jac
+
+        def resid_jac(t):
+            t = np.asarray(t, dtype=float)
+            r, J = resid_jac_peaks(t[:p_peaks])
+            return r + Bw @ t[p_peaks:], np.hstack([J, Bw])
+
+        # start the coefficients at their best fit to the data less the start peaks
+        r_start, _ = resid_jac_peaks(theta0)
+        c0 = -np.linalg.lstsq(Bw, r_start, rcond=None)[0]
+        theta0 = np.r_[theta0, c0]
+        bounds = (np.r_[bounds[0], np.full(m, -np.inf)], np.r_[bounds[1], np.full(m, np.inf)])
+        x_scale = np.r_[x_scale, np.maximum(1.0, np.abs(c0))]
 
     for _ in range(max(1, restarts)):
         if jitter_pct:
@@ -204,7 +231,7 @@ def solve(
         raise RuntimeError("least_squares failed")
 
     theta_full = theta0_full.copy()
-    theta_full[indices] = best.x
+    theta_full[indices] = best.x[: best.x.size - m]
     jac_full = getattr(best, "jac", None)
     cov = None
     if jac_full is not None and jac_full.size:
@@ -230,6 +257,7 @@ def solve(
         jac=jac_full,
         cov=cov,
         meta=meta,
+        baseline_coef=None if B is None else np.asarray(best.x[best.x.size - m:], dtype=float),
     )
 
 

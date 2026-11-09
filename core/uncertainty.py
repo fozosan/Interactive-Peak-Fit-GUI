@@ -1157,6 +1157,19 @@ def bootstrap_ci(
 
         peaks_obj = _peaks_from_theta(theta0)
 
+    # The peaks' parameters come first, four per peak; any after them are the
+    # joint baseline's coefficients (game plan 1.6), which are not peaks and are
+    # never relabelled.
+    n_pk_params = 4 * len(peaks_obj) if (peaks_obj and 4 * len(peaks_obj) <= P) else P
+
+    def _relabel_peaks(th: np.ndarray) -> np.ndarray:
+        th = np.asarray(th, float)
+        if n_pk_params >= th.size:
+            return _relabel_by_center(th, theta0, block=4)
+        out = th.copy()
+        out[:n_pk_params] = _relabel_by_center(th[:n_pk_params], theta0[:n_pk_params], block=4)
+        return out
+
     user_refit = fit.get("refit", None)
     if not callable(user_refit):
         module_refit = globals().get("refit", None)
@@ -1598,7 +1611,7 @@ def bootstrap_ci(
         target = np.asarray(target, float)
         cand = []
         for off in range(4):
-            idx = np.arange(off, P, 4)
+            idx = np.arange(off, n_pk_params, 4)
             if idx.size != target.size:
                 continue
             err = np.nanmean(np.abs(theta0[idx] - target))
@@ -1827,7 +1840,7 @@ def bootstrap_ci(
             err_msg = f"{type(e).__name__}: {e}"
         else:
             if ok and bool(fit.get("relabel_by_center", True)):
-                th_new = _relabel_by_center(np.asarray(th_new, float), theta0, block=4)
+                th_new = _relabel_peaks(th_new)
                 th_new = _apply_locks_bounds(th_new)
 
         if not ok and (Jf is None or not Jf.size or np.sum(free_mask) == 0):
@@ -1840,7 +1853,7 @@ def bootstrap_ci(
                     err_msg = f"{type(e).__name__}: {e}"
             else:
                 if ok and bool(fit.get("relabel_by_center", True)):
-                    th_new = _relabel_by_center(np.asarray(th_new, float), theta0, block=4)
+                    th_new = _relabel_peaks(th_new)
                     th_new = _apply_locks_bounds(th_new)
         elif not ok and use_linearized_fast_path:
             theta_lin = theta0.copy()
@@ -1859,7 +1872,7 @@ def bootstrap_ci(
                 linear_fallbacks += 1
                 linear_lambda = 0.0 if linear_lambda is None else linear_lambda
                 if bool(fit.get("relabel_by_center", True)):
-                    theta_lin = _relabel_by_center(np.asarray(theta_lin, float), theta0, block=4)
+                    theta_lin = _relabel_peaks(theta_lin)
                     theta_lin = _apply_locks_bounds(theta_lin)
                 th_new = np.asarray(theta_lin, float)
                 ok = np.all(np.isfinite(th_new))
@@ -1872,7 +1885,7 @@ def bootstrap_ci(
                             err_msg = f"{type(e).__name__}: {e}"
                     else:
                         if ok_refit and bool(fit.get("relabel_by_center", True)):
-                            th_refit = _relabel_by_center(np.asarray(th_refit, float), theta0, block=4)
+                            th_refit = _relabel_peaks(th_refit)
                             th_refit = _apply_locks_bounds(th_refit)
                         th_new = _apply_locks_bounds(th_refit)
                         ok = bool(ok_refit and np.all(np.isfinite(th_new)))
@@ -2376,6 +2389,15 @@ def bayesian_ci(
     k * sigma_i at point i, and the sampled scale k takes the place of the single
     sigma (its prior scale is the RMS of r_i / sigma_i). With sigma None, or
     constant, this is the single-sigma likelihood as before.
+
+    ``fit_ctx["baseline_basis"]`` (n x m) marks the last m entries of theta as a
+    joint baseline's coefficients (game plan 1.6), linear in the model. They are
+    not sampled: the likelihood is integrated over them exactly, with a flat
+    prior, by projecting the weighted residual off the columns and counting
+    n - m points in the scale's term. Their draws come from the exact
+    conditional, c | theta, k ~ N(c_hat(theta), k^2 (B_w^T B_w)^-1), for up to
+    4000 evenly spaced posterior draws (and the band's), so the peaks' posterior
+    and the band include the baseline's uncertainty.
     """
     try:
         import emcee
@@ -2532,16 +2554,23 @@ def bayesian_ci(
     # sampled, and get no spread or interval in the statistics below.
     fixed = _locked_vector(locked_mask, theta_hat.size)
     locked_eff = fixed.copy()
+    # A joint baseline's coefficients, last in theta, are integrated out, not sampled.
+    _basis_raw = fit_ctx.get("baseline_basis") if fit_ctx else None
+    B_lin = None if _basis_raw is None else np.atleast_2d(np.asarray(_basis_raw, float))
+    m_lin = 0 if B_lin is None else int(B_lin.shape[1])
+    P_pk = int(theta_hat.size) - m_lin
+    if m_lin:
+        locked_eff[P_pk:] = True
     tie_groups: list[tuple[int, list[int]]] = []
     if share_fwhm:
-        idx = [4 * i + 2 for i in range(theta_hat.size // 4)]
+        idx = [4 * i + 2 for i in range(P_pk // 4)]
         leader = next((j for j in idx if not locked_eff[j]), idx[0])
         for j in idx:
             if j != leader:
                 locked_eff[j] = True
         tie_groups.append((leader, idx))
     if share_eta:
-        idx = [4 * i + 3 for i in range(theta_hat.size // 4)]
+        idx = [4 * i + 3 for i in range(P_pk // 4)]
         leader = next((j for j in idx if not locked_eff[j]), idx[0])
         for j in idx:
             if j != leader:
@@ -2572,6 +2601,16 @@ def bayesian_ci(
     log_sigma_sum = 0.0 if point_sigma is None else float(np.sum(np.log(point_sigma)))
     # With sigma_i the sampled "sigma" is the dimensionless scale k.
     diag_perf["noise_weighted"] = point_sigma is not None
+    lin_bay = None
+    if m_lin:
+        from .baseline_model import LinearPart
+
+        if B_lin.shape[0] != n:
+            raise ValueError(f"baseline_basis has {B_lin.shape[0]} rows for {n} points")
+        lin_bay = LinearPart(B_lin if inv_sigma is None else B_lin * inv_sigma[:, None])
+        diag_perf["baseline_marginalized"] = m_lin
+    # The points left for the scale once the baseline is integrated out.
+    n_eff = n - m_lin
 
     lo = np.full(theta_hat.size, -np.inf)
     hi = np.full(theta_hat.size,  np.inf)
@@ -2584,7 +2623,9 @@ def bayesian_ci(
     resid0 = y_all - pred(theta_hat)
     if inv_sigma is not None:
         resid0 = resid0 * inv_sigma
-    rmse = float(np.sqrt(np.mean(resid0**2))) if resid0.size else 1.0
+    if lin_bay is not None:
+        resid0 = lin_bay.project(resid0)
+    rmse = float(np.sqrt(np.sum(resid0**2) / max(n_eff, 1))) if resid0.size else 1.0
     if not math.isfinite(rmse) or rmse <= 0: rmse = 1.0
 
     th_loc = th_free.copy()
@@ -2626,7 +2667,10 @@ def bayesian_ci(
         r = y_all - mu
         if inv_sigma is not None:
             r = r * inv_sigma
-        return -0.5*np.sum((r/sigma)**2) - n*np.log(sigma) - log_sigma_sum - 0.5*n*math.log(2*math.pi)
+        if lin_bay is not None:
+            # integrated over the baseline's coefficients (flat prior)
+            r = lin_bay.project(r)
+        return -0.5*np.sum((r/sigma)**2) - n_eff*np.log(sigma) - log_sigma_sum - 0.5*n_eff*math.log(2*math.pi)
 
     def log_prob(z):
         th_f = z[:-1]
@@ -2798,6 +2842,33 @@ def bayesian_ci(
     for leader, group in tie_groups:
         T_full[:, group] = T_full[:, [leader]]
 
+    # The baseline's coefficients for a draw: their exact conditional given the
+    # draw's peaks and scale, c = c_hat + R^-1 U^T r_w + k R^-1 z.
+    lin_rows = np.zeros(T_full.shape[0], bool)
+    rng_lin = np.random.default_rng(0 if seed_effective is None else int(seed_effective))
+
+    def _fill_baseline(rows) -> None:
+        if lin_bay is None:
+            return
+        from scipy.linalg import solve_triangular as _solve_tri
+
+        for r_i in np.asarray(rows, int):
+            if lin_rows[r_i]:
+                continue
+            th_r = T_full[r_i].copy()
+            th_r[P_pk:] = theta_hat[P_pk:]
+            res_r = y_all - np.asarray(pred(th_r), float)
+            if inv_sigma is not None:
+                res_r = res_r * inv_sigma
+            z_r = rng_lin.standard_normal(m_lin)
+            T_full[r_i, P_pk:] = theta_hat[P_pk:] + lin_bay.coef(res_r) + sigma_draws[r_i] * _solve_tri(lin_bay.R, z_r)
+            lin_rows[r_i] = True
+
+    lin_stat_rows = np.arange(T_full.shape[0])
+    if lin_bay is not None:
+        lin_stat_rows = np.unique(np.linspace(0, T_full.shape[0] - 1, min(T_full.shape[0], 4000)).astype(int))
+        _fill_baseline(lin_stat_rows)
+
     def _nanstd_safe(a: np.ndarray) -> float:
         a = a[np.isfinite(a)]
         if a.size < 2:
@@ -2811,7 +2882,7 @@ def bayesian_ci(
         return st
 
     P = int(T_full.shape[1])
-    n_pk = P // 4 if P >= 4 else 0
+    n_pk = P_pk // 4 if P_pk >= 4 else 0
 
     def _col(col: int) -> np.ndarray:
         return T_full[:, col]
@@ -2907,7 +2978,8 @@ def bayesian_ci(
     default_names = [f"p{i}" for i in range(P)]
     custom_names = list(param_names) if param_names is not None else []
     for idx in range(P):
-        draws_flat = T_full[:, idx]
+        # a baseline coefficient's draws exist for the rows it was drawn for
+        draws_flat = T_full[lin_stat_rows, idx] if idx >= P_pk else T_full[:, idx]
         stats_flat = _scalar_stats_for(draws_flat)
         try:
             alpha_lo = float(alpha) / 2.0
@@ -2981,7 +3053,7 @@ def bayesian_ci(
             diag_notes.append(repr(e))
         try:
             if np.isfinite(ess_min) and ess_min > 0 and T_full.size:
-                sd_vals = np.nanstd(T_full, axis=0, ddof=1)
+                sd_vals = np.nanstd(T_full[:, :P_pk], axis=0, ddof=1)
                 mcse_vals = np.asarray(sd_vals, float) / np.sqrt(max(ess_min, 1.0))
                 if mcse_vals.size:
                     # Mean MCSE is more stable than the worst-parameter max.
@@ -3283,6 +3355,7 @@ def bayesian_ci(
                     diag["band_stride"] = int(stride)
                     diag.pop("band_skip_reason", None)
                     diag.pop("band_gating_thresholds", None)
+                    _fill_baseline(idx)
                     theta_sel = T_full[idx, :]
 
                     def _evaluate(theta_vec: np.ndarray) -> np.ndarray:

@@ -21,6 +21,9 @@ def test_batch_baseline_range(tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     cfg = {
+        # The batch fits the baseline with the peaks by default (decision D2); this
+        # compares the fixed-baseline fit, as the core and the GUI run it.
+        "baseline_fit": "fixed",
         "peaks": [peak.__dict__],
         "solver": "classic",
         "mode": "add",

@@ -21,7 +21,7 @@ from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 
 STATUS_COLUMNS = [
     "file", "path", "status", "flags", "message", "n_points_window", "n_peaks",
-    "rmse", "fit_ok", "noise_s0", "noise_g", "noise_n", "noise_method",
+    "rmse", "fit_ok", "baseline_fit", "baseline_order", "noise_s0", "noise_g", "noise_n", "noise_method",
     "unc_method", "unc_status", "unc_message",
 ]
 TRUE_PEAKS = [Peak(40.0, 100.0, 5.0, 0.5), Peak(60.0, 80.0, 6.0, 0.5)]

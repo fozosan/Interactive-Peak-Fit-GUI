@@ -36,6 +36,9 @@ def test_batch_vs_single_polynomial(tmp_path):
     )
 
     cfg_batch = {
+        # The batch fits the baseline with the peaks by default (decision D2); this
+        # compares the fixed-baseline fit, as the core and the GUI run it.
+        "baseline_fit": "fixed",
         "peaks": [p.__dict__ for p in seeds],
         "solver": "modern_vp",
         "mode": "add",

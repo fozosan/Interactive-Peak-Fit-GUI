@@ -26,7 +26,7 @@ if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safegu
     os.environ.setdefault("MPLBACKEND", "Agg")
 
 import core.data_io as data_io
-from core import models, peaks, signals, fit_api
+from core import models, peaks, signals, fit_api, baseline_model
 from core.residuals import build_residual, finite_diff_jacobian
 from core.uncertainty import bootstrap_ci, UncertaintyResult
 from core.uncertainty_router import route_uncertainty
@@ -53,6 +53,10 @@ logger = logging.getLogger(__name__)
 # the n points it was estimated from and how (fit_residuals_d4: from the 4th
 # differences of a first fit's residuals, core.noise_model). Blank when no model
 # was estimated (noise_model "none").
+# baseline_fit says how the fit treated the baseline: "joint", fitted with the
+# peaks as Legendre columns of order baseline_order over the fit window (the
+# batch default, decision D2), or "fixed", held at the ALS or polynomial
+# baseline (baseline_order blank). Blank when no fit ran.
 STATUS_COLUMNS = (
     "file",
     "path",
@@ -63,6 +67,8 @@ STATUS_COLUMNS = (
     "n_peaks",
     "rmse",
     "fit_ok",
+    "baseline_fit",
+    "baseline_order",
     "noise_s0",
     "noise_g",
     "noise_n",
@@ -135,6 +141,51 @@ def _remove_stale_uncertainty(out_dir: Path, stem: str, inputs: set, log=None) -
             logger.warning(msg)
             if log:
                 log(msg)
+
+
+def _baseline_record(res: dict, base_cfg: dict) -> dict:
+    """How the fit treated the baseline, as the uncertainty writers record it."""
+
+    jb = res.get("joint_baseline")
+    if jb is None:
+        return {"fit": "fixed", "method": str((base_cfg or {}).get("method", "als")).lower()}
+    out = jb.as_dict()
+    out["coef"] = [float(v) for v in np.asarray(res["baseline_coef"], float)]
+    return out
+
+
+def _pop_baseline_stats(unc_res, n_peak_params: int, names: Sequence[str]) -> dict:
+    """Take the joint baseline's coefficients out of a method's statistics.
+
+    The asymptotic method keys them ``p<i>`` (i after the peaks'), the bootstrap
+    and the Bayesian by name (``baseline_c<j>``). Returns their estimate, standard
+    error and interval, one entry per coefficient, NaN where a method has none.
+    """
+
+    stats = unc_res.get("stats") if isinstance(unc_res, dict) else getattr(unc_res, "stats", None)
+    out = {"coef": [], "sd": [], "ci_lo": [], "ci_hi": []}
+    for j, name in enumerate(names):
+        blk = None
+        for key in (name, f"p{int(n_peak_params) + j}"):
+            got = stats.pop(key, None) if isinstance(stats, dict) else None
+            if blk is None and isinstance(got, dict):
+                blk = got
+        blk = blk or {}
+
+        def _num(*keys):
+            for k in keys:
+                if blk.get(k) is not None:
+                    try:
+                        return float(blk[k])
+                    except (TypeError, ValueError):
+                        continue
+            return float("nan")
+
+        out["coef"].append(_num("est"))
+        out["sd"].append(_num("sd"))
+        out["ci_lo"].append(_num("p2_5", "p2.5", "ci_lo"))
+        out["ci_hi"].append(_num("p97_5", "p97.5", "ci_hi"))
+    return out
 
 
 def _write_status_table(path: Path, rows: Sequence[dict]) -> None:
@@ -307,6 +358,11 @@ def run_batch(
     fit_config = dict(config)
     fit_config.setdefault("noise_model", "per_spectrum")
     fit_api._noise_model_choice(fit_config)  # a wrong setting stops the batch here
+    # The batch fits the baseline with the peaks unless the config says
+    # baseline_fit "fixed" (decision D2); the GUI's core default is "fixed".
+    fit_config.setdefault("baseline_fit", "joint")
+    baseline_model.baseline_fit_choice(fit_config)  # a wrong setting stops the batch here
+    baseline_model.baseline_order(fit_config)
     mode = config.get("mode", "add")
     base_cfg = config.get("baseline", {})
     save_traces = bool(config.get("save_traces", False))
@@ -540,6 +596,15 @@ def run_batch(
         fitted = res["peaks_out"]
         theta = np.asarray(res["theta"], dtype=float)  # noqa: F841 - for debugging
         rmse = float(res["rmse"])
+        # The baseline the fit used: the one computed above, or the one it fitted.
+        if res.get("baseline") is not None:
+            baseline = np.asarray(res["baseline"], float)
+        mode_used = res.get("mode", mode)
+        joint_fit = res.get("joint_baseline") is not None
+        entry.update(
+            baseline_fit=res.get("baseline_fit", "fixed"),
+            baseline_order=res.get("baseline_order") if joint_fit else "",
+        )
         noise_info = res.get("noise_model")
         noise_sigma = res.get("noise_sigma")
         if noise_info:
@@ -551,10 +616,10 @@ def run_batch(
             )
         if os.environ.get("IPF_SHADOW") == "1":
             x_fit = x[mask]
-            y_fit = (y if mode == "add" else y - baseline)[mask]
-            base_fit = baseline[mask] if mode == "add" else None
+            y_fit = (y if mode_used == "add" else y - baseline)[mask]
+            base_fit = baseline[mask] if mode_used == "add" else None
             resid_fn = build_residual(
-                x_fit, y_fit, fitted, mode, base_fit, "linear", None
+                x_fit, y_fit, fitted, mode_used, base_fit, "linear", None
             )
             r = resid_fn(theta)
             rmse_shadow = float(np.sqrt(np.mean(r * r))) if r.size else float("nan")
@@ -597,7 +662,7 @@ def run_batch(
                 "area_pct": 100.0 * area / total,
                 "rmse": rmse,
                 "fit_ok": bool(res["fit_ok"]),
-                "mode": mode,
+                "mode": mode_used,
                 "fit_xmin": fit_lo,
                 "fit_xmax": fit_hi,
                 "solver_choice": solver_name,
@@ -612,10 +677,12 @@ def run_batch(
                 "solver_restarts": config.get("solver_restarts", np.nan),
                 "solver_jitter_pct": config.get("solver_jitter_pct", np.nan),
                 "use_baseline": True,
-                "baseline_mode": mode,
+                "baseline_mode": mode_used,
                 "baseline_uses_fit_range": bool(
                     config.get("baseline_uses_fit_range", True)
                 ),
+                "baseline_fit": entry["baseline_fit"],
+                "baseline_order": entry["baseline_order"],
                 **perf_extras,
                 "bounds_center_lo": center_bounds[0],
                 "bounds_center_hi": center_bounds[1],
@@ -749,10 +816,31 @@ def run_batch(
                     except Exception:
                         predict_fit_fn = _predict_fit_local
                 predict_full_fn = predict_fit_fn
+                bounds_exact = res.get("bounds")
+                locked_exact = res.get("locked_mask")
+                param_names_unc = res.get("param_names")
+
+                # A joint baseline's coefficients are parameters like the
+                # heights: every method gets them after the peaks' (theta,
+                # Jacobian columns, predictor, locks, bounds and names), and
+                # the Bayesian integrates them out (baseline_basis).
+                joint_pb = None
+                if joint_fit:
+                    joint_pb = baseline_model.uncertainty_problem(res, x_fit, y_fit)
+                    theta_hat = joint_pb["theta"]
+                    residual_fn = joint_pb["residual_fn"]
+                    jac = joint_pb["jacobian"]
+                    predict_fit_fn = predict_full_fn = joint_pb["predict"]
+                    bounds_exact = joint_pb["bounds"]
+                    locked_exact = joint_pb["locked_mask"]
+                    param_names_unc = joint_pb["param_names"]
 
                 fit_ctx = dict(res.get("fit_ctx") or {})
                 # Every method takes the sigma_i that weighted the fit.
                 fit_ctx["noise_sigma"] = noise_sigma
+                if joint_pb is not None:
+                    fit_ctx["baseline_basis"] = joint_pb["basis"]
+                    fit_ctx["param_names"] = param_names_unc
                 solver_choice = (
                     config.get("solver_choice")
                     or config.get("solver")
@@ -767,10 +855,8 @@ def run_batch(
                 # Hand the solved peak list and constraints from THIS fit
                 fit_ctx["peaks_out"] = peaks_obj
                 # Forward exact constraints and start used by the solver so bootstrap refits respect them
-                bounds_exact = res.get("bounds")
                 if bounds_exact is not None:
                     fit_ctx["bounds"] = bounds_exact
-                locked_exact = res.get("locked_mask")
                 if locked_exact is not None:
                     fit_ctx["locked_mask"] = locked_exact
                 fit_ctx["theta0"] = np.asarray(theta_hat, float)
@@ -865,7 +951,9 @@ def run_batch(
 
                 def _refit_wrapper(theta_init, locked_mask, bounds, x, y):
                     """One refit. It counts only if the solver converged; an
-                    exception is a failed draw, recorded by bootstrap_ci."""
+                    exception is a failed draw, recorded by bootstrap_ci. With a
+                    joint baseline the refit fits it again over the same window,
+                    and its coefficients follow the peaks' parameters."""
 
                     t = np.asarray(theta_init, float).ravel()
                     peaks_start = copy.deepcopy(peaks_obj)
@@ -878,12 +966,17 @@ def run_batch(
                         y,
                         peaks_start,
                         refit_cfg,
-                        base_fit,
+                        None if joint_pb is not None else base_fit,
                         fit_mode,
                         np.ones_like(x, bool),
                         rng_seed=seed,
                     )
                     theta_out = np.asarray(out.get("theta"), float).ravel()
+                    if joint_pb is not None:
+                        coef = out.get("baseline_coef")
+                        if coef is None:
+                            return t, False
+                        theta_out = np.r_[theta_out, np.asarray(coef, float).ravel()]
                     if theta_out.size != t.size:
                         return t, False
                     return theta_out, bool(out.get("fit_ok")) and bool(np.all(np.isfinite(theta_out)))
@@ -958,7 +1051,7 @@ def run_batch(
                                 x_eval=x_fit,
                                 fit_ctx=fit_ctx_local,
                                 bounds=top_bounds if top_bounds is not None else bounds_exact,
-                                param_names=res.get("param_names"),
+                                param_names=param_names_unc,
                                 locked_mask=top_locked if top_locked is not None else locked_exact,
                                 n_boot=n_boot,
                                 seed=seed_val,
@@ -1103,6 +1196,13 @@ def run_batch(
                 if unc_res is None:
                     raise RuntimeError("the uncertainty method returned no result")
                 stem = Path(path).stem
+                # The baseline's coefficients are reported with the baseline,
+                # never as another peak's parameters.
+                baseline_info = _baseline_record(res, base_cfg)
+                if joint_pb is not None:
+                    baseline_info.update(
+                        _pop_baseline_stats(unc_res, joint_pb["n_peak_params"], res["joint_baseline"].names())
+                    )
 
                 unc_norm = data_io.normalize_unc_result(unc_res)
                 method_lbl = data_io.canonical_unc_label(
@@ -1110,6 +1210,7 @@ def run_batch(
                 )
                 unc_norm["label"] = method_lbl
                 unc_norm["noise_model"] = noise_info
+                unc_norm["baseline_model"] = baseline_info
                 # Missing statistics stay missing (NaN), and the writers leave
                 # them blank: a NaN rmse is not 0, and dof <= 0 is not 1.
                 unc_norm["rmse"] = rmse

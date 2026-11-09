@@ -92,8 +92,10 @@ def test_batch_estimates_the_noise_model_by_default_and_records_it(tmp_path):
 def test_noise_model_none_fits_unweighted_and_leaves_the_columns_blank(tmp_path):
     spec = _spectrum(tmp_path)
     out = tmp_path / "out"
+    # parity with the core's fixed-baseline fit (the batch default is joint)
     runner.run_batch(
-        [str(spec)], _config(out, noise_model="none"), compute_uncertainty=True, unc_method="asymptotic"
+        [str(spec)], _config(out, noise_model="none", baseline_fit="fixed"), compute_uncertainty=True,
+        unc_method="asymptotic",
     )
     _h, (status,) = _rows(out / "batch_files.csv")
     assert [status[c] for c in NOISE_COLUMNS] == ["", "", "", ""]
@@ -117,7 +119,8 @@ def test_batch_matches_the_core_weighted_fit_and_its_asymptotic_se(tmp_path):
     same sigma_i, the same weighted standard errors."""
     spec = _spectrum(tmp_path, 42)
     out = tmp_path / "out"
-    runner.run_batch([str(spec)], _config(out), compute_uncertainty=True, unc_method="asymptotic")
+    # parity with the core's fixed-baseline fit (the batch default is joint)
+    runner.run_batch([str(spec)], _config(out, baseline_fit="fixed"), compute_uncertainty=True, unc_method="asymptotic")
     _h, rows = _rows(out / "spec_uncertainty.csv")
     se_batch = {(int(r["peak"]), r["param"]): float(r["stderr"]) for r in rows if r["param"] != "eta"}
     _h, fit_rows = _rows(out / "spec_fit.csv")

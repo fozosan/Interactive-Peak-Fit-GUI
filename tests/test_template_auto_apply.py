@@ -42,6 +42,9 @@ def test_batch_template_auto_apply(tmp_path):
     )
 
     cfg_batch = {
+        # The batch fits the baseline with the peaks by default (decision D2); this
+        # compares the fixed-baseline fit, as the core and the GUI run it.
+        "baseline_fit": "fixed",
         "peaks": [pk.__dict__],
         "solver": "modern_vp",
         "mode": "add",

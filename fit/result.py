@@ -24,3 +24,6 @@ class FitResult:
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     hit_bounds: bool = False
     hit_mask: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    # The joint baseline's coefficients (game plan 1.6), when the solver was given
+    # its columns in options["baseline_basis"]; None for a fixed baseline.
+    baseline_coef: Optional[np.ndarray] = None

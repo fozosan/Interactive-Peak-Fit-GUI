@@ -66,12 +66,23 @@ def _adapt_result(
     peaks: Sequence,
     mode: str,
     baseline: np.ndarray | None,
+    baseline_basis: np.ndarray | None = None,
 ) -> FitResult:
-    """Convert legacy ``SolveResult`` dictionaries into :class:`FitResult`."""
+    """Convert legacy ``SolveResult`` dictionaries into :class:`FitResult`.
+
+    With a joint baseline (``baseline_basis``, game plan 1.6) the fitted baseline
+    is the columns times the solver's ``baseline_coef``, added to any given one.
+    """
 
     theta = np.asarray(raw.get("theta", []), dtype=float)
     peaks_out = _peaks_from_theta(peaks, theta)
     base = baseline if baseline is not None else 0.0
+    coef = raw.get("baseline_coef")
+    if baseline_basis is not None and coef is not None:
+        coef = np.asarray(coef, dtype=float)
+        base = base + np.asarray(baseline_basis, dtype=float) @ coef
+    else:
+        coef = None
     model = models.pv_sum(x, peaks_out)
     if mode == "add":
         resid = model + base - y
@@ -97,6 +108,7 @@ def _adapt_result(
         diagnostics=meta,
         hit_bounds=hit_bounds,
         hit_mask=hit_mask,
+        baseline_coef=coef,
     )
 
 
@@ -120,7 +132,7 @@ def solve(
     if func is None:  # pragma: no cover - defensive programming
         raise ValueError(f"unknown solver '{solver_name}'")
     raw = func(x, y, peaks, mode, baseline, options)
-    return _adapt_result(raw, solver_name, x, y, peaks, mode, baseline)
+    return _adapt_result(raw, solver_name, x, y, peaks, mode, baseline, options.get("baseline_basis"))
 
 
 def iterate(state: dict) -> dict:

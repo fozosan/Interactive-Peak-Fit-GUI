@@ -13,7 +13,9 @@ from ui.app import pseudo_voigt
 def test_batch_uncertainty_exports(tmp_path, method):
     x = np.linspace(-5, 5, 101)
     pk = Peak(0.0, 1.0, 1.0, 0.5)
-    y = pseudo_voigt(x, pk.height, pk.center, pk.fwhm, pk.eta)
+    # A little noise: the batch's joint baseline fits a noiseless line exactly,
+    # and an exact fit has no spread to report.
+    y = pseudo_voigt(x, pk.height, pk.center, pk.fwhm, pk.eta) + 0.01 * np.random.default_rng(0).standard_normal(x.size)
     p = tmp_path / "a.csv"
     np.savetxt(p, np.column_stack([x, y]), delimiter=",")
 

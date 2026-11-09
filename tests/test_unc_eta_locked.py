@@ -130,6 +130,9 @@ def test_batch_asymptotic_writes_no_eta_error_and_dof_n_minus_3n(tmp_path):
         "output_base": "batch",
         "fit_xmin": WINDOW[0],
         "fit_xmax": WINDOW[1],
+        # the peaks' dof alone; a joint baseline (the batch default) also counts
+        # its coefficients (tests/test_batch_joint_baseline.py)
+        "baseline_fit": "fixed",
     }
     runner.run_batch([str(spectrum)], cfg, compute_uncertainty=True, unc_method="asymptotic")
     with open(tmp_path / "out" / "batch_files.csv", newline="", encoding="utf-8") as fh:

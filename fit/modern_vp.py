@@ -7,6 +7,7 @@ import numpy as np
 from scipy.optimize import nnls
 
 from core.models import pv_sum_with_jac
+from core.baseline_model import LinearPart, joint_from_options
 from infra import performance as perf
 from core.weights import noise_weights, robust_weights, combine_weights
 from core.peaks import Peak
@@ -16,7 +17,7 @@ from .utils import mad_sigma, robust_cost
 from . import step_engine
 
 
-class SolveResult(TypedDict):
+class SolveResult(TypedDict, total=False):
     ok: bool
     theta: np.ndarray
     message: str
@@ -24,6 +25,8 @@ class SolveResult(TypedDict):
     jac: Optional[np.ndarray]
     cov: Optional[np.ndarray]
     meta: dict
+    # the joint baseline's coefficients, when options["baseline_basis"] is given
+    baseline_coef: Optional[np.ndarray]
 
 
 def _to_solver_vectors(theta0: np.ndarray, bounds, peaks, fwhm_min: float):
@@ -92,21 +95,27 @@ def solve(
     dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
     fwhm_min = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
 
+    # Joint baseline (game plan 1.6): its columns are free linear parameters,
+    # solved with the heights; each linear solve projects them out exactly.
+    B = joint_from_options(options, x.size)
+    lin = LinearPart(None if B is None else (B * weights[:, None] if weights is not None else B))
+
+    def _linear(A_, bw_):
+        """Heights (>= 0) and baseline coefficients, and the model they give."""
+        Aw_ = A_ * weights[:, None] if weights is not None else A_
+        h_, cb_ = lin.solve(Aw_, bw_, options["max_height"])
+        model_ = A_ @ h_ if B is None else A_ @ h_ + B @ cb_
+        return h_, cb_, model_
+
     all_locked = all(p.lock_center and p.lock_width for p in peaks)
 
     if all_locked:
         unit_peaks = [(1.0, p.center, p.fwhm, p.eta) for p in peaks]
         A = perf.design_matrix(x, unit_peaks)
         b = y_target
-        if weights is not None:
-            Aw = A * weights[:, None]
-            bw = b * weights
-        else:
-            Aw = A
-            bw = b
-        h, _ = nnls(Aw, bw)
-        h = np.minimum(h, options["max_height"])
-        model = A @ h
+        bw = b * weights if weights is not None else b
+        h, cb, model = _linear(A, bw)
+        Aw = A * weights[:, None] if weights is not None else A
         r = model - b
         if weights is not None:
             r = r * weights
@@ -121,9 +130,10 @@ def solve(
             theta=theta_full,
             message="linear",
             cost=cost,
-            jac=Aw if weights is not None else A,
+            jac=Aw,
             cov=None,
             meta={"nfev": 1, "sigma": sigma, "f_scale": fs},
+            baseline_coef=None if B is None else cb,
         )
 
     theta0, bounds, x_scale, indices, mapping = _to_solver_vectors(theta0_full, bounds_full, peaks, fwhm_min)
@@ -153,15 +163,8 @@ def solve(
         unit_peaks = [(1.0, p.center, p.fwhm, p.eta) for p in pk_iter]
         A = perf.design_matrix(x, unit_peaks)
         b = y_target
-        if weights is not None:
-            Aw = A * weights[:, None]
-            bw = b * weights
-        else:
-            Aw = A
-            bw = b
-        h, _ = nnls(Aw, bw)
-        h = np.minimum(h, options["max_height"])
-        model = A @ h
+        bw = b * weights if weights is not None else b
+        h, cb, model = _linear(A, bw)
         r = model - b
         if weights is not None:
             r = r * weights
@@ -183,6 +186,9 @@ def solve(
         J = np.column_stack(cols) if cols else np.zeros((x.size, 0))
         if weights is not None:
             J = J * weights[:, None]
+        # At the solved coefficients the residual is orthogonal to the baseline
+        # columns, so the step sees the peaks' columns with them projected out.
+        J = lin.project(J)
 
         tether_rows = []
         tether_vals = []
@@ -222,15 +228,9 @@ def solve(
         pk_new = [Peak(c_new[i], 1.0, f_new[i], peaks[i].eta) for i in range(len(peaks))]
         unit_new = [(1.0, p.center, p.fwhm, p.eta) for p in pk_new]
         A_new = perf.design_matrix(x, unit_new)
-        if weights is not None:
-            Aw_new = A_new * weights[:, None]
-            bw = b * weights
-        else:
-            Aw_new = A_new
-            bw = b
-        h_new, _ = nnls(Aw_new, bw)
-        h_new = np.minimum(h_new, options["max_height"])
-        r_new = A_new @ h_new - b
+        bw = b * weights if weights is not None else b
+        h_new, _cb_new, model_new = _linear(A_new, bw)
+        r_new = model_new - b
         if weights is not None:
             r_new = r_new * weights
         cost_new = robust_cost(r_new, loss, fs)
@@ -242,13 +242,8 @@ def solve(
             pk_new = [Peak(c_new[i], 1.0, f_new[i], peaks[i].eta) for i in range(len(peaks))]
             unit_new = [(1.0, p.center, p.fwhm, p.eta) for p in pk_new]
             A_new = perf.design_matrix(x, unit_new)
-            if weights is not None:
-                Aw_new = A_new * weights[:, None]
-            else:
-                Aw_new = A_new
-            h_new, _ = nnls(Aw_new, bw)
-            h_new = np.minimum(h_new, options["max_height"])
-            r_new = A_new @ h_new - b
+            h_new, _cb_new, model_new = _linear(A_new, bw)
+            r_new = model_new - b
             if weights is not None:
                 r_new = r_new * weights
             cost_new = robust_cost(r_new, loss, fs)
@@ -270,15 +265,8 @@ def solve(
     pk_final = [Peak(c[i], 1.0, f[i], peaks[i].eta) for i in range(len(peaks))]
     unit_final = [(1.0, p.center, p.fwhm, p.eta) for p in pk_final]
     A = perf.design_matrix(x, unit_final)
-    if weights is not None:
-        Aw = A * weights[:, None]
-        bw = b * weights
-    else:
-        Aw = A
-        bw = b
-    h, _ = nnls(Aw, bw)
-    h = np.minimum(h, options["max_height"])
-    model = A @ h
+    bw = b * weights if weights is not None else b
+    h, cb, model = _linear(A, bw)
     r = model - b
     if weights is not None:
         r = r * weights
@@ -316,6 +304,7 @@ def solve(
     J = np.column_stack(cols) if cols else np.zeros((x.size, 0))
     if weights is not None:
         J = J * weights[:, None]
+    J = lin.project(J)
 
     theta_full = theta0_full.copy()
     theta_full[indices] = theta
@@ -337,6 +326,7 @@ def solve(
         jac=J,
         cov=cov,
         meta={"nfev": nfev, "sigma": sigma, "f_scale": fs, "backtracked": backtracked},
+        baseline_coef=None if B is None else cb,
     )
 
 
