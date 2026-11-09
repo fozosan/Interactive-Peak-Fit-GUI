@@ -1,9 +1,9 @@
 """The suite never touches the user's real settings and never waits on a Tk dialog.
 
-``ui.app`` builds ``CONFIG_PATH`` from ``Path.home()`` when it is imported, so
-conftest moves HOME to a temporary directory before any test module imports the
-app. It also answers Tk dialogs without opening them, and it resets both before
-every test. The paired tests below run in file order: the first leaves state
+``ui.app`` builds ``CONFIG_PATH`` when it is imported, so conftest points
+``GL_PEAKFIT_CONFIG`` into a temporary HOME before any test module imports the
+app (test_config_location.py covers the real location). It also answers Tk
+dialogs without opening them, and it resets both before every test. The paired tests below run in file order: the first leaves state
 behind and the second checks that it is gone.
 """
 import os
