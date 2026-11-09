@@ -10,7 +10,7 @@ from core.peaks import Peak
 from core.weights import noise_weights
 from core.baseline_model import joint_from_options
 from infra import performance as perf
-from .bounds import height_cap, held_heights, pack_theta_bounds
+from .bounds import NO_BOUND, height_cap, held_heights, pack_theta_bounds
 
 W_MIN = 1e-6  # minimal physical FWHM
 
@@ -39,6 +39,10 @@ def _pack(
         s: dict = {"eta": float(pk.eta)}
         # height: free, unless its bounds hold it (fit.bounds.held_heights). A
         # held one is no parameter: a finite-difference step would not fit in it.
+        # One the cap does not bound (fit.bounds.NO_BOUND) has no bound here, as
+        # Classic's heights had on main: least_squares scales a step by its
+        # distance to a finite bound, and 1e12 scaled every height step by about
+        # 1e6 (f3a3605's Classic ran its heights away and ended worse that way).
         if np.isfinite(held[i]):
             s["ih"] = None
             s["h_fixed"] = float(held[i])
@@ -46,7 +50,7 @@ def _pack(
             s["ih"] = len(theta)
             theta.append(max(pk.height, 0.0))
             lo.append(h_lo)
-            hi.append(h_hi)
+            hi.append(np.inf if h_hi >= NO_BOUND else h_hi)
         # centre
         if pk.lock_center:
             s["ic"] = None

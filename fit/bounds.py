@@ -11,23 +11,19 @@ import logging
 log = logging.getLogger(__name__)
 
 
-# Every height is bounded above by this many times the largest |value| the peaks
-# are fitted to over the window (options["max_height_factor"] sets another),
-# times the share of the peak's maximum the window can show (visible_share).
-HEIGHT_CAP_FACTOR = 2.0
+# make_bounds' stand-in for "no bound": the bound of a height the fit keeps
+# below the cap (fit_api.run_fit_consistent), as on main.
+NO_BOUND = 1e12
 
 
 def visible_share(center: float, fwhm: float, eta: float, xmin: float, xmax: float) -> float:
     """The largest value a unit-height peak takes over [xmin, xmax]: 1 when its
     centre lies inside, else its value at the nearer end of the window.
 
-    A peak centred outside the window reaches the data with its tail only, which
-    cannot fix its height: with a template's centres held outside the window the
-    solvers drove such heights to 4e7 (Classic), 1e12 (Modern TRF) and 5.6e16
-    (Modern VP), the tails standing in for the background and taking the area
-    of the peaks in the window. pack_theta_bounds scales the height bound by
-    this share: a peak whose shoulder the window shows keeps most of it, one
-    the window does not see keeps none."""
+    A peak centred outside the window reaches the data with its tail only.
+    pack_theta_bounds holds the height of a peak whose share is below sqrt(eps):
+    no data can see it (a near-Gaussian locked 200 cm-1 away shows 1e-43 of
+    itself), and its column would only feed the solvers noise."""
 
     if xmax <= xmin or xmin <= center <= xmax:
         return 1.0
@@ -35,12 +31,28 @@ def visible_share(center: float, fwhm: float, eta: float, xmin: float, xmax: flo
     return float(pseudo_voigt(np.array([edge], dtype=float), 1.0, center, max(fwhm, 1e-12), eta)[0])
 
 
-def height_cap(y_target, options=None) -> float:
-    """The upper bound of every height in a fit of ``y_target`` (the window's data
-    less any fixed baseline): ``options["max_height"]`` when given (a refit takes
-    its fit's), else HEIGHT_CAP_FACTOR times max |y_target|. One value for every
-    solver; pack_theta_bounds scales it per peak (visible_share), and every
-    solver enforces the result inside its solve."""
+def height_cap(y_target, options=None, y_data=None) -> float:
+    """The largest height a fit may give a peak: ``options["max_height"]`` when
+    given (a bootstrap refit takes its fit's), else the data's largest value
+    above the lowest the baseline can lie, plus the peak signal max|y_target|.
+
+    ``y_target`` is the window's data less the baseline the peaks are fitted
+    over: the fixed one, or the computed one a joint baseline starts from. A
+    peak adds its height to the baseline at its centre, so it can be no taller
+    than the data there above the lowest the baseline can lie, plus what the
+    fit leaves in the residual, for which the peak signal is the allowance.
+
+    - A fixed baseline lies where it is: the bound is twice the peak signal.
+    - A joint baseline (``y_data``, the window's data, given) is fitted with the
+      peaks and can dip below the data, a broad peak and the baseline trading
+      against each other; it cannot dip below zero counts (or below the data,
+      for data that go below zero). The bound is max(y_data) - min(0,
+      min(y_data)) plus the peak signal: on the 5 s MoS2 spectrum 595 + 91,
+      where twice the signal, 181, cut fits whose broad peaks reach 258 and 535.
+
+    One value for every height. A height the fit keeps below it is bound by
+    nothing (fit_api.run_fit_consistent), and one that ends at it makes the fit
+    fail, by name."""
 
     opts = options or {}
     given = opts.get("max_height")
@@ -50,8 +62,13 @@ def height_cap(y_target, options=None) -> float:
     y = y[np.isfinite(y)]
     if not y.size:
         return float("inf")
-    factor = float(opts.get("max_height_factor", HEIGHT_CAP_FACTOR))
-    return factor * max(float(np.max(np.abs(y))), 1e-12)
+    signal = max(float(np.max(np.abs(y))), 1e-12)
+    if y_data is None:
+        return 2.0 * signal
+    d = np.asarray(y_data, dtype=float).ravel()
+    d = d[np.isfinite(d)]
+    above = float(np.max(d)) - min(0.0, float(np.min(d))) if d.size else signal
+    return max(above, 0.0) + signal
 
 
 def held_heights(bounds) -> np.ndarray:
@@ -101,7 +118,9 @@ def pack_theta_bounds(
         Mapping of solver options.  ``min_fwhm`` (default ``1e-6``) enforces a
         lower bound on widths.  ``centers_in_window`` constrains centers to the
         range of ``x`` when true.  ``max_height`` is the heights' upper bound
-        (:func:`height_cap`), which every caller sets from the window's data.
+        (:func:`height_cap`), which every caller sets from the window's data;
+        ``capped`` (one flag per peak; default: every peak) says which heights
+        take it, the others keeping make_bounds' stand-in for none.
 
     Returns
     -------
@@ -145,6 +164,7 @@ def pack_theta_bounds(
     ub_list: list[float] = []
 
     caps = options.get("width_caps", None)
+    capped = options.get("capped")
     xmin, xmax = (float(x.min()), float(x.max())) if x.size else (0.0, 0.0)
     for i, pk in enumerate(peaks):
         h_lo, c_lo, w_lo = lo_hw[3 * i : 3 * i + 3]
@@ -180,17 +200,19 @@ def pack_theta_bounds(
         if pk.lock_center:
             c_lo = c_hi = c
 
-        # bounds for height: the data's cap (height_cap) times the most of a unit
-        # peak the window can show over the centres and widths the peak may take
-        # (visible_share at the allowed centre nearest the window and the widest
-        # allowed width; eta is never fitted). That share is 1 unless the centre
-        # is held outside the window, so only such a peak's bound changes.
-        if h_hi < 1e12:  # a bound from the data, not make_bounds' stand-in for none
+        # bounds for height: the data's cap (height_cap) for a height that takes
+        # it; one that does not keeps the stand-in for none. A peak whose largest
+        # value in the window (visible_share at the allowed centre nearest the
+        # window and the widest allowed width; eta is never fitted) is below
+        # sqrt(eps) of a unit peak is held at 0 in every pass, cap or none: a
+        # finite-difference derivative of it is rounding noise (Classic drove
+        # such heights to 4e7) and its NNLS column as small (Modern VP: 4.6e15).
+        if h_hi < NO_BOUND:  # a bound from the data, not make_bounds' stand-in for none
             c_near = float(np.clip(0.5 * (xmin + xmax), c_lo, c_hi))
-            share = visible_share(c_near, w_hi, e, xmin, xmax)
-            # cap * share**2 bounds the peak's largest value in the window: below
-            # the cap's precision the data cannot see it, and its height is held.
-            h_hi = h_lo if share * share < np.finfo(float).eps else max(h_lo, h_hi * share)
+            if visible_share(c_near, w_hi, e, xmin, xmax) < np.sqrt(np.finfo(float).eps):
+                h_hi = h_lo
+            elif capped is not None and not capped[i]:
+                h_hi = NO_BOUND
         h = float(np.clip(max(pk.height, 1e-12), h_lo, h_hi))
 
         theta_list.extend([c, h, w, e])

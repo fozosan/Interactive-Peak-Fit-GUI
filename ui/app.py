@@ -4427,7 +4427,8 @@ class PeakFitApp:
                     f"Fit at bound: {', '.join(hits)}. Those values are the bound, not free estimates.{hint}"
                 )
             if not res.get("fit_ok"):
-                self.status_warn(f"The fit did not converge: {res.get('message') or 'no message'}")
+                lead = "The fit is not usable" if res.get("height_at_cap") else "The fit did not converge"
+                self.status_warn(f"{lead}: {res.get('message') or 'no message'}")
 
         self.step_btn.config(state=tk.DISABLED)
         self.set_busy(True, "Fitting…")
@@ -4613,6 +4614,11 @@ class PeakFitApp:
             return (
                 "Fit first. No fit has produced these peaks on these data, baseline and "
                 "window: they are new, or changed since the last fit."
+            )
+        if rec["result"].get("height_at_cap"):
+            return (
+                f"{', '.join(rec['result']['height_at_cap'])} ended at the cap the data allow. "
+                "Fit again from other peaks or over another window."
             )
         if not rec["result"].get("fit_ok"):
             return "the fit did not converge. Fit again, or change the solver settings."

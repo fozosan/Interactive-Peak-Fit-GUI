@@ -189,3 +189,34 @@ def test_export_retires_only_its_own_stale_uncertainty(gui, tmp_path):
     assert sorted(p.name for p in out.iterdir()) == sorted(
         ["G_band.csv", "G_fit.csv", "G_trace.csv"] + [f"G{suffix}" for suffix in kept]
     )
+
+
+def test_an_aborted_export_retires_its_own_stale_uncertainty_as_batch_does(gui, tmp_path, monkeypatch):
+    # An export runs uncertainty unless the fit or the settings block it, as batch
+    # with uncertainty on does; aborted, it writes none, and the app's own files
+    # from an earlier export go, as batch's do for a file whose run was aborted:
+    # the new fit table replaces the one they described. A file the app did not
+    # write stays.
+    out = tmp_path / "out"
+    out.mkdir()
+    gui.fit()
+    gui.app.cfg["export_unc_wide"] = True
+    gui.export(out / "G.csv")
+    assert all((out / f"G{suffix}").exists() for suffix in UNC)
+    (out / "G_uncertainty.txt").write_text(USER_TEXT, encoding="utf-8")
+
+    def aborted(*args, **kwargs):
+        raise pipeline.UncertaintyAborted("the user aborted the uncertainty run")
+
+    monkeypatch.setattr(gui.app, "_compute_uncertainty", aborted)
+    gui.fit()  # a new fit: no uncertainty cached for it
+    n0 = len(gui.app._log_buffer)
+    gui.export(out / "G.csv")
+
+    own = [s for s in UNC if s != "_uncertainty.txt"]
+    assert not any((out / f"G{suffix}").exists() for suffix in own)
+    assert (out / "G_uncertainty.txt").read_text(encoding="utf-8") == USER_TEXT
+    assert (out / "G_fit.csv").exists() and (out / "G_trace.csv").exists()
+    logged = gui.app._log_buffer[n0:]
+    assert any("removed G_uncertainty.csv" in line for line in logged)
+    assert any("left G_uncertainty.txt (it is not this app's output)" in line for line in logged)

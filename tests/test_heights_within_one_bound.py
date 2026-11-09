@@ -1,5 +1,6 @@
-"""Every solver fits every height within one bound, and a peak held outside the
-window cannot take the fit.
+"""Every height within one cap, which bounds only the heights a fit puts above
+it, and fails a fit that leaves one at it; a peak held outside the window cannot
+take the fit.
 
 The 2026-11-09 check of #257. A template's peaks locked outside the fit window
 reach the data with their tails only, which cannot fix their heights, and no
@@ -13,12 +14,22 @@ solver bounded them (make_bounds' 1e12 stands in for "no bound"):
   area in the GUI), and drove one to 1.5e8 in batch; LMFIT-VP's NNLS put them at
   0 in the GUI and at 2.5e6 in batch (2400H-2ZF-Rad on the 0.20 s spectrum).
 
-Now fit.bounds.pack_theta_bounds gives every height one bound, which every solver
-enforces in its solve: the data's cap (height_cap, twice the largest value the
-peaks are fitted to) times the most of the peak the window can show
-(visible_share: 1 for a centre the window can hold, the value at the nearer
-window edge for one locked outside). A peak the window cannot see is held at 0,
-and flagged.
+Round 2 bounded every height by twice the peak signal from the start. Its
+re-check found 13 sweep fits main got right made silently wrong (Modern VP
+2ZF-Rad-3 on the 5 s spectrum: RMSE 0.79 to 12.6, a height at the cap of 181
+where main's fit has 258), the default path (auto seeds, LMFIT-VP, joint
+baseline) not converged, and the Modern TRF sweep 7x slower:
+- with a joint baseline, which can dip below the data, twice the signal above
+  the computed baseline is no bound on a broad peak: fit.bounds.height_cap is
+  now the data above zero counts plus that signal (595 + 91 there);
+- a bound the fit stays below still changed it: least_squares scales every step
+  by the distance to the bound, and NNLS's path met it where heights pass it on
+  the way. run_fit_consistent now bounds a height only once the fit puts it
+  above the cap, and runs the fit again from the same start;
+- a height that ends at the cap fails the fit, by name (batch status
+  height_at_cap): the cap, not the data, set it.
+A peak the window cannot see (visible_share below sqrt(eps)) is held at 0 in
+every pass, and flagged.
 """
 
 from __future__ import annotations
@@ -101,25 +112,142 @@ def test_the_batch_fit_with_its_baseline_keeps_every_height_in_bounds(solver):
     assert np.all(theta[1::4] <= res["height_cap"])
 
 
-def test_the_height_bound_is_the_cap_times_what_the_window_shows():
-    from fit.bounds import height_cap, pack_theta_bounds, visible_share
+def test_the_cap_bounds_every_height_it_is_given_to_and_none_other():
+    from fit.bounds import NO_BOUND, pack_theta_bounds, visible_share
 
     x = np.linspace(WINDOW[0], WINDOW[1], 95)
     peaks = _seeds()
-    _, (lo, hi) = pack_theta_bounds(peaks, x, {"max_height": 100.0})
     shares = [visible_share(p.center, p.fwhm, p.eta, *WINDOW) for p in peaks]
     assert shares[:2] == [1.0, 1.0]
     assert 1e-3 < shares[2] < 1e-2 and 0.4 < shares[4] < 0.6
-    assert hi[1::4][:2] == pytest.approx([100.0, 100.0])
-    assert hi[1::4][2] == pytest.approx(100.0 * shares[2]) and hi[1::4][4] == pytest.approx(100.0 * shares[4])
+    assert shares[3] < 1e-40 and shares[5] < 1e-15
+    visible = [i for i in range(len(peaks)) if i not in INVISIBLE]
+    # every height takes the cap, whatever its share: a peak outside the window
+    # may be as tall as the data allow
+    _, (lo, hi) = pack_theta_bounds(peaks, x, {"max_height": 100.0})
+    assert hi[1::4][visible] == pytest.approx([100.0] * len(visible))
     for i in INVISIBLE:  # held at 0, as pack_theta_bounds holds a locked value
         assert lo[4 * i + 1] == 0.0 and hi[4 * i + 1] <= 1e-12
-    # a free centre may sit in the window: its peak keeps the whole cap
-    free = [Peak(450.0, 1.0, 5.0, 0.0)]
-    assert pack_theta_bounds(free, x, {"max_height": 100.0})[1][1][1] == pytest.approx(100.0)
-    # the cap is the data's, or the one given (a bootstrap refit takes its fit's)
+    # a height the cap is not given to keeps make_bounds' stand-in for none; a
+    # peak the window cannot see stays held
+    capped = np.zeros(len(peaks), bool)
+    capped[1] = True
+    _, (lo, hi) = pack_theta_bounds(peaks, x, {"max_height": 100.0, "capped": capped})
+    assert hi[1::4][1] == pytest.approx(100.0)
+    assert all(hi[4 * i + 1] == NO_BOUND for i in visible if i != 1)
+    for i in INVISIBLE:
+        assert hi[4 * i + 1] <= 1e-12
+
+
+def test_the_cap_is_the_data_above_the_lowest_the_baseline_can_lie_plus_the_signal():
+    from fit.bounds import height_cap
+
+    # a fixed baseline lies where it is: twice the peak signal (|y - baseline|)
     assert height_cap(np.array([-3.0, 2.0, 1.0])) == pytest.approx(6.0)
+    # a joint one can dip below the data, not below zero counts: max(y) + signal
+    y = np.array([505.0, 595.0, 510.0])
+    assert height_cap(y - 504.0, y_data=y) == pytest.approx(595.0 + 91.0)
+    # data that go below zero: their minimum is the floor
+    y = np.array([-20.0, 70.0, -5.0])
+    assert height_cap(y - (-20.0), y_data=y) == pytest.approx(90.0 + 90.0)
+    # the one given (a bootstrap refit takes its fit's)
     assert height_cap(np.array([1.0]), {"max_height": 7.5}) == 7.5
+    assert height_cap(y, {"max_height": 7.5}, y_data=y) == 7.5
+
+
+def _broad_bump():
+    # E2g and A1g on a broad peak (250 counts, FWHM 30) over a curved baseline:
+    # the shape that a computed baseline follows, so twice the signal above it
+    # (round 2's cap, 178 here) cuts the broad peak, as on the 5 s spectrum,
+    # where main's broad peaks reach 258 and 535 under a 181 cap.
+    from tests.synthetic_raman import MOS2_LINES, mos2_x
+
+    x = mos2_x()
+    mask = (x >= WINDOW[0]) & (x <= WINDOW[1])
+    curve = BACKGROUND - 100.0 * ((x - 395.0) / 35.0) ** 2
+    broad = pseudo_voigt(x, 250.0, 395.0, 30.0, 0.5)
+    lines = sum(pseudo_voigt(x, h, c, w, e) for c, h, w, e in MOS2_LINES)
+    seeds = [Peak(383.0, 60.0, 3.0, 0.5), Peak(408.0, 80.0, 3.0, 0.5), Peak(395.0, 100.0, 25.0, 0.5)]
+    return x, curve + broad + lines, mask, curve + broad, seeds
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_a_broad_peak_under_the_lines_keeps_its_height_with_a_joint_baseline(solver):
+    x, y, mask, computed, seeds = _broad_bump()
+    cfg = {"solver": solver, solver: {"maxfev": 20000}, "baseline_fit": "joint"}
+    res = fit_api.run_fit_consistent(x, y, seeds, cfg, computed, "add", mask)
+    signal = np.max(np.abs(y[mask] - computed[mask]))
+    assert 2 * signal < 200.0  # round 2's cap, below the broad peak
+    assert res["fit_ok"], res["message"]
+    assert res["height_cap"] == pytest.approx(np.max(y[mask]) + signal)
+    assert np.asarray(res["theta"], float)[1::4] == pytest.approx([68.7, 92.3, 250.0], rel=0.02)
+    assert res["rmse"] < 0.5
+    assert not res["height_at_cap"]
+
+
+@pytest.mark.parametrize("baseline_fit", ["fixed", "joint"])
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_a_cap_the_fit_stays_below_changes_nothing(solver, baseline_fit):
+    # The same fit, to the last bit, as with no cap: least_squares scales its
+    # steps by the distance to a bound, so a finite bound changes the path and
+    # the cost of a fit it never touches (Modern TRF's sweep ran 7x longer).
+    x, y = mos2_spectrum(7)
+    mask = (x >= WINDOW[0]) & (x <= WINDOW[1])
+    seeds = [Peak(383.0, 60.0, 3.0, 0.5), Peak(408.0, 80.0, 3.0, 0.5)]
+    base = np.full_like(x, BACKGROUND)
+    cfg = {"solver": solver, solver: {"maxfev": 20000}, "baseline_fit": baseline_fit}
+    capped = fit_api.run_fit_consistent(x, y, seeds, cfg, base, "add", mask)
+    none = fit_api.run_fit_consistent(
+        x, y, seeds, {**cfg, solver: {"maxfev": 20000, "max_height": 1e12}}, base, "add", mask
+    )
+    assert capped["fit_ok"] and capped["height_cap"] < 1e3
+    assert np.array_equal(np.asarray(capped["theta"]), np.asarray(none["theta"]))
+    assert capped["rmse"] == none["rmse"]
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_a_height_that_ends_at_the_cap_fails_the_fit_by_name(solver):
+    # A1g is 92 counts; a cap of 80 leaves it there, set by the cap and not by
+    # the data: no result, and it says which height.
+    x, y = mos2_spectrum(7)
+    mask = (x >= WINDOW[0]) & (x <= WINDOW[1])
+    seeds = [Peak(383.0, 60.0, 3.0, 0.5), Peak(408.0, 80.0, 3.0, 0.5)]
+    cfg = {"solver": solver, solver: {"maxfev": 20000, "max_height": 80.0}}
+    res = fit_api.run_fit_consistent(x, y, seeds, cfg, np.full_like(x, BACKGROUND), "add", mask)
+    heights = np.asarray(res["theta"], float)[1::4]
+    assert heights[1] == pytest.approx(80.0)
+    assert heights[0] < 75.0
+    assert not res["fit_ok"]
+    assert res["height_at_cap"] == ["height2"]
+    assert "height2" in res["bound_hit"]
+    assert "height2 ended at the cap" in res["message"]
+
+
+def test_batch_says_height_at_cap_and_computes_no_uncertainty(tmp_path):
+    import csv
+
+    from batch import runner
+    from tests.test_batch_file_isolation import _config
+
+    x, y = mos2_spectrum(7)
+    src = tmp_path / "in"
+    src.mkdir()
+    np.savetxt(src / "spec.csv", np.column_stack([x, y]), delimiter=",")
+    solver = "modern_vp"
+    out = tmp_path / "out"
+    seeds = [{"center": c, "height": h, "fwhm": 3.0, "eta": 0.5, "lock_center": False, "lock_width": False}
+             for c, h in ((383.0, 60.0), (408.0, 80.0))]
+    cfg = {**_config(out, solver), "peaks": seeds, solver: {"maxfev": 20000, "max_height": 80.0},
+           "fit_xmin": WINDOW[0], "fit_xmax": WINDOW[1], "unc_method": "asymptotic"}
+    runner.run_batch([str(src / "spec.csv")], cfg, compute_uncertainty=True, unc_method="asymptotic")
+    rows = list(csv.DictReader(open(next(out.glob("*_files.csv")), newline="", encoding="utf-8")))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["status"] == "height_at_cap"
+    assert row["fit_ok"] == "False"
+    assert "height2 ended at the cap" in row["message"]
+    assert row["unc_status"] == "skipped" and row["unc_message"] == "a height ended at its cap"
+    assert not list(out.glob("*uncertainty*"))
 
 
 def test_a_bootstrap_refits_within_the_bounds_of_its_fit(tmp_path, monkeypatch):
