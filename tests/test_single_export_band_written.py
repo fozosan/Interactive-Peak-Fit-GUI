@@ -7,8 +7,10 @@ tk = pytest.importorskip("tkinter")
 
 def test_single_export_band_written(tmp_path, monkeypatch):
     from ui.app import PeakFitApp, Peak, pseudo_voigt
+    from tests.gui_driver import Driver
     root = tk.Tk()
     app = PeakFitApp(root)
+    gui = Driver(app, monkeypatch)
 
     x = np.linspace(-3,3,241)
     pk = Peak(0.0, 1.0, 0.8, 0.3)
@@ -24,11 +26,9 @@ def test_single_export_band_written(tmp_path, monkeypatch):
     except Exception:
         pass
 
-    out = tmp_path / "s.csv"
-    monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **k: str(out))
-    monkeypatch.setattr(messagebox, "showinfo", lambda *a, **k: None)
-
-    app.on_export()
+    # The uncertainty is of a fit (as in batch), and Export runs on a worker thread.
+    gui.fit()
+    gui.export(tmp_path / "s.csv")
 
     assert (tmp_path / "s_uncertainty.csv").exists()
     # Asymptotic should write band

@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from batch import runner
+from core import pipeline
 from core import fit_api, models
 from core.peaks import Peak
 from fit import classic
@@ -260,7 +261,7 @@ def test_stale_uncertainty_files_are_removed_when_uncertainty_now_fails(tmp_path
     def failing_router(*args, **kwargs):
         raise RuntimeError("synthetic uncertainty failure")
 
-    monkeypatch.setattr(runner, "route_uncertainty", failing_router)
+    monkeypatch.setattr(pipeline, "route_uncertainty", failing_router)  # batch uncertainty runs there
     ok, n = runner.run_batch([str(in_dir / "a.csv")], cfg, compute_uncertainty=True, unc_method="Asymptotic")
 
     assert (ok, n) == (1, 1)

@@ -155,3 +155,46 @@ def test_one_uncertainty_result_is_written_as_batch_writes_it(gui, monkeypatch, 
         return sorted(p.name for p in folder.iterdir() if p.name.startswith(STEM))
 
     assert spectrum_files(gui_dir) == spectrum_files(batch_dir)
+
+
+# --- the uncertainty, computed: one context for the GUI and batch -------------
+
+METHOD_LABELS = {"asymptotic": "Asymptotic", "bootstrap": "Bootstrap", "bayesian": "Bayesian"}
+
+
+@pytest.mark.parametrize("method", ["asymptotic", "bootstrap", "bayesian"])
+def test_fit_export_and_uncertainty_write_what_batch_writes(gui, monkeypatch, tmp_path, spectrum, method):
+    """Fit, then Export with the uncertainty computed, against Run Batch with
+    uncertainty: every file of the spectrum matches, uncertainty files included.
+    Seed all makes the bootstrap and the chain repeatable; alpha 0.1 on the
+    asymptotic case checks that the level reaches the context and the labels."""
+
+    app = gui.app
+    gui.open_file(spectrum)
+    gui.set_window(*WINDOW)
+    app.perf_seed_all.set(True)
+    app.seed_var.set("11")
+    app.unc_method.set(METHOD_LABELS[method])
+    app.boot_n_var.set(40)
+    app.bayes_burn_var.set(100)
+    app.bayes_steps_var.set(400)
+    if method == "asymptotic":
+        app.alpha_var.set(0.1)
+    _seed(gui)
+    gui.fit()
+    (tmp_path / "gui").mkdir()
+    gui.export(tmp_path / "gui" / SPECTRUM)
+
+    _batch_like_the_gui(gui, monkeypatch, spectrum, tmp_path / "batch", compute_uncertainty=True)
+
+    gui_dir, batch_dir = tmp_path / "gui", tmp_path / "batch"
+    files = sorted(p.name for p in gui_dir.iterdir() if p.name.startswith(STEM))
+    assert files == sorted(p.name for p in batch_dir.iterdir() if p.name.startswith(STEM))
+    assert {f"{STEM}_uncertainty.csv", f"{STEM}_uncertainty.txt"} <= set(files)
+    for name in files:
+        diff = text_differences if name.endswith(".txt") else table_differences
+        assert diff(gui_dir / name, batch_dir / name) == [], name
+    if method == "asymptotic":
+        header = (gui_dir / f"{STEM}_uncertainty.csv").read_text(encoding="utf-8").splitlines()[0]
+        assert "p5" in header.split(",") and "p95" in header.split(",")
+        assert "90% CI" in (gui_dir / f"{STEM}_uncertainty.txt").read_text(encoding="utf-8")

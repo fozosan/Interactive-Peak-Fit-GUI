@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from batch import runner
+from core import pipeline
 from core.uncertainty import bayesian_ci
 from tests.bayes_problem import model, mos2_problem, recording_sampler, sampled_index
 from tests.synthetic_raman import BACKGROUND, TEMPLATE, WINDOW, curved_shape, mos2_spectrum, write_spectrum
@@ -74,7 +75,7 @@ def test_batch_hands_the_bayesian_a_batched_predictor(baseline_fit, monkeypatch,
         captured.update(kw)
         raise RuntimeError("captured")
 
-    monkeypatch.setattr(runner, "route_uncertainty", capture)
+    monkeypatch.setattr(pipeline, "route_uncertainty", capture)  # batch uncertainty runs there
     spec = tmp_path / "spec.csv"
     write_spectrum(spec, *mos2_spectrum(0, background=lambda x: BACKGROUND + curved_shape(x)))
     cfg = {

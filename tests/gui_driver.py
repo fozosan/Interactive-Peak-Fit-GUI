@@ -120,6 +120,20 @@ class Driver:
         )
         self._raise_on_error("Fit", start)
 
+    UNC_OUTCOMES = ("Computed ", "Uncertainty failed", "Uncertainty not computed")
+
+    def run_uncertainty(self) -> str:
+        """Press Run in the Uncertainty panel; return the log line that ends it."""
+
+        n0 = len(self.app._log_buffer)
+        self.click("Run", within="Uncertainty")
+
+        def outcome():
+            return [ln for ln in self.app._log_buffer[n0:] if any(k in ln for k in self.UNC_OUTCOMES)]
+
+        self.pump_until(lambda: bool(outcome()), what="Uncertainty")
+        return outcome()[0]
+
     def export(self, path) -> None:
         start, d0 = len(self.dialogs), self._dialog_count("Export")
         self.save_answers.append(str(path))

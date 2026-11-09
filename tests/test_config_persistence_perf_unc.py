@@ -20,10 +20,9 @@ def test_config_persistence_perf_unc(tmp_path, monkeypatch):
     root = tk.Tk(); root.withdraw()
     app = app_module.PeakFitApp(root)
     app.perf_numba.set(True)
-    app.perf_gpu.set(True)
     app.perf_cache_baseline.set(False)
     app.perf_seed_all.set(True)
-    app.perf_max_workers.set(5)
+    app.perf_unc_workers.set(5)  # GPU and Max workers are gone (game plan 3.3)
     app.show_ci_band_var.set(False)
     app.toggle_components()
     app.show_legend_var.set(False)
@@ -34,10 +33,9 @@ def test_config_persistence_perf_unc(tmp_path, monkeypatch):
     app2 = app_module.PeakFitApp(root2)
     cfg = app_module.load_config()
     assert cfg["perf_numba"] is True
-    assert cfg["perf_gpu"] is True
     assert cfg["perf_cache_baseline"] is False
     assert cfg["perf_seed_all"] is True
-    assert cfg["perf_max_workers"] == 5
+    assert cfg["perf_unc_workers"] == 5
     assert cfg["ui_show_uncertainty_band"] is False
     assert cfg["ui_show_components"] is False
     assert cfg["ui_show_legend"] is False

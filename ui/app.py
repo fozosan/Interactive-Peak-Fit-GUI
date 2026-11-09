@@ -11,7 +11,7 @@ What’s new since v3.0 / v3.1
 • “Step ▶” parity: Step uses the same residual/bounds as Fit and reports damping λ, backtracks, step_norm, and accept/reject reasons. Non-finite guards prevent freezes.
 • Persisted settings: Shape factor η, “Add peaks on click”, solver choice, uncertainty method, performance toggles, legend visibility, and defaults (e.g., labels) are saved to ui/ui_config/gl_peakfit_config.json, beside the code, so OneDrive syncs them (the old ~/.gl_peakfit_config.json is read until that file exists, and never changed).
 • UI/UX: Segmented action bar (File | Fit | Plot | Help) is always visible; F1 opens Help. Right panel scrolling is independent from the Help window; splitter enforces sensible min widths; status bar with progress + collapsible green-on-black log; batch streams progress.
-• Defaults: “Show uncertainty band” = ON. “Baseline uses fit range” = ON. Performance toggles persist (Numba/CuPy/cache/seed/workers).
+• Defaults: “Show uncertainty band” = ON. “Baseline uses fit range” = ON. Performance toggles persist (Numba/cache/seed/uncertainty workers).
 • Legend: Toggleable legend with peak centers in labels; legend font set to Arial.
 • Export parity: Canonical per-file outputs with no blank lines — *_fit.csv, *_trace.csv, *_uncertainty.csv, *_uncertainty.txt — identical schemas for single and batch; batch writes to the chosen output folder plus a batch summary.
 • Uncertainty: Asymptotic band via SVD covariance (smoothed prediction band), Bootstrap (residual resampling with seeded determinism and worker cap), and optional Bayesian (emcee) with ESS/R-hat diagnostics and smoothed bands.
@@ -151,7 +151,7 @@ Export (single & batch share formats; no blank lines)
 
 Persistence & defaults
 ======================
-The configuration file (ui/ui_config/gl_peakfit_config.json, beside the code: git-ignored and synced by OneDrive; the GL_PEAKFIT_CONFIG environment variable names another file) stores: ALS defaults (λ, p, iterations, threshold), solver choice & options (loss/weights/f_scale/maxfev/restarts/jitter/step_lambda), uncertainty method, click-to-add toggle, global η, performance toggles (numba/gpu/cache/seed_all/max_workers), batch defaults, x-label, legend visibility, and templates (including auto-apply). Settings update on change and are loaded at startup. Until that file exists, the old ~/.gl_peakfit_config.json is loaded in its place; the first save writes the new file, and the old one is never changed.
+The configuration file (ui/ui_config/gl_peakfit_config.json, beside the code: git-ignored and synced by OneDrive; the GL_PEAKFIT_CONFIG environment variable names another file) stores: ALS defaults (λ, p, iterations, threshold), solver choice & options (loss/weights/f_scale/maxfev/restarts/jitter/step_lambda), uncertainty method, click-to-add toggle, global η, performance toggles (numba/cache/seed_all/uncertainty workers), batch defaults, x-label, legend visibility, and templates (including auto-apply). Settings update on change and are loaded at startup. Until that file exists, the old ~/.gl_peakfit_config.json is loaded in its place; the first save writes the new file, and the old one is never changed.
 
 UI details
 ==========
@@ -182,6 +182,7 @@ Known limitations / tips
 import json
 import logging
 import math  # used for band row filtering
+import queue
 import re
 import shutil
 import tempfile
@@ -191,13 +192,8 @@ from dataclasses import dataclass
 from functools import wraps  # used by @log_action
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Tuple, Optional, Mapping
-from contextlib import nullcontext
+from typing import Dict, List, Optional
 from types import SimpleNamespace  # ensure this import exists
-from core.data_io import (
-    write_uncertainty_csvs,
-    write_uncertainty_txt,
-)
 try:
     import core.data_io as _dio  # for build_peak_table/trace_table in batch exports
 except Exception:
@@ -205,7 +201,6 @@ except Exception:
     _dio = None  # type: ignore
 
 import numpy as np
-import pandas as pd
 
 import os
 import matplotlib
@@ -256,9 +251,6 @@ try:
     _canonical_unc_label = _dio.canonical_unc_label  # type: ignore[attr-defined]
 except Exception:
     _canonical_unc_label = lambda s: str(s).strip().lower()
-# aliases used in export-parity logic
-from core.data_io import normalize_unc_result as _normalize_unc_result
-import core.uncertainty as core_uncertainty
 from ui.uncertainty_utils import (
     method_display_to_key,
     normalize_float,
@@ -278,7 +270,6 @@ except Exception:  # pragma: no cover - NotAvailable may be absent
 
     class NotAvailable:  # pragma: no cover - fallback placeholder
         pass
-from core.residuals import build_residual, jacobian_fd
 from core import fit_api, pipeline
 from core import peaks as core_peaks
 from core.fit_api import (
@@ -287,7 +278,7 @@ from core.fit_api import (
     modern_vp_step,
     lmfit_step,
 )
-from fit import orchestrator, classic, modern_vp, modern
+from fit import classic, modern_vp, modern
 try:  # optional
     from fit import lmfit_backend
 except Exception:  # pragma: no cover - optional dependency may be missing
@@ -435,7 +426,13 @@ def _config_paths():
 
 
 CONFIG_PATH, LEGACY_CONFIG_PATH = _config_paths()
+# The app wrote its defaults into every settings file at startup, so a stored value
+# is no sign of a choice. When a default changes, files from before carry the old
+# one; _upgrade_settings resets those values once, and the file then carries the
+# version, after which what the user sets is kept.
+SETTINGS_VERSION = 2
 DEFAULTS = {
+    "settings_version": SETTINGS_VERSION,
     "baseline_defaults": {
         "method": "als",
         "als": {"lam": 1e5, "p": 0.001, "niter": 10, "thresh": 0.0},
@@ -469,10 +466,8 @@ DEFAULTS = {
     "show_uncertainty_band": True,
     "baseline_uses_fit_range": True,
     "perf_numba": False,
-    "perf_gpu": False,
     "perf_cache_baseline": True,
     "perf_seed_all": False,
-    "perf_max_workers": 0,
     # Font configuration defaults (added for font rendering improvements)
     "ui_font_family": "auto",
     "ui_font_size": 10,
@@ -482,6 +477,40 @@ DEFAULTS = {
 
 LOG_MAX_LINES = 5000
 _config_log = logging.getLogger(__name__)
+# What the last load_config changed in an older file; the app logs these once.
+_SETTINGS_NOTES: List[str] = []
+
+
+def _upgrade_settings(cfg: dict, version: int) -> None:
+    """Bring the settings of a file written by an older version up to this one.
+
+    Version 2: the bootstrap start jitter's default became 0 (PR #248). It scales
+    with each parameter's value, so at 2 % a centre at 383 cm-1 started 7.7 cm-1
+    away, the refits landed in other minima and the intervals came out 4 to 4500x
+    too wide. An older file holds the old default, which the app wrote into every
+    file, or a value chosen on that scale before this was measured: it starts at
+    0, once, and the app says so. The Bayesian default became 8000 steps (PR
+    #252), so the old default, 4000, becomes 8000; another stored value is kept.
+    """
+
+    if version < 2:
+        old = cfg.get("bootstrap_jitter")
+        cfg["bootstrap_jitter"] = 0.0
+        try:
+            old_pct = 100.0 * float(old)
+        except (TypeError, ValueError):
+            old_pct = 0.0
+        if old_pct:
+            note = (
+                f"Settings: the bootstrap start jitter is now 0, the default (it was {old_pct:g} %). "
+                "It scales with each parameter's value, so the refits started far from the fit and "
+                "landed in other minima: at 2 % the intervals came out 4 to 4500x too wide. "
+                "To use one anyway, set the bootstrap Jitter % under Uncertainty again."
+            )
+            _config_log.warning(note)
+            _SETTINGS_NOTES.append(note)
+        if cfg.get("bayes_steps") == 4000:
+            cfg["bayes_steps"] = 8000
 
 
 def _read_settings(path):
@@ -530,6 +559,7 @@ def _replace_settings(src, dst, attempts=5):
 
 
 def load_config():
+    _SETTINGS_NOTES.clear()
     path = CONFIG_PATH
     if not path.exists() and LEGACY_CONFIG_PATH is not None and LEGACY_CONFIG_PATH.exists():
         path = LEGACY_CONFIG_PATH  # read once; the next save_config writes CONFIG_PATH
@@ -566,6 +596,12 @@ def load_config():
                 cfg["solver_choice"] = "modern_vp"
             elif sc == "lmfit":
                 cfg["solver_choice"] = "lmfit_vp"
+            try:
+                version = int(data.get("settings_version", 1))
+            except (TypeError, ValueError):
+                version = 1
+            _upgrade_settings(cfg, version)
+            cfg["settings_version"] = SETTINGS_VERSION
             cfg.pop("ui_theme", None)
             # Migration: if the user file lacked baseline_defaults, construct
             # one from any legacy ALS keys present.  We look at the original
@@ -811,142 +847,7 @@ def load_xy_any(path: str):
     """Wrapper around :func:`core.data_io.load_xy` for backwards compatibility."""
     return _dio.load_xy(path)
 
-def _coerce_param_stats(res: Any) -> Dict[str, Dict[str, Any]]:
-    """Return normalized parameter stats mapping."""
 
-    def _norm_map(d: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        out: Dict[str, Dict[str, Any]] = {}
-        nested = True
-        for v in d.values():
-            if not isinstance(v, dict):
-                nested = False
-                break
-        if nested:
-            for p, inner in d.items():
-                if not isinstance(inner, dict):
-                    continue
-                est = inner.get("est") or inner.get("mean") or inner.get("median")
-                sd = inner.get("sd") or inner.get("stderr") or inner.get("sigma")
-                p25 = (
-                    inner.get("p2_5")
-                    or inner.get("p025")
-                    or inner.get("q2_5")
-                    or inner.get("q025")
-                )
-                p975 = (
-                    inner.get("p97_5")
-                    or inner.get("p975")
-                    or inner.get("q97_5")
-                    or inner.get("q975")
-                )
-                out[p] = {"est": est, "sd": sd, "p2_5": p25, "p97_5": p975}
-            return out
-
-        buckets: Dict[str, Dict[str, Any]] = {}
-        for k, v in d.items():
-            if not isinstance(k, str) or "_" not in k:
-                continue
-            base, suffix = k.rsplit("_", 1)
-            suffix = suffix.lower()
-            if suffix not in (
-                "est",
-                "mean",
-                "median",
-                "sd",
-                "stderr",
-                "sigma",
-                "p2",
-                "p2_5",
-                "p025",
-                "p97",
-                "p97_5",
-                "p975",
-                "q2_5",
-                "q025",
-                "q97_5",
-                "q975",
-            ):
-                continue
-            b = buckets.setdefault(base, {})
-            b[suffix] = v
-
-        for base, inner in buckets.items():
-            est = inner.get("est") or inner.get("mean") or inner.get("median")
-            sd = inner.get("sd") or inner.get("stderr") or inner.get("sigma")
-            p25 = inner.get("p2_5") or inner.get("p025") or inner.get("p2") or inner.get("q2_5") or inner.get("q025")
-            p975 = (
-                inner.get("p97_5")
-                or inner.get("p975")
-                or inner.get("p97")
-                or inner.get("q97_5")
-                or inner.get("q975")
-            )
-            out[base] = {"est": est, "sd": sd, "p2_5": p25, "p97_5": p975}
-        return out
-
-    if isinstance(res, dict):
-        for key in ("param_stats", "params", "parameters", "stats"):
-            if key in res and isinstance(res[key], dict):
-                return _norm_map(res[key])
-        return _norm_map(res)
-    else:
-        for key in ("param_stats", "params", "parameters", "stats"):
-            if hasattr(res, key):
-                val = getattr(res, key)
-                if isinstance(val, dict):
-                    return _norm_map(val)
-        if hasattr(res, "to_dict"):
-            maybe = res.to_dict()
-            if isinstance(maybe, dict):
-                return _norm_map(maybe)
-    return {}
-
-
-def _iter_peakwise(stats_map: Dict[str, Dict[str, Any]], n_peaks: int) -> Iterable[Tuple[int, Dict[str, Any]]]:
-    def _get(param: str):
-        return stats_map.get(param) or stats_map.get(param.rstrip("s"))
-
-    rows = []
-    for i in range(n_peaks):
-        row: Dict[str, Any] = {}
-        for pname in ("center", "fwhm", "height"):
-            rec = _get(pname)
-            if not rec:
-                continue
-
-            def pick(x):
-                if isinstance(x, (list, tuple, np.ndarray)):
-                    return x[i] if i < len(x) else None
-                return x
-
-            p25 = rec.get("p2_5", rec.get("p2.5"))
-            p975 = rec.get("p97_5", rec.get("p97.5"))
-            row[pname] = {
-                "est": pick(rec.get("est")),
-                "sd": pick(rec.get("sd")),
-                "p2_5": pick(p25),
-                "p97_5": pick(p975),
-            }
-        rows.append((i + 1, row))
-    return rows
-
-
-def _format_unc_row(i: int, row: Dict[str, Any]) -> str:
-    def fmt(name: str) -> str:
-        v = row.get(name) or {}
-        est = v.get("est")
-        sd = v.get("sd")
-        if est is None or sd is None:
-            return f"{name} = n/a"
-        s = f"{name} = {est:.6g} ± {sd:.2g}"
-        p25 = v.get("p2_5")
-        p975 = v.get("p97_5")
-        if p25 is not None and p975 is not None:
-            s += f" (2.5%={p25:.6g}, 97.5%={p975:.6g})"
-        return s
-
-    parts = [fmt("center"), fmt("fwhm"), fmt("height")]
-    return f"Peak {i}: " + " | ".join(parts)
 
 
 def _set_thread_limits(strategy: str, blas_threads):
@@ -979,7 +880,7 @@ class PeakFitApp:
         try:
             v = float(v)
         except Exception:
-            v = 0.02
+            v = 0.0
         if v < 0.0:
             v = 0.0
         return v if v <= 0.25 else 0.25
@@ -1003,40 +904,6 @@ class PeakFitApp:
                 self.log_threadsafe(f"[DEBUG] {msg}")
         except Exception:
             pass
-
-    def _tp_limits_ctx(self):
-        try:
-            from threadpoolctl import threadpool_limits
-        except Exception:
-            class threadpool_limits:  # type: ignore[no-redef]
-                def __init__(self, *a, **k):
-                    pass
-
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *a):
-                    return False
-
-        strategy = str(getattr(self, "perf_parallel_strategy", tk.StringVar(value="outer")).get())
-        try:
-            blas_threads = int(getattr(self, "perf_blas_threads", tk.IntVar(value=0)).get())
-        except Exception:
-            blas_threads = 0
-        limit = 1 if strategy == "outer" else (blas_threads if blas_threads > 0 else None)
-        try:
-            if limit is None:
-                raise RuntimeError("no limit -> no-op")
-            return threadpool_limits(limits=limit)
-        except Exception:
-            class _Nop:
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *a):
-                    return False
-
-            return _Nop()
 
     # --- Bootstrap parity helpers (F) ---
     def _bootstrap_cfg_from_gui(self):
@@ -1067,9 +934,9 @@ class PeakFitApp:
                 jv = float(jitter_raw.get())
                 jitter_val = jv / 100.0 if jv > 1.0 else jv
             else:
-                jitter_val = float(cfg.get("bootstrap_jitter", 0.02))
+                jitter_val = float(cfg.get("bootstrap_jitter", 0.0))
         except Exception:
-            jitter_val = 0.02
+            jitter_val = 0.0
         jitter = self._norm_jitter_val(jitter_val)
 
         seed = None
@@ -1100,24 +967,6 @@ class PeakFitApp:
             "band_pref": band_pref,
         }
 
-    def _blas_limit_ctx(self):
-        """Mirror single-file BLAS/threads policy during batch uncertainty."""
-        cfg = getattr(self, "cfg", {}) or {}
-        try:
-            strategy = str(cfg.get("perf_parallel_strategy", cfg.get("perf_strategy", "outer")))
-        except Exception:
-            strategy = "outer"
-        try:
-            blas_threads = int(cfg.get("perf_blas_threads", 0) or 0)
-        except Exception:
-            blas_threads = 0
-        limit = 1 if strategy == "outer" else (blas_threads if blas_threads > 0 else None)
-        if threadpool_limits is not None and limit is not None:
-            try:
-                return threadpool_limits(limits=limit)
-            except Exception:
-                pass
-        return nullcontext()
     # --- small config helper used by Bootstrap controls ---
     def _cfg_set(self, key, value):
         try:
@@ -1244,15 +1093,17 @@ class PeakFitApp:
 
     def __init__(self, root, cfg=None):
         self.root = root
+        # The Tk thread, and what worker threads hand it (see run_in_thread).
+        self._tk_thread = threading.current_thread()
+        self._ui_calls = queue.SimpleQueue()
+        self._log_lock = threading.Lock()
         self.cfg = cfg if cfg is not None else load_config()
         self.cfg.setdefault("baseline_uses_fit_range", True)
         self.cfg.setdefault("ui_show_uncertainty_band", False)
         self.cfg.setdefault("perf_numba", False)
-        self.cfg.setdefault("perf_gpu", False)
         self.cfg.setdefault("perf_cache_baseline", True)
         self.cfg.setdefault("perf_seed_all", False)
         self.cfg.setdefault("perf_seed", "")
-        self.cfg.setdefault("perf_max_workers", 0)
         self.cfg.setdefault("perf_unc_workers", 0)
         self.cfg.setdefault("perf_parallel_strategy", "outer")
         self.cfg.setdefault("perf_blas_threads", 0)
@@ -1301,11 +1152,11 @@ class PeakFitApp:
         self._unc_change_busy = False
         # Group B: user override marker for bootstrap solver selection
         self.boot_solver_overridden = False
-        self.cfg.setdefault("bootstrap_jitter", 0.02)
+        self.cfg.setdefault("bootstrap_jitter", 0.0)
         self.cfg.setdefault("log_debug_mode", False)
         self.cfg.setdefault("bayes_walkers", 0)
         self.cfg.setdefault("bayes_burn", 1000)
-        self.cfg.setdefault("bayes_steps", 4000)
+        self.cfg.setdefault("bayes_steps", 8000)
         self.cfg.setdefault("bayes_thin", 1)
         self.cfg.setdefault("bayes_prior_sigma", "half_cauchy")
         # Bayesian band + diagnostics defaults (persisted for cache parity)
@@ -1514,8 +1365,11 @@ class PeakFitApp:
             except Exception:
                 pass
         self._compute_chk = None
-        # The last fit and what it was fitted to (see _current_fit)
+        # The last fit and what it was fitted to (see _current_fit), and the
+        # uncertainty computed for it (see _cached_uncertainty)
         self._fit = None
+        self._unc_cache = None
+        self._export_running = False
         # Uncertainty state
         self.last_uncertainty = None
         self._last_unc_locks: List[Dict[str, bool]] = []
@@ -1545,25 +1399,23 @@ class PeakFitApp:
         self._perf_apply_after_id: Optional[str] = None
         self._perf_last_signature: Optional[tuple] = None
         self._perf_pending_source: str = ""
+        # No GPU switch, GPU chunk or fit-worker count (game plan 3.3): CuPy made the
+        # fits 2.6 to 7x slower, nothing reads the chunk, and nothing fits in parallel.
         self.perf_numba = tk.BooleanVar(value=bool(self.cfg.get("perf_numba", False)))
-        self.perf_gpu = tk.BooleanVar(value=bool(self.cfg.get("perf_gpu", False)))
         self.perf_cache_baseline = tk.BooleanVar(value=bool(self.cfg.get("perf_cache_baseline", True)))
         self.perf_seed_all = tk.BooleanVar(value=bool(self.cfg.get("perf_seed_all", False)))
-        self.perf_max_workers = tk.IntVar(value=int(self.cfg.get("perf_max_workers", 0)))
         self.perf_unc_workers = tk.IntVar(value=int(self.cfg.get("perf_unc_workers", 0)))
         self.perf_numba.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_numba"))
-        self.perf_gpu.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_gpu"))
         self.perf_cache_baseline.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_cache_baseline"))
         self.perf_seed_all.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_seed_all"))
-        self.perf_max_workers.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_max_workers"))
         self.perf_unc_workers.trace_add("write", lambda *_: self.request_apply_performance(source="trace:perf_unc_workers"))
         self.alpha_var = tk.DoubleVar(value=float(self.cfg.get("unc_alpha", 0.05)))
         self.center_resid_var = tk.BooleanVar(value=bool(self.cfg.get("unc_center_resid", True)))
-        self.bootstrap_jitter_var = tk.DoubleVar(value=100.0 * float(self.cfg.get("bootstrap_jitter", 0.02)))
+        self.bootstrap_jitter_var = tk.DoubleVar(value=100.0 * float(self.cfg.get("bootstrap_jitter", 0.0)))
 
         self.bayes_walkers_var = tk.IntVar(value=int(self.cfg.get("bayes_walkers", 0)))  # 0 => auto
         self.bayes_burn_var = tk.IntVar(value=int(self.cfg.get("bayes_burn", 1000)))
-        self.bayes_steps_var = tk.IntVar(value=int(self.cfg.get("bayes_steps", 4000)))
+        self.bayes_steps_var = tk.IntVar(value=int(self.cfg.get("bayes_steps", 8000)))
         self.bayes_thin_var = tk.IntVar(value=int(self.cfg.get("bayes_thin", 1)))
         self.bayes_prior_var = tk.StringVar(value=str(self.cfg.get("bayes_prior_sigma", "half_cauchy")))
         def _on_prior_change(*_e):
@@ -1593,7 +1445,6 @@ class PeakFitApp:
         )
         self.seed_var = tk.StringVar(value=str(self.cfg.get("perf_seed", "")))
         self.seed_var.trace_add("write", lambda *_: self.request_apply_performance(source="trace:seed_var"))
-        self.gpu_chunk_var = tk.IntVar(value=262144)
 
         # UI
         self._build_ui()
@@ -1605,6 +1456,10 @@ class PeakFitApp:
         self._unc_job_id = 0
         self._unc_running = False
         self._last_unc_log = None
+
+        # what loading the settings changed in an older file, said once
+        while _SETTINGS_NOTES:
+            self.status_warn(_SETTINGS_NOTES.pop(0))
 
         self._debug_snapshot("init")
 
@@ -1651,11 +1506,7 @@ class PeakFitApp:
         except Exception:
             seed_val = None
         try:
-            workers_fit = self._resolve_fit_workers()
-        except Exception:
-            workers_fit = None
-        try:
-            workers_unc = self._resolve_unc_workers()
+            workers_unc = pipeline.uncertainty_workers({"perf_unc_workers": self.perf_unc_workers.get()})[0]
         except Exception:
             workers_unc = None
         state = {
@@ -1668,7 +1519,6 @@ class PeakFitApp:
             "compute_band": compute_band,
             "seed_all": seed_all,
             "seed": seed_val,
-            "workers_fit": workers_fit,
             "workers_unc": workers_unc,
         }
         state.update(extra or {})
@@ -1694,25 +1544,6 @@ class PeakFitApp:
             self._compute_chk.pack(anchor="w", padx=4, pady=(0, 2))
         except Exception:
             pass
-
-    def _debug_uncertainty_import(self) -> None:
-        if not self._is_debug():
-            return
-        try:
-            import inspect
-            import core.uncertainty as _unc
-
-            co = getattr(_unc.bootstrap_ci, "__code__", None)
-            path = getattr(co, "co_filename", None)
-            try:
-                src = inspect.getsource(_unc.bootstrap_ci)
-            except Exception:
-                src = ""
-            self._dbg(
-                f"uncertainty.import path={path} band_lo_present={'band_lo' in src}"
-            )
-        except Exception as exc:
-            self._dbg(f"uncertainty.import failed: {exc!r}")
 
     # ----- UI -----
     def _build_ui(self):
@@ -2310,8 +2141,9 @@ class PeakFitApp:
         )
         br += 1
 
+        # Studentized residuals by default, as batch (PR #252: +0.6 to 2.2 coverage points)
         self.boot_studentize_var = tk.BooleanVar(
-            value=bool(self.cfg.get("boot_studentize"))
+            value=bool(self.cfg.get("boot_studentize", True))
         )
         self.boot_studentize_chk = ttk.Checkbutton(
             self._boot_opts_frame,
@@ -2490,7 +2322,6 @@ class PeakFitApp:
         # Performance panel
         perf_box = ttk.Labelframe(right, text="Performance"); perf_box.pack(fill=tk.X, pady=4)
         ttk.Checkbutton(perf_box, text="Numba", variable=self.perf_numba).pack(anchor="w")
-        ttk.Checkbutton(perf_box, text="GPU", variable=self.perf_gpu).pack(anchor="w")
         ttk.Checkbutton(perf_box, text="Cache baseline", variable=self.perf_cache_baseline).pack(anchor="w")
         ttk.Checkbutton(perf_box, text="Seed all", variable=self.perf_seed_all).pack(anchor="w")
         par = ttk.Labelframe(perf_box, text="Parallelism")
@@ -2523,8 +2354,6 @@ class PeakFitApp:
         rowp = ttk.Frame(perf_box); rowp.pack(fill=tk.X, pady=2)
         ttk.Label(rowp, text="Seed:").pack(side=tk.LEFT)
         ttk.Entry(rowp, width=8, textvariable=self.seed_var).pack(side=tk.LEFT, padx=4)
-        ttk.Label(rowp, text="Max workers:").pack(side=tk.LEFT, padx=(8,0))
-        ttk.Spinbox(rowp, from_=0, to=64, textvariable=self.perf_max_workers, width=5).pack(side=tk.LEFT)
         ttk.Label(rowp, text="Unc. workers (0=auto):").pack(side=tk.LEFT, padx=(8,0))
         ttk.Spinbox(
             rowp,
@@ -2534,8 +2363,6 @@ class PeakFitApp:
             width=6,
             command=self.apply_performance,
         ).pack(side=tk.LEFT)
-        ttk.Label(rowp, text="GPU chunk:").pack(side=tk.LEFT, padx=(8,0))
-        ttk.Entry(rowp, width=7, textvariable=self.gpu_chunk_var).pack(side=tk.LEFT, padx=2)
         ttk.Button(rowp, text="Apply", command=self._apply_performance_immediate).pack(side=tk.LEFT, padx=4)
 
         # Batch processing
@@ -2651,6 +2478,7 @@ class PeakFitApp:
 
         solver = self.solver_choice.get()
         opts = self._solver_options(solver)
+        self._safe_jitter_pct()  # clamps the jitter field and keeps the user's value
         boot = self._bootstrap_cfg_from_gui()
         try:
             unc_workers = int(float(self.perf_unc_workers.get()))
@@ -2667,11 +2495,9 @@ class PeakFitApp:
             "baseline": self._current_baseline_cfg(),
             "baseline_uses_fit_range": bool(self.baseline_use_range.get()),
             "perf_numba": bool(self.perf_numba.get()),
-            "perf_gpu": bool(self.perf_gpu.get()),
             "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
             "perf_seed_all": bool(self.perf_seed_all.get()),
             "perf_seed": boot["seed"] if boot["seed"] is not None else "",
-            "perf_max_workers": int(self.perf_max_workers.get()),
             "perf_unc_workers": unc_workers,
             "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
             "perf_blas_threads": int(self.perf_blas_threads.get()),
@@ -2681,6 +2507,7 @@ class PeakFitApp:
             "unc_boot_solver": boot["solver"],
             "bootstrap_n": int(boot["n"]),
             "bootstrap_jitter": float(boot["jitter"]),
+            "boot_studentize": bool(self.boot_studentize_var.get()),
             # whether a band is computed: the GUI's Compute band, not its Show band
             "ui_band_pref_bootstrap": bool(self._should_compute_ci_band()),
             "export_unc_wide": bool(self.cfg.get("export_unc_wide", False)),
@@ -2700,9 +2527,21 @@ class PeakFitApp:
             "bayes_prior_sigma": str(self.bayes_prior_var.get() or self.cfg.get("bayes_prior_sigma", "half_cauchy")),
             "log_debug_mode": bool(self.debug_mode_var.get()),
         }
+        # the bootstrap's other knobs, as the user set them (absent: the method's default)
+        for key in ("boot_resampling", "boot_wild_weights", "boot_center_clamp_mode", "boot_center_clamp_value"):
+            if self.cfg.get(key) not in (None, ""):
+                settings[key] = self.cfg[key]
+        # refits with another solver take that solver's own options
+        if boot["solver"] != solver and boot["solver"] in SOLVER_LABELS:
+            settings[boot["solver"]] = self._solver_options(boot["solver"])
         if self.fit_xmin is not None and self.fit_xmax is not None:
             settings["fit_xmin"] = float(self.fit_xmin)
             settings["fit_xmax"] = float(self.fit_xmax)
+        # keep what the user set for the next start
+        for key in ("bootstrap_n", "unc_center_resid", "bayes_walkers", "bayes_burn", "bayes_steps", "bayes_thin",
+                    "bayes_diagnostics"):
+            self.cfg[key] = settings[key]
+        save_config(self.cfg)
         return settings
 
     def _fit_inputs(self):
@@ -2837,57 +2676,6 @@ class PeakFitApp:
         self._update_unc_widgets()
         self._on_uncertainty_method_changed()
         self._debug_snapshot("_on_unc_method_change(post)")
-
-    def _get_int(self, name: str, default: int) -> int:
-        try:
-            v = getattr(self, name)
-            return int(v.get()) if hasattr(v, "get") else int(v)
-        except Exception:
-            try:
-                cfg_val = int(self.cfg.get(name, self.cfg.get(f"unc_{name}", default)))
-                return cfg_val
-            except Exception:
-                return default
-
-    def _resolve_fit_workers(self) -> int:
-        """Return effective worker count for fitting."""
-        try:
-            raw = self.perf_max_workers.get()
-        except Exception:
-            raw = self.cfg.get("perf_max_workers", 0)
-        try:
-            w = int(raw)
-        except Exception:
-            try:
-                w = int(float(str(raw).strip()))
-            except Exception:
-                w = 0
-        if w <= 0:
-            try:
-                return os.cpu_count() or 1
-            except Exception:
-                return 1
-        return w
-
-    def _resolve_unc_workers(self) -> int:
-        """Return effective worker count for uncertainty pipelines."""
-        try:
-            raw = self.perf_unc_workers.get()
-        except Exception:
-            raw = self.cfg.get("perf_unc_workers", 0)
-        try:
-            w = int(raw)
-        except Exception:
-            try:
-                w = int(float(str(raw).strip()))
-            except Exception:
-                w = 0
-        if w <= 0:
-            try:
-                return os.cpu_count() or 1
-            except Exception:
-                return 1
-        return w
 
     def _as_seq(self, v):
         if isinstance(v, (list, tuple)):
@@ -3053,70 +2841,6 @@ class PeakFitApp:
         return v
 
 
-    def _current_uncertainty_signature(self) -> dict:
-        cfg = getattr(self, "cfg", {})
-        attr_map = {
-            "unc_alpha": "alpha_var",
-            "bootstrap_n": "boot_n_var",
-            "unc_center_resid": "center_resid_var",
-            "bootstrap_jitter": "bootstrap_jitter_var",
-        }
-
-        def _pick(key: str, default: Any):
-            attr_name = attr_map.get(key)
-            if attr_name and hasattr(self, attr_name):
-                var = getattr(self, attr_name)
-                try:
-                    return var.get()
-                except Exception:
-                    pass
-            return cfg.get(key, default)
-
-        seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
-
-        sig = {
-            "method": _canonical_unc_label(self._unc_selected_method_key()),
-            "alpha": float(_pick("unc_alpha", 0.05)),
-            "n_boot": int(_pick("bootstrap_n", 200)),
-            "seed": seed_val,
-            "center_resid": bool(_pick("unc_center_resid", True)),
-            # store normalized jitter so cache invalidates when the effective value changes
-            "jitter": self._norm_jitter_val(_pick("bootstrap_jitter", 0.0)),
-            # include bootstrap solver + workers so cache respects engine changes
-            "boot_solver": getattr(self, "_select_bootstrap_solver", lambda: "")(),
-            "workers": int(self._resolve_unc_workers()),
-            "seed_all": bool(self.perf_seed_all.get()),
-        }
-        try:
-            sig.update(
-                {
-                    "bayes_diagnostics": bool(self.bayes_diag_var.get()),
-                    "bayes_band_enabled": bool(self.bayes_band_enabled_var.get()),
-                    "bayes_band_force": bool(self.bayes_band_force_var.get()),
-                    "bayes_band_max_draws": self._bayes_band_max_draws_value(),
-                    "bayes_diag_ess_min": self._bayes_diag_ess_min_value(),
-                    "bayes_diag_rhat_max": self._bayes_diag_rhat_max_value(),
-                    "bayes_diag_mcse_mean": (
-                        self._bayes_diag_mcse_value()
-                    ),
-                }
-            )
-            sig.update(
-                {
-                    "bayes_walkers": self._safe_bayes_walkers(),
-                    "bayes_burn": self._safe_bayes_burn(),
-                    "bayes_steps": self._safe_bayes_steps(),
-                    "bayes_thin": self._safe_bayes_thin(),
-                    "bayes_prior_sigma": str(
-                        self.bayes_prior_var.get()
-                        or self.cfg.get("bayes_prior_sigma", "half_cauchy")
-                    ),
-                }
-            )
-        except Exception:
-            pass
-        return sig
-
 
     def _suspend_clicks(self):
         """Disable click-to-add regardless of checkbox state."""
@@ -3188,58 +2912,6 @@ class PeakFitApp:
             pass
 
     # --- Uncertainty helpers (UI-side) ------------------------------------------
-    def _as_mapping(self, obj):
-        """Return a mapping-like view for obj. If it's a list (stats), wrap it."""
-        if obj is None:
-            return {"stats": None}
-        if isinstance(obj, dict):
-            return obj
-        if isinstance(obj, list):
-            return {"stats": obj}
-        d = {}
-        for k in (
-            "label",
-            "method",
-            "method_label",
-            "type",
-            "stats",
-            "parameters",
-            "param_stats",
-            "rmse",
-            "dof",
-            "backend",
-            "n_draws",
-            "n_boot",
-            "ess",
-            "rhat",
-            "band",
-            "prediction_band",
-            "band_x",
-            "band_lo",
-            "band_hi",
-        ):
-            if hasattr(obj, k):
-                d[k] = getattr(obj, k)
-        if not d and hasattr(obj, "__dict__"):
-            d = {**obj.__dict__}
-        if "stats" not in d and "parameters" in d:
-            d["stats"] = d["parameters"]
-        return d
-
-    def _unc_label_from(self, m):
-        """Best-effort human label from mapping m."""
-        lab = m.get("label") or m.get("method_label") or m.get("method") or m.get("type")
-        if not lab:
-            return "Unknown"
-        s = str(lab).lower()
-        if "asym" in s:
-            return "Asymptotic (JᵀJ)"
-        if "bayes" in s or "mcmc" in s:
-            return "Bayesian (MCMC)"
-        if "boot" in s:
-            return "Bootstrap"
-        return str(lab)
-
     def _band_tuple_from(self, m):
         """
         Return (x, lo, hi) or None.
@@ -3432,37 +3104,6 @@ class PeakFitApp:
         self.show_legend_var.set(not self.show_legend_var.get())
         self._on_legend_toggle()
 
-    def _fd_jacobian(self, residual, p0):
-        p0 = np.asarray(p0, float)
-        r0 = residual(p0)
-        J = np.empty((r0.size, p0.size), float)
-        for j in range(p0.size):
-            step = 1e-6 * max(1.0, abs(p0[j]))
-            tp = p0.copy()
-            tp[j] += step
-            J[:, j] = (residual(tp) - r0) / step
-        return J, r0
-
-    @staticmethod
-    def _svd_cov_from_jacobian(J: np.ndarray, rss: float, m: int) -> tuple[np.ndarray, int, float]:
-        """Return PSD covariance via SVD of the Jacobian."""
-        U, s, Vt = np.linalg.svd(J, full_matrices=False)
-        tol = max(J.shape) * np.finfo(float).eps * (s[0] if s.size else 0.0)
-        nz = s > tol
-        rank = int(np.count_nonzero(nz))
-        dof = max(1, m - rank)
-        sigma2 = rss / dof
-        inv_s2 = np.zeros_like(s)
-        inv_s2[nz] = 1.0 / (s[nz] ** 2)
-        cov = (Vt.T * inv_s2) @ Vt
-        cond = float(s[nz].max() / s[nz].min()) if rank > 0 else np.inf
-        return sigma2 * cov, rank, cond
-
-    @staticmethod
-    def _safe_sqrt_vec(x: np.ndarray) -> np.ndarray:
-        """Clip negatives to zero before sqrt to avoid warnings."""
-        return np.sqrt(np.clip(x, 0.0, np.inf))
-
     def _on_eta_change(self):
         self.cfg["ui_eta"] = float(self.global_eta.get())
         save_config(self.cfg)
@@ -3536,9 +3177,10 @@ class PeakFitApp:
         ts = time.strftime("%H:%M:%S")
         glyph = {"INFO": "\u2139", "WARN": "\u26A0", "ERROR": "\u2716"}.get(level.upper(), "\u2139")
         line = f"[{ts}] {glyph} {level.upper()} \u2014 {msg}"
-        self._log_buffer.append(line)
-        if len(self._log_buffer) > LOG_MAX_LINES:
-            del self._log_buffer[: len(self._log_buffer) - LOG_MAX_LINES]
+        with self._log_lock:
+            self._log_buffer.append(line)
+            if len(self._log_buffer) > LOG_MAX_LINES:
+                del self._log_buffer[: len(self._log_buffer) - LOG_MAX_LINES]
 
         def ui_update():
             if hasattr(self, "status_var"):
@@ -3557,6 +3199,9 @@ class PeakFitApp:
             ):
                 self._ensure_log_panel_visible()
 
+        if not self._on_tk_thread():
+            self._ui_calls.put(ui_update)  # a worker: the Tk thread shows it when it polls
+            return
         try:
             self.root.after(0, ui_update)
         except Exception:
@@ -3564,6 +3209,31 @@ class PeakFitApp:
 
     def log_threadsafe(self, msg: str, level: str = "INFO"):
         self.log(msg, level)
+
+    # --- Worker threads never call Tk (game plan 3.4) -------------------------
+    POLL_MS = 25
+
+    def _on_tk_thread(self) -> bool:
+        return threading.current_thread() is self._tk_thread
+
+    def call_on_main(self, fn) -> None:
+        """Run ``fn`` on the Tk thread: now when called there, else when it polls."""
+
+        if self._on_tk_thread():
+            fn()
+        else:
+            self._ui_calls.put(fn)
+
+    def _drain_ui_calls(self) -> None:
+        while True:
+            try:
+                fn = self._ui_calls.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception:
+                traceback.print_exc()
 
     def log_info(self, msg: str) -> None:
         self.log(msg, "INFO")
@@ -3652,75 +3322,37 @@ class PeakFitApp:
         except Exception:
             pass
 
-    def _label_from_unc(self, obj) -> str:
-        # Accept UncertaintyResult-like, SimpleNamespace, or dict
-        try:
-            lbl = getattr(obj, "label", None) or getattr(obj, "method_label", None)
-            if not lbl:
-                lbl = getattr(obj, "method", None) or getattr(obj, "type", None)
-        except Exception:
-            lbl = None
-        if not lbl and isinstance(obj, dict):
-            lbl = obj.get("label") or obj.get("method") or obj.get("type")
-        text = (str(lbl) if lbl else "").lower()
-
-        # Map common aliases
-        if "asym" in text or "j" in text and "t" in text and "j" in text:  # covers "jtj", "j^t j"
-            return "Asymptotic (JᵀJ)"
-        if "boot" in text or "resid" in text:
-            return "Bootstrap"
-        if "bayes" in text or "mcmc" in text:
-            return "Bayesian (MCMC)"
-        # Fallback to original label or generic
-        return str(lbl) if lbl else "Unknown"
-
-    def _extract_band(self, obj):
-        import numpy as np
-        # return (x, lo, hi) or None
-        # Attribute forms
-        for attr in ("band", "prediction_band"):
-            xlh = getattr(obj, attr, None)
-            if xlh:
-                try:
-                    x, lo, hi = xlh
-                    x = np.asarray(x); lo = np.asarray(lo); hi = np.asarray(hi)
-                    if x.shape == lo.shape == hi.shape and x.size > 0:
-                        return (x, lo, hi)
-                except Exception:
-                    pass
-        # Dict forms
-        if isinstance(obj, dict):
-            # Combined
-            if "band" in obj:
-                try:
-                    x, lo, hi = obj["band"]
-                    x = np.asarray(x); lo = np.asarray(lo); hi = np.asarray(hi)
-                    if x.shape == lo.shape == hi.shape and x.size > 0:
-                        return (x, lo, hi)
-                except Exception:
-                    pass
-            # Split keys
-            keys = obj.keys()
-            if {"band_x", "band_lo", "band_hi"} <= set(keys):
-                try:
-                    x = np.asarray(obj["band_x"]); lo = np.asarray(obj["band_lo"]); hi = np.asarray(obj["band_hi"])
-                    if x.shape == lo.shape == hi.shape and x.size > 0:
-                        return (x, lo, hi)
-                except Exception:
-                    pass
-        return None
-
     def run_in_thread(self, fn, on_done):
+        """Run ``fn()`` on a worker thread and ``on_done(result, error)`` on the Tk thread.
+
+        The worker never calls Tk, which serves other threads only inside its main
+        loop: the Tk thread polls for it with root.after and meanwhile runs what the
+        worker queued (log lines, progress) through call_on_main.
+        """
+
+        box = {}
+
         def worker():
             try:
-                res = fn()
-                err = None
-            except Exception as e:
-                res, err = None, e
-            def _cb():
-                on_done(res, err)
-            self.root.after(0, _cb)
-        threading.Thread(target=worker, daemon=True).start()
+                box["result"] = fn()
+            except Exception as exc:
+                box["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        def poll():
+            self._drain_ui_calls()
+            if thread.is_alive():
+                try:
+                    self.root.after(self.POLL_MS, poll)
+                except tk.TclError:
+                    pass  # the window is gone
+                return
+            self._drain_ui_calls()
+            on_done(box.get("result"), box.get("error"))
+
+        self.root.after(self.POLL_MS, poll)
 
     def _new_figure(self):
         self.ax.clear()
@@ -4706,6 +4338,7 @@ class PeakFitApp:
             self._fit = {
                 "result": res, "settings": settings, "x": np.array(x), "y": np.array(y),
                 "baseline": np.array(base), "mask": np.array(mask), "mode": mode, "peaks": self._peak_state(),
+                "rng_seed": rng_seed,
             }
             self.refresh_tree(keep_selection=True)
             self.last_uncertainty = None
@@ -4827,7 +4460,7 @@ class PeakFitApp:
 
         def work():
             def prog(i, total, path):
-                self.root.after(0, lambda: self.status_var.set(f"Batch {i}/{total}: {Path(path).name}"))
+                self.call_on_main(lambda: self.status_var.set(f"Batch {i}/{total}: {Path(path).name}"))
 
             return batch_runner.run_batch(
                 patterns,
@@ -4865,260 +4498,6 @@ class PeakFitApp:
         self.set_busy(True, "Batch running…")
         self.run_in_thread(work, done)
 
-    def _run_asymptotic_uncertainty(
-        self,
-        *,
-        locked_mask: Optional[np.ndarray] = None,
-        bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        alpha: Optional[float] = None,
-    ):
-        if self.x is None or self.y_raw is None or not self.peaks:
-            self.ci_band = None
-            return None
-        mask = self.current_fit_mask()
-        if mask is None or not np.any(mask):
-            self.ci_band = None
-            return None
-        x_fit = self.x[mask]
-        y_fit = self.get_fit_target()[mask]
-        base_applied = self.use_baseline.get() and self.baseline is not None
-        add_mode = (self.baseline_mode.get() == "add")
-        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
-        mode = "add" if add_mode else "subtract"
-
-        theta = []
-        for p in self.peaks:
-            theta.extend([p.center, p.height, p.fwhm, p.eta])
-        theta = np.asarray(theta, float)
-
-        resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
-        J, r0 = self._fd_jacobian(resid_fn, theta)
-
-        x_all = self.x
-        base_all = self.baseline if (base_applied and add_mode) else None
-
-        def ymodel(th):
-            total = np.zeros_like(x_all)
-            for i in range(len(self.peaks)):
-                c, h, fw, eta = th[4 * i : 4 * i + 4]
-                total += pseudo_voigt(x_all, h, c, fw, eta)
-            if base_all is not None:
-                total = total + base_all
-            return total
-
-        P = int(theta.size)
-        if locked_mask is None:
-            locked_mask_arr = np.zeros(P, dtype=bool)
-            for i, pk in enumerate(self.peaks):
-                if bool(getattr(pk, "lock_center", False)):
-                    locked_mask_arr[4 * i + 0] = True
-                if bool(getattr(pk, "lock_height", False)):
-                    locked_mask_arr[4 * i + 1] = True
-                if bool(getattr(pk, "lock_width", False)):
-                    locked_mask_arr[4 * i + 2] = True
-                if bool(getattr(pk, "lock_eta", False)):
-                    locked_mask_arr[4 * i + 3] = True
-        else:
-            locked_mask_arr = np.asarray(locked_mask, bool).reshape(-1)
-            if locked_mask_arr.size != P:
-                tmp = np.zeros(P, dtype=bool)
-                n = min(P, int(locked_mask_arr.size))
-                if n:
-                    tmp[:n] = locked_mask_arr[:n]
-                locked_mask_arr = tmp
-
-        lo_arr = np.full(P, -np.inf, dtype=float)
-        hi_arr = np.full(P, np.inf, dtype=float)
-        if P:
-            # Match the batch asymptotic defaults so GUI/batch produce consistent bounds.
-            try:
-                xlo = float(np.min(x_fit))
-                xhi = float(np.max(x_fit))
-            except Exception:
-                xlo = float(np.nanmin(self.x)) if self.x is not None else -np.inf
-                xhi = float(np.nanmax(self.x)) if self.x is not None else np.inf
-            if np.isfinite(xlo) and np.isfinite(xhi):
-                lo_arr[0::4] = xlo
-                hi_arr[0::4] = xhi
-            lo_arr[1::4] = 0.0
-            y_corr = y_fit if add_mode or base_fit is None else (y_fit - base_fit)
-            try:
-                yscale = float(np.nanmax(y_corr))
-            except Exception:
-                yscale = 1.0
-            if not np.isfinite(yscale) or yscale <= 0.0:
-                yscale = 1.0
-            hi_arr[1::4] = max(1.0, 1.5 * yscale)
-            try:
-                fwhm_min = float(self.classic_fwhm_min.get())
-            except Exception:
-                fwhm_min = 1e-2
-            fwhm_min = max(1e-3, fwhm_min)
-            width_span = float(xhi - xlo) if np.isfinite(xhi - xlo) else 0.0
-            hi_width = max(1.0, width_span)
-            lo_arr[2::4] = fwhm_min
-            hi_arr[2::4] = hi_width
-            lo_arr[3::4] = 0.0
-            hi_arr[3::4] = 1.0
-        if bounds is not None:
-            try:
-                lo_raw, hi_raw = bounds
-            except Exception:
-                lo_raw = hi_raw = None
-            if lo_raw is not None:
-                try:
-                    lo_vec = np.asarray(lo_raw, float).reshape(-1)
-                    if int(lo_vec.size) == P:
-                        lo_arr = lo_vec.copy()
-                    else:
-                        n = min(P, int(lo_vec.size))
-                        if n:
-                            lo_arr[:n] = lo_vec[:n]
-                except Exception:
-                    pass
-            if hi_raw is not None:
-                try:
-                    hi_vec = np.asarray(hi_raw, float).reshape(-1)
-                    if int(hi_vec.size) == P:
-                        hi_arr = hi_vec.copy()
-                    else:
-                        n = min(P, int(hi_vec.size))
-                        if n:
-                            hi_arr[:n] = hi_vec[:n]
-                except Exception:
-                    pass
-
-        alpha_val = float(alpha if alpha is not None else self._safe_alpha())
-        try:
-            core_res = core_uncertainty.asymptotic_ci(
-                theta_hat=theta,
-                residual=r0,
-                jacobian=J,
-                ymodel_fn=ymodel,
-                alpha=alpha_val,
-                locked_mask=locked_mask_arr,
-                bounds=(lo_arr, hi_arr),
-                xgrid=x_all,
-            )
-        except Exception:
-            core_res = None
-
-        warn_nonfinite = False
-        if core_res is not None and core_res.band is not None:
-            xb, lob, hib = core_res.band
-            xb = np.asarray(xb)
-            lob = np.asarray(lob)
-            hib = np.asarray(hib)
-            warn_nonfinite = not (np.all(np.isfinite(lob)) and np.all(np.isfinite(hib)))
-            self.ci_band = (xb, lob, hib)
-        else:
-            self.ci_band = None
-
-        theta_vec = np.asarray(theta, float)
-        free_mask = ~locked_mask_arr if locked_mask_arr is not None else np.ones(P, bool)
-        m = r0.size
-        rss = float(np.dot(r0, r0))
-        n_free = int(np.sum(free_mask))
-        dof = max(m - n_free, 1)
-        sigma2 = rss / dof if dof > 0 else 0.0
-
-        if n_free > 0:
-            Jf = J[:, free_mask]
-            try:
-                U, s, Vt = np.linalg.svd(Jf, full_matrices=False)
-            except np.linalg.LinAlgError:
-                s = np.linalg.svd(Jf, compute_uv=False)
-                U = Vt = np.eye(Jf.shape[1])
-            tol = max(Jf.shape) * np.finfo(float).eps * (s[0] if s.size else 0.0)
-            nz = s > tol
-            rank = int(np.count_nonzero(nz))
-            inv_s = np.zeros_like(s)
-            inv_s[nz] = 1.0 / (s[nz] ** 2)
-            cov_free = (Vt.T * inv_s) @ Vt
-            # Report cond(JᵀJ) to match the UI message; cond(JᵀJ) = cond(J)^2
-            cond = (float(s[nz].max() / s[nz].min()) ** 2) if rank > 0 else float("inf")
-            cov_free = sigma2 * cov_free
-        else:
-            rank = 0
-            cond = 0.0
-            cov_free = np.zeros((0, 0), dtype=float)
-
-        cov = np.zeros((P, P), dtype=float)
-        if n_free > 0:
-            cov[np.ix_(free_mask, free_mask)] = cov_free
-
-        std = np.zeros(P, dtype=float)
-        if n_free > 0:
-            std[free_mask] = np.sqrt(np.maximum(np.diag(cov_free), 0.0))
-        self.param_sigma = std
-
-        z = core_uncertainty._z_value(alpha_val)
-        ci_lo = theta_vec - z * std
-        ci_hi = theta_vec + z * std
-        ci_lo = np.maximum(ci_lo, lo_arr)
-        ci_hi = np.minimum(ci_hi, hi_arr)
-
-        bw_stats = (0.0, 0.0, 0.0)
-        try:
-            if self.ci_band is not None:
-                xb, lob, hib = self.ci_band
-                bw = (np.asarray(hib) - np.asarray(lob))[mask]
-                if bw.size:
-                    bw_stats = (
-                        float(np.min(bw)),
-                        float(np.median(bw)),
-                        float(np.max(bw)),
-                    )
-        except Exception:
-            pass
-
-        info = {
-            "m": m,
-            "n": P,
-            "rank": rank,
-            "dof": dof,
-            "cond": cond,
-            "rmse": math.sqrt(rss / m) if m else float("nan"),
-            "s2": sigma2,
-            "bw": bw_stats,
-            "warn_nonfinite": warn_nonfinite,
-        }
-        self.unc_info = info
-        return cov, theta_vec, info
-
-    def _format_asymptotic_summary(self, cov, theta, info, band):
-        lines: list[str] = []
-        lines.append(
-            f"Uncertainty (asymptotic): m={info['m']}, n={info['n']}, rank={info['rank']}, dof={info['dof']}, cond={info['cond']:.3g}"
-        )
-        bw_min, bw_med, bw_max = info["bw"]
-        lines.append(
-            f"Band width (95% CI): min={bw_min:.3g}, median={bw_med:.3g}, max={bw_max:.3g}"
-        )
-        warns: list[str] = []
-        if info['rank'] < info['n']:
-            warns.append("rank-deficient Jacobian; intervals may be wide.")
-        if info.get('cond', np.inf) > 1e8:
-            warns.append(
-                f"Ill-conditioning detected: cond(JᵀJ)={info['cond']:.3g}; some σ may be inflated (consider locking or narrowing range)"
-            )
-        if info.get('warn_nonfinite'):
-            warns.append("CI band contained non-finite values; replaced with zeros.")
-        std = self._safe_sqrt_vec(np.diag(cov))
-        for i, _p in enumerate(self.peaks, 1):
-            idx = 4 * (i - 1)
-            c, h, w = theta[idx: idx + 3]
-            sc, sh, sw = std[idx: idx + 3]
-            lines.append(
-                f"Peak {i} @ center={c:.5g} ± {sc:.3g}; height={h:.3g} ± {sh:.3g}; FWHM={w:.3g} ± {sw:.3g} (CI95 ≈ ±1.96σ)"
-            )
-        if np.any(~np.isfinite(std)):
-            warns.append("Uncertain parameter(s) due to poor conditioning; try adjusting locks, range, or η.")
-        lines.append(
-            "Tip: σ is the standard error of the fitted parameter. CI95 ≈ ±1.96σ assumes local linearity near the solution."
-        )
-        return lines, warns
-
     # --- BEGIN: local helper for canonical method labels ---
     def _unc_method_label(self, info: dict) -> str:
         """Return a stable canonical label for an uncertainty method key."""
@@ -5138,1322 +4517,202 @@ class PeakFitApp:
         return label
     # --- END: local helper ---
 
-    # --- BEGIN: batch uncertainty helpers ---
     def _unc_selected_method_key(self) -> str:
         """Return the canonical uncertainty method key."""
         return method_display_to_key(self.unc_method.get())
 
-    def _compute_uncertainty_sync(self, method: str, x_fit, y_fit, base_fit, add_mode: bool):
-        """Compute uncertainty synchronously for batch processing."""
-        mode = "add" if add_mode else "subtract"
-        theta: list[float] = []
-        for p in self.peaks:
-            theta.extend([p.center, p.height, p.fwhm, p.eta])
-        theta = np.asarray(theta, dtype=float)
+    # --- Uncertainty: the one context batch uses (game plan 2.1) ---------------
+    def _uncertainty_key(self, settings: dict) -> dict:
+        """The settings an uncertainty result depends on: all but export-only ones."""
 
-        resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
+        return {k: v for k, v in settings.items() if k not in ("export_unc_wide", "log_debug_mode")}
 
-        method_key = method.strip().lower()
-        if method_key.startswith("bootstrap"):
-            method_key = "bootstrap"
-        elif method_key.startswith("asymptotic"):
-            method_key = "asymptotic"
-        elif method_key.startswith("bayes"):
-            method_key = "bayesian"
+    def _cached_uncertainty(self, rec, settings: dict):
+        """The uncertainty already computed for the fit ``rec`` with these settings."""
 
-        # Build locked mask (center/fwhm locks) for bootstrap/Bayesian refits
-        locked_mask = np.zeros(theta.size, dtype=bool)
-        for i, pk in enumerate(self.peaks):
-            if bool(getattr(pk, "lock_center", False)):
-                locked_mask[4 * i + 0] = True
-            if bool(getattr(pk, "lock_width", False)):
-                locked_mask[4 * i + 2] = True
-            if bool(getattr(pk, "lock_height", False)):
-                locked_mask[4 * i + 1] = True
-            if bool(getattr(pk, "lock_eta", False)):
-                locked_mask[4 * i + 3] = True
+        cache = getattr(self, "_unc_cache", None)
+        if cache and rec is not None and cache["fit"] is rec and cache["key"] == self._uncertainty_key(settings):
+            return cache["result"]
+        return None
 
-        P = int(theta.size)
-        param_lo = np.full(P, -np.inf, dtype=float)
-        param_hi = np.full(P, np.inf, dtype=float)
-        try:
-            from fit.bounds import pack_theta_bounds as _pack_theta_bounds
+    @staticmethod
+    def _uncertainty_blocker(rec) -> Optional[str]:
+        """Why no uncertainty can be computed now, or None.
 
-            _hdr, (lo_raw, hi_raw) = _pack_theta_bounds(
-                self.peaks,
-                np.asarray(x_fit, float),
-                dict(self.cfg.get("solver_options", {}) or {}),
+        Like batch, the GUI computes the uncertainty of a converged fit, and of the
+        peaks on screen only while they are that fit's."""
+
+        if rec is None:
+            return (
+                "Fit first. No fit has produced these peaks on these data, baseline and "
+                "window: they are new, or changed since the last fit."
             )
-        except Exception:
-            lo_raw = hi_raw = None
-        if lo_raw is not None:
-            try:
-                lo_vec = np.asarray(lo_raw, float).reshape(-1)
-                if int(lo_vec.size) == P:
-                    param_lo = lo_vec.copy()
-                else:
-                    n = min(P, int(lo_vec.size))
-                    if n:
-                        param_lo[:n] = lo_vec[:n]
-            except Exception:
-                pass
-        if hi_raw is not None:
-            try:
-                hi_vec = np.asarray(hi_raw, float).reshape(-1)
-                if int(hi_vec.size) == P:
-                    param_hi = hi_vec.copy()
-                else:
-                    n = min(P, int(hi_vec.size))
-                    if n:
-                        param_hi[:n] = hi_vec[:n]
-            except Exception:
-                pass
+        if not rec["result"].get("fit_ok"):
+            return "the fit did not converge. Fit again, or change the solver settings."
+        return None
 
-        try:
-            workers = int(self._resolve_unc_workers())
-        except Exception:
-            workers = 0
-        workers = workers if workers and workers > 0 else None
-        band_workers = workers
-        alpha = self._safe_alpha()
-        unc_sig = self._current_uncertainty_signature()
-        jitter_frac = float(unc_sig.get("jitter", 0.0) or 0.0)
-        center_res = bool(self.center_resid_var.get())
-
-        compute_pref = self._should_compute_ci_band()
-
-        # NOTE: This method is the "fast" uncertainty path used by the GUI.
-        if method_key == "asymptotic":
-            compute_band = compute_pref
-            if not compute_band:
-                # compute disabled; leave any existing band as-is (plot visibility handled by Show toggle)
-                return {"label": "asymptotic", "stats": []}
-            bounds_tuple = (
-                np.asarray(param_lo, float).copy(),
-                np.asarray(param_hi, float).copy(),
-            )
-            res = self._run_asymptotic_uncertainty(
-                locked_mask=locked_mask,
-                bounds=bounds_tuple,
-                alpha=alpha,
-            )
-            if res is None:
-                return {"label": "unknown", "stats": []}
-            cov, _th, _info = res
-            sigma = self._safe_sqrt_vec(np.diag(np.asarray(cov, float)))
-            param_stats = {
-                "center": {"est": [p.center for p in self.peaks], "sd": sigma[0::4].tolist()},
-                "height": {"est": [p.height for p in self.peaks], "sd": sigma[1::4].tolist()},
-                "fwhm": {"est": [p.fwhm for p in self.peaks], "sd": sigma[2::4].tolist()},
-                "eta": {"est": [p.eta for p in self.peaks], "sd": sigma[3::4].tolist()},
-            }
-            out: dict[str, Any] = {
-                "method": "asymptotic",
-                "method_label": "Asymptotic (JᵀJ)",
-                "band": getattr(self, "ci_band", None) or None,
-                "param_stats": param_stats,
-            }
-        elif method_key == "bootstrap":
-            r0 = resid_fn(theta)
-            J = jacobian_fd(resid_fn, theta)
-            # Compute solver constraints (lo/hi) on the FIT-RANGE before launching bootstrap,
-            # so refits respect the same bounds as the main fit.
-
-            def _predict_fit_local(
-                th,
-                *,
-                _x=x_fit,
-                _peaks=self.peaks,
-                _base=base_fit,
-                _mode=mode,
-            ):
-                total = np.zeros_like(_x, float)
-                for i in range(len(_peaks)):
-                    c, h, fw, eta = th[4 * i : 4 * (i + 1)]
-                    total += pseudo_voigt(_x, h, c, fw, eta)
-                if _mode == "add" and _base is not None:
-                    total = total + _base
-                return total
-
-            def _predict_model(theta_vec):
-                try:
-                    y_pred = self.model.ymodel(theta_vec)
-                except Exception:
-                    return _predict_fit_local(theta_vec)
-                try:
-                    y_arr = np.asarray(y_pred, dtype=float)
-                except Exception:
-                    return _predict_fit_local(theta_vec)
-                if y_arr.ndim > 1:
-                    y_arr = np.asarray(y_arr).reshape(-1)
-                if int(y_arr.size) != int(x_fit.size):
-                    return _predict_fit_local(theta_vec)
-                return y_arr
-
-            # Robust, fit-window predictor (shape-checked)
-            try:
-                predict_fit = _predict_model
-                _probe = np.asarray(predict_fit(np.asarray(theta, float)), dtype=float)
-                if int(_probe.size) != int(x_fit.size):
-                    predict_fit = _predict_fit_local
-            except Exception:
-                predict_fit = _predict_fit_local
-            # Build (lo, hi) bounds for the refit path on the SAME x-fit window:
-            # Prefer the solver's packed bounds so bootstrap refits mirror the main fit exactly.
-            try:
-                from fit.bounds import pack_theta_bounds as _pack_theta_bounds
-                _hdr, (lo, hi) = _pack_theta_bounds(
-                    self.peaks,
-                    np.asarray(x_fit, float),
-                    dict(self.cfg.get("solver_options", {}) or {}),
-                )
-            except Exception:
-                # Fallback: use unbounded parameter arrays (±inf) sized to theta
-                P = int(np.asarray(theta, float).size)
-                lo = np.full(P, -np.inf, dtype=float)
-                hi = np.full(P,  np.inf, dtype=float)
-                try:
-                    self._dbg("pack_theta_bounds failed; using ±inf parameter bounds")
-                except Exception:
-                    pass
-
-            boot_solver = self._select_bootstrap_solver()
-
-            # --- Parameter bounds for bootstrap (independent of band arrays) ---
-            P = int(np.asarray(theta, float).size)
-            p_lo = np.asarray(param_lo, float).copy()
-            p_hi = np.asarray(param_hi, float).copy()
-
-            fit_ctx = {
-                "x": x_fit,
-                "y": y_fit,
-                "baseline": base_fit,
-                "mode": mode,
-                "lmfit_share_fwhm": bool(
-                    getattr(self, "share_fwhm_var", None) and self.share_fwhm_var.get()
-                ),
-                "lmfit_share_eta": bool(
-                    getattr(self, "share_eta_var", None) and self.share_eta_var.get()
-                ),
-                "residual_fn": (lambda th: resid_fn(th)),
-                # The uncertainty core expects "predict_full" as the name, but we intentionally
-                # provide a FIT-RANGE sized predictor here (it must match len(x_all)).
-                "predict_full": predict_fit,
-                "x_all": x_fit,
-                "y_all": y_fit,
-                "unc_workers": workers,
-                "unc_band_workers": band_workers,
-                "unc_use_gpu": bool(getattr(self, "use_gpu_var", None) and self.use_gpu_var.get()),
-                "solver": boot_solver,
-                # Make caps/bounds derivable inside bootstrap via pack_theta_bounds
-                "solver_options": dict(self.cfg.get("solver_options", {})),
-                "strict_refit": True,
-                "bootstrap_jitter": jitter_frac,
-                "locked_mask": locked_mask,
-                "theta0": np.asarray(theta, float),
-                # Residual resampling knobs (pass-through; None means disabled)
-                "boot_resampling": self.cfg.get("boot_resampling"),
-                "boot_wild_weights": self.cfg.get("boot_wild_weights"),
-                "boot_studentize": self.cfg.get("boot_studentize"),
-                # Center clamp knobs (user-driven; None → no clamp)
-                "boot_center_clamp_mode": self.cfg.get("boot_center_clamp_mode"),
-                "boot_center_clamp_value": self.cfg.get("boot_center_clamp_value"),
-            }
-            # helpful breadcrumb in logs for parity/debugging
-            try:
-                self.status_info(
-                    f"Bootstrap: jitter={jitter_frac:.3f}, workers={workers or 0}, band_workers={band_workers or 0}, solver={boot_solver}"
-                )
-            except Exception:
-                pass
-
-            n_boot = self._get_int("bootstrap_n", 200)
-            seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
-            try:
-                req_workers = self._resolve_unc_workers()
-            except Exception:
-                req_workers = 0
-            compute_band = compute_pref
-            show_pref = bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else True
-            try:
-                kind = "prediction" if compute_band else "resampling"
-                self.log(
-                    f"Bootstrap band ({kind}): draws={n_boot} | "
-                    f"workers_requested={req_workers} | workers_band={band_workers or 0}"
-                )
-            except Exception:
-                pass
-            with self._tp_limits_ctx():
-                self._dbg(
-                    f"bounds check: P={P}, p_lo.shape={getattr(p_lo,'shape',None)}, p_hi.shape={getattr(p_hi,'shape',None)}"
-                )
-                try:
-                    self._dbg(
-                        f"unc: compute_band={compute_band} show_band={show_pref} (solver={boot_solver})"
-                    )
-                except Exception:
-                    pass
-                res = core_uncertainty.bootstrap_ci(
-                    theta=theta,
-                    residual=r0,
-                    jacobian=J,
-                    predict_full=predict_fit,     # fit-range sized, shape-checked
-                    x_all=x_fit,
-                    y_all=y_fit,
-                    fit_ctx=fit_ctx,
-                    bounds=(p_lo, p_hi),          # mirror constraints at the top level too
-                    locked_mask=locked_mask,
-                    return_band=compute_band,
-                    alpha=alpha,
-                    center_residuals=center_res,
-                    workers=workers,
-                    n_boot=n_boot,
-                    seed=seed_val,
-                )
-            out = res
-        elif method_key == "bayesian":
-            # Pre-run user notices (only if the user intends to see a band)
-            try:
-                if self._should_compute_ci_band() and self.show_ci_band_var.get() and not self.bayes_band_enabled_var.get():
-                    self.status_warn("Bayesian band is disabled. Turn on 'Enable posterior band' to plot the band.")
-            except Exception:
-                pass
-            try:
-                if self._should_compute_ci_band() and self.show_ci_band_var.get() and self.bayes_band_enabled_var.get():
-                    if (not self.bayes_diag_var.get()) and (not self.bayes_band_force_var.get()):
-                        self.status_warn(
-                            "Bayesian band will NOT be computed: diagnostics are OFF. Enable diagnostics or toggle 'Force band'."
-                        )
-            except Exception:
-                pass
-            def predict_full(th):
-                total = np.zeros_like(x_fit, float)
-                for i in range(len(self.peaks)):
-                    c, h, fw, eta = th[4 * i : 4 * (i + 1)]
-                    total += pseudo_voigt(x_fit, h, c, fw, eta)
-                if add_mode and base_fit is not None:
-                    total = total + base_fit
-                return total
-
-            prior_sigma = str(
-                self.bayes_prior_var.get()
-                or self.cfg.get("bayes_prior_sigma", "half_cauchy")
-            )
-
-            fit_ctx = {
-                "x": x_fit,
-                "y": y_fit,
-                "baseline": base_fit,
-                "mode": mode,
-                "lmfit_share_fwhm": bool(
-                    getattr(self, "share_fwhm_var", None) and self.share_fwhm_var.get()
-                ),
-                "lmfit_share_eta": bool(
-                    getattr(self, "share_eta_var", None) and self.share_eta_var.get()
-                ),
-                "residual_fn": (lambda th: resid_fn(th)),
-                "predict_full": predict_full,
-                "x_all": x_fit,
-                "y_all": y_fit,
-                "unc_workers": workers,
-                "unc_band_workers": band_workers,
-                "unc_use_gpu": bool(getattr(self, "use_gpu_var", None) and self.use_gpu_var.get()),
-                "bayes_diagnostics": bool(self.bayes_diag_var.get()),
-                # pass band flags + thresholds + progress callback
-                "bayes_band_enabled": bool(self.bayes_band_enabled_var.get()),
-                "bayes_band_force": bool(self.bayes_band_force_var.get()),
-                "bayes_band_max_draws": self._bayes_band_max_draws_value(),
-                "bayes_diag_ess_min": self._bayes_diag_ess_min_value(),
-                "bayes_diag_rhat_max": self._bayes_diag_rhat_max_value(),
-                "bayes_diag_mcse_mean": self._bayes_diag_mcse_value(),
-                "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
-            }
-            fit_ctx.update(
-                {
-                    "bayes_walkers": walkers,
-                    "bayes_burn": burn,
-                    "bayes_steps": steps,
-                    "bayes_thin": thin,
-                    "bayes_prior_sigma": prior_sigma,
-                }
-            )
-            seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
-            with self._tp_limits_ctx():
-                out = core_uncertainty.bayesian_ci(
-                    theta_hat=theta,
-                    model=predict_full,
-                    predict_full=predict_full,
-                    x_all=x_fit,
-                    y_all=y_fit,
-                    residual_fn=(lambda th: resid_fn(th)),
-                    seed=seed_val,
-                    fit_ctx=fit_ctx,
-                    locked_mask=locked_mask,
-                    bounds=(
-                        np.asarray(param_lo, float).copy(),
-                        np.asarray(param_hi, float).copy(),
-                    ),
-                    workers=workers,
-                    n_walkers=(walkers or None),
-                    n_burn=burn,
-                    n_steps=steps,
-                    thin=thin,
-                    prior_sigma=prior_sigma,
-                )
-        else:
-            return {"label": "unknown", "stats": []}
-
-        if isinstance(out, dict):
-            out.setdefault("method", method_key)
-            if "label" not in out and "method_label" not in out:
-                out["method_label"] = self._unc_method_label({"method": method_key})
-            ps = out.get("param_stats")
-            if isinstance(ps, dict):
-                for blk in ps.values():
-                    if isinstance(blk, dict):
-                        for k, v in list(blk.items()):
-                            if isinstance(v, np.ndarray):
-                                blk[k] = v.tolist()
-
-        # --- Inject RMSE and DoF so exports have meaningful values (parity with batch) ---
-        try:
-            r = np.asarray(resid_fn(theta), float)
-            rmse_val = float(np.sqrt(np.mean(r ** 2))) if r.size else float("nan")
-            dof_val = max(1, int(r.size - int(theta.size)))
-        except Exception:
-            rmse_val = float("nan")
-            dof_val = 1
-
-        norm = _normalize_unc_result(out)
-        if isinstance(norm, dict):
-            if not np.isfinite(norm.get("rmse", float("nan"))):
-                norm["rmse"] = rmse_val if np.isfinite(rmse_val) else 0.0
-            # tolerate float dof in norm and coerce to int≥1
-            try:
-                dv = float(norm.get("dof", float("nan")))
-            except Exception:
-                dv = float("nan")
-            if not np.isfinite(dv):
-                norm["dof"] = dof_val
-            else:
-                norm["dof"] = max(1, int(dv))
-        return norm
-
-    def _batch_unc_enabled(self) -> bool:
-        """
-        Return True if batch uncertainty is enabled, from the UI variable if present,
-        otherwise fall back to config (default True).
-        """
-        try:
-            var = getattr(self, "compute_uncertainty_batch", None)
-            if isinstance(var, tk.BooleanVar):
-                return bool(var.get())
-        except Exception:
-            pass
-        try:
-            var2 = getattr(self, "batch_unc_enabled", None)
-            if isinstance(var2, tk.BooleanVar):
-                return bool(var2.get())
-        except Exception:
-            pass
-        # Safe config fallback; default True so batch jobs compute uncertainty unless explicitly disabled.
-        cfg = getattr(self, "cfg", {}) or {}
-        return bool(cfg.get("batch_compute_uncertainty", cfg.get("compute_uncertainty_batch", True)))
-
-    def _export_band_csv(self, out_path: Path) -> bool:
-        """Write the current uncertainty band to a CSV file."""
-        try:
-            band = getattr(self, "ci_band", None)
-            if band is None:
-                self.dlog("[DEBUG] export_band: no band present; skipping.")
-                return False
-            x, lo, hi = band
-            x = np.asarray(x, dtype=float).reshape(-1)
-            lo = np.asarray(lo, dtype=float).reshape(-1)
-            hi = np.asarray(hi, dtype=float).reshape(-1)
-            if not (x.size and lo.size and hi.size) or not (x.shape == lo.shape == hi.shape):
-                self.dlog("[DEBUG] export_band: band arrays have mismatched shapes; skipping.")
-                return False
-
-            df = pd.DataFrame({"x": x, "band_lo": lo, "band_hi": hi})
-            out_path = Path(out_path)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-
-            method_label = ""
-            method_var = getattr(self, "unc_method", None)
-            if method_var is not None:
-                try:
-                    method_label = str(method_var.get())
-                except Exception:
-                    method_label = str(method_var)
-
-            try:
-                alpha = float(self._safe_alpha())
-            except Exception:
-                alpha = np.nan
-
-            header_lines = [
-                "# Uncertainty band export",
-                f"# generated={datetime.now().isoformat(timespec='seconds')}",
-                f"# source={getattr(self, 'file_path', None) or '-'}",
-                f"# method={method_label}",
-                f"# alpha={alpha}",
-            ]
-
-            with out_path.open("w", encoding="utf-8", newline="") as f:
-                f.write("\n".join(header_lines) + "\n")
-                df.to_csv(f, index=False)
-
-            self.log(f"Saved band CSV: {out_path}")
+    def _uncertainty_settings_ok(self, settings: dict) -> bool:
+        if settings.get("unc_method") != "bayesian":
             return True
-        except Exception as exc:
-            self.log(f"Failed to save band CSV: {exc}", level="ERROR")
+        try:
+            validate_unc_knobs(
+                {k: settings[f"bayes_{k}"] for k in ("walkers", "burn", "steps", "thin")}
+            )
+        except ValueError as exc:
+            self.status_error(f"Bayesian settings invalid: {exc}")
             return False
+        return True
 
-    def _export_uncertainty_from_result(self, unc_norm, out_base: Path, file_path: str, *, write_wide: bool = True):
-        saved: list[str] = []
-        long_csv, wide_csv = write_uncertainty_csvs(out_base, file_path, unc_norm, write_wide=write_wide)
-        saved.append(str(long_csv))
-        if wide_csv:
-            saved.append(str(wide_csv))
+    def _compute_uncertainty(self, rec: dict, settings: dict):
+        """The uncertainty of the fit ``rec``, on a worker thread: no Tk calls here.
 
-        txt_path = out_base.with_name(out_base.name + "_uncertainty.txt")
-        write_uncertainty_txt(
-            txt_path,
-            unc_norm,
-            peaks=self.peaks,
-            method_label=str(unc_norm.get("label", "")),
-            file_path=file_path,
+        Batch's context, unchanged: the window's points, the fit's baseline, locks,
+        bounds and noise weights, and refits with the fit's own settings and seed.
+        Returns the method's raw result and the finished one the writers take."""
+
+        method = settings["unc_method"]
+        raw = pipeline.compute_uncertainty(
+            rec["result"], rec["x"], rec["y"], rec["mask"], settings, method,
+            fit_config=rec["settings"], file_seed=rec.get("rng_seed"),
+            abort_event=self._abort_evt, log=self.log_threadsafe,
         )
-        saved.append(str(txt_path))
+        return raw, pipeline.finish_uncertainty(raw, rec["result"], rec["settings"], method)
 
-        band = unc_norm.get("band")
-        if band is not None:
-            xb, lob, hib = band
-            band_csv = out_base.with_name(out_base.name + "_uncertainty_band.csv")
-            import csv as _csv
-            with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                w = _csv.writer(fh, lineterminator="\n")
+    @staticmethod
+    def _uncertainty_error_text(error) -> str:
+        msg = str(error)
+        diag = getattr(error, "diagnostics", None) or {}
+        if "Insufficient successful bootstrap refits" in msg:
+            errs = diag.get("refit_errors")
+            if errs:
+                msg = f"{msg} | {' | '.join(map(str, errs[:5]))}"
+        return msg
+
+    def _show_uncertainty(self, rec: dict, settings: dict, raw, unc_norm: dict) -> None:
+        """Keep a computed uncertainty for Export and show it (Tk thread)."""
+
+        self._unc_cache = {"fit": rec, "key": self._uncertainty_key(settings), "result": unc_norm}
+        self.last_uncertainty = unc_norm
+        self._last_unc_locks = pipeline.locks(rec["result"])
+        band = self._band_tuple_from(unc_norm)
+        self.ci_band = band
+        self._set_ci_toggle_state(True)
+        # A band just became available: honour the user's saved per-method preference.
+        try:
+            mk = self._unc_selected_method_key()
+            if (
+                band is not None
+                and bool(getattr(self, "_band_pref", {}).get(mk, False))
+                and not bool(self.show_ci_band_var.get())
+            ):
                 try:
-                    ci_pct = int(round(100 * (1.0 - self._safe_alpha())))
-                except Exception:
-                    ci_pct = 95
-                w.writerow(["x", f"y_lo{ci_pct}", f"y_hi{ci_pct}"])
-                for xi, lo, hi in zip(xb, lob, hib):
-                    if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
-                        continue
-                    w.writerow([float(xi), float(lo), float(hi)])
-            saved.append(str(band_csv))
+                    self._suspend_ci_trace = True
+                    self.show_ci_band_var.set(True)
+                finally:
+                    self._suspend_ci_trace = False
+                self._toggle_ci_band()
+        except Exception:
+            pass
+        label = str(unc_norm.get("label") or self._unc_method_label({"method": settings.get("unc_method")}))
+        self.status_info(f"Computed {label} uncertainty.")
+        diag = (raw.get("diagnostics") if isinstance(raw, dict) else getattr(raw, "diagnostics", None)) or {}
+        if label.lower().startswith("bayes"):
+            self._report_bayes_diagnostics(diag, band)
+        n_fail = int(diag.get("n_fail") or 0)
+        if n_fail:
+            self.status_warn(f"{n_fail} of {int(diag.get('n_boot') or 0)} bootstrap refits failed and were left out.")
+        for i, row in enumerate(unc_norm.get("stats") or [], start=1):
+            def _fmt(blk):
+                blk = blk if isinstance(blk, dict) else {}
+                try:
+                    est = f"{float(blk.get('est')):.6g}"
+                except (TypeError, ValueError):
+                    est = "n/a"
+                try:
+                    sd = f"{float(blk.get('sd')):.3g}"
+                except (TypeError, ValueError):
+                    sd = "n/a"
+                return f"{est} ± {sd}"
 
-        for p in saved:
-            self.log(f"  wrote: {p}")
-        return saved
-    # --- END: batch uncertainty helpers ---
+            self.status_info(
+                f"Peak {i}: center={_fmt(row.get('center'))} | height={_fmt(row.get('height'))} | "
+                f"FWHM={_fmt(row.get('fwhm'))} | eta={_fmt(row.get('eta'))}"
+            )
+        self.refresh_plot()
+
+    def _report_bayes_diagnostics(self, diag: dict, band) -> None:
+        if bool(diag.get("diagnostics_enabled")):
+            self.log_threadsafe(
+                f"Posterior health: ess_min={_finite_or_nan(diag.get('ess_min')):.3g}, "
+                f"rhat_max={_finite_or_nan(diag.get('rhat_max')):.3g}, "
+                f"MCSE_mean={_finite_or_nan(diag.get('mcse_mean')):.3g}"
+            )
+        if diag.get("chain_short"):
+            ratio = diag.get("chain_tau_ratio")
+            self.status_warn(
+                f"The MCMC chain is {float(ratio):.1f} autocorrelation times long; emcee advises at least "
+                f"{float(diag.get('chain_tau_min') or 50):g}: run more steps."
+                if ratio is not None and math.isfinite(float(ratio))
+                else "The MCMC autocorrelation time could not be estimated: run more steps."
+            )
+        if band is None and bool(diag.get("band_gated")):
+            skip = diag.get("band_skip_reason")
+            if skip == BAND_SKIP_DIAG_DISABLED:
+                self.status_warn("Bayesian band not computed: diagnostics were OFF (no force).")
+            elif skip == BAND_SKIP_DIAG_UNHEALTHY:
+                thr = diag.get("band_gating_thresholds", {})
+                self.status_warn(
+                    f"Bayesian band gated: ESS_min={_finite_or_nan(thr.get('ess_min')):.3g} (≥{thr.get('ess_min_req')}), "
+                    f"R̂_max={_finite_or_nan(thr.get('rhat_max')):.3g} (≤{thr.get('rhat_max_req')}), "
+                    f"MCSE_mean={_finite_or_nan(thr.get('mcse_mean')):.3g} (≤{thr.get('mcse_mean_req')})."
+                )
+            elif skip == BAND_SKIP_INSUFF_DRAWS:
+                self.log_threadsafe(
+                    "Bayesian band skipped: not enough posterior draws to build a stable band. "
+                    "Try increasing walkers/steps or reducing thinning; alternatively lower the band draw cap in Settings."
+                )
+            elif skip == BAND_SKIP_ABORTED:
+                self.status_warn("Bayesian band aborted before completion.")
+        elif band is not None and bool(diag.get("band_forced")):
+            self.status_info("Bayesian band computed (forced).")
 
     @log_action
     def run_uncertainty(self):
-        strategy = str(self.perf_parallel_strategy.get())
-        blas_raw = None
-        try:
-            blas_raw = self.perf_blas_threads.get()
-        except Exception:
-            blas_raw = None
-        _set_thread_limits(strategy, blas_raw)
-        self.dlog(
-            f"[DEBUG] [perf] pre-run_uncertainty threadpools={threadpool_info()}"
-        )
-        self._debug_uncertainty_import()
-        self._debug_snapshot("run_uncertainty(start)")
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Uncertainty", "Load data and perform a fit first.")
             return
         self._sync_selected_edits()
-        mask = self.current_fit_mask()
-        if mask is None or not np.any(mask):
-            messagebox.showwarning("Uncertainty", "Fit range is empty. Use 'Full range' or set a valid Min/Max.")
+        rec = self._current_fit()
+        blocker = self._uncertainty_blocker(rec)
+        if blocker is not None:
+            self.status_warn(f"Uncertainty not computed: {blocker}")
             return
-        x_fit = self.x[mask]
-        y_fit = self.get_fit_target()[mask]
-        base_applied = self.use_baseline.get() and self.baseline is not None
-        add_mode = (self.baseline_mode.get() == "add")
-        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
-        mode = "add" if add_mode else "subtract"
-
-        theta = []
-        for p in self.peaks:
-            theta.extend([p.center, p.height, p.fwhm, p.eta])
-        theta = np.asarray(theta, dtype=float)
-
-        resid_fn = build_residual(x_fit, y_fit, self.peaks, mode, base_fit, "linear", None)
-
-        method_label = self.unc_method.get()
-        method = "bootstrap" if method_label.startswith("Bootstrap") else method_label.lower()
-        abort_evt = self._abort_evt
-
-        def work():
-            try:
-                compute_band_flag = bool(self.compute_ci_band_var.get())
-            except Exception:
-                compute_band_flag = True
-            try:
-                show_band_flag = bool(self.show_ci_band_var.get())
-            except Exception:
-                show_band_flag = False
-            # Always clear abort flag at start of run
-            try:
-                abort_evt.clear()
-            except Exception:
-                pass
-            if abort_evt.is_set():
-                return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
-            workers_val = 0
-            try:
-                workers_val = int(self._resolve_unc_workers())
-            except Exception:
-                workers_val = 0
-            workers = workers_val if workers_val > 0 else None
-            band_workers = workers
-
-            # Build locked mask (center/fwhm locks) for bootstrap/Bayesian refits
-            locked_mask = np.zeros(theta.size, dtype=bool)
-            for i, pk in enumerate(self.peaks):
-                if bool(getattr(pk, "lock_center", False)):
-                    locked_mask[4 * i + 0] = True
-                if bool(getattr(pk, "lock_height", False)):
-                    locked_mask[4 * i + 1] = True
-                if bool(getattr(pk, "lock_width", False)):
-                    locked_mask[4 * i + 2] = True
-                if bool(getattr(pk, "lock_eta", False)):
-                    locked_mask[4 * i + 3] = True
-
-            P = int(theta.size)
-            param_lo = np.full(P, -np.inf, dtype=float)
-            param_hi = np.full(P, np.inf, dtype=float)
-            try:
-                from fit.bounds import pack_theta_bounds as _pack_theta_bounds
-
-                _hdr, (lo_raw, hi_raw) = _pack_theta_bounds(
-                    self.peaks,
-                    np.asarray(x_fit, float),
-                    dict(self.cfg.get("solver_options", {}) or {}),
-                )
-            except Exception:
-                lo_raw = hi_raw = None
-            if lo_raw is not None:
-                try:
-                    lo_vec = np.asarray(lo_raw, float).reshape(-1)
-                    if int(lo_vec.size) == P:
-                        param_lo = lo_vec.copy()
-                    else:
-                        n = min(P, int(lo_vec.size))
-                        if n:
-                            param_lo[:n] = lo_vec[:n]
-                except Exception:
-                    pass
-            if hi_raw is not None:
-                try:
-                    hi_vec = np.asarray(hi_raw, float).reshape(-1)
-                    if int(hi_vec.size) == P:
-                        param_hi = hi_vec.copy()
-                    else:
-                        n = min(P, int(hi_vec.size))
-                        if n:
-                            param_hi[:n] = hi_vec[:n]
-                except Exception:
-                    pass
-
-            alpha = self._safe_alpha()
-            jitter_pct = self._safe_jitter_pct()
-            jitter_frac = jitter_pct / 100.0
-            walkers = self._safe_bayes_walkers()
-            burn = self._safe_bayes_burn()
-            steps = self._safe_bayes_steps()
-            thin = self._safe_bayes_thin()
-            knobs_local = {
-                "walkers": walkers,
-                "burn": burn,
-                "steps": steps,
-                "thin": thin,
-            }
-            try:
-                bayes_knobs = validate_unc_knobs(knobs_local)
-            except ValueError as exc:
-                self.status_error(f"Bayesian settings invalid: {exc}")
-                return {
-                    "label": "Bayesian configuration error",
-                    "stats": [],
-                    "diagnostics": {"error": str(exc)},
-                }
-            walkers = bayes_knobs["walkers"]
-            burn = bayes_knobs["burn"]
-            steps = bayes_knobs["steps"]
-            thin = bayes_knobs["thin"]
-            try:
-                self.bayes_walkers_var.set(walkers)
-                self.bayes_burn_var.set(burn)
-                self.bayes_steps_var.set(steps)
-                self.bayes_thin_var.set(thin)
-            except Exception:
-                pass
-            logger = getattr(self, "logger", None)
-            try:
-                if logger:
-                    logger.info(
-                        "Bayesian plan: walkers=%d burn=%d steps=%d thin=%d",
-                        walkers,
-                        burn,
-                        steps,
-                        thin,
-                    )
-            except Exception:
-                pass
-            prior_sigma = str(
-                self.bayes_prior_var.get()
-                or self.cfg.get("bayes_prior_sigma", "half_cauchy")
-            )
-
-            self._cfg_set("unc_center_resid", bool(self.center_resid_var.get()))
-            self._cfg_set("bayes_walkers", walkers)
-            self._cfg_set("bayes_burn", burn)
-            self._cfg_set("bayes_steps", steps)
-            self._cfg_set("bayes_thin", thin)
-            self._cfg_set("bayes_diagnostics", bool(self.bayes_diag_var.get()))
-            if method == "asymptotic":
-                res = self._run_asymptotic_uncertainty(
-                    locked_mask=locked_mask,
-                    bounds=(param_lo.copy(), param_hi.copy()),
-                    alpha=alpha,
-                )
-                if abort_evt.is_set():
-                    return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
-                if res is None:
-                    return None
-                if not compute_band_flag:
-                    try:
-                        self.ci_band = None
-                    except Exception:
-                        pass
-                cov, th, _info = res
-                sigma = self._safe_sqrt_vec(np.diag(np.asarray(cov, float)))
-                param_stats = {
-                    "center": {
-                        "est": [p.center for p in self.peaks],
-                        "sd": sigma[0::4].tolist(),
-                    },
-                    "height": {
-                        "est": [p.height for p in self.peaks],
-                        "sd": sigma[1::4].tolist(),
-                    },
-                    "fwhm": {
-                        "est": [p.fwhm for p in self.peaks],
-                        "sd": sigma[2::4].tolist(),
-                    },
-                    "eta": {
-                        "est": [p.eta for p in self.peaks],
-                        "sd": sigma[3::4].tolist(),
-                    },
-                }
-                return {
-                    "method": "asymptotic",
-                    "method_label": "Asymptotic (JᵀJ)",
-                    "band": self.ci_band if self.ci_band else None,
-                    "param_stats": param_stats,
-                }
-            if method == "bootstrap":
-                # Prefer live widget values; persist to cfg
-                n_boot = int(getattr(self, "boot_n_var", None).get() if hasattr(self, "boot_n_var") else self._get_int("bootstrap_n", 200))
-                self._cfg_set("bootstrap_n", n_boot)
-                seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
-
-                r0 = resid_fn(theta)
-                J = jacobian_fd(resid_fn, theta)
-
-                def _predict_fit_local(
-                    th,
-                    *,
-                    _x=x_fit,
-                    _peaks=self.peaks,
-                    _base=base_fit,
-                    _mode=mode,
-                ):
-                    total = np.zeros_like(_x, float)
-                    for i in range(len(_peaks)):
-                        c, h, fw, eta = th[4 * i : 4 * (i + 1)]
-                        total += pseudo_voigt(_x, h, c, fw, eta)
-                    if _mode == "add" and _base is not None:
-                        total = total + _base
-                    return total
-
-                def _predict_model(theta_vec):
-                    try:
-                        y_pred = self.model.ymodel(theta_vec)
-                    except Exception:
-                        return _predict_fit_local(theta_vec)
-                    try:
-                        y_arr = np.asarray(y_pred, dtype=float)
-                    except Exception:
-                        return _predict_fit_local(theta_vec)
-                    if y_arr.ndim > 1:
-                        y_arr = np.asarray(y_arr).reshape(-1)
-                    if int(y_arr.size) != int(x_fit.size):
-                        return _predict_fit_local(theta_vec)
-                    return y_arr
-
-                try:
-                    predict_fit = _predict_model
-                    _probe = np.asarray(predict_fit(np.asarray(theta, float)), dtype=float)
-                    if int(_probe.size) != int(x_fit.size):
-                        predict_fit = _predict_fit_local
-                except Exception:
-                    predict_fit = _predict_fit_local
-
-                boot_solver = self._select_bootstrap_solver()
-                compute_band = bool(compute_band_flag)
-                show_pref = bool(show_band_flag)
-
-                # --- Parameter bounds for bootstrap (independent of band arrays) ---
-                P = int(np.asarray(theta, float).size)
-                p_lo = np.asarray(param_lo, float).copy()
-                p_hi = np.asarray(param_hi, float).copy()
-                # If this function has existing logic that determines per-parameter bounds,
-                # fold it into p_lo/p_hi here (keeping shapes length-P). Otherwise leave ±inf.
-
-                self._dbg(
-                    "Bootstrap plan: "
-                    + _kv(
-                        {
-                            "solver": boot_solver,
-                            "n_boot": n_boot,
-                            "seed": seed_val,
-                            "workers": int(workers or 0),
-                            "band_workers": int(band_workers or 0),
-                            "return_band": compute_band,
-                            "show_pref": show_pref,
-                        }
-                    )
-                )
-                fit_ctx = {
-                    "x": x_fit,
-                    "y": y_fit,
-                    "baseline": base_fit,
-                    "mode": mode,
-                    "residual_fn": (lambda th: resid_fn(th)),
-                    "predict_full": predict_fit,
-                    "x_all": x_fit,
-                    "y_all": y_fit,
-                    "solver": boot_solver,
-                    # propagate sharing flags for LMFIT VP
-                    "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
-                    "lmfit_share_eta":  bool(self.lmfit_share_eta.get()),
-                    "peaks": self.peaks,
-                    "locked_mask": locked_mask,
-                    "unc_workers": workers,
-                    "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
-                    "abort_event": abort_evt,
-                    "strict_refit": True,
-                    "bootstrap_jitter": jitter_frac,
-                    "unc_band_workers": band_workers,
-                    "theta0": np.asarray(theta, float),
-                    "boot_resampling": self.cfg.get("boot_resampling"),
-                    "boot_wild_weights": self.cfg.get("boot_wild_weights"),
-                    "boot_studentize": self.cfg.get("boot_studentize"),
-                    "boot_center_clamp_mode": self.cfg.get("boot_center_clamp_mode"),
-                    "boot_center_clamp_value": self.cfg.get("boot_center_clamp_value"),
-                }
-
-                try:
-                    self.status_info(
-                        f"Bootstrap: jitter={jitter_frac:.3f}, workers={workers or 0}, band_workers={band_workers or 0}, solver={boot_solver}"
-                    )
-                except Exception:
-                    pass
-
-                try:
-                    req_workers = self._resolve_unc_workers()
-                except Exception:
-                    req_workers = 0
-                try:
-                    kind = "prediction" if compute_band else "resampling"
-                    self.log(
-                        f"Bootstrap band ({kind}): draws={n_boot} | "
-                        f"workers_requested={req_workers} | workers_band={band_workers or 0}"
-                    )
-                except Exception:
-                    pass
-                with self._tp_limits_ctx():
-                    self._dbg(
-                        f"bounds check: P={P}, p_lo.shape={getattr(p_lo,'shape',None)}, p_hi.shape={getattr(p_hi,'shape',None)}"
-                    )
-                    try:
-                        self._dbg(
-                            f"unc: compute_band={compute_band} show_band={show_pref} (solver={boot_solver})"
-                        )
-                    except Exception:
-                        pass
-                    out = core_uncertainty.bootstrap_ci(
-                        theta=theta,
-                        residual=r0,
-                        jacobian=J,
-                        predict_full=predict_fit,
-                        x_all=x_fit,
-                        y_all=y_fit,
-                        bounds=(p_lo, p_hi),
-                        locked_mask=locked_mask,
-                        fit_ctx=fit_ctx,
-                        n_boot=n_boot,
-                        seed=seed_val,
-                        workers=workers,
-                        return_band=compute_band,
-                        alpha=alpha,
-                        center_residuals=bool(self.center_resid_var.get()),
-                    )
-                if abort_evt.is_set():
-                    return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
-                return out
-            if method == "bayesian":
-                # Pre-run user notices (only if the user intends to see a band)
-                try:
-                    if (
-                        compute_band_flag
-                        and show_band_flag
-                        and not self.bayes_band_enabled_var.get()
-                    ):
-                        self.status_warn("Bayesian band is disabled. Turn on 'Enable posterior band' to plot the band.")
-                except Exception:
-                    pass
-                try:
-                    if (
-                        compute_band_flag
-                        and show_band_flag
-                        and self.bayes_band_enabled_var.get()
-                    ):
-                        if (not self.bayes_diag_var.get()) and (not self.bayes_band_force_var.get()):
-                            self.status_warn(
-                                "Bayesian band will NOT be computed: diagnostics are OFF. Enable diagnostics or toggle 'Force band'."
-                            )
-                except Exception:
-                    pass
-                self._dbg(
-                    "Bayesian plan: "
-                    + _kv(
-                        {
-                            "solver": self.solver_choice.get(),
-                            "workers": int(workers or 0),
-                            "band_workers": int(band_workers or 0),
-                            "seed_all": bool(self.perf_seed_all.get()),
-                            "seed": self._perf_seed_value()
-                            if bool(self.perf_seed_all.get())
-                            else None,
-                            "return_band": compute_band_flag,
-                            "show_pref": show_band_flag,
-                            "band_enabled": bool(self.bayes_band_enabled_var.get())
-                            if hasattr(self, "bayes_band_enabled_var")
-                            else None,
-                        }
-                    )
-                )
-                def predict_full(th):
-                    total = np.zeros_like(x_fit, float)
-                    for i in range(len(self.peaks)):
-                        c, h, fw, eta = th[4 * i : 4 * (i + 1)]
-                        total += pseudo_voigt(x_fit, h, c, fw, eta)
-                    if add_mode and base_fit is not None:
-                        total = total + base_fit
-                    return total
-
-                fit_ctx = {
-                    "x": x_fit,
-                    "y": y_fit,
-                    "baseline": base_fit,
-                    "mode": mode,
-                    "residual_fn": (lambda th: resid_fn(th)),
-                    "predict_full": predict_full,
-                    "x_all": x_fit,
-                    "y_all": y_fit,
-                    "solver": self.solver_choice.get(),
-                    "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
-                    "lmfit_share_eta": bool(self.lmfit_share_eta.get()),
-                    "peaks": self.peaks,
-                    "locked_mask": locked_mask,
-                    "unc_workers": workers,
-                    "unc_band_workers": band_workers,
-                    "progress_cb": lambda msg: self.log_threadsafe(str(msg)),
-                    "abort_event": abort_evt,
-                    "bayes_diagnostics": bool(self.bayes_diag_var.get()),
-                    "bayes_band_enabled": bool(self.bayes_band_enabled_var.get()),
-                    "bayes_band_force": bool(self.bayes_band_force_var.get()),
-                    "bayes_band_max_draws": self._bayes_band_max_draws_value(),
-                    "bayes_diag_ess_min": self._bayes_diag_ess_min_value(),
-                    "bayes_diag_rhat_max": self._bayes_diag_rhat_max_value(),
-                    "bayes_diag_mcse_mean": self._bayes_diag_mcse_value(),
-                }
-                fit_ctx.update(
-                    {
-                        "bayes_walkers": walkers,
-                        "bayes_burn": burn,
-                        "bayes_steps": steps,
-                        "bayes_thin": thin,
-                        "bayes_prior_sigma": prior_sigma,
-                    }
-                )
-                # sensible bounds for MCMC to prevent runaway widths/etas
-                n_pk = len(self.peaks)
-                P = 4 * n_pk
-                lo = np.full(P, -np.inf, float)
-                hi = np.full(P, np.inf, float)
-                xlo, xhi = float(np.min(x_fit)), float(np.max(x_fit))
-                lo[0::4] = xlo
-                hi[0::4] = xhi                     # centers
-                lo[1::4] = 0.0                     # heights >= 0
-                # use corrected y without ambiguous array truthiness
-                y_corr = y_fit if add_mode or base_fit is None else (y_fit - base_fit)
-                yscale = float(np.nanmax(y_corr))
-                if not np.isfinite(yscale):
-                    yscale = 1.0
-                hi[1::4] = max(1.0, 1.5 * yscale)  # height cap
-                lo[2::4] = max(1e-3, float(self.classic_fwhm_min.get() if hasattr(self, "classic_fwhm_min") else 1e-2))
-                # width ≤ window, then tighten by per-peak caps if present
-                hi[2::4] = max(1.0, xhi - xlo)
-                try:
-                    caps = (self.cfg.get("solver_options", {}) or {}).get("width_caps", []) or []
-                    for i_cap, cap in enumerate(caps):
-                        if cap is not None:
-                            ci = 4 * i_cap + 2
-                            if ci < hi.size and np.isfinite(cap) and cap > 0:
-                                hi[ci] = min(hi[ci], float(cap))
-                except Exception:
-                    pass
-                lo[3::4] = 0.0
-                hi[3::4] = 1.0                     # 0 ≤ eta ≤ 1
-
-                seed_val = self._perf_seed_value() if bool(self.perf_seed_all.get()) else None
-                with self._tp_limits_ctx():
-                    out = core_uncertainty.bayesian_ci(
-                        theta_hat=theta,
-                        model=predict_full,
-                        predict_full=predict_full,
-                        x_all=x_fit,
-                        y_all=y_fit,
-                        residual_fn=(lambda th: resid_fn(th)),
-                        seed=seed_val,
-                        fit_ctx=fit_ctx,
-                        locked_mask=locked_mask,
-                        n_walkers=(walkers or None),
-                        n_burn=burn,
-                        n_steps=steps,
-                        thin=thin,
-                        prior_sigma=prior_sigma,
-                        bounds=(lo, hi),
-                        return_band=compute_band_flag,
-                    )
-                if abort_evt.is_set():
-                    return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
-                return out
-            return {"label": "Aborted", "stats": {}, "diagnostics": {"aborted": True}}
-
-        def done(result, error):
-            # Drop stale callbacks (auto asymptotic finishing after a newer user-triggered run)
-            if job_id != getattr(self, "_unc_job_id", 0):
-                self._progress_end("uncertainty")
-                self.abort_btn.config(state=tk.DISABLED)
-                return
-
-            self._unc_running = False
-            self._progress_end("uncertainty")
-            self.abort_btn.config(state=tk.DISABLED)
-            try:
-                self._abort_evt.clear()
-            except Exception:
-                pass
-
-            if error is not None:
-                msg = str(error)
-                if "Insufficient successful bootstrap refits" in msg:
-                    diag = {}
-                    if isinstance(result, dict):
-                        diag = result.get("diagnostics", {})
-                    else:
-                        diag = getattr(result, "diagnostics", {}) or {}
-                    ns = diag.get("n_success")
-                    nf = diag.get("n_fail")
-                    if ns is not None or nf is not None:
-                        msg = f"{msg} (success={ns}, fail={nf})"
-                    errs = diag.get("refit_errors")
-                    if errs:
-                        msg = f"{msg} | {' | '.join(errs)}"
-                self.status_error(f"Uncertainty failed: {msg}")
-                return
-
-            res = result
-            diag = {}
-            try:
-                if isinstance(result, dict):
-                    diag = result.get("diagnostics", {}) or {}
-                else:
-                    diag = getattr(result, "diagnostics", {}) or {}
-            except Exception:
-                diag = {}
-            debug = _safe_bool(self.debug_mode_var.get(), False)
-            try:
-                # Ensure method/label hints are present to avoid 'unknown' in logs/exports
-                if isinstance(res, dict):
-                    # Add robust defaults if the backend didn't set these fields
-                    res.setdefault("method", method)
-                    if "label" not in res and "method_label" not in res:
-                        res["method_label"] = self._unc_method_label({"method": method})
-                self.last_uncertainty = _normalize_unc_result(res)
-            except Exception:
-                self.last_uncertainty = {"label": "unknown", "stats": []}
-
-            locks = []
-            for pk in self.peaks:
-                locks.append({
-                    "center": bool(getattr(pk, "lock_center", False)),
-                    "fwhm": bool(getattr(pk, "lock_width", False)),
-                    "eta": False,
-                })
-            self._last_unc_locks = locks
-
-            # Derive a stable, canonical label; fall back to the selected method
-            raw_lbl = (self.last_uncertainty.get("label") or self.last_uncertainty.get("method") or "")
-            label = _canonical_unc_label(raw_lbl)
-            if label == "unknown":
-                # Fallback to UI-selected method if the payload didn't specify a label/method
-                label = self._unc_method_label({"method": method})
-                self.last_uncertainty["method"] = method
-            self.last_uncertainty["label"] = label
-
-            # Guarantee per-peak stats even if backend omitted blocks
-            if not (self.last_uncertainty.get("stats") or []):
-                pm = None
-                if isinstance(res, dict):
-                    pm = (
-                        res.get("param_stats")
-                        or res.get("parameters")
-                        or res.get("params")
-                    )
-                if pm is not None:
-                    rebuilt = {"param_stats": pm}
-                    self.last_uncertainty["stats"] = (
-                        _normalize_unc_result(rebuilt).get("stats") or []
-                    )
-
-            band = self.last_uncertainty.get("band")
-            if band is not None:
-                xb, lob, hib = band
-                self.ci_band = (
-                    np.asarray(xb),
-                    np.asarray(lob),
-                    np.asarray(hib),
-                )
-                if self.show_ci_band_var.get():
-                    self.refresh_plot()
-            else:
-                self.ci_band = None
-            self._set_ci_toggle_state(True)
-            # If a band just became available, honor the user's saved per-method preference.
-            try:
-                mk = self._unc_selected_method_key()
-                if (
-                    getattr(self, "ci_band", None) is not None
-                    and bool(getattr(self, "_band_pref", {}).get(mk, False))
-                    and not bool(self.show_ci_band_var.get())
-                ):
-                    try:
-                        self._suspend_ci_trace = True
-                        self.show_ci_band_var.set(True)
-                    finally:
-                        self._suspend_ci_trace = False
-                    # Render immediately now that the toggle is on
-                    self._toggle_ci_band()
-            except Exception:
-                pass
-
-            # persist band for export when method is asymptotic or Bayesian
-            try:
-                if getattr(self, "ci_band", None):
-                    xb, lob, hib = self.ci_band
-                    self.last_uncertainty["band"] = (
-                        np.asarray(xb),
-                        np.asarray(lob),
-                        np.asarray(hib),
-                    )
-            except Exception:
-                pass
-
-            label_dict = self.last_uncertainty if isinstance(self.last_uncertainty, dict) else {}
-            human_label = (
-                (label_dict.get("label") if isinstance(label_dict, dict) else None)
-                or self._unc_method_label(self.last_uncertainty)
-                or str(label)
-            )
-            self.status_info(f"Computed {human_label} uncertainty.")
-            # Always record backend + worker normalization for troubleshooting (if present)
-            try:
-                if isinstance(self.last_uncertainty, dict):
-                    _stats = self.last_uncertainty.get("stats") or []
-                    if isinstance(_stats, list) and _stats:
-                        first_row = _stats[0] if isinstance(_stats[0], dict) else {}
-                        center_blk = first_row.get("center") if isinstance(first_row, dict) else None
-                        if isinstance(center_blk, dict):
-                            _mcse_lo = center_blk.get("ci_lo_mcse")
-                            _mcse_hi = center_blk.get("ci_hi_mcse")
-                            if _mcse_lo is not None or _mcse_hi is not None:
-                                self.dlog(
-                                    f"[DEBUG] Bayesian CI MCSE (first peak center): lo={_mcse_lo!r}, hi={_mcse_hi!r}"
-                                )
-                _bk = diag.get("numpy_backend") if isinstance(diag, dict) else None
-                _bw_req = diag.get("band_workers_requested") if isinstance(diag, dict) else None
-                _bw_eff = diag.get("band_workers_effective") if isinstance(diag, dict) else None
-                self.dlog(
-                    f"[DEBUG] backend={_bk}, band_workers requested={_bw_req}, effective={_bw_eff}"
-                )
-            except Exception:
-                pass
-            if isinstance(label, str) and label.lower().startswith("bayesian"):
-                try:
-                    out = res
-                    d = (
-                        out.get("diagnostics", {})
-                        if isinstance(out, dict)
-                        else getattr(out, "diagnostics", {})
-                        or {}
-                    )
-                    if bool(d.get("diagnostics_enabled")):
-                        ess_min = _finite_or_nan(d.get("ess_min"))
-                        rhat_max = _finite_or_nan(d.get("rhat_max"))
-                        mcse_mean = _finite_or_nan(d.get("mcse_mean"))
-                        self.log_threadsafe(
-                            f"Posterior health: ess_min={ess_min:.3g}, "
-                            f"rhat_max={rhat_max:.3g}, "
-                            f"MCSE_mean={mcse_mean:.3g}"
-                        )
-                except Exception:
-                    pass
-            try:
-                if isinstance(result, dict):
-                    lbl = str(result.get("method") or result.get("label") or "").lower()
-                    if "bayes" in lbl or "bayesian" in lbl:
-                        band = result.get("band", None)
-                        if band is None and bool(diag.get("band_gated")):
-                            band_skip = diag.get("band_skip_reason")
-                            if band_skip == BAND_SKIP_DIAG_DISABLED:
-                                self.status_warn("Bayesian band not computed: diagnostics were OFF (no force).")
-                            elif band_skip == BAND_SKIP_DIAG_UNHEALTHY:
-                                thr = diag.get("band_gating_thresholds", {})
-                                ess = thr.get("ess_min")
-                                ess_req = thr.get("ess_min_req")
-                                rh = thr.get("rhat_max")
-                                rh_req = thr.get("rhat_max_req")
-                                mc = thr.get("mcse_mean")
-                                mc_req = thr.get("mcse_mean_req")
-                                self.status_warn(
-                                    f"Bayesian band gated: ESS_min={ess:.3g} (≥{ess_req}), R̂_max={rh:.3g} (≤{rh_req}), MCSE_mean={mc:.3g} (≤{mc_req})."
-                                )
-                            elif band_skip == BAND_SKIP_INSUFF_DRAWS:
-                                msg = (
-                                    "Bayesian band skipped: not enough posterior draws to build a stable band. "
-                                    "Try increasing walkers/steps or reducing thinning; alternatively lower the band draw cap in Settings."
-                                )
-                                self.log_threadsafe(msg)
-                                if debug:
-                                    # These fields are added by bayesian_ci for precise logging.
-                                    dr_used = diag.get("band_draws_used")
-                                    min_req = diag.get("bayes_band_min_required")
-                                    cap = diag.get("bayes_band_max_draws")
-                                    self.dlog(
-                                        f"[DEBUG] draws_used={dr_used}, min_required={min_req}, cap={cap}"
-                                    )
-                            elif band_skip == BAND_SKIP_ABORTED:
-                                self.status_warn("Bayesian band aborted before completion.")
-                        elif band is not None and bool(diag.get("band_forced")):
-                            self.status_info("Bayesian band computed (forced).")
-            except Exception:
-                pass
-            # Mirror Bayesian band to the plot state so export parity holds
-            try:
-                if isinstance(self.last_uncertainty, dict):
-                    lbl = str(self.last_uncertainty.get("label") or "").lower()
-                    if "bayes" in lbl or "bayesian" in lbl:
-                        band_tup = self.last_uncertainty.get("band")
-                        if band_tup and self.show_ci_band_var.get():
-                            xb, lob, hib = band_tup
-                            self.ci_band = (
-                                np.asarray(xb),
-                                np.asarray(lob),
-                                np.asarray(hib),
-                            )
-                            self._set_ci_toggle_state(True)
-                        elif not band_tup:
-                            self.ci_band = None
-            except Exception:
-                pass
-            # --- cache signature for export parity ---
-            try:
-                theta_sig = []
-                for _p in self.peaks:
-                    theta_sig.extend([_p.center, _p.height, _p.fwhm, _p.eta])
-                self._last_unc_theta = np.asarray(theta_sig, float)
-                # capture fit-window signature (range + count) for a light staleness check
-                self._last_unc_fitwin = (
-                    float(x_fit[0]) if x_fit.size else float("nan"),
-                    float(x_fit[-1]) if x_fit.size else float("nan"),
-                    int(x_fit.size),
-                )
-                self._last_unc_method = _canonical_unc_label(label)
-                self._last_unc_signature = self._current_uncertainty_signature()
-            except Exception:
-                # best-effort cache; export will still fall back to recompute if missing
-                pass
-
-            try:
-                for i, row in enumerate(self.last_uncertainty.get("stats", []), start=1):
-                    def _fmt(est, sd):
-                        try:
-                            s_est = f"{float(est):.6g}" if est is not None else "n/a"
-                        except Exception:
-                            s_est = "n/a"
-                        try:
-                            s_sd = f"{float(sd):.3g}" if sd is not None else "n/a"
-                        except Exception:
-                            s_sd = "n/a"
-                        return s_est, s_sd
-
-                    c_est, c_sd = _fmt(row.get("center", {}).get("est"), row.get("center", {}).get("sd"))
-                    h_est, h_sd = _fmt(row.get("height", {}).get("est"), row.get("height", {}).get("sd"))
-                    w_est, w_sd = _fmt(row.get("fwhm", {}).get("est"), row.get("fwhm", {}).get("sd"))
-                    e_est, e_sd = _fmt(row.get("eta", {}).get("est"), row.get("eta", {}).get("sd"))
-                    self.status_info(
-                        f"Peak {i}: center={c_est} ± {c_sd} | height={h_est} ± {h_sd} | FWHM={w_est} ± {w_sd} | eta={e_est} ± {e_sd}"
-                    )
-            except Exception as _e:
-                self.status_warn(f"Uncertainty stats formatting skipped ({_e.__class__.__name__}).")
-
-            self.refresh_plot()
-
-        self._unc_running = True
+        settings = self._settings()
+        if not self._uncertainty_settings_ok(settings):
+            return
         self._unc_job_id += 1
         job_id = self._unc_job_id
+
+        def work():
+            return self._compute_uncertainty(rec, settings)
+
+        def done(result, error):
+            self._progress_end("uncertainty")
+            if job_id != self._unc_job_id:
+                return  # a newer run replaced this one
+            self._unc_running = False
+            self.abort_btn.config(state=tk.DISABLED)
+            self._abort_evt.clear()
+            if error is not None:
+                self.status_error(f"Uncertainty failed: {self._uncertainty_error_text(error)}")
+                return
+            raw, unc_norm = result
+            self._show_uncertainty(rec, settings, raw, unc_norm)
+
+        self._unc_running = True
         self._abort_evt.clear()
         self.abort_btn.config(state=tk.NORMAL)
         self._progress_begin("uncertainty")
-        # Perf snapshot for debug parity with batch uncertainty runs
-        try:
-            from infra import performance
-
-            cfg_perf = performance.get_parallel_config()
-            strategy = str(self.perf_parallel_strategy.get())
-            try:
-                _bt_raw = int(self.perf_blas_threads.get() or 0)
-            except Exception:
-                _bt_raw = 0
-            blas_effective = 1 if strategy == "outer" else (_bt_raw if _bt_raw > 0 else "lib")
-            self.dlog(
-                f"[DEBUG] perf: fit_workers={cfg_perf.fit_workers} unc_workers={cfg_perf.unc_workers} "
-                f"blas_threads={blas_effective} seed_all={cfg_perf.seed_all} seed={cfg_perf.seed_value}"
-            )
-        except Exception:
-            pass
         self.status_info("Computing uncertainty…")
         self.run_in_thread(work, done)
 
@@ -6512,7 +4771,6 @@ class PeakFitApp:
             from infra import performance as perf_mod
             
             backend_name = perf_mod.which_backend()
-            fit_req = int(self.perf_max_workers.get()) if hasattr(self, "perf_max_workers") else 0
             unc_req = int(self.perf_unc_workers.get()) if hasattr(self, "perf_unc_workers") else 0
             strategy = str(self.perf_parallel_strategy.get()) if hasattr(self, "perf_parallel_strategy") else "outer"
             
@@ -6529,10 +4787,10 @@ class PeakFitApp:
             except Exception:
                 pass
             
-            return (backend_name, fit_req, unc_req, strategy, mkl_threads, openblas_threads, omp_threads, seed_all, seed_val)
+            return (backend_name, unc_req, strategy, mkl_threads, openblas_threads, omp_threads, seed_all, seed_val)
         except Exception:
             # Fallback signature on error
-            return ("error", 0, 0, "unknown", "-", "-", "-", False, None)
+            return ("error", 0, "unknown", "-", "-", "-", False, None)
 
     
     def apply_performance(
@@ -6566,14 +4824,6 @@ class PeakFitApp:
                 seed = None
         # Parse workers safely even if the Entry is blank while typing
         try:
-            w_txt = str(self.perf_max_workers.get()).strip()
-        except Exception:
-            w_txt = ""
-        try:
-            workers = int(float(w_txt)) if w_txt else 0
-        except Exception:
-            workers = 0
-        try:
             unc_txt = str(self.perf_unc_workers.get()).strip()
         except Exception:
             unc_txt = ""
@@ -6583,11 +4833,9 @@ class PeakFitApp:
             unc_workers = 0
         settings = {
             "perf_numba": bool(self.perf_numba.get()),
-            "perf_gpu": bool(self.perf_gpu.get()),
             "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
             "perf_seed_all": bool(self.perf_seed_all.get()),
             "perf_seed": seed if seed is not None else "",
-            "perf_max_workers": workers,
             "perf_unc_workers": unc_workers,
             "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
             "perf_blas_threads": int(self.perf_blas_threads.get()),
@@ -6607,17 +4855,13 @@ class PeakFitApp:
         # Call the actual apply logic
         settings = self._store_perf_settings()
         seed = settings["perf_seed"] if settings["perf_seed"] != "" else None
-        workers = settings["perf_max_workers"]
         unc_workers = settings["perf_unc_workers"]
         performance.set_numba(settings["perf_numba"])
-        performance.set_gpu(settings["perf_gpu"])
         performance.set_cache_baseline(settings["perf_cache_baseline"])
         # apply_global_seed stores the seed and, if enabled, seeds RNGs globally.
         # No need to call set_seed separately.
         performance.apply_global_seed(seed, settings["perf_seed_all"])
-        performance.set_max_workers(workers)
         performance.set_unc_workers(unc_workers)
-        performance.set_gpu_chunk(self.gpu_chunk_var.get())
 
         # Set env for child processes/futures
         import os
@@ -6645,27 +4889,21 @@ class PeakFitApp:
         if save_cfg:
             save_config(self.cfg)
         try:
-            fit_req = int(self.perf_max_workers.get())
-        except Exception:
-            fit_req = workers
-        try:
             unc_req = int(self.perf_unc_workers.get())
         except Exception:
             unc_req = unc_workers
-        fit_eff = self._resolve_fit_workers()
-        unc_eff = self._resolve_unc_workers()
+        # what the uncertainty runs with: "auto" (0) is one worker, i.e. sequential
+        unc_eff = pipeline.uncertainty_workers({"perf_unc_workers": unc_req})[0]
         self.dlog("[DEBUG] apply_performance()")
         # Log only if the applied state changed or the caller forces it, to reduce
         # spam. The signature is taken after the apply, so it holds the new backend.
         new_signature = self._compute_perf_signature()
         if force_log or new_signature != self._perf_last_signature:
             self.log(
-                "Backend: %s | fit_workers_req=%s | fit_workers_eff=%s | unc_workers_req=%s | unc_workers_eff=%s | "
+                "Backend: %s | unc_workers_req=%s | unc_workers_eff=%s | "
                 "strategy=%s | MKL_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s OMP_NUM_THREADS=%s | seed_all=%s seed=%s"
                 % (
                     performance.which_backend(),
-                    fit_req,
-                    fit_eff,
                     unc_req,
                     unc_eff,
                     strategy,
@@ -6695,242 +4933,12 @@ class PeakFitApp:
         self._set_env_if_changed("OPENBLAS_NUM_THREADS", openblas)
         self._set_env_if_changed("OMP_NUM_THREADS", omp)
 
-    # --- BEGIN: hook batch runner to compute + export uncertainty ---
-    @log_action
-    def _batch_process_file(
-        self, in_path: Path, out_dir: Path, unc_rows: Optional[List[dict]] = None
-    ):
-        """Process one spectrum: reset band, fit, export fit/trace, then compute and export uncertainty if enabled."""
-        # Decoupled toggles: COMPUTE controls whether we materialize a band at all
-        try:
-            compute_band = bool(self.compute_ci_band_var.get())
-        except Exception:
-            compute_band = True
-        try:
-            show_band_ui = bool(self.show_ci_band_var.get())
-        except Exception:
-            show_band_ui = False
-
-        try:
-            self.dlog(
-                f"[DEBUG] batch toggles: compute_band={compute_band} show_band={show_band_ui}"
-            )
-        except Exception:
-            pass
-
-        # reset any previous band so batch files don't leak state
-        self.ci_band = None
-        self._open_file(str(in_path))
-        # ensure latest UI/config solver/baseline options are applied before the fit
-        try:
-            self._sync_selected_edits()
-        except Exception:
-            pass
-        self._do_fit()
-
-        base_csv = out_dir / f"{in_path.stem}_fit.csv"
-        trace_csv = out_dir / f"{in_path.stem}_trace.csv"
-
-        rows = []
-        opts = self._solver_options()
-        center_bounds = (self.fit_xmin, self.fit_xmax) if (opts.get("centers_in_window") or opts.get("bound_centers_to_window")) else (np.nan, np.nan)
-        med_dx = float(np.median(np.diff(np.sort(self.x)))) if (self.x is not None and self.x.size > 1) else 0.0
-        fwhm_lo = opts.get("min_fwhm", max(1e-6, 2.0 * med_dx))
-        for i, p in enumerate(self.peaks, 1):
-            rows.append(
-                {
-                    "center": p.center,
-                    "height": p.height,
-                    "fwhm": p.fwhm,
-                    "eta": p.eta,
-                    "bounds_center_lo": center_bounds[0],
-                    "bounds_center_hi": center_bounds[1],
-                    "bounds_fwhm_lo": fwhm_lo,
-                    "bounds_height_lo": 0.0,
-                    "bounds_height_hi": np.nan,
-                    "x_scale": opts.get("x_scale", np.nan),
-                }
-            )
-        fit_csv = _dio.build_peak_table(rows)
-        with base_csv.open("w", encoding="utf-8", newline="") as fh:
-            fh.write(fit_csv)
-
-        base_fit = self.baseline if self.use_baseline.get() else None
-        trace_csv_s = _dio.build_trace_table(self.x, self.y_raw, base_fit, self.peaks)
-        with trace_csv.open("w", encoding="utf-8", newline="") as fh:
-            fh.write(trace_csv_s)
-
-        band_csv_path = out_dir / f"{in_path.stem}_band.csv"
-
-        # Always decide via the batch toggle (not GUI history). If disabled or no peaks, skip with a log line.
-        write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
-
-        if self.peaks and self._batch_unc_enabled():
-            try:
-                method_key = self._unc_selected_method_key()
-                add_mode = (self.baseline_mode.get() == "add")
-
-                # Fit window mask: fall back to full range if empty
-                mask = self.current_fit_mask()
-                if mask is None or (isinstance(mask, np.ndarray) and (mask.size == 0 or not np.any(mask))):
-                    mask = np.ones_like(self.x, dtype=bool)
-
-                x_fit = self.x[mask]
-                y_fit = self.get_fit_target()[mask]
-                base_for_unc = (
-                    self.baseline[mask]
-                    if (self.use_baseline.get() and add_mode and self.baseline is not None)
-                    else None
-                )
-
-                unc_res = self._compute_uncertainty_sync(
-                    method_key,
-                    x_fit=x_fit,
-                    y_fit=y_fit,
-                    base_fit=base_for_unc,
-                    add_mode=add_mode,
-                )
-
-                if not compute_band:
-                    # Stats are still useful, but ensure we don't carry over stale band data.
-                    self.ci_band = None
-
-                # Normalize, label, attach RMSE/DOF (using current file context)
-                unc_norm = _normalize_unc_result(unc_res)
-                raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or "")
-                label = _canonical_unc_label(raw_lbl) or self._unc_method_label({"method": method_key})
-                unc_norm["label"] = label
-
-                # Export the band CSV (x, lo, hi) when a band is present and compute is enabled.
-                band_triplet = unc_norm.get("band") if isinstance(unc_norm, Mapping) else None
-                band_written = False
-                if band_triplet:
-                    try:
-                        xb, lob, hib = band_triplet
-                        self.ci_band = (
-                            np.asarray(xb, dtype=float),
-                            np.asarray(lob, dtype=float),
-                            np.asarray(hib, dtype=float),
-                        )
-                        band_written = self._export_band_csv(band_csv_path)
-                    except Exception as exc:
-                        band_written = False
-                        self.dlog(f"[DEBUG] batch: band export failed during prep ({exc})")
-                else:
-                    self.dlog("[DEBUG] batch: no band to export (compute disabled or unavailable).")
-
-                y_target = self.get_fit_target()
-                total_peaks = np.zeros_like(self.x)
-                for p in self.peaks:
-                    total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
-                base_array = self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
-                model = base_array + total_peaks if add_mode else total_peaks
-                rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float(np.sqrt(np.mean((y_target - model) ** 2)))
-                dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
-                unc_norm["rmse"] = rmse
-                unc_norm["dof"] = dof
-
-                out_base = out_dir / in_path.stem
-                self._export_uncertainty_from_result(unc_norm, out_base, str(in_path), write_wide=write_wide)
-
-                # Append to batch-unc summary rows
-                if unc_rows is not None:
-                    unc_rows.extend(_dio.iter_uncertainty_rows(in_path, unc_norm))
-
-                if band_written:
-                    self.dlog(f"[DEBUG] batch: band CSV saved -> {band_csv_path}")
-                self.status_info(f"[Batch] Uncertainty: {label} for {in_path.name}.")
-                self._debug_snapshot(
-                    "batch._export_uncertainty",
-                    label=label,
-                    show_band=bool(self.show_ci_band_var.get()) if hasattr(self, "show_ci_band_var") else None,
-                )
-            except Exception as e:
-                self.status_warn(f"[Batch] Uncertainty skipped for {in_path.name} ({e.__class__.__name__}).")
-        else:
-            self.status_info(f"[Batch] Skipping uncertainty for {in_path.name} (disabled or no peaks).")
-
-    def start_batch(self, in_folder: str, out_folder: str):
-        """Process all spectra in ``in_folder`` writing results to ``out_folder``."""
-        # Persist the selected uncertainty method for future sessions
-        try:
-            method_key = self._unc_selected_method_key()
-            self.cfg["unc_method"] = method_key
-            try:
-                unc_section = self.cfg.setdefault("uncertainty", {})
-                unc_section["method"] = method_key
-            except Exception:
-                pass
-            save_config(self.cfg)
-        except Exception:
-            pass
-
-        in_dir = Path(in_folder)
-        out_dir = Path(out_folder)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        files = sorted([p for p in in_dir.iterdir() if p.suffix.lower() in {".csv", ".txt", ".dat"}])
-
-        all_rows: List[dict] = []
-        self._debug_snapshot(
-            "batch.start",
-            in_dir=str(in_dir),
-            out_dir=str(out_dir),
-            n_files=len(files),
-        )
-        for p in files:
-            if getattr(self, "_abort_evt", None) and self._abort_evt.is_set():
-                self.status_warn("[Batch] Aborted by user.")
-                break
-            self._batch_process_file(p, out_dir, all_rows)
-
-        # Batch summaries (fit already written per-file; now write uncertainty summaries if any rows)
-        if all_rows:
-            _dio.write_batch_uncertainty_long(out_dir, all_rows)
-        self.status_info(f"Batch done: processed {len(files)} files.")
-        self._debug_snapshot("batch.done", n_rows=len(all_rows))
-
-    def _export_uncertainty_raw(self):
-        """The uncertainty result Export writes: the cached one while it belongs to
-        the current peaks, window, method and settings, else one computed now."""
-
-        method_key = self._unc_selected_method_key()
-        mask = self.current_fit_mask()
-        if mask is None or not np.any(mask):
-            mask = np.ones_like(self.x, dtype=bool)
-        add_mode = self.baseline_mode.get() == "add"
-        x_fit = self.x[mask]
-        y_fit_target = self.get_fit_target()[mask]
-        base_for_unc = (
-            self.baseline[mask]
-            if (self.use_baseline.get() and add_mode and self.baseline is not None)
-            else None
-        )
-        theta_now = np.asarray([v for p in self.peaks for v in (p.center, p.height, p.fwhm, p.eta)], float)
-        cached = getattr(self, "last_uncertainty", None)
-        fw = getattr(self, "_last_unc_fitwin", (float("nan"), float("nan"), 0))
-        same_window = x_fit.size == int(fw[2]) and (
-            x_fit.size == 0 or (float(x_fit[0]) == float(fw[0]) and float(x_fit[-1]) == float(fw[1]))
-        )
-        reuse = (
-            isinstance(cached, dict)
-            and bool(cached)
-            and _canonical_unc_label(cached.get("label") or cached.get("method") or "")
-            == _canonical_unc_label(method_key)
-            and np.array_equal(theta_now, getattr(self, "_last_unc_theta", np.asarray([], float)))
-            and same_window
-            and getattr(self, "_last_unc_signature", None) == self._current_uncertainty_signature()
-        )
-        if reuse:
-            self.status_info("Exporting uncertainty: reusing cached GUI result.")
-            return cached
-        self.status_info("Exporting uncertainty: recomputed (cache stale/missing).")
-        return self._compute_uncertainty_sync(
-            method_key, x_fit=x_fit, y_fit=y_fit_target, base_fit=base_for_unc, add_mode=add_mode
-        )
-
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Export", "Load data and perform a fit first.")
+            return
+        if getattr(self, "_export_running", False):
+            self.status_warn("Export is already running.")
             return
         out_csv = filedialog.asksaveasfilename(
             title="Save export base name",
@@ -6939,38 +4947,72 @@ class PeakFitApp:
         )
         if not out_csv:
             return
+        self._sync_selected_edits()
         # Only a trailing .csv is dropped: a typed MoS2_0.5mW keeps its dots.
         base = _dio._drop_csv_suffix(out_csv)
         # The fit the table describes, with the settings it ran with; peaks no fit
         # produced (placed by hand, or edited since the fit) say fit_ok False.
-        record = self._current_fit()
+        rec = self._current_fit()
         fit = self._export_fit()
-        settings = dict(record["settings"]) if record is not None else self._settings()
-        settings["export_unc_wide"] = bool(self.cfg.get("export_unc_wide", False))
-        unc_norm = None
-        try:
-            raw = self._export_uncertainty_raw()
-            if raw is not None:
-                unc_norm = pipeline.finish_uncertainty(raw, fit, settings, self._unc_selected_method_key())
-                if not unc_norm.get("stats"):
-                    raise RuntimeError("Export uncertainty normalization produced no stats")
-        except Exception as e:  # pragma: no cover - defensive
-            unc_norm = None
-            self.status_warn(f"Uncertainty export failed: {e}")
+        settings = self._settings()
+        write_settings = {**(rec["settings"] if rec is not None else settings), "export_unc_wide": settings["export_unc_wide"]}
+        blocker = self._uncertainty_blocker(rec)
+        if blocker is None and not self._uncertainty_settings_ok(settings):
+            blocker = "the uncertainty settings are invalid."
+        cached = self._cached_uncertainty(rec, settings)
         source = str(self.current_file or "")
         keep = {os.path.normcase(os.path.abspath(source))} if source else set()
-        # The writer batch uses: the fit table, the trace and the uncertainty
-        # files, after removing uncertainty files an earlier export left here.
-        written = pipeline.write_spectrum(
-            base, source, x=self.x, y_raw=self.y_raw, fit=fit, settings=settings,
-            unc_norm=unc_norm, trace=True, keep=keep, log=self.log,
-        )
-        if unc_norm is not None:
-            self.log(f"Exported uncertainty ({unc_norm['label']}).")
-        saved_lines = [str(p) for p in written]
-        for p in saved_lines:
-            self.log(f"Export: wrote {p}")
-        messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved_lines))
+        x, y_raw = self.x, self.y_raw
+
+        def work():
+            # A worker thread: the uncertainty, then the files, and no Tk calls.
+            unc, computed, unc_error = cached, None, None
+            if blocker is None and cached is None:
+                try:
+                    computed = self._compute_uncertainty(rec, settings)
+                    unc = computed[1]
+                except Exception as exc:
+                    unc_error = exc
+            # The writer batch uses: the fit table, the trace and the uncertainty
+            # files, after removing uncertainty files an earlier export left here.
+            written = pipeline.write_spectrum(
+                base, source, x=x, y_raw=y_raw, fit=fit, settings=write_settings,
+                unc_norm=unc, trace=True, keep=keep, log=self.log_threadsafe,
+            )
+            return written, unc, computed, unc_error
+
+        def done(result, error):
+            self._export_running = False
+            self.abort_btn.config(state=tk.DISABLED)
+            self._abort_evt.clear()
+            self.set_busy(False, "Export done." if error is None else "Export failed.")
+            if error is not None:
+                self.log(f"Export failed: {error}", level="ERROR")
+                messagebox.showerror("Export", f"Export failed:\n{error}")
+                return
+            written, unc, computed, unc_error = result
+            if computed is not None and self._current_fit() is rec:
+                self._show_uncertainty(rec, settings, computed[0], computed[1])
+            if blocker is not None:
+                self.status_warn(f"Uncertainty not computed: {blocker}")
+            elif unc_error is not None:
+                self.status_warn(f"Uncertainty export failed: {self._uncertainty_error_text(unc_error)}")
+            else:
+                self.status_info(
+                    "Exporting uncertainty: reusing the computed result." if cached is not None
+                    else "Exporting uncertainty: computed for this export."
+                )
+                self.log(f"Exported uncertainty ({unc['label']}).")
+            saved_lines = [str(p) for p in written]
+            for p in saved_lines:
+                self.log(f"Export: wrote {p}")
+            messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved_lines))
+
+        self._export_running = True
+        self._abort_evt.clear()
+        self.abort_btn.config(state=tk.NORMAL)
+        self.set_busy(True, "Exporting…")
+        self.run_in_thread(work, done)
 
 
     # ----- Plot -----
