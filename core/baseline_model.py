@@ -178,7 +178,8 @@ def uncertainty_problem(res: dict, x_fit, y_fit) -> Dict[str, Any]:
 
     ``res`` is ``run_fit_consistent``'s result (``return_jacobian=True``); x_fit and
     y_fit are the window's points and data. Returns the parameter vector
-    [theta, coef], the residual (model - data) and predictor on the window, the
+    [theta, coef], the residual (model - data) and predictor on the window
+    (``predict_batch``: the same model for rows of parameter vectors), the
     Jacobian with the baseline columns appended, the lock mask, bounds and
     names extended for the coefficients (free, unbounded), and the number of
     peak parameters in front.
@@ -202,6 +203,10 @@ def uncertainty_problem(res: dict, x_fit, y_fit) -> Dict[str, Any]:
             out = out + models.pseudo_voigt(xf, h, c, w, e)
         return out
 
+    def predict_batch(rows) -> np.ndarray:
+        T = np.atleast_2d(np.asarray(rows, dtype=float))
+        return models.pseudo_voigt_rows(xf, T[:, :P]) + T[:, P:] @ B.T
+
     def residual_fn(th) -> np.ndarray:
         return predict(th) - yf
 
@@ -210,6 +215,7 @@ def uncertainty_problem(res: dict, x_fit, y_fit) -> Dict[str, Any]:
     return {
         "theta": np.r_[theta, coef],
         "predict": predict,
+        "predict_batch": predict_batch,
         "residual_fn": residual_fn,
         "jacobian": np.hstack([J, B]),
         "locked_mask": np.r_[np.asarray(res["locked_mask"], bool), np.zeros(m, bool)],

@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 # Its flags are advice, never a veto (";"-separated):
 #   bound_hit           a fitted parameter sits on its bound (named in message)
 #   ci_at_bound         an uncertainty interval reaches a parameter bound
+#   mcmc_short_chain    the Bayesian chain is under 50 integrated autocorrelation
+#                       times long (emcee's rule); unc_message gives its length
 # The noise_* columns record the spectrum's noise model, var_i = s0^2 + g * S_i
 # with S_i the fitted signal above the baseline, which weighted the fit: s0, g,
 # the n points it was estimated from and how (fit_residuals_d4: from the 4th
@@ -816,6 +818,12 @@ def run_batch(
                     except Exception:
                         predict_fit_fn = _predict_fit_local
                 predict_full_fn = predict_fit_fn
+
+                # The same window model for rows of parameter vectors at once
+                # (the Bayesian's vectorised likelihood).
+                def predict_batch_fn(rows, *, _x=x_fit, _base=base_fit):
+                    return models.pseudo_voigt_rows(_x, rows) + _base[None, :]
+
                 bounds_exact = res.get("bounds")
                 locked_exact = res.get("locked_mask")
                 param_names_unc = res.get("param_names")
@@ -831,6 +839,7 @@ def run_batch(
                     residual_fn = joint_pb["residual_fn"]
                     jac = joint_pb["jacobian"]
                     predict_fit_fn = predict_full_fn = joint_pb["predict"]
+                    predict_batch_fn = joint_pb["predict_batch"]
                     bounds_exact = joint_pb["bounds"]
                     locked_exact = joint_pb["locked_mask"]
                     param_names_unc = joint_pb["param_names"]
@@ -888,6 +897,7 @@ def run_batch(
                         "residual_fn": residual_fn,
                         "predict_full": predict_full_fn,
                         "predict_fit": predict_fit_fn,
+                        "predict_batch": predict_batch_fn,
                         "x_all": x_fit,
                         "y_all": y_fit,
                         "x_fit": x_fit,
@@ -1027,8 +1037,11 @@ def run_batch(
                     fit_ctx_local["solver"] = str(boot_solver)
                     # Always force strict non-linear refits for bootstrap (matches GUI stability)
                     fit_ctx_local["strict_refit"] = True
-                    if "boot_studentize" in config:
-                        fit_ctx_local["boot_studentize"] = config.get("boot_studentize")
+                    # Studentized residuals, r / sqrt(1 - h), by default in batch:
+                    # measured (PR F, B = 500, 400 paired replicates) it gains 0.6 to 2.2
+                    # coverage points in every cell and loses none. The core default
+                    # (GUI) stays off.
+                    fit_ctx_local["boot_studentize"] = config.get("boot_studentize", True)
                     if "boot_resampling" in config:
                         fit_ctx_local["boot_resampling"] = config.get("boot_resampling")
                     if "boot_wild_weights" in config:
@@ -1178,8 +1191,9 @@ def run_batch(
                     if log:
                         log(perf_line)
 
+                    # numpy's global state is left alone: the asymptotic draws
+                    # nothing, and the Bayesian seeds its own generator from seed.
                     with _tp_limits_ctx_for_config(config):
-                        performance.apply_global_seed(seed_val, perf_seed_all)
                         unc_res = route_uncertainty(
                             unc_method_canon,
                             theta_hat=theta_hat,
@@ -1324,6 +1338,15 @@ def run_batch(
                 if n_fail:
                     entry["unc_message"] = (
                         f"{n_fail} of {int(unc_diag.get('n_boot') or 0)} bootstrap refits failed and were left out"
+                    )
+                if unc_diag.get("chain_short"):
+                    entry["flags"] = ";".join(f for f in (entry["flags"], "mcmc_short_chain") if f)
+                    ratio = unc_diag.get("chain_tau_ratio")
+                    entry["unc_message"] = (
+                        f"MCMC chain is {float(ratio):.1f} autocorrelation times long; emcee advises at least "
+                        f"{float(unc_diag.get('chain_tau_min') or 50):g}: run more bayes_steps"
+                        if ratio is not None and math.isfinite(float(ratio))
+                        else "the MCMC autocorrelation time could not be estimated: run more bayes_steps"
                     )
             except Exception as exc:
                 msg = str(exc)

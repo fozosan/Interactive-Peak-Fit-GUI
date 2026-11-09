@@ -32,7 +32,7 @@ def test_bayes_sharing_default_off(monkeypatch):
     u = importlib.import_module("core.uncertainty")
 
     class DummySampler:
-        def __init__(self, nwalkers, dim, log_prob, pool=None, random_state=None):
+        def __init__(self, nwalkers, dim, log_prob, pool=None, random_state=None, **kwargs):  # vectorize=True
             self.nwalkers = nwalkers
             self.dim = dim
             self.log_prob = log_prob

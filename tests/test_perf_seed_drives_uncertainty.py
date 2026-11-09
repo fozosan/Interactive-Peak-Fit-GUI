@@ -13,7 +13,7 @@ def _fake_resid(th, x):
 
 
 class _DummySamplerBand:
-    def __init__(self, nwalkers, dim, log_prob_fn, pool=None):
+    def __init__(self, nwalkers, dim, log_prob_fn, pool=None, **kwargs):  # vectorize=True
         self._log_prob = log_prob_fn
         self.pool = pool
         self.nwalkers = nwalkers
