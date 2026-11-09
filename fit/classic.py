@@ -10,7 +10,7 @@ from core.peaks import Peak
 from core.weights import noise_weights
 from core.baseline_model import joint_from_options
 from infra import performance as perf
-from .bounds import pack_theta_bounds
+from .bounds import height_cap, held_heights, pack_theta_bounds
 
 W_MIN = 1e-6  # minimal physical FWHM
 
@@ -28,6 +28,7 @@ def _pack(
     after the solve, onto a bound it had never seen.
     """
     _, (lo_full, hi_full) = pack_theta_bounds(peaks, x, opts)
+    held = held_heights((lo_full, hi_full))
     theta: list[float] = []
     lo: list[float] = []
     hi: list[float] = []
@@ -36,11 +37,16 @@ def _pack(
         c_lo, h_lo, w_lo = lo_full[4 * i : 4 * i + 3]
         c_hi, h_hi, w_hi = hi_full[4 * i : 4 * i + 3]
         s: dict = {"eta": float(pk.eta)}
-        # height always free
-        s["ih"] = len(theta)
-        theta.append(max(pk.height, 0.0))
-        lo.append(h_lo)
-        hi.append(h_hi)
+        # height: free, unless its bounds hold it (fit.bounds.held_heights). A
+        # held one is no parameter: a finite-difference step would not fit in it.
+        if np.isfinite(held[i]):
+            s["ih"] = None
+            s["h_fixed"] = float(held[i])
+        else:
+            s["ih"] = len(theta)
+            theta.append(max(pk.height, 0.0))
+            lo.append(h_lo)
+            hi.append(h_hi)
         # centre
         if pk.lock_center:
             s["ic"] = None
@@ -64,14 +70,20 @@ def _pack(
     return np.asarray(theta, float), (np.asarray(lo, float), np.asarray(hi, float)), struct
 
 
+def _params(theta: np.ndarray, s: dict) -> tuple[float, float, float]:
+    """One peak's centre, height and width, from the free parameters ``theta``."""
+
+    h = s["h_fixed"] if s["ih"] is None else max(theta[s["ih"]], 0.0)
+    c = s["c_fixed"] if s["ic"] is None else theta[s["ic"]]
+    c = float(np.clip(c, s.get("c_lo", -np.inf), s.get("c_hi", np.inf)))
+    w = s["w_fixed"] if s["iw"] is None else theta[s["iw"]]
+    return c, float(h), max(float(w), W_MIN)
+
+
 def _theta_full(theta: np.ndarray, struct: Sequence[dict]) -> np.ndarray:
     out: list[float] = []
     for s in struct:
-        h = max(theta[s["ih"]], 0.0)
-        c = s["c_fixed"] if s["ic"] is None else theta[s["ic"]]
-        c = float(np.clip(c, s.get("c_lo", -np.inf), s.get("c_hi", np.inf)))
-        w = s["w_fixed"] if s["iw"] is None else theta[s["iw"]]
-        w = max(w, W_MIN)
+        c, h, w = _params(theta, s)
         out.extend([c, h, w, s["eta"]])
     return np.asarray(out, float)
 
@@ -79,11 +91,7 @@ def _theta_full(theta: np.ndarray, struct: Sequence[dict]) -> np.ndarray:
 def _theta_to_peaks(theta: np.ndarray, struct: Sequence[dict]) -> list[Peak]:
     out: list[Peak] = []
     for s in struct:
-        h = float(max(theta[s["ih"]], 0.0))
-        c = float(s["c_fixed"] if s["ic"] is None else theta[s["ic"]])
-        c = float(np.clip(c, s.get("c_lo", -np.inf), s.get("c_hi", np.inf)))
-        w = float(s["w_fixed"] if s["iw"] is None else theta[s["iw"]])
-        w = max(w, W_MIN)
+        c, h, w = _params(theta, s)
         out.append(
             Peak(
                 c,
@@ -104,15 +112,10 @@ def _build_residual(
     struct: Sequence[dict],
 ):
     def residual(theta_free: np.ndarray) -> np.ndarray:
-        peaks = []
+        pk_tuples = []
         for s in struct:
-            h = max(theta_free[s["ih"]], 0.0)
-            c = s["c_fixed"] if s["ic"] is None else theta_free[s["ic"]]
-            c = float(np.clip(c, s.get("c_lo", -np.inf), s.get("c_hi", np.inf)))
-            w = s["w_fixed"] if s["iw"] is None else theta_free[s["iw"]]
-            w = max(w, W_MIN)
-            peaks.append(Peak(c, h, w, s["eta"]))
-        pk_tuples = [(p.height, p.center, p.fwhm, p.eta) for p in peaks]
+            c, h, w = _params(theta_free, s)
+            pk_tuples.append((h, c, w, s["eta"]))
         model = perf.eval_total(x_fit, pk_tuples)
         if base_fit is not None:
             model = model + base_fit
@@ -145,6 +148,7 @@ def solve(x, y, peaks, mode, baseline, opts):
         w = noise_weights(y_target, weights)
         with np.errstate(divide="ignore"):
             point_sigma = np.where(w > 0, 1.0 / w, np.inf)
+    opts = {**opts, "max_height": height_cap(y - (base if base is not None else 0.0), opts)}
     theta0, bounds, struct = _pack(peaks, x, opts)
     theta0 = np.clip(theta0, bounds[0], bounds[1])
     B = joint_from_options(opts, x.size)
@@ -160,15 +164,10 @@ def solve(x, y, peaks, mode, baseline, opts):
 
     def model_func(xdata, *t):
         theta = np.asarray(t, float)
-        peaks_loc = []
+        pk_tuples = []
         for s in struct:
-            h = max(theta[s["ih"]], 0.0)
-            c = s["c_fixed"] if s["ic"] is None else theta[s["ic"]]
-            c = float(np.clip(c, s.get("c_lo", -np.inf), s.get("c_hi", np.inf)))
-            w = s["w_fixed"] if s["iw"] is None else theta[s["iw"]]
-            w = max(w, W_MIN)
-            peaks_loc.append(Peak(c, h, w, s["eta"]))
-        pk_tuples = [(p.height, p.center, p.fwhm, p.eta) for p in peaks_loc]
+            c, h, w = _params(theta, s)
+            pk_tuples.append((h, c, w, s["eta"]))
         model = perf.eval_total(xdata, pk_tuples)
         if base_fit is not None:
             model = model + base_fit
@@ -224,6 +223,7 @@ def prepare_state(x, y, peaks, mode, baseline, opts):
     else:
         y_target = y - (base if base is not None else 0.0)
         base_fit = None
+    opts = {**opts, "max_height": height_cap(y - (base if base is not None else 0.0), opts)}
     theta0, bounds, struct = _pack(peaks, x, opts)
     theta0 = np.clip(theta0, bounds[0], bounds[1])
     resid = _build_residual(x, y_target, base_fit, struct)

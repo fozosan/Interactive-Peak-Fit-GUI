@@ -88,13 +88,15 @@ def build_residual_jac(
     baseline: np.ndarray | None,
     weights: np.ndarray | None,
     wmin_eval: float = 0.0,
+    held_heights: np.ndarray | None = None,
 ) -> Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]:
     """Return residual and Jacobian builder for solvers.
 
-    The parameter vector ``theta`` follows the order ``[h1,(c1),(w1), h2,(c2),(w2), ...]``
-    where centres and widths are omitted when locked.  ``wmin_eval`` provides a
-    minimum width used only for evaluation to guard against singular intermediate
-    values.
+    The parameter vector ``theta`` follows the order ``[(h1),(c1),(w1), (h2),(c2),(w2), ...]``
+    where centres and widths are omitted when locked, and a height when
+    ``held_heights`` holds a value for it (NaN for a free one: see
+    fit.bounds.held_heights).  ``wmin_eval`` provides a minimum width used only
+    for evaluation to guard against singular intermediate values.
     """
 
     x = np.asarray(x, dtype=float)
@@ -109,18 +111,22 @@ def build_residual_jac(
     e = np.array([p.eta for p in peaks], dtype=float)
     lock_c = np.array([p.lock_center for p in peaks], dtype=bool)
     lock_w = np.array([p.lock_width for p in peaks], dtype=bool)
+    hold = np.full(n, np.nan) if held_heights is None else np.asarray(held_heights, dtype=float)
+    lock_h = np.isfinite(hold)
+    h0[lock_h] = hold[lock_h]
 
     def residual_jac(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         theta = np.asarray(theta, dtype=float)
-        if theta.size != (n + (~lock_c).sum() + (~lock_w).sum()):
+        if theta.size != ((~lock_h).sum() + (~lock_c).sum() + (~lock_w).sum()):
             raise ValueError("theta has wrong size")
         h = h0.copy()
         c = c0.copy()
         f = f0.copy()
         j = 0
         for i in range(n):
-            h[i] = theta[j]
-            j += 1
+            if not lock_h[i]:
+                h[i] = theta[j]
+                j += 1
             if not lock_c[i]:
                 c[i] = theta[j]
                 j += 1
@@ -137,7 +143,8 @@ def build_residual_jac(
         cols = []
         for i in range(n):
             _, d_dc, d_df = pv_and_grads(x, h[i], c[i], f[i], e[i])
-            cols.append(comps_unit[i])
+            if not lock_h[i]:
+                cols.append(comps_unit[i])
             if not lock_c[i]:
                 cols.append(d_dc)
             if not lock_w[i]:

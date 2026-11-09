@@ -354,7 +354,7 @@ def retire_stale_uncertainty(base, written: Iterable = (), keep: Iterable[str] =
         if norm(old) in skip or not old.is_file():
             continue
         if not (remove and data_io.is_own_uncertainty_file(old)):
-            why = "it is not this app's output" if remove else "uncertainty is off, so nothing is deleted"
+            why = "it is not this app's output" if remove else "no uncertainty is computed, so nothing is deleted"
             msg = f"left {old.name} ({why}): it does not describe this fit"
         else:
             try:
@@ -448,6 +448,7 @@ def write_spectrum(
     keep: Iterable[str] = (),
     log=None,
     retire_stale: bool = True,
+    remove_stale: bool = True,
 ) -> List[Path]:
     """Write one spectrum's files under ``base`` (the path the suffixes follow).
 
@@ -456,7 +457,9 @@ def write_spectrum(
     ``unc_norm`` (from :func:`finish_uncertainty`). Then, when ``retire_stale``,
     the uncertainty files of an earlier fit that this export did not write are
     retired (:func:`retire_stale_uncertainty`), so the folder does not pair this
-    fit with another fit's uncertainty. Returns the paths written.
+    fit with another fit's uncertainty: deleted when ``remove_stale`` (the export
+    computes uncertainty, as a batch with it on), else left and logged.
+    Returns the paths written.
     """
 
     base = Path(base)
@@ -472,7 +475,7 @@ def write_spectrum(
     unc_written = write_uncertainty(base, file_path, unc_norm, fit, settings) if unc_norm is not None else []
     written.extend(unc_written)
     if retire_stale:
-        retire_stale_uncertainty(base, unc_written, keep=keep, log=log)
+        retire_stale_uncertainty(base, unc_written, keep=keep, log=log, remove=remove_stale)
     return written
 
 
@@ -848,6 +851,10 @@ def compute_uncertainty(
         _extra = dict(config.get(boot_solver, {}))
         _extra.update(dict(config.get("solver_options") or {}))
         refit_cfg[boot_solver] = _extra
+    if res.get("height_cap") is not None:
+        # the fit's height bounds, not ones from each resampled spectrum
+        refit_cfg[boot_solver] = {**dict(refit_cfg.get(boot_solver) or {}),
+                                  "max_height": float(res["height_cap"])}
 
     def _refit_wrapper(theta_init, locked_mask, bounds, x, y):
         """One refit. It counts only if the solver converged; an

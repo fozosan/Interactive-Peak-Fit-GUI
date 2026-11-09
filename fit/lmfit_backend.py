@@ -10,7 +10,7 @@ from core.models import pv_design_matrix
 from core.peaks import Peak
 from core.weights import noise_weights
 from core.baseline_model import LinearPart, joint_from_options
-from .bounds import pack_theta_bounds
+from .bounds import height_cap, pack_theta_bounds
 from .utils import mad_sigma, robust_cost
 from . import step_engine
 
@@ -69,12 +69,11 @@ def solve(
     base = baseline if baseline is not None else 0.0
     y_target = y - base
     weights = noise_weights(y_target, weight_mode)
-    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
-    max_height_factor = float(options.get("max_height_factor", np.inf))
-    options["max_height"] = max_height_factor * p95
+    options["max_height"] = height_cap(y_target, options)
     options["max_fwhm"] = options.get("max_fwhm", 0.5 * (x.max() - x.min()))
 
     theta0_full, bounds_full = pack_theta_bounds(peaks, x, options)
+    h_caps = np.asarray(bounds_full[1], float)[1::4]  # every height's upper bound
     dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
     min_fwhm = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
     # Joint baseline (game plan 1.6): free linear columns solved with the heights.
@@ -111,7 +110,7 @@ def solve(
         else:
             Aw = A
             bw = b
-        h, cb = lin.solve(Aw, bw, options["max_height"])
+        h, cb = lin.solve(Aw, bw, h_caps)
         model = A @ h if B is None else A @ h + B @ cb
         r = model - b
         if weights is not None:
@@ -154,7 +153,7 @@ def solve(
     else:
         Aw = A
         bw = y_target
-    h, cb = lin.solve(Aw, bw, options["max_height"])
+    h, cb = lin.solve(Aw, bw, h_caps)
     model = A @ h if B is None else A @ h + B @ cb
     r = model - y_target
     if weights is not None:
@@ -208,6 +207,8 @@ def iterate(state: dict):
     loss = options.get("loss", "linear")
     weight_mode = options.get("weights", "none")
 
+    base0 = baseline if baseline is not None else 0.0
+    options = {**options, "max_height": height_cap(y - base0, options)}
     _, bounds = pack_theta_bounds(peaks, x, options)
 
     theta, cost1, cost0, info = step_engine.step_once(

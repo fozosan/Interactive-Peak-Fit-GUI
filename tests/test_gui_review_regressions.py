@@ -5,7 +5,8 @@
    screen were no longer the fit's.
 5. Unchecking Compute band no longer suppressed the asymptotic band.
 6. The bootstrap and Bayesian progress lines no longer reached the log and the
-   status bar (no progress callback was passed).
+   status bar (no progress callback was passed). Passing it (#257) logged the
+   Bayesian sampler's verdicts twice: the core sent them through it too.
 7. An empty BLAS threads field made Fit, Export, Run and Run Batch do nothing,
    without a word.
 9. A typed export name "name.txt" gave name.txt_fit.csv.
@@ -114,6 +115,27 @@ def test_progress_lines_reach_the_log_and_the_status_bar(gui, method):
     on_bar = [text for thread, text in shown if expected in text]
     assert on_bar, "no progress line reached the status bar"
     assert {thread for thread, _ in shown} == {app._tk_thread}  # Tk only from its own thread
+
+
+def test_a_bayesian_run_states_each_verdict_once(gui):
+    # The progress callback carries progress; a short chain and a forced band are
+    # the result's verdicts, which the GUI reports once, from its diagnostics.
+    gui.fit()
+    app = gui.app
+    _choose_method(gui, app._unc_bayes_radio)
+    app.bayes_walkers_var.set(16)
+    app.bayes_burn_var.set(100)
+    app.bayes_steps_var.set(400)  # far below 50 autocorrelation times
+    app.bayes_band_enabled_var.set(True)
+    app.bayes_band_force_var.set(True)
+    app.bayes_diag_var.set(False)
+    n0 = len(app._log_buffer)
+    assert "Computed" in gui.run_uncertainty()
+    gui.root.update()
+    lines = app._log_buffer[n0:]
+    assert any("Bayesian MCMC: " in ln for ln in lines)
+    assert sum("autocorrelation" in ln for ln in lines) == 1, lines
+    assert sum("band computed" in ln.lower() for ln in lines) == 1, lines
 
 
 def test_an_empty_blas_threads_field_falls_back_to_the_default(gui):

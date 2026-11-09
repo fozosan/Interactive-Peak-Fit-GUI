@@ -4709,6 +4709,9 @@ class PeakFitApp:
         self.refresh_plot()
 
     def _report_bayes_diagnostics(self, diag: dict, band) -> None:
+        """The sampler's verdicts, once: the chain's length and the band's outcome.
+        The core's Bayesian lines through the progress callback are progress only."""
+
         if bool(diag.get("diagnostics_enabled")):
             self.log_threadsafe(
                 f"Posterior health: ess_min={_finite_or_nan(diag.get('ess_min')):.3g}, "
@@ -4741,8 +4744,8 @@ class PeakFitApp:
                 )
             elif skip == BAND_SKIP_ABORTED:
                 self.status_warn("Bayesian band aborted before completion.")
-        elif band is not None and bool(diag.get("band_forced")):
-            self.status_info("Bayesian band computed (forced).")
+        elif band is not None:
+            self.status_info("Bayesian band computed (forced)." if diag.get("band_forced") else "Bayesian band computed.")
 
     @log_action
     def run_uncertainty(self):
@@ -5068,10 +5071,12 @@ class PeakFitApp:
                 except Exception as exc:
                     unc_error = exc
             # The writer batch uses: the fit table, the trace and the uncertainty
-            # files, after removing uncertainty files an earlier export left here.
+            # files. The app's own uncertainty files an earlier export left here go
+            # only when this one computes uncertainty, as in batch with it on.
             written = pipeline.write_spectrum(
                 base, source, x=x, y_raw=y_raw, fit=fit, settings=write_settings,
                 unc_norm=unc, trace=True, keep=keep, log=self.log_threadsafe,
+                remove_stale=blocker is None,
             )
             return written, unc, computed, unc_error
 
