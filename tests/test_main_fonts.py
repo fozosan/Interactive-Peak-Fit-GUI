@@ -21,7 +21,7 @@ def run_main(monkeypatch):
     roots = []
 
     class _App:  # stands in for PeakFitApp, which main() builds after the font policy
-        def __init__(self, root):
+        def __init__(self, root, cfg=None):
             roots.append(root)
 
     monkeypatch.setattr(app_module, "PeakFitApp", _App)

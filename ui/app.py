@@ -180,8 +180,11 @@ Known limitations / tips
 """
 
 import json
+import logging
 import math  # used for band row filtering
 import re
+import shutil
+import tempfile
 import time
 import csv
 from dataclasses import dataclass
@@ -476,6 +479,52 @@ DEFAULTS = {
 }
 
 LOG_MAX_LINES = 5000
+_config_log = logging.getLogger(__name__)
+
+
+def _read_settings(path):
+    """The settings in ``path`` as a dict; raises when the file does not hold a JSON object."""
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"expected a JSON object, found {type(data).__name__}")
+    return data
+
+
+def _set_aside_unreadable(path, err, then):
+    """Rename a settings file that cannot be read, so that no save writes over it, and warn.
+
+    The new name keeps the suffix, so the ui/ui_config/*.json git-ignore rule still covers
+    it. Returns True when ``path`` is free to write.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    aside, n = path.with_name(f"{path.stem}.unreadable-{stamp}{path.suffix}"), 1
+    while aside.exists():
+        n += 1
+        aside = path.with_name(f"{path.stem}.unreadable-{stamp}-{n}{path.suffix}")
+    try:
+        os.rename(path, aside)
+        moved = True
+        msg = f"The settings file {path} could not be read ({err}). It was kept as {aside.name}, and {then}."
+    except OSError as move_err:
+        moved = False
+        msg = (f"The settings file {path} could not be read ({err}) or moved aside ({move_err}). "
+               "It is left as it is, and settings are not saved over it.")
+    _config_log.warning(msg)
+    messagebox.showwarning("Settings", msg)
+    return moved
+
+
+def _replace_settings(src, dst, attempts=5):
+    # Windows refuses to replace a file that another program, such as a sync client or a
+    # virus scanner, holds open for a moment.
+    for k in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if k == attempts - 1:
+                raise
+            time.sleep(0.05 * (k + 1))
 
 
 def load_config():
@@ -484,7 +533,7 @@ def load_config():
         path = LEGACY_CONFIG_PATH  # read once; the next save_config writes CONFIG_PATH
     if path.exists():
         try:
-            data = json.loads(path.read_text())
+            data = _read_settings(path)
             cfg = {**DEFAULTS, **data}
             # Ensure nested uncertainty config exists and is independent of defaults
             unc_section = dict(cfg.get("uncertainty") or {})
@@ -541,20 +590,47 @@ def load_config():
                         "polynomial": poly_block,
                     }
             return cfg
-        except Exception:
-            cfg = dict(DEFAULTS)
-            cfg["uncertainty"] = dict(cfg.get("uncertainty") or {})
-            return cfg
+        except Exception as err:
+            if path == CONFIG_PATH:  # the start saves at once, and would write over it
+                _set_aside_unreadable(path, err, "the app starts from the default settings")
     cfg = dict(DEFAULTS)
     cfg["uncertainty"] = dict(cfg.get("uncertainty") or {})
     return cfg
 
 def save_config(cfg):
+    """Write the settings so that a save that fails part-way leaves the previous file whole.
+
+    The JSON goes to a temporary file in the same folder and is flushed to disk before
+    os.replace swaps it in. A file already there that cannot be read is set aside first,
+    never written over.
+    """
+    path, tmp = CONFIG_PATH, None
     try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+        text = json.dumps(cfg, indent=2)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            try:
+                _read_settings(path)
+            except Exception as err:
+                if not _set_aside_unreadable(path, err, "the current settings are saved in its place"):
+                    return
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=f".saving{path.suffix}", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if path.exists():
+            shutil.copymode(path, tmp)
+        _replace_settings(tmp, path)
+        tmp = None
     except Exception as e:
         messagebox.showwarning("Config", f"Could not save config: {e}")
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def add_tooltip(widget, text: str) -> None:
@@ -7329,7 +7405,7 @@ def main():
                         mono_family=_mono_selected, ui_size=_size)
     # --- END font policy ---
     
-    app = PeakFitApp(root)
+    app = PeakFitApp(root, cfg=_cfg)  # one read per start: a file set aside stays aside
     root.mainloop()
 
 
