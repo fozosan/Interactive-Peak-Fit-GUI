@@ -59,7 +59,7 @@ Interactive Peak Fit GUI/
 │   ├── bootstrap.py    # Bootstrap resampling
 │   └── bayes.py        # Bayesian/MCMC with emcee
 ├── infra/               # Infrastructure (359K)
-│   ├── config.py       # Configuration persistence (~/.gl_peakfit_config.json)
+│   ├── config.py       # Config load/save helpers taking a path; nothing calls them
 │   ├── performance.py  # Performance backend (Numba/CuPy, 577 lines)
 │   └── logging.py      # Logging setup
 ├── tests/               # Comprehensive test suite (778K, 164 test files)
@@ -300,7 +300,7 @@ Defensive performance layer:
 
 ### `infra/config.py` (78 lines)
 Persistent configuration management:
-- File: `~/.gl_peakfit_config.json`
+- File: none of its own. `load(path)` and `save(path)` take one, and nothing calls them; the GUI's file is `ui/ui_config/gl_peakfit_config.json` (`ui/app.py`)
 - Keys: baseline defaults, solver/options, uncertainty method, UI toggles, batch defaults, performance flags
 - Load/save with recursive merge for backward compatibility
 
@@ -342,7 +342,7 @@ Persistent configuration management:
    - **Plot**: Show uncertainty band, Toggle legend, Show components
    - **Help**: F1 opens scrollable help window
 
-**Persistence** (`~/.gl_peakfit_config.json`):
+**Persistence** (`ui/ui_config/gl_peakfit_config.json`, beside the code and synced by OneDrive; the old `~/.gl_peakfit_config.json` is read until it exists):
 - Last solver choice and options
 - Baseline method and defaults
 - Uncertainty method and parameters
@@ -651,7 +651,7 @@ Test categories:
 ## 13. Configuration
 
 ### Persistent Config File
-**Location**: `~/.gl_peakfit_config.json`
+**Location**: `ui/ui_config/gl_peakfit_config.json`, beside the code, so OneDrive syncs it; git-ignored. `GL_PEAKFIT_CONFIG` names another file. Until it exists, the old `~/.gl_peakfit_config.json` is read in its place and never changed.
 
 **Structure**:
 ```json

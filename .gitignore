@@ -10,3 +10,6 @@ graphify-out/
 
 # Build artifact: the docx is compiled from the wiki markdown, never edited
 docs/*.docx
+
+# GUI settings are personal: OneDrive syncs them between machines, git never publishes them
+ui/ui_config/*.json

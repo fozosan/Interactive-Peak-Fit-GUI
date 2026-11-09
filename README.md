@@ -31,7 +31,8 @@
   - **Action bar** (top-right) segmented: **File** [Open, Export, Batch] | **Fit** [Step, Fit] | **Plot** [Uncertainty, Legend, Components] | **Help** (F1).
   - Right panel scroll isolated from Help; resizable splitter with sensible mins; status bar with progress + green-on-black log; Arial legend/font.
 - **Persistence**
-  - Saves to `~/.gl_peakfit_config.json`: baseline defaults, solver choice & options, uncertainty method, “Add peaks on click”, global η, legend toggle, batch defaults, x-label, **performance toggles** (Numba/GPU/cache/seed_all/max_workers), and templates (including **auto-apply**).
+  - Saves to `ui/ui_config/gl_peakfit_config.json`, beside the code, so OneDrive syncs it with the repo folder between machines. The file is git-ignored, and the `GL_PEAKFIT_CONFIG` environment variable names another file. Until it exists, the old `~/.gl_peakfit_config.json` is read in its place; the first save writes the new file, and the old one is never changed.
+  - Settings saved: baseline defaults, solver choice & options, uncertainty method, “Add peaks on click”, global η, legend toggle, batch defaults, x-label, **performance toggles** (Numba/GPU/cache/seed_all/max_workers), and templates (including **auto-apply**).
 
 > The previous **v2.7** stable standalone release remains available.
 
@@ -66,7 +67,7 @@
   - Folder patterns (`*.csv;*.txt;*.dat`), seed from current/template (**auto-apply**) / auto; optional per-file **re-height**; one summary CSV; optional per-spectrum **trace CSVs**; outputs go to your selected directory.
 
 - **Persisted configuration**
-  - Stored in `~/.gl_peakfit_config.json` (see **Persistence** above).
+  - Stored in `ui/ui_config/gl_peakfit_config.json` (see **Persistence** above).
 
 - **Unified exports**
   - `_fit.csv`, `_trace.csv`, `_uncertainty.csv`, `_uncertainty.txt` for **single** runs and **per-file** in **batch**; plus a batch **summary CSV**.
@@ -121,7 +122,7 @@ and `poly_degree`, `poly_normalize_x` (filled for polynomial, `NaN` under ALS).
 
 ### Defaults & persistence
 The app stores per-method defaults and the last used method under
-`~/.gl_peakfit_config.json` in a `baseline_defaults` block:
+`ui/ui_config/gl_peakfit_config.json` in a `baseline_defaults` block:
 ```json
 {
   "baseline_defaults": {

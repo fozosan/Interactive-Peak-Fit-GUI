@@ -35,7 +35,7 @@ The application enables researchers to:
 3. **Flexible Baseline** - ALS with windowing or polynomial with automatic degree clamping
 4. **Reproducibility** - Deterministic seeding, lock-aware jitter, per-draw seed control
 5. **Performance** - Optional GPU (CuPy) and JIT (Numba) acceleration with safe fallback
-6. **Persistence** - Configuration saved to ~/.gl_peakfit_config.json with backward-compatible merging
+6. **Persistence** - Configuration saved to ui/ui_config/gl_peakfit_config.json (beside the code, synced by OneDrive) with backward-compatible merging
 7. **Comprehensive Testing** - 163 test files covering solvers, uncertainty, batch processing, exports
 8. **Batch Processing** - Process folders with pattern matching, template seeding, progress streaming
 
@@ -534,7 +534,7 @@ residuals: r = y_fit - (y_raw - baseline)
   - Per-peak and global η control
   - Uncertainty band overlay
   - Help window (F1) with scrollable content
-- **Persistence**: Configuration saved to ~/.gl_peakfit_config.json
+- **Persistence**: Configuration saved to ui/ui_config/gl_peakfit_config.json
 - **Design**: Monolithic but well-structured with clear sections
 
 #### `helptext.py` - Help Documentation (~15k lines)
@@ -563,7 +563,7 @@ residuals: r = y_fit - (y_raw - baseline)
 - **Design**: Transparent acceleration, no breaking changes if GPU unavailable
 
 #### `config.py` - Configuration Persistence (78 lines)
-- **Purpose**: Load/save ~/.gl_peakfit_config.json
+- **Purpose**: Load/save a config file passed as `path`; nothing calls it (the GUI's file is `ui/ui_config/gl_peakfit_config.json`, in `ui/app.py`)
 - **Stored Settings**:
   - Baseline method and defaults (ALS/polynomial params)
   - Solver choice and options (loss, weights, f_scale, etc)
@@ -869,7 +869,7 @@ Height [param]:     456.78 ± 2.34
 
 ## 11. Configuration Persistence
 
-**File**: `~/.gl_peakfit_config.json`
+**File**: `ui/ui_config/gl_peakfit_config.json`, beside the code, so OneDrive syncs it; git-ignored. `GL_PEAKFIT_CONFIG` names another file. Until it exists, the old `~/.gl_peakfit_config.json` is read in its place and never changed.
 
 **Structure**:
 ```json

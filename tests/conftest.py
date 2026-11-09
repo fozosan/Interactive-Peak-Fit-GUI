@@ -5,16 +5,20 @@ import shutil
 import sys
 import tempfile
 
-# Keep the suite away from the user's settings. ui.app sets
-# CONFIG_PATH = Path.home() / ".gl_peakfit_config.json" when it is imported, and
-# gl_decon_gui_batch.py does the same, so a test that saves a setting would write
-# the user's real file. Pytest imports this conftest before any test module, so
-# pointing HOME at a throwaway directory here, ahead of every other import, moves
-# those paths with it. Windows reads USERPROFILE instead of HOME.
+# Keep the suite away from the user's settings. ui.app and gl_decon_gui_batch.py
+# set CONFIG_PATH to ui/ui_config/gl_peakfit_config.json in this repo when they
+# are imported, and read the old ~/.gl_peakfit_config.json while that file is
+# absent, so a test that saves a setting would write the user's real file.
+# Pytest imports this conftest before any test module, so GL_PEAKFIT_CONFIG set
+# here, ahead of every other import, sends every import of either module, fresh
+# re-imports included, to a throwaway file with no old file. HOME moves too, for
+# code that joins paths to it; Windows reads USERPROFILE instead of HOME.
 _TEST_HOME = Path(tempfile.mkdtemp(prefix="peakfit-tests-home-"))
 _TEST_CONFIG = _TEST_HOME / ".gl_peakfit_config.json"
 atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
 os.environ["HOME"] = os.environ["USERPROFILE"] = str(_TEST_HOME)
+os.environ["GL_PEAKFIT_CONFIG"] = str(_TEST_CONFIG)
+_REPO_CONFIG_DIR = Path(__file__).resolve().parents[1] / "ui" / "ui_config"
 
 from tkinter import filedialog, messagebox, simpledialog  # noqa: E402
 
@@ -50,6 +54,13 @@ def _answer_dialogs(set_attribute=setattr):
 _answer_dialogs()
 
 
+def _repo_config_state():
+    """The user's real settings folder in this repo: file names, sizes, mtimes."""
+    if not _REPO_CONFIG_DIR.is_dir():
+        return None
+    return sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in _REPO_CONFIG_DIR.iterdir())
+
+
 @pytest.fixture(autouse=True)
 def _clean_slate(monkeypatch):
     """Start every test with no saved settings and the stock dialog answers.
@@ -58,7 +69,8 @@ def _clean_slate(monkeypatch):
     test_ui_classic_defaults saves the classic solver, the re-import in
     test_config_migration_baseline_defaults points ui.app at that test's legacy
     file, and test_single_export_wide_toggle replaces showinfo and
-    asksaveasfilename without monkeypatch.
+    asksaveasfilename without monkeypatch. After the test, ui/ui_config must be
+    as it was: a test that wrote there changed the user's real settings.
     """
     _TEST_CONFIG.unlink(missing_ok=True)
     for name in ("ui.app", "gl_decon_gui_batch"):
@@ -66,6 +78,9 @@ def _clean_slate(monkeypatch):
         if module is not None:
             monkeypatch.setattr(module, "CONFIG_PATH", _TEST_CONFIG)
     _answer_dialogs(monkeypatch.setattr)
+    before = _repo_config_state()
+    yield
+    assert _repo_config_state() == before, f"this test changed the user's settings in {_REPO_CONFIG_DIR}"
 
 
 # Use non-interactive backend when headless

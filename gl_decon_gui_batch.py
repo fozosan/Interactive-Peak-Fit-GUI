@@ -23,11 +23,11 @@ An interactive desktop GUI (Tkinter + Matplotlib) that lets you:
 • Choose Gaussian–Lorentzian mix (η, 0..1). “Apply to all” copies η to every peak.
 • Choose/clear a fit x-range by typing limits or dragging on the plot. Shaded region indicates the active window.
 • Thin line rendering and “Toggle components” for clarity during inspection.
-• **Axes/Labels:** set a custom X-axis label and save it as default (persists in ~/.gl_peakfit_config.json).
+• **Axes/Labels:** set a custom X-axis label and save it as default (persists in ui/ui_config/gl_peakfit_config.json).
 • Peak templates: save as new, save changes, apply, delete; optional auto-apply on file open.
 • Batch processing over folders with patterns (*.csv;*.txt;*.dat). Seed from current/template/auto. Optional re-height per file. Optional per-spectrum trace exports. One summary CSV.
 • Scrollable right-side control panel (mouse-wheel works anywhere on the panel).
-• Configuration persisted in ~/.gl_peakfit_config.json (baseline defaults, batch defaults, templates, auto-apply, x-label).
+• Configuration persisted in ui/ui_config/gl_peakfit_config.json beside the code, the file ui/app.py uses (baseline defaults, batch defaults, templates, auto-apply, x-label). Until it exists, the old ~/.gl_peakfit_config.json is read in its place, and never changed.
 
 Data Exports
 ============
@@ -74,6 +74,7 @@ v1.0  – First stable GUI with ALS baseline, GL peaks, iterative fitting, CSV e
 
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -265,7 +266,24 @@ class Peak:
 
 
 # ---------- Config persistence ----------
-CONFIG_PATH = Path.home() / ".gl_peakfit_config.json"
+def _config_paths():
+    """Return (settings file, old file to read while the settings file is absent).
+
+    The same file as ui/app.py, written out here so this release stays standalone:
+    ui/ui_config/gl_peakfit_config.json beside the code, synced by OneDrive and
+    git-ignored. GL_PEAKFIT_CONFIG names another file and has no old file. The old
+    ~/.gl_peakfit_config.json is read until the new file exists, and never written.
+    """
+    override = os.environ.get("GL_PEAKFIT_CONFIG")
+    if override:
+        return Path(override), None
+    return (
+        Path(__file__).resolve().parent / "ui" / "ui_config" / "gl_peakfit_config.json",
+        Path.home() / ".gl_peakfit_config.json",
+    )
+
+
+CONFIG_PATH, LEGACY_CONFIG_PATH = _config_paths()
 DEFAULTS = {
     "als_lam": 1e5,
     "als_asym": 0.001,
@@ -286,9 +304,12 @@ DEFAULTS = {
 }
 
 def load_config():
-    if CONFIG_PATH.exists():
+    path = CONFIG_PATH
+    if not path.exists() and LEGACY_CONFIG_PATH is not None and LEGACY_CONFIG_PATH.exists():
+        path = LEGACY_CONFIG_PATH  # read once; the next save_config writes CONFIG_PATH
+    if path.exists():
         try:
-            data = json.loads(CONFIG_PATH.read_text())
+            data = json.loads(path.read_text())
             cfg = {**DEFAULTS, **data}
             if cfg.get("saved_peaks") and not cfg.get("templates"):
                 cfg["templates"] = {"default": cfg["saved_peaks"]}
@@ -299,6 +320,7 @@ def load_config():
 
 def save_config(cfg):
     try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
     except Exception as e:
         messagebox.showwarning("Config", f"Could not save config: {e}")
@@ -1688,7 +1710,7 @@ class PeakFitApp:
 
             "6) Axes / Labels\n"
             "   • Set a custom X-axis label (e.g., Raman shift [cm⁻¹], 2θ [deg]) and click ‘Apply’.\n"
-            "   • ‘Save as default’ persists the label to ~/.gl_peakfit_config.json.\n\n"
+            "   • ‘Save as default’ persists the label to ui/ui_config/gl_peakfit_config.json.\n\n"
 
             "7) Templates\n"
             "   • Save as new… : store the current peak set as a named template.\n"

@@ -200,9 +200,11 @@ def build_help(opts: dict) -> str:
 
         Persistence
         -----------
-        • Saved in ~/.gl_peakfit_config.json: ALS defaults, solver choice & options, uncertainty method, click-to-add,
-          global η, performance toggles (Numba/CuPy/cache/seed_all/max_workers), batch defaults, x-label, legend visibility,
-          and templates (including auto-apply).
+        • Saved in ui/ui_config/gl_peakfit_config.json, beside the code, so OneDrive syncs it with the repo folder:
+          ALS defaults, solver choice & options, uncertainty method, click-to-add, global η, performance toggles
+          (Numba/CuPy/cache/seed_all/max_workers), batch defaults, x-label, legend visibility, and templates (including auto-apply).
+        • Until that file exists, the old ~/.gl_peakfit_config.json is read in its place; the first save writes the new
+          file, and the old one is never changed. The GL_PEAKFIT_CONFIG environment variable names another file.
 
         Practical tips
         --------------

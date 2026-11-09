@@ -9,7 +9,7 @@ Build: v3.2-beta
 What’s new since v3.0 / v3.1
 • Reliability & parity: Classic is restored as a simple SciPy curve_fit backend (lock-aware, minimal bounds). Modern TRF/VP stabilized (robust losses/weights; VP heights via NNLS).
 • “Step ▶” parity: Step uses the same residual/bounds as Fit and reports damping λ, backtracks, step_norm, and accept/reject reasons. Non-finite guards prevent freezes.
-• Persisted settings: Shape factor η, “Add peaks on click”, solver choice, uncertainty method, performance toggles, legend visibility, and defaults (e.g., labels) are saved to ~/.gl_peakfit_config.json.
+• Persisted settings: Shape factor η, “Add peaks on click”, solver choice, uncertainty method, performance toggles, legend visibility, and defaults (e.g., labels) are saved to ui/ui_config/gl_peakfit_config.json, beside the code, so OneDrive syncs them (the old ~/.gl_peakfit_config.json is read until that file exists, and never changed).
 • UI/UX: Segmented action bar (File | Fit | Plot | Help) is always visible; F1 opens Help. Right panel scrolling is independent from the Help window; splitter enforces sensible min widths; status bar with progress + collapsible green-on-black log; batch streams progress.
 • Defaults: “Show uncertainty band” = ON. “Baseline uses fit range” = ON. Performance toggles persist (Numba/CuPy/cache/seed/workers).
 • Legend: Toggleable legend with peak centers in labels; legend font set to Arial.
@@ -151,7 +151,7 @@ Export (single & batch share formats; no blank lines)
 
 Persistence & defaults
 ======================
-The configuration file (~/.gl_peakfit_config.json) stores: ALS defaults (λ, p, iterations, threshold), solver choice & options (loss/weights/f_scale/maxfev/restarts/jitter/step_lambda), uncertainty method, click-to-add toggle, global η, performance toggles (numba/gpu/cache/seed_all/max_workers), batch defaults, x-label, legend visibility, and templates (including auto-apply). Settings update on change and are loaded at startup.
+The configuration file (ui/ui_config/gl_peakfit_config.json, beside the code: git-ignored and synced by OneDrive; the GL_PEAKFIT_CONFIG environment variable names another file) stores: ALS defaults (λ, p, iterations, threshold), solver choice & options (loss/weights/f_scale/maxfev/restarts/jitter/step_lambda), uncertainty method, click-to-add toggle, global η, performance toggles (numba/gpu/cache/seed_all/max_workers), batch defaults, x-label, legend visibility, and templates (including auto-apply). Settings update on change and are loaded at startup. Until that file exists, the old ~/.gl_peakfit_config.json is loaded in its place; the first save writes the new file, and the old one is never changed.
 
 UI details
 ==========
@@ -410,7 +410,26 @@ class Peak:
 
 
 # ---------- Config persistence ----------
-CONFIG_PATH = Path.home() / ".gl_peakfit_config.json"
+def _config_paths():
+    """Return (settings file, old file to read while the settings file is absent).
+
+    Settings live beside the code, in ui/ui_config/, because OneDrive syncs the repo
+    folder between machines and $HOME is neither synced nor backed up. The file is
+    git-ignored: personal, not published. GL_PEAKFIT_CONFIG names another file, for
+    tests and tools, and has no old file. Settings used to live in
+    ~/.gl_peakfit_config.json: load_config reads it until the new file exists, and
+    nothing writes to it. gl_decon_gui_batch.py uses the same file.
+    """
+    override = os.environ.get("GL_PEAKFIT_CONFIG")
+    if override:
+        return Path(override), None
+    return (
+        Path(__file__).resolve().parent / "ui_config" / "gl_peakfit_config.json",
+        Path.home() / ".gl_peakfit_config.json",
+    )
+
+
+CONFIG_PATH, LEGACY_CONFIG_PATH = _config_paths()
 DEFAULTS = {
     "baseline_defaults": {
         "method": "als",
@@ -460,9 +479,12 @@ LOG_MAX_LINES = 5000
 
 
 def load_config():
-    if CONFIG_PATH.exists():
+    path = CONFIG_PATH
+    if not path.exists() and LEGACY_CONFIG_PATH is not None and LEGACY_CONFIG_PATH.exists():
+        path = LEGACY_CONFIG_PATH  # read once; the next save_config writes CONFIG_PATH
+    if path.exists():
         try:
-            data = json.loads(CONFIG_PATH.read_text())
+            data = json.loads(path.read_text())
             cfg = {**DEFAULTS, **data}
             # Ensure nested uncertainty config exists and is independent of defaults
             unc_section = dict(cfg.get("uncertainty") or {})
@@ -529,6 +551,7 @@ def load_config():
 
 def save_config(cfg):
     try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
     except Exception as e:
         messagebox.showwarning("Config", f"Could not save config: {e}")
