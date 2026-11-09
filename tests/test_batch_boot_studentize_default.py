@@ -12,19 +12,20 @@ core default stays off, so the GUI, whose checkbox shows it, is unchanged.
 """
 
 from batch import runner
+from core import pipeline
 from tests.synthetic_raman import SI_BACKGROUND, SI_CURVE_SCALE, SI_LINES, SI_TEMPLATE, SI_WINDOW, curved_shape, mos2_spectrum, write_spectrum
 
 
 def _studentize_seen(tmp_path, monkeypatch, extra):
     seen = []
-    real = runner.bootstrap_ci
+    real = pipeline.bootstrap_ci  # batch uncertainty runs there
 
     def spy(*args, **kwargs):
         res = real(*args, **kwargs)
         seen.append((kwargs["fit_ctx"].get("boot_studentize"), res.diagnostics.get("boot_studentize")))
         return res
 
-    monkeypatch.setattr(runner, "bootstrap_ci", spy)
+    monkeypatch.setattr(pipeline, "bootstrap_ci", spy)
     folder = tmp_path / str(len(list(tmp_path.iterdir())))
     folder.mkdir()
     spec = folder / "si.csv"

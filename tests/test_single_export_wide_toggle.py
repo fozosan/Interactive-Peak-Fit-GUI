@@ -10,11 +10,13 @@ if headless:
 tk = pytest.importorskip("tkinter")
 
 
-def _run_once(tmp_path, write_wide):
+def _run_once(tmp_path, monkeypatch, write_wide):
     from ui.app import PeakFitApp, Peak, pseudo_voigt
+    from tests.gui_driver import Driver
 
     root = tk.Tk()
     app = PeakFitApp(root)
+    gui = Driver(app, monkeypatch)
     app.cfg["export_unc_wide"] = bool(write_wide)
 
     x = np.linspace(-3, 3, 201)
@@ -29,17 +31,16 @@ def _run_once(tmp_path, write_wide):
         pass
 
     out = tmp_path / ("w_true.csv" if write_wide else "w_false.csv")
-    monkey = filedialog
-    monkey.asksaveasfilename = lambda **k: str(out)
-    messagebox.showinfo = lambda *a, **k: None
-    app.on_export()
+    # The uncertainty is of a fit (as in batch), and Export runs on a worker thread.
+    gui.fit()
+    gui.export(out)
     root.destroy()
     base = out.with_suffix("")
     wide = base.with_name(base.stem + "_uncertainty_wide.csv")
+    assert base.with_name(base.stem + "_uncertainty.csv").exists()
     return wide.exists()
 
 
-def test_wide_toggle(tmp_path):
-    assert _run_once(tmp_path, True) is True
-    assert _run_once(tmp_path, False) is False
-
+def test_wide_toggle(tmp_path, monkeypatch):
+    assert _run_once(tmp_path, monkeypatch, True) is True
+    assert _run_once(tmp_path, monkeypatch, False) is False

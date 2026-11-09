@@ -3,6 +3,7 @@ import pytest
 from pathlib import Path
 
 from batch import runner
+from core import pipeline
 from core.peaks import Peak
 from ui.app import pseudo_voigt
 
@@ -56,7 +57,7 @@ def _install_bootstrap_stub(monkeypatch):
             "dof": 1,
         }
 
-    monkeypatch.setattr(runner, "bootstrap_ci", fake_bootstrap_ci)
+    monkeypatch.setattr(pipeline, "bootstrap_ci", fake_bootstrap_ci)  # batch uncertainty runs there
     monkeypatch.setattr(runner.performance, "apply_global_seed", lambda *a, **k: None)
     return seen
 

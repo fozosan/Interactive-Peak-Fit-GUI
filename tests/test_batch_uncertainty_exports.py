@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from batch import runner
+from core import pipeline
 from core.peaks import Peak
 from tests.conftest import bayes_knobs, bootstrap_cfg, ensure_unc_common
 from ui.app import pseudo_voigt
@@ -140,7 +141,7 @@ def test_batch_uncertainty_failure_does_not_abort(tmp_path, monkeypatch, caplog)
             "band": band,
         }
 
-    monkeypatch.setattr(runner, "bootstrap_ci", fake_bootstrap_ci)
+    monkeypatch.setattr(pipeline, "bootstrap_ci", fake_bootstrap_ci)  # batch uncertainty runs there
 
     with caplog.at_level(logging.WARNING):
         ok, total = runner.run_batch(

@@ -27,14 +27,14 @@ def test_single_export_always_computes_uncertainty(tmp_path, monkeypatch):
     app.peaks = [pk]
     app.use_baseline.set(False)
     app.fit_xmin = x[0]; app.fit_xmax = x[-1]
-    app.fit()
+    from tests.gui_driver import Driver
+    gui = Driver(app, monkeypatch)
+    # The uncertainty is of a fit (as in batch), and Export runs on a worker thread.
+    gui.fit()
 
     out = tmp_path / "single.csv"
     app.file_label = tk.Label(root, text="sample")
-    monkeypatch.setattr(filedialog, "asksaveasfilename", lambda **k: str(out))
-    monkeypatch.setattr(messagebox, "showinfo", lambda *a, **k: None)
-
-    app.on_export()
+    gui.export(out)
 
     # Must exist even when batch toggle is OFF
     unc = pd.read_csv(tmp_path / "single_uncertainty.csv")

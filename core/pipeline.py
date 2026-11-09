@@ -19,20 +19,26 @@ module:
 
 from __future__ import annotations
 
+import copy
 import csv
 import logging
 import math
 import os
 import zlib
+from contextlib import nullcontext
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
 
-from . import data_io, models
+from infra import performance
+
+from . import baseline_model, data_io, fit_api, models
 from .peaks import Peak
-from .residuals import build_residual
+from .residuals import build_residual, finite_diff_jacobian
+from .uncertainty import UncertaintyResult, bootstrap_ci
+from .uncertainty_router import route_uncertainty
 
 logger = logging.getLogger(__name__)
 
@@ -415,3 +421,618 @@ def write_spectrum(
     if unc_norm is not None:
         written.extend(write_uncertainty(base, file_path, unc_norm, fit, settings))
     return written
+
+
+# --- the one uncertainty context (game plan 2.1) ---------------------------------
+
+
+def _parse_int(value) -> int:
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return 0
+
+
+def uncertainty_workers(settings: Mapping[str, Any]) -> tuple:
+    """Uncertainty and band worker counts: 0 ("auto") is one worker, i.e. sequential."""
+
+    cfg_perf = performance.get_parallel_config()
+    maxcpu = max(1, (os.cpu_count() or 1))
+    req = _parse_int(settings.get("perf_unc_workers", settings.get("unc_workers", settings.get("perf_max_workers", 0))))
+    workers = min(maxcpu, max(1, int(cfg_perf.unc_workers))) if req <= 0 else max(1, min(req, maxcpu))
+    band_req = _parse_int(settings.get("unc_band_workers", req if req > 0 else cfg_perf.unc_workers))
+    band_workers = workers if band_req <= 0 else max(1, min(band_req, maxcpu))
+    return workers, band_workers
+
+
+def bootstrap_band_wanted(settings: Mapping[str, Any]) -> bool:
+    export_cfg = dict(settings.get("export", {}) or {})
+    unc_section = dict(settings.get("uncertainty", {}) or {})
+    need_band = bool(export_cfg.get("include_band", False)) or bool(unc_section.get("return_band", False))
+    return bool(settings.get("ui_band_pref_bootstrap", True)) or need_band
+
+
+def seed_settings(settings: Mapping[str, Any]) -> tuple:
+    """(seed all, the seed or None) from the Performance settings."""
+
+    seed_all = bool(settings.get("perf_seed_all", False))
+    seed = None
+    if seed_all:
+        try:
+            seed = int(str(settings.get("perf_seed", "")).strip())
+        except Exception:
+            seed = None
+    return seed_all, seed
+
+
+def bootstrap_draws(settings: Mapping[str, Any]) -> int:
+    if "bootstrap_n" not in settings:
+        raise KeyError("bootstrap_n missing in batch config")
+    try:
+        n = int(settings["bootstrap_n"])
+    except Exception as exc:
+        raise ValueError(f"invalid bootstrap_n: {settings.get('bootstrap_n')!r}") from exc
+    if n <= 0:
+        raise ValueError(f"bootstrap_n must be > 0 (got {n})")
+    return n
+
+
+def threadpool_limits_for(config: Mapping[str, Any]):
+    """
+    Robust BLAS/threadpool limiter for batch path.
+    Returns a real context object (threadpool_limits or nullcontext), never a generator.
+    """
+
+    try:
+        from threadpoolctl import threadpool_limits  # type: ignore
+    except Exception:
+        threadpool_limits = None  # type: ignore
+
+    strategy = str(config.get("perf_parallel_strategy", "outer"))
+    try:
+        _bt = int(config.get("perf_blas_threads", 0) or 0)
+    except Exception:
+        _bt = 0
+    limit = 1 if strategy == "outer" else (_bt if _bt > 0 else None)
+    if threadpool_limits is not None and limit is not None:
+        try:
+            return threadpool_limits(limits=limit)
+        except Exception:
+            return nullcontext()
+    return nullcontext()
+
+
+
+def norm_jitter(v, default=0.0):
+    """Normalize bootstrap jitter to a fractional value.
+
+    The default is no jitter: every refit starts at the fit. A start jitter
+    scales with each parameter's absolute value, so 2 % moves a centre at
+    383 cm-1 by 7.7 cm-1 and the refits land in other minima.
+    """
+
+    try:
+        f = float(v)
+    except Exception:
+        return float(default)
+    if f < 0:
+        f = 0.0
+    if f > 1.5:
+        f = f / 100.0
+    if f > 1.0:
+        f = 1.0
+    return f
+
+
+
+def compute_uncertainty(
+    fit: Mapping[str, Any],
+    x,
+    y,
+    mask,
+    settings: Mapping[str, Any],
+    method: str,
+    *,
+    fit_config: Optional[Mapping[str, Any]] = None,
+    file_seed: Optional[int] = None,
+    abort_event=None,
+    log=None,
+):
+    """One uncertainty method on one fit: the context the GUI and batch share.
+
+    ``fit`` is ``run_fit_consistent``'s result for ``x``, ``y`` over ``mask``
+    (with ``return_jacobian`` and ``return_predictors``). ``settings`` holds the
+    uncertainty settings: the method's knobs, alpha, seeds, workers and band.
+    ``fit_config`` is the configuration the fit ran with, which the bootstrap's
+    refits reuse (default: ``settings``), and ``file_seed`` the seed of the fit's
+    own restarts, which the refits reuse too. Every method sees what the fit saw:
+    the window's points, the fit's baseline, its locks, bounds and noise weights.
+    Returns the method's result, raw (see :func:`finish_uncertainty`).
+    """
+
+    res = fit
+    config = settings
+    fit_config = dict(fit_config if fit_config is not None else settings)
+    unc_method_canon = data_io.canonical_unc_label(method)
+    if unc_method_canon == "unknown":
+        raise ValueError(f"Unknown uncertainty method: {method!r}")
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    mask = np.asarray(mask, bool)
+    mode = res.get("mode", "add")
+    baseline = res.get("baseline")
+    baseline = np.zeros_like(x) if baseline is None else np.asarray(baseline, float)
+    noise_sigma = res.get("noise_sigma")
+    joint_fit = res.get("joint_baseline") is not None
+    seed = file_seed
+    cfg_perf = performance.get_parallel_config()
+    unc_workers, unc_band_workers = uncertainty_workers(settings)
+    band_pref_bootstrap = bootstrap_band_wanted(settings)
+    perf_seed_all, perf_seed = seed_settings(settings)
+    bootstrap_n_cfg = bootstrap_draws(settings) if str(unc_method_canon).lower() == "bootstrap" else None
+    _tp_limits_ctx_for_config = threadpool_limits_for
+    _norm_jitter = norm_jitter
+
+    theta_hat = np.asarray(res["theta"], float)
+    peaks_obj = (
+        res.get("peaks_out")
+        or res.get("peaks")
+        or []
+    )
+    fit_mode = res.get("mode", mode)
+    add_mode = fit_mode == "add"
+    # Every method sees what the fit saw: the points in the fit
+    # window, in the data space of the fitted model. In add mode
+    # that is y with the baseline in the model; in subtract mode it
+    # is y minus the baseline, with the peaks alone as the model.
+    x_fit = np.asarray(x[mask], float)
+    base_window = np.asarray(baseline[mask], float)
+    y_fit = np.asarray(y[mask] if add_mode else y[mask] - base_window, float)
+    base_fit = base_window if add_mode else np.zeros_like(base_window)
+
+    rj = res.get("residual_jac")
+    residual_fn = res.get("residual_fn")
+    if residual_fn is None and rj is not None:
+        residual_fn = lambda th: rj(th)[0]
+    if residual_fn is None:
+        residual_fn = build_residual(
+            x_fit, y_fit, peaks_obj, "add", base_fit, "linear", None
+        )
+
+    jac = res.get("jacobian")
+    if jac is None and rj is not None:
+        jac = lambda th: rj(th)[1]
+    if jac is None:
+        jac = finite_diff_jacobian(residual_fn, theta_hat)
+
+    residual_vec = res.get("residual")
+    if residual_vec is None:
+        residual_vec = residual_fn(theta_hat)
+    residual_vec = np.asarray(residual_vec, float)
+
+    # One predictor on the fit window serves every method and band:
+    # the fit's own, or the same model built here.
+    predict_fit_fn = res.get("predict_fit")
+
+    def _predict_fit_local(
+        th,
+        *,
+        _x=x_fit,
+        _peaks=peaks_obj,
+        _base=base_fit,
+    ):
+        total = np.zeros_like(_x, float)
+        t = np.asarray(th, float).ravel()
+        for i in range(len(_peaks)):
+            j = 4 * i
+            c, h, fw, eta = t[j : j + 4]
+            total += models.pseudo_voigt(_x, h, c, fw, eta)
+        return total + _base
+
+    if not callable(predict_fit_fn):
+        predict_fit_fn = _predict_fit_local
+    else:
+        try:
+            _probe = np.asarray(
+                predict_fit_fn(np.asarray(theta_hat, float)), float
+            ).reshape(-1)
+            if int(_probe.size) != int(x_fit.size):
+                predict_fit_fn = _predict_fit_local
+        except Exception:
+            predict_fit_fn = _predict_fit_local
+    predict_full_fn = predict_fit_fn
+
+    # The same window model for rows of parameter vectors at once
+    # (the Bayesian's vectorised likelihood).
+    def predict_batch_fn(rows, *, _x=x_fit, _base=base_fit):
+        return models.pseudo_voigt_rows(_x, rows) + _base[None, :]
+
+    bounds_exact = res.get("bounds")
+    locked_exact = res.get("locked_mask")
+    param_names_unc = res.get("param_names")
+
+    # A joint baseline's coefficients are parameters like the
+    # heights: every method gets them after the peaks' (theta,
+    # Jacobian columns, predictor, locks, bounds and names), and
+    # the Bayesian integrates them out (baseline_basis).
+    joint_pb = None
+    if joint_fit:
+        joint_pb = baseline_model.uncertainty_problem(res, x_fit, y_fit)
+        theta_hat = joint_pb["theta"]
+        residual_fn = joint_pb["residual_fn"]
+        jac = joint_pb["jacobian"]
+        predict_fit_fn = predict_full_fn = joint_pb["predict"]
+        predict_batch_fn = joint_pb["predict_batch"]
+        bounds_exact = joint_pb["bounds"]
+        locked_exact = joint_pb["locked_mask"]
+        param_names_unc = joint_pb["param_names"]
+
+    fit_ctx = dict(res.get("fit_ctx") or {})
+    # Every method takes the sigma_i that weighted the fit.
+    fit_ctx["noise_sigma"] = noise_sigma
+    if joint_pb is not None:
+        fit_ctx["baseline_basis"] = joint_pb["basis"]
+        fit_ctx["param_names"] = param_names_unc
+    solver_choice = (
+        config.get("solver_choice")
+        or config.get("solver")
+        or res.get("solver")
+        or "modern_trf"
+    )
+    solver_choice = str(solver_choice)
+    # Normalize & seed bootstrap defaults for parity with GUI
+    fit_ctx.setdefault("bootstrap_residual_mode", "raw")
+    fit_ctx.setdefault("relabel_by_center", True)
+    fit_ctx.setdefault("center_residuals", True)
+    # Hand the solved peak list and constraints from THIS fit
+    fit_ctx["peaks_out"] = peaks_obj
+    # Forward exact constraints and start used by the solver so bootstrap refits respect them
+    if bounds_exact is not None:
+        fit_ctx["bounds"] = bounds_exact
+    if locked_exact is not None:
+        fit_ctx["locked_mask"] = locked_exact
+    fit_ctx["theta0"] = np.asarray(theta_hat, float)
+    if not str(solver_choice).lower().startswith("lmfit"):
+        fit_ctx.pop("lmfit_share_fwhm", None)
+        fit_ctx.pop("lmfit_share_eta", None)
+    boot_solver = (
+        config.get("unc_boot_solver")
+        or solver_choice
+        or config.get("solver")
+        or "modern_vp"
+    )
+    boot_solver = str(boot_solver)
+    has_lmfit = bool(res.get("has_lmfit", config.get("has_lmfit", False)))
+    if boot_solver.lower().startswith("lmfit") and not has_lmfit:
+        boot_solver = solver_choice
+
+    jitter_frac = _norm_jitter(config.get("bootstrap_jitter", 0.0))
+    centers_ref = [float(p.center) for p in peaks_obj] if peaks_obj else []
+    # Make the chosen bootstrap solver visible to inner refits.
+    fit_ctx["unc_boot_solver"] = str(boot_solver)
+
+    # Also mirror constraints at the top level when invoking bootstrap_ci.
+    top_bounds = bounds_exact
+    top_locked = locked_exact
+
+    fit_ctx.update(
+        {
+            "residual_fn": residual_fn,
+            "predict_full": predict_full_fn,
+            "predict_fit": predict_fit_fn,
+            "predict_batch": predict_batch_fn,
+            "x_all": x_fit,
+            "y_all": y_fit,
+            "x_fit": x_fit,
+            "y_fit": y_fit,
+            "baseline": base_fit,
+            "mode": fit_mode,
+            "peaks": peaks_obj,
+            # set solver once to the chosen bootstrap engine
+            "solver": boot_solver,
+            # Make per-peak caps available to bootstrap's bounds derivation
+            "solver_options": dict(config.get("solver_options", {})),
+            "bootstrap_jitter": jitter_frac,
+            "lmfit_share_fwhm": bool(config.get("lmfit_share_fwhm", False)),
+            "lmfit_share_eta": bool(config.get("lmfit_share_eta", False)),
+            "centers_ref": centers_ref,
+            "relabel_by_center": True,
+            # Parity with GUI: never use linearized fallback path
+            "allow_linear_fallback": False,
+            "strict_refit": True,
+            # Every method reports at the configured confidence level.
+            "alpha": float(config.get("unc_alpha", 0.05)),
+        }
+    )
+    try:
+        _blas_cfg = int(config.get("perf_blas_threads", 0) or 0)
+    except Exception:
+        _blas_cfg = 0
+    fit_ctx.update(
+        {
+            "perf_parallel_strategy": str(
+                config.get("perf_parallel_strategy", "outer")
+            ),
+            "perf_blas_threads": _blas_cfg,
+        }
+    )
+    workers_eff = int(unc_workers)
+    band_workers_eff = int(unc_band_workers)
+    fit_ctx.update({
+        "unc_workers": workers_eff if workers_eff > 0 else None,
+        "unc_band_workers": (
+            band_workers_eff if band_workers_eff > 0 else None
+        ),
+        "unc_use_gpu": bool(config.get("unc_use_gpu", False)),
+    })
+
+    # keep 3.9-compatible typing
+    n_boot: Optional[int] = None
+
+    # Refits use the file's own solver options and the window's
+    # baseline, and start from the start bootstrap_ci hands over.
+    refit_cfg = copy.deepcopy(fit_config)
+    refit_cfg["solver_choice"] = refit_cfg["solver"] = boot_solver
+    # Refits are weighted by the fit's sigma_i, never re-estimated.
+    refit_cfg["noise_model"] = "none"
+    if noise_sigma is not None:
+        refit_cfg["noise_sigma"] = noise_sigma
+    if "solver_options" in config:
+        _extra = dict(config.get(boot_solver, {}))
+        _extra.update(dict(config.get("solver_options") or {}))
+        refit_cfg[boot_solver] = _extra
+
+    def _refit_wrapper(theta_init, locked_mask, bounds, x, y):
+        """One refit. It counts only if the solver converged; an
+        exception is a failed draw, recorded by bootstrap_ci. With a
+        joint baseline the refit fits it again over the same window,
+        and its coefficients follow the peaks' parameters."""
+
+        t = np.asarray(theta_init, float).ravel()
+        peaks_start = copy.deepcopy(peaks_obj)
+        for i, pk in enumerate(peaks_start):
+            pk.center, pk.height, pk.fwhm, pk.eta = (float(v) for v in t[4 * i : 4 * i + 4])
+        # The refit's restarts are seeded like the file's own fit, so a
+        # seeded batch gives the same bootstrap on every run.
+        out = fit_api.run_fit_consistent(
+            x,
+            y,
+            peaks_start,
+            refit_cfg,
+            None if joint_pb is not None else base_fit,
+            fit_mode,
+            np.ones_like(x, bool),
+            rng_seed=seed,
+        )
+        theta_out = np.asarray(out.get("theta"), float).ravel()
+        if joint_pb is not None:
+            coef = out.get("baseline_coef")
+            if coef is None:
+                return t, False
+            theta_out = np.r_[theta_out, np.asarray(coef, float).ravel()]
+        if theta_out.size != t.size:
+            return t, False
+        return theta_out, bool(out.get("fit_ok")) and bool(np.all(np.isfinite(theta_out)))
+
+    fit_ctx.update({"refit": _refit_wrapper})
+
+    workers_eff = int(unc_workers)
+    band_workers_eff = int(unc_band_workers)
+    fit_ctx["unc_workers"] = workers_eff if workers_eff > 0 else None
+    fit_ctx["unc_band_workers"] = (
+        band_workers_eff if band_workers_eff > 0 else None
+    )
+
+    if str(unc_method_canon).lower() == "bootstrap":
+        if bootstrap_n_cfg is None:
+            raise KeyError("bootstrap_n missing in batch config")
+        n_boot = int(bootstrap_n_cfg)
+        bounds = res.get("bounds")
+        locked_mask = res.get("locked_mask")
+        alpha = float(config.get("unc_alpha", 0.05))
+        center_res = bool(config.get("unc_center_resid", True))
+        seed_val = perf_seed if perf_seed_all and (perf_seed is not None) else None
+
+        jac_mat = jac(theta_hat) if callable(jac) else np.asarray(jac, float)
+        jac_mat = np.atleast_2d(np.asarray(jac_mat, float))
+        jac = jac_mat
+
+        fit_ctx["abort_event"] = abort_event
+        strategy = str(config.get("perf_parallel_strategy", "outer"))
+        try:
+            _bt_raw = int(config.get("perf_blas_threads", 0) or 0)
+        except Exception:
+            _bt_raw = 0
+        blas_effective = 1 if strategy == "outer" else (_bt_raw if _bt_raw > 0 else "lib")
+        workers_arg = workers_eff if workers_eff > 0 else None
+
+        perf_line = (
+            f"[DEBUG] perf: fit_workers={cfg_perf.fit_workers} unc_workers={workers_eff} "
+            f"blas_threads={blas_effective} seed_all={perf_seed_all} seed={seed_val}"
+        )
+        logger.debug(perf_line)
+        if log:
+            log(perf_line)
+
+        # Run bootstrap with the configured solver; NO fallbacks. If it fails, surface it.
+        fit_ctx_local = dict(fit_ctx)
+        fit_ctx_local["unc_boot_solver"] = str(boot_solver)
+        fit_ctx_local["solver"] = str(boot_solver)
+        # Always force strict non-linear refits for bootstrap (matches GUI stability)
+        fit_ctx_local["strict_refit"] = True
+        # Studentized residuals, r / sqrt(1 - h), by default in batch:
+        # measured (PR F, B = 500, 400 paired replicates) it gains 0.6 to 2.2
+        # coverage points in every cell and loses none. The core default
+        # (GUI) stays off.
+        fit_ctx_local["boot_studentize"] = config.get("boot_studentize", True)
+        if "boot_resampling" in config:
+            fit_ctx_local["boot_resampling"] = config.get("boot_resampling")
+        if "boot_wild_weights" in config:
+            fit_ctx_local["boot_wild_weights"] = config.get("boot_wild_weights")
+        if "boot_center_clamp_mode" in config:
+            fit_ctx_local["boot_center_clamp_mode"] = config.get("boot_center_clamp_mode")
+        if "boot_center_clamp_value" in config:
+            fit_ctx_local["boot_center_clamp_value"] = config.get("boot_center_clamp_value")
+        with _tp_limits_ctx_for_config(config):
+            performance.apply_global_seed(seed_val, perf_seed_all)
+            try:
+                # IMPORTANT: align everything to the fit grid so Y, residuals and band share the same length
+                unc_res = bootstrap_ci(
+                    theta=theta_hat,
+                    residual=residual_vec,
+                    jacobian=jac,
+                    predict_full=predict_full_fn,
+                    x_all=x_fit,
+                    y_all=y_fit,
+                    x_eval=x_fit,
+                    fit_ctx=fit_ctx_local,
+                    bounds=top_bounds if top_bounds is not None else bounds_exact,
+                    param_names=param_names_unc,
+                    locked_mask=top_locked if top_locked is not None else locked_exact,
+                    n_boot=n_boot,
+                    seed=seed_val,
+                    workers=workers_arg,
+                    alpha=alpha,
+                    center_residuals=center_res,
+                    return_band=band_pref_bootstrap,
+                    jitter=jitter_frac,
+                )
+            except Exception as _e:
+                ctx = (
+                    f" (solver={boot_solver}, jitter={jitter_frac:.3f}, "
+                    f"workers={workers_arg}, band_workers={unc_band_workers})"
+                )
+                raise type(_e)(f"{_e}{ctx}").with_traceback(_e.__traceback__)
+        if isinstance(unc_res, dict):
+            diag = (unc_res.get("diagnostics") or {})
+        else:
+            diag = getattr(unc_res, "diagnostics", {}) or {}
+        errs = (diag.get("refit_errors") or [])[:5]
+        if errs:
+            msg = "; ".join(map(str, errs))
+            logger.info("bootstrap refit errors (first few): %s", msg)
+            if log:
+                log(f"bootstrap refit errors (first few): {msg}")
+        if isinstance(unc_res, UncertaintyResult):
+            diag = dict(unc_res.diagnostics)
+            unc_res = {
+                "method": unc_res.method,
+                "label": unc_res.label,
+                "method_label": unc_res.label,
+                "stats": unc_res.stats,
+                "diagnostics": diag,
+                "band": unc_res.band,
+                "alpha": diag.get("alpha", alpha),
+            }
+        if not band_pref_bootstrap and isinstance(unc_res, dict):
+            unc_res["band"] = None  # a band only when one was asked for
+    else:
+        if "bayes" in str(unc_method_canon).lower():
+            try:
+                walkers_cfg_raw = config["bayes_walkers"]
+            except KeyError as exc:
+                raise KeyError(
+                    "Missing required Bayesian knob: bayes_walkers"
+                ) from exc
+            if walkers_cfg_raw is None:
+                raise ValueError("bayes_walkers must be ≥ 0 (got None)")
+            try:
+                walkers_cfg = int(walkers_cfg_raw)
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid bayes_walkers: {walkers_cfg_raw!r}"
+                ) from exc
+            if walkers_cfg < 0:
+                raise ValueError(
+                    f"bayes_walkers must be ≥ 0 (got {walkers_cfg})"
+                )
+            try:
+                burn_cfg = int(config["bayes_burn"])
+                steps_cfg = int(config["bayes_steps"])
+                thin_cfg = int(config["bayes_thin"])
+            except KeyError as exc:
+                raise KeyError(
+                    f"Missing required Bayesian knob: {exc.args[0]}"
+                ) from exc
+            except Exception as exc:
+                raise ValueError(
+                    "Invalid Bayesian knobs in config: burn/steps/thin"
+                ) from exc
+            if burn_cfg < 0:
+                raise ValueError(f"bayes_burn must be ≥ 0 (got {burn_cfg})")
+            if steps_cfg <= 0:
+                raise ValueError(f"bayes_steps must be > 0 (got {steps_cfg})")
+            if thin_cfg <= 0:
+                raise ValueError(f"bayes_thin must be > 0 (got {thin_cfg})")
+            fit_ctx.update({
+                "bayes_diagnostics": bool(
+                    config.get(
+                        "bayes_diagnostics", config.get("bayes_diag", False)
+                    )
+                ),
+                "unc_band_workers": band_workers_eff
+                if band_workers_eff > 0
+                else None,
+                "bayes_band_enabled": bool(
+                    config.get("bayes_band_enabled", False)
+                ),
+                "bayes_band_force": bool(config.get("bayes_band_force", False)),
+                "bayes_band_max_draws": int(
+                    config.get("bayes_band_max_draws", 512) or 512
+                ),
+                "bayes_diag_ess_min": float(
+                    config.get("bayes_diag_ess_min", 200.0)
+                ),
+                "bayes_diag_rhat_max": float(
+                    config.get("bayes_diag_rhat_max", 1.05)
+                ),
+                "bayes_diag_mcse_mean": float(
+                    config.get("bayes_diag_mcse_mean", float("inf"))
+                ),
+                # Router expects a non-negative int; 0 means "auto".
+                "bayes_walkers": walkers_cfg,
+                "bayes_burn": burn_cfg,
+                "bayes_steps": steps_cfg,
+                "bayes_thin": thin_cfg,
+                "bayes_prior_sigma": str(
+                    config.get("bayes_prior_sigma", "half_cauchy")
+                ),
+                "abort_event": abort_event,
+            })
+        seed_val = perf_seed if perf_seed_all and (perf_seed is not None) else None
+        workers_eff = int(unc_workers)
+        strategy = str(config.get("perf_parallel_strategy", "outer"))
+        try:
+            _bt_raw = int(config.get("perf_blas_threads", 0) or 0)
+        except Exception:
+            _bt_raw = 0
+        blas_effective = 1 if strategy == "outer" else (_bt_raw if _bt_raw > 0 else "lib")
+
+        perf_line = (
+            f"[DEBUG] perf: fit_workers={cfg_perf.fit_workers} unc_workers={workers_eff} "
+            f"blas_threads={blas_effective} seed_all={perf_seed_all} seed={seed_val}"
+        )
+        logger.debug(perf_line)
+        if log:
+            log(perf_line)
+
+        # numpy's global state is left alone: the asymptotic draws
+        # nothing, and the Bayesian seeds its own generator from seed.
+        with _tp_limits_ctx_for_config(config):
+            unc_res = route_uncertainty(
+                unc_method_canon,
+                theta_hat=theta_hat,
+                residual_fn=residual_fn,
+                jacobian=jac,
+                model_eval=predict_fit_fn,
+                fit_ctx=fit_ctx,
+                x_all=x_fit,
+                y_all=y_fit,
+                workers=(workers_eff if workers_eff > 0 else None),
+                seed=seed_val,
+                n_boot=(n_boot if n_boot is not None else 0),
+            )
+    return unc_res

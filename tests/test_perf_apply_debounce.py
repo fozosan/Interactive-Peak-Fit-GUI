@@ -63,18 +63,18 @@ def _run_events(root, until, timeout=5.0):
 
 def test_a_change_reaches_the_config_before_the_debounced_apply(gui):
     app, saves, lines = gui
-    app.perf_max_workers.set(5)
+    app.perf_unc_workers.set(5)
     assert app._perf_apply_after_id is not None  # the apply is still pending
-    assert json.loads(app_module.CONFIG_PATH.read_text())["perf_max_workers"] == 5
+    assert json.loads(app_module.CONFIG_PATH.read_text())["perf_unc_workers"] == 5
 
 
 def test_a_burst_of_writes_is_applied_and_logged_once(gui):
     app, saves, lines = gui
     for workers in range(1, 11):
-        app.perf_max_workers.set(workers)
+        app.perf_unc_workers.set(workers)
     _run_events(app.root, until=lambda: _backend_lines(lines))
     assert len(_backend_lines(lines)) == 1
-    assert "fit_workers_req=10" in _backend_lines(lines)[0]
+    assert "unc_workers_req=10" in _backend_lines(lines)[0]
 
 
 def test_applying_the_same_settings_again_logs_nothing(gui):
