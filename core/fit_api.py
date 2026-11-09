@@ -333,10 +333,12 @@ def run_fit_consistent(
     # a joint one, which can dip below the data, the data above zero counts plus
     # the signal above the computed baseline.
     peak_signal = base_fit if base_fit is not None else provisional_fit
-    opts["max_height"] = height_cap(
-        y_fit - (peak_signal if peak_signal is not None else 0.0), opts, y_data=y_fit if joint else None
-    )
+    above = y_fit - (peak_signal if peak_signal is not None else 0.0)
+    opts["max_height"] = height_cap(above, opts, y_data=y_fit if joint else None)
     cap = float(opts["max_height"])
+    # the window's peak signal, max |y - baseline|: the most a bound can let a
+    # peak show in the window before the bound, not the data, sets it (below)
+    signal = float(np.max(np.abs(above))) if above.size else 0.0
     # Which heights the cap bounds: at first none, so a fit keeping every height
     # below it is the fit with no bound (as on main, its path and cost too: a
     # finite bound changes least_squares' scaling of every step, and NNLS's
@@ -344,6 +346,19 @@ def run_fit_consistent(
     # the cap is bound by it, and the fit is run again from the same start
     # (the loop after _fit_once, below).
     capped = np.zeros(len(peaks0), bool)
+    # Each peak's visible share: 1 for one the window can hold, and the cap
+    # times it bounds a height the cap bounds (fit.bounds.pack_theta_bounds).
+    shares: list = []
+    pack_theta_bounds(peaks0, x_fit, {**opts, "capped": None}, shares=shares)
+    shares = np.asarray(shares, float)
+    if solver_name == "classic":
+        # Classic's trust region steps a height as it steps a centre: the height
+        # of a peak the window cannot hold walks along the valley its tail
+        # shares with the baseline, far from its start, and stops under the cap
+        # (2400H-2ZF-Rad's six peaks at 126-242 cm-1 on the 0.20 s spectrum: 258,
+        # 97 % of the area). Main's Classic never met such a peak: it moved
+        # locked centres into the window. So its bound applies from the start.
+        capped |= shares < 1.0
     opts["capped"] = capped.copy()
     p0, (lo, hi) = pack_theta_bounds(peaks0, x_fit, opts)
     if joint:
@@ -553,7 +568,11 @@ def run_fit_consistent(
         over = ~capped & (np.asarray(best_theta, float)[1::4] > cap)
         if not over.any():
             break
-        capped[over] = True
+        # The heights past the cap, and every peak the window cannot hold: a fit
+        # that runs a height away has found a direction its data do not fix, and
+        # the tails of such peaks all share it with the baseline (bounding one at
+        # a time, Modern VP ran the next one away, and on the third pass lost A1g).
+        capped[over | (shares < 1.0)] = True
         opts["capped"] = capped.copy()
         p0, (lo, hi) = pack_theta_bounds(peaks0, x_fit, opts)
         held, free_mask = _held((lo, hi))
@@ -628,8 +647,9 @@ def run_fit_consistent(
             )
         )
 
-    # The fit's bounds: every height's is the cap, which bound in the solve only
-    # the heights the fit put above it (a held one stays held).
+    # The fit's bounds: a height the cap bounded in the solve has its bound, the
+    # cap times its peak's visible share; one it did not, the cap, past which
+    # it would have been bound (a held one stays held).
     hi_fit = hi.copy()
     hi_fit[1::4] = np.where(held[1::4], hi[1::4], np.minimum(hi[1::4], cap))
     result = {
@@ -667,17 +687,26 @@ def run_fit_consistent(
     locked_mask = ~free_mask
     n_free = int(np.count_nonzero(free_mask))
     # A free parameter on its bound is a flag, not a failure: the fit is kept. So
-    # is a held height: the fit says nothing about its peak. A height at the cap
-    # is a failure: the fit put more into that peak than the data hold, and
-    # the cap, not the data, set it.
+    # is a held height: the fit says nothing about its peak. A height is at its
+    # bound within 1e-3 of it: least_squares' interior steps stop short of an
+    # active bound (Modern TRF: 2.5e-5 under the cap), and BVLS lands on it. It
+    # is a failure when its peak's largest value in the window there, bound
+    # times share, reaches the window's peak signal (or the cap, if that is
+    # smaller): then the bound, not the data, set how much of the signal the
+    # peak takes. A height at the cap always does. A peak the window cannot
+    # hold shows the cap times its share squared at its bound; while that is
+    # less, the bound is a flag: its height is one the window cannot fix.
     flagged = free_mask.copy()
     flagged[1::4] = True
     bound_hit = _params_on_bounds(theta, lo, hi_fit, ~flagged, names)
     outside_bounds = [n for n, out in zip(names, outside) if out]
-    at_cap = [
-        f"height{i + 1}" for i in range(len(peaks0))
-        if not held[4 * i + 1] and theta[4 * i + 1] >= cap - 1e-6 * max(1.0, cap)
-    ]
+    h_bound = hi_fit[1::4]
+    h_free = ~held[1::4]
+    at_bound = h_free & (theta[1::4] >= h_bound * (1.0 - 1e-3))
+    shown = min(signal, cap)  # what the data let a peak show in the window
+    loud = np.flatnonzero(at_bound & (h_bound * shares >= shown * (1.0 - 1e-3)))
+    at_cap = [f"height{i + 1}" for i in loud]
+    bound_hit = [n for n in names if n in bound_hit or n in {f"height{i + 1}" for i in np.flatnonzero(at_bound)}]
     result.update(
         {
             "param_names": names,
@@ -694,8 +723,13 @@ def run_fit_consistent(
             f"the {solver_name} solver returned values outside the fit's bounds: {', '.join(outside_bounds)}"
         )
     elif at_cap:
+        where = [
+            f"height{i + 1}" if shares[i] >= 1.0
+            else f"height{i + 1} (the cap times the {shares[i]:.2g} of its peak the window shows)"
+            for i in loud
+        ]
         note = (
-            f"{', '.join(at_cap)} ended at the cap the window's data allow ({cap:.4g}): the cap, "
+            f"{', '.join(where)} ended at the cap the window's data allow ({cap:.4g}): the cap, "
             f"not the data, set {'that height' if len(at_cap) == 1 else 'those heights'}"
         )
         if not result["fit_ok"] and result["message"]:

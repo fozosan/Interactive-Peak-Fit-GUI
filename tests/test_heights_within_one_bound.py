@@ -112,7 +112,7 @@ def test_the_batch_fit_with_its_baseline_keeps_every_height_in_bounds(solver):
     assert np.all(theta[1::4] <= res["height_cap"])
 
 
-def test_the_cap_bounds_every_height_it_is_given_to_and_none_other():
+def test_the_cap_bounds_every_height_it_is_given_to_times_its_share_and_none_other():
     from fit.bounds import NO_BOUND, pack_theta_bounds, visible_share
 
     x = np.linspace(WINDOW[0], WINDOW[1], 95)
@@ -122,13 +122,15 @@ def test_the_cap_bounds_every_height_it_is_given_to_and_none_other():
     assert 1e-3 < shares[2] < 1e-2 and 0.4 < shares[4] < 0.6
     assert shares[3] < 1e-40 and shares[5] < 1e-15
     visible = [i for i in range(len(peaks)) if i not in INVISIBLE]
-    # every height takes the cap, whatever its share: a peak outside the window
-    # may be as tall as the data allow
-    _, (lo, hi) = pack_theta_bounds(peaks, x, {"max_height": 100.0})
-    assert hi[1::4][visible] == pytest.approx([100.0] * len(visible))
+    # a height the cap bounds takes it times the share of its peak the window
+    # shows: a peak locked outside the window cannot take more than its tail
+    reported = []
+    _, (lo, hi) = pack_theta_bounds(peaks, x, {"max_height": 100.0}, shares=reported)
+    assert reported == pytest.approx(shares)
+    assert hi[1::4][visible] == pytest.approx([100.0 * shares[i] for i in visible])
     for i in INVISIBLE:  # held at 0, as pack_theta_bounds holds a locked value
         assert lo[4 * i + 1] == 0.0 and hi[4 * i + 1] <= 1e-12
-    # a height the cap is not given to keeps make_bounds' stand-in for none; a
+    # a height the cap does not bound keeps make_bounds' stand-in for none; a
     # peak the window cannot see stays held
     capped = np.zeros(len(peaks), bool)
     capped[1] = True
@@ -137,6 +139,9 @@ def test_the_cap_bounds_every_height_it_is_given_to_and_none_other():
     assert all(hi[4 * i + 1] == NO_BOUND for i in visible if i != 1)
     for i in INVISIBLE:
         assert hi[4 * i + 1] <= 1e-12
+    # a free centre may sit in the window: its peak keeps the whole cap
+    free = [Peak(450.0, 1.0, 5.0, 0.0)]
+    assert pack_theta_bounds(free, x, {"max_height": 100.0})[1][1][1] == pytest.approx(100.0)
 
 
 def test_the_cap_is_the_data_above_the_lowest_the_baseline_can_lie_plus_the_signal():
