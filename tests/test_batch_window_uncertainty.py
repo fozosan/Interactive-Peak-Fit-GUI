@@ -62,13 +62,13 @@ def test_bootstrap_with_a_window_uses_the_window(tmp_path, spectrum, mode):
     runner.run_batch([str(path)], _config(out, mode), compute_uncertainty=True, unc_method="bootstrap")
     status = _rows(out / "batch_files.csv")[0]
     assert status["unc_status"] == "ok", status["unc_message"]
-    band = _rows(out / "spec_band.csv")
+    band = _rows(out / "spec_uncertainty_band.csv")  # every method's band, one writer
     assert len(band) == n_window
     xs = [float(r["x"]) for r in band]
     assert WINDOW[0] <= min(xs) and max(xs) <= WINDOW[1]
     # The band is of the curve the fit models: data with the baseline in add
     # mode, the baseline-subtracted signal in subtract mode.
-    edge = float(band[0]["ci_lo"])
+    edge = float(band[0]["y_lo95"])
     if mode == "add":
         assert edge == pytest.approx(BACKGROUND, abs=3.0)
     else:
