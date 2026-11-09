@@ -3145,13 +3145,9 @@ def bayesian_ci(
             )
         else:
             short_msg = "the MCMC autocorrelation time could not be estimated: run more steps"
+        # A verdict, not progress: the caller reports it from diag["chain_short"].
         diag_notes.append(short_msg)
         logger.warning("[Bayes] %s", short_msg)
-        if callable(progress_cb):
-            try:
-                progress_cb(f"Bayesian: {short_msg}")
-            except Exception:
-                pass
 
     if (
         diagnostics_enabled
@@ -3404,14 +3400,9 @@ def bayesian_ci(
 
     band_tuple: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
     should_attempt_band = bool(bayes_band_enabled) and bool(post is not None and post.size) and callable(predict_full)
+    # The band's outcome (computed, forced, gated, skipped) is a verdict, not
+    # progress: diag carries it and the caller reports it, once.
     if should_attempt_band and not (diagnostics_enabled or bayes_band_force):
-        if callable(progress_cb):
-            try:
-                progress_cb(
-                    "Bayesian band skipped: diagnostics are OFF (turn on diagnostics or toggle 'Force band')."
-                )
-            except Exception:
-                pass
         diag["band_gated"] = True
         diag["band_forced"] = False
         diag["band_skip_reason"] = BAND_SKIP_DIAG_DISABLED
@@ -3428,13 +3419,6 @@ def bayesian_ci(
             diag["band_forced"] = bool(bayes_band_force)
             diag["band_draws_used"] = int(n_total)
             diag["band_skip_reason"] = BAND_SKIP_INSUFF_DRAWS
-            if callable(progress_cb):
-                try:
-                    progress_cb(
-                        f"Bayesian band skipped: draws={n_total} < required {min_required}"
-                    )
-                except Exception:
-                    pass
         else:
             # Clamp BLAS for the prediction pass (parity with bootstrap band path)
             with performance.blas_limit_ctx(limit):
@@ -3479,14 +3463,6 @@ def bayesian_ci(
                         "mcse_mean_req": thr_mcse_mean,
                         "mcse_mean": mcse_mean,
                     }
-                    if callable(progress_cb):
-                        try:
-                            progress_cb(
-                                f"Bayesian band gated: ESS_min={ess_min:.3g} (≥{thr_ess_min}), "
-                                f"R̂_max={rhat_max:.3g} (≤{thr_rhat_max}), MCSE_mean={mcse_mean:.3g} (≤{thr_mcse_mean})."
-                            )
-                        except Exception:
-                            pass
                 else:
                     diag["band_gated"] = False
                     diag["band_forced"] = bool(bayes_band_force)
@@ -3531,14 +3507,6 @@ def bayesian_ci(
                         band_tuple = (xb, lo, hi)
                         diag["band_source"] = "posterior_predictive_subset"
                         diag["band_backend"] = "numpy"
-                        if callable(progress_cb):
-                            try:
-                                if diag["band_forced"]:
-                                    progress_cb("Bayesian band computed (FORCED despite diagnostics).")
-                                else:
-                                    progress_cb("Bayesian band computed.")
-                            except Exception:
-                                pass
 
     diag["band_workers_requested"] = (
         int(band_workers_requested) if band_workers_requested > 0 else None

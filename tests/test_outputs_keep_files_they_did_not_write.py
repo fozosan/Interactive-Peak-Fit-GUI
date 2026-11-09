@@ -8,7 +8,9 @@ off deleted them too. G_band.csv is no output of the GUI: it was the user's file
 Now the files an export writes replace their namesakes, and of the uncertainty
 files it does not write, only those whose first line shows they are the app's own
 output (an earlier fit's) are deleted, and only when it computes uncertainty.
-Anything else is left, and the log says so.
+Anything else is left, and the log says so. The 2026-11-09 check of #257 found the
+GUI's Export still deleting its own when it computed none: it now keeps them, as
+batch with uncertainty off does.
 """
 
 from __future__ import annotations
@@ -167,9 +169,54 @@ def test_export_retires_only_its_own_stale_uncertainty(gui, tmp_path):
     assert all((out / f"G{suffix}").exists() for suffix in UNC)
     (out / "G_band.csv").write_text(USER_TEXT, encoding="utf-8")
 
-    gui.app.peaks[0].center += 0.5  # no longer the fit: this export writes no uncertainty
+    # An export that computes uncertainty retires the app's own files it does not
+    # write again: here the wide table.
+    gui.app.cfg["export_unc_wide"] = False
+    gui.export(out / "G.csv")
+    kept = [s for s in UNC if s != "_uncertainty_wide.csv"]
+    assert not (out / "G_uncertainty_wide.csv").exists()
+    assert all((out / f"G{suffix}").exists() for suffix in kept)
+
+    # One that computes none deletes nothing, as batch with uncertainty off does:
+    # the peaks are no longer the fit's.
+    gui.app.peaks[0].center += 0.5
+    n0 = len(gui.app._log_buffer)
     gui.export(out / "G.csv")
 
-    assert not any((out / f"G{suffix}").exists() for suffix in UNC)
+    assert all((out / f"G{suffix}").exists() for suffix in kept)
+    assert any("left G_uncertainty.csv" in line for line in gui.app._log_buffer[n0:])
     assert (out / "G_band.csv").read_text(encoding="utf-8") == USER_TEXT
-    assert sorted(p.name for p in out.iterdir()) == ["G_band.csv", "G_fit.csv", "G_trace.csv"]
+    assert sorted(p.name for p in out.iterdir()) == sorted(
+        ["G_band.csv", "G_fit.csv", "G_trace.csv"] + [f"G{suffix}" for suffix in kept]
+    )
+
+
+def test_an_aborted_export_retires_its_own_stale_uncertainty_as_batch_does(gui, tmp_path, monkeypatch):
+    # An export runs uncertainty unless the fit or the settings block it, as batch
+    # with uncertainty on does; aborted, it writes none, and the app's own files
+    # from an earlier export go, as batch's do for a file whose run was aborted:
+    # the new fit table replaces the one they described. A file the app did not
+    # write stays.
+    out = tmp_path / "out"
+    out.mkdir()
+    gui.fit()
+    gui.app.cfg["export_unc_wide"] = True
+    gui.export(out / "G.csv")
+    assert all((out / f"G{suffix}").exists() for suffix in UNC)
+    (out / "G_uncertainty.txt").write_text(USER_TEXT, encoding="utf-8")
+
+    def aborted(*args, **kwargs):
+        raise pipeline.UncertaintyAborted("the user aborted the uncertainty run")
+
+    monkeypatch.setattr(gui.app, "_compute_uncertainty", aborted)
+    gui.fit()  # a new fit: no uncertainty cached for it
+    n0 = len(gui.app._log_buffer)
+    gui.export(out / "G.csv")
+
+    own = [s for s in UNC if s != "_uncertainty.txt"]
+    assert not any((out / f"G{suffix}").exists() for suffix in own)
+    assert (out / "G_uncertainty.txt").read_text(encoding="utf-8") == USER_TEXT
+    assert (out / "G_fit.csv").exists() and (out / "G_trace.csv").exists()
+    logged = gui.app._log_buffer[n0:]
+    assert any("removed G_uncertainty.csv" in line for line in logged)
+    assert any("left G_uncertainty.txt (it is not this app's output)" in line for line in logged)

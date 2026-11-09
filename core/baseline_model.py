@@ -38,7 +38,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from numpy.polynomial import legendre as _legendre
 from scipy.linalg import solve_triangular
-from scipy.optimize import nnls
+from scipy.optimize import lsq_linear, nnls
 
 BASELINE_FITS = ("fixed", "joint")
 DEFAULT_ORDER = 3
@@ -116,12 +116,32 @@ class JointBaseline:
         return {"fit": "joint", "order": self.order, "basis": "legendre", "x_lo": self.lo, "x_hi": self.hi}
 
 
+def nonneg_heights(Aw: np.ndarray, bw: np.ndarray, cap=np.inf) -> np.ndarray:
+    """The heights 0 <= h <= cap that minimise ||Aw h - bw||, exactly.
+
+    NNLS, whose solution is also the bounded one when it stays under the cap;
+    when it does not, the bounded problem itself (BVLS). Clipping the NNLS
+    solution instead would leave the other heights fitted to the clipped one's
+    old value. ``cap`` is a number or one per column."""
+
+    Aw = np.asarray(Aw, dtype=float)
+    bw = np.asarray(bw, dtype=float)
+    if not Aw.shape[1]:
+        return np.zeros(0)
+    h, _ = nnls(Aw, bw)
+    cap_arr = np.broadcast_to(np.asarray(cap, dtype=float), h.shape)
+    if np.any(h > cap_arr):
+        h = lsq_linear(Aw, bw, bounds=(np.zeros_like(h), cap_arr), method="bvls").x
+    return h
+
+
 class LinearPart:
     """The model's free linear columns beside the peaks: weighted baseline columns ``Bw``.
 
-    ``solve`` returns the heights h >= 0 and the coefficients c (free) that
-    minimise ||Aw h + Bw c - bw||. It is exact: with Bw = U R, c is projected
-    out, h = NNLS((I - U U^T) Aw, (I - U U^T) bw), then c = R^-1 U^T (bw - Aw h).
+    ``solve`` returns the heights 0 <= h <= max_height and the coefficients c
+    (free) that minimise ||Aw h + Bw c - bw||. It is exact: with Bw = U R, c is
+    projected out, h = nonneg_heights((I - U U^T) Aw, (I - U U^T) bw), then
+    c = R^-1 U^T (bw - Aw h).
     ``project`` applies I - U U^T, the step that turns a Jacobian at fixed
     linear parameters into the variable-projection one. With no columns both
     reduce to plain NNLS and the identity.
@@ -153,11 +173,7 @@ class LinearPart:
     def solve(self, Aw: np.ndarray, bw: np.ndarray, max_height: float = np.inf) -> Tuple[np.ndarray, np.ndarray]:
         Aw = np.asarray(Aw, dtype=float)
         bw = np.asarray(bw, dtype=float)
-        if Aw.shape[1]:
-            h, _ = nnls(self.project(Aw), self.project(bw))
-            h = np.minimum(h, max_height)
-        else:
-            h = np.zeros(0)
+        h = nonneg_heights(self.project(Aw), self.project(bw), max_height)
         return h, self.coef(bw - Aw @ h)
 
 

@@ -35,13 +35,16 @@ logger = logging.getLogger(__name__)
 # file. Its status is one of:
 #   ok                  fitted, and the solver converged
 #   not_converged       the solver stopped without converging
+#   height_at_cap       a height ended at the cap the window's data allow (named in
+#                       message, fit.bounds.height_cap): the fit put more into
+#                       that peak than the data hold; fit_ok False, no uncertainty
 #   fit_error           the baseline or the fit raised an error
 #   skipped_format      not two-column numeric data
 #   skipped_unreadable  could not be opened (permissions, or a directory)
 #   skipped_no_points   the fit window has no more points than free parameters
 #   no_peaks            no peaks to fit, e.g. auto seeding found none
 #   not_processed       the batch stopped before this file
-# Its unc_status, with uncertainty on, is ok, failed, skipped (no converged fit),
+# Its unc_status, with uncertainty on, is ok, failed, skipped (no usable fit),
 # or aborted (the user aborted the run during this file's uncertainty: no result).
 # Its flags are advice, never a veto (";"-separated):
 #   bound_hit           a fitted parameter sits on its bound (named in message)
@@ -55,8 +58,8 @@ logger = logging.getLogger(__name__)
 # was estimated (noise_model "none").
 # baseline_fit says how the fit treated the baseline: "joint", fitted with the
 # peaks as Legendre columns of order baseline_order over the fit window (the
-# batch default, decision D2), or "fixed", held at the ALS or polynomial
-# baseline (baseline_order blank). Blank when no fit ran.
+# batch default, decision D2), "fixed", held at the ALS or polynomial baseline
+# (baseline_order blank), or "none" with use_baseline off. Blank when no fit ran.
 STATUS_COLUMNS = (
     "file",
     "path",
@@ -430,7 +433,7 @@ def run_batch(
         mode_used = res.get("mode", mode)
         joint_fit = res.get("joint_baseline") is not None
         entry.update(
-            baseline_fit=res.get("baseline_fit", "fixed"),
+            baseline_fit=pipeline.baseline_fit_label(res, config),
             baseline_order=res.get("baseline_order") if joint_fit else "",
         )
         noise_info = res.get("noise_model")
@@ -467,7 +470,7 @@ def run_batch(
         if res.get("bound_hit"):
             notes.append("at bound: " + ", ".join(res["bound_hit"]))
         entry.update(
-            status="ok" if res["fit_ok"] else "not_converged",
+            status="ok" if res["fit_ok"] else "height_at_cap" if res.get("height_at_cap") else "not_converged",
             flags=";".join(res.get("flags") or []),
             message=_one_line("; ".join(notes)),
             n_peaks=len(fitted),
@@ -568,11 +571,10 @@ def run_batch(
                 entry["unc_method"] = unc_method_canon
                 if not entry["unc_status"]:
                     entry["unc_status"] = "skipped"
-                    entry["unc_message"] = (
-                        "the fit did not converge"
-                        if entry["status"] == "not_converged"
-                        else "no fit"
-                    )
+                    entry["unc_message"] = {
+                        "not_converged": "the fit did not converge",
+                        "height_at_cap": "a height ended at its cap",
+                    }.get(entry["status"], "no fit")
             if entry["status"] == "ok":
                 ok += 1
             if abort_on_uncertainty_failure and entry["unc_status"] == "failed":

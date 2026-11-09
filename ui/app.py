@@ -2504,7 +2504,7 @@ class PeakFitApp:
             "perf_seed": boot["seed"] if boot["seed"] is not None else "",
             "perf_unc_workers": unc_workers,
             "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
-            "perf_blas_threads": int(self.perf_blas_threads.get()),
+            "perf_blas_threads": self._blas_threads(),
             "unc_method": self._unc_selected_method_key(),
             "unc_alpha": float(self._safe_alpha()),
             "unc_center_resid": bool(self.center_resid_var.get()),
@@ -4244,16 +4244,27 @@ class PeakFitApp:
 
     # ----- Fit & Export -----
     def _sync_selected_edits(self):
+        """Apply what is typed in the selected peak's fields, as Apply would.
+
+        Only an edit changes the peaks. The fields of a selected row hold its own
+        values, and re-sorting peaks that a fit left out of order made a fresh fit
+        no longer current ("Fit first")."""
+
         sel = self._selected_index()
         if sel is None:
             return
         try:
             pk = self.peaks[sel]
-            pk.center = float(self.center_var.get())
-            pk.height = float(self.height_var.get())
-            pk.fwhm   = max(float(self.fwhm_var.get()), 1e-6)
-            pk.lock_width  = bool(self.lockw_var.get())
-            pk.lock_center = bool(self.lockc_var.get())
+            typed = (
+                float(self.center_var.get()),
+                float(self.height_var.get()),
+                max(float(self.fwhm_var.get()), 1e-6),
+                bool(self.lockw_var.get()),
+                bool(self.lockc_var.get()),
+            )
+            if typed == (pk.center, pk.height, pk.fwhm, bool(pk.lock_width), bool(pk.lock_center)):
+                return
+            pk.center, pk.height, pk.fwhm, pk.lock_width, pk.lock_center = typed
             self.peaks.sort(key=lambda p: p.center)
         except Exception:
             pass
@@ -4405,6 +4416,19 @@ class PeakFitApp:
             self.log(
                 f"Fit finished: RMSE={rmse:.4g} over {npts} pts (peaks={len(self.peaks)})"
             )
+            hits = list(res.get("bound_hit") or [])
+            if hits:
+                # as batch's status table says it ("at bound: fwhm1"), and _fit.csv's bound_hit
+                hint = (
+                    " A FWHM is bounded by twice the point spacing and half the fit window (or its cap)."
+                    if any(h.startswith("fwhm") for h in hits) else ""
+                )
+                self.status_warn(
+                    f"Fit at bound: {', '.join(hits)}. Those values are the bound, not free estimates.{hint}"
+                )
+            if not res.get("fit_ok"):
+                lead = "The fit is not usable" if res.get("height_at_cap") else "The fit did not converge"
+                self.status_warn(f"{lead}: {res.get('message') or 'no message'}")
 
         self.step_btn.config(state=tk.DISABLED)
         self.set_busy(True, "Fitting…")
@@ -4422,8 +4446,8 @@ class PeakFitApp:
         )
         if not out_csv:
             return
-        # Only a trailing .csv is dropped: a typed name keeps its dots.
-        base = _dio._drop_csv_suffix(out_csv)
+        # Only a data extension is dropped: a typed name keeps its other dots.
+        base = _dio.export_base(out_csv)
         output_dir = base.parent
         output_base = base.name
         fit_path = output_dir / f"{output_base}_fit.csv"
@@ -4591,6 +4615,11 @@ class PeakFitApp:
                 "Fit first. No fit has produced these peaks on these data, baseline and "
                 "window: they are new, or changed since the last fit."
             )
+        if rec["result"].get("height_at_cap"):
+            return (
+                f"{', '.join(rec['result']['height_at_cap'])} ended at the cap the data allow. "
+                "Fit again from other peaks or over another window."
+            )
         if not rec["result"].get("fit_ok"):
             return "the fit did not converge. Fit again, or change the solver settings."
         return None
@@ -4619,7 +4648,7 @@ class PeakFitApp:
         raw = pipeline.compute_uncertainty(
             rec["result"], rec["x"], rec["y"], rec["mask"], settings, method,
             fit_config=rec["settings"], file_seed=rec.get("rng_seed"),
-            abort_event=abort_event, log=self.log_threadsafe,
+            abort_event=abort_event, log=self.log_threadsafe, progress=self.log_threadsafe,
         )
         return raw, pipeline.finish_uncertainty(raw, rec["result"], rec["settings"], method)
 
@@ -4686,6 +4715,9 @@ class PeakFitApp:
         self.refresh_plot()
 
     def _report_bayes_diagnostics(self, diag: dict, band) -> None:
+        """The sampler's verdicts, once: the chain's length and the band's outcome.
+        The core's Bayesian lines through the progress callback are progress only."""
+
         if bool(diag.get("diagnostics_enabled")):
             self.log_threadsafe(
                 f"Posterior health: ess_min={_finite_or_nan(diag.get('ess_min')):.3g}, "
@@ -4718,8 +4750,8 @@ class PeakFitApp:
                 )
             elif skip == BAND_SKIP_ABORTED:
                 self.status_warn("Bayesian band aborted before completion.")
-        elif band is not None and bool(diag.get("band_forced")):
-            self.status_info("Bayesian band computed (forced).")
+        elif band is not None:
+            self.status_info("Bayesian band computed (forced)." if diag.get("band_forced") else "Bayesian band computed.")
 
     @log_action
     def run_uncertainty(self):
@@ -4884,11 +4916,35 @@ class PeakFitApp:
             "perf_seed": seed if seed is not None else "",
             "perf_unc_workers": unc_workers,
             "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
-            "perf_blas_threads": int(self.perf_blas_threads.get()),
+            "perf_blas_threads": self._blas_threads(),
             "log_debug_mode": bool(self.debug_mode_var.get()),
         }
         self.cfg.update(settings)
         return settings
+
+    def _blas_threads(self) -> int:
+        """The BLAS threads field: a whole number >= 0 (0, the default, leaves the
+        count to the library). Empty or anything else falls back to the default,
+        the field shows it, and the log says so: Fit, Export, Run and Run Batch
+        used to stop on it without a word."""
+
+        var = self.perf_blas_threads
+        try:
+            n = int(var.get())
+            if n >= 0:
+                return n
+        except (tk.TclError, ValueError, TypeError):
+            pass
+        try:
+            typed = str(var._tk.globalgetvar(var._name))
+        except Exception:
+            typed = "?"
+        self.log(
+            f"BLAS threads {typed!r} is not a whole number >= 0: using the default, 0 (the library's own count).",
+            level="WARN",
+        )
+        var.set(0)
+        return 0
 
     def _apply_performance_now(
         self, 
@@ -4994,8 +5050,8 @@ class PeakFitApp:
         if not out_csv:
             return
         self._sync_selected_edits()
-        # Only a trailing .csv is dropped: a typed MoS2_0.5mW keeps its dots.
-        base = _dio._drop_csv_suffix(out_csv)
+        # Only a data extension (.csv, .txt, .dat) is dropped: MoS2_0.5mW keeps its dots.
+        base = _dio.export_base(out_csv)
         # The fit the table describes, with the settings it ran with; peaks no fit
         # produced (placed by hand, or edited since the fit) say fit_ok False.
         rec = self._current_fit()
@@ -5021,10 +5077,12 @@ class PeakFitApp:
                 except Exception as exc:
                     unc_error = exc
             # The writer batch uses: the fit table, the trace and the uncertainty
-            # files, after removing uncertainty files an earlier export left here.
+            # files. The app's own uncertainty files an earlier export left here go
+            # only when this one computes uncertainty, as in batch with it on.
             written = pipeline.write_spectrum(
                 base, source, x=x, y_raw=y_raw, fit=fit, settings=write_settings,
                 unc_norm=unc, trace=True, keep=keep, log=self.log_threadsafe,
+                remove_stale=blocker is None,
             )
             return written, unc, computed, unc_error
 

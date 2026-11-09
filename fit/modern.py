@@ -8,11 +8,11 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from core.residuals import build_residual_jac
-from core.baseline_model import joint_from_options
+from core.baseline_model import LinearPart, joint_from_options
 from infra import performance as perf
 from core.weights import noise_weights
 from core.peaks import Peak
-from .bounds import pack_theta_bounds
+from .bounds import height_cap, held_heights, pack_theta_bounds
 from .utils import mad_sigma, robust_cost
 from . import step_engine
 
@@ -31,18 +31,22 @@ class SolveResult(TypedDict, total=False):
 
 def _to_solver_vectors(theta0: np.ndarray, bounds, peaks, fwhm_min: float):
     lb, ub = bounds
+    # a held height is no parameter: in the vector, a box that narrow would
+    # shrink every step to fit inside it
+    held = np.isfinite(held_heights(bounds))
     theta_list = []
     lb_list = []
     ub_list = []
     x_scale = []
     indices = []
     for i, p in enumerate(peaks):
-        h = theta0[4 * i + 1]
-        theta_list.append(h)
-        lb_list.append(lb[4 * i + 1])
-        ub_list.append(ub[4 * i + 1])
-        x_scale.append(max(1.0, abs(h)))
-        indices.append(4 * i + 1)
+        if not held[i]:
+            h = theta0[4 * i + 1]
+            theta_list.append(h)
+            lb_list.append(lb[4 * i + 1])
+            ub_list.append(ub[4 * i + 1])
+            x_scale.append(max(1.0, abs(h)))
+            indices.append(4 * i + 1)
         if not p.lock_center:
             c = theta0[4 * i + 0]
             theta_list.append(c)
@@ -88,9 +92,7 @@ def solve(
     base = baseline if baseline is not None else 0.0
     y_target = y - base
     weights = noise_weights(y_target, weight_mode)
-    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
-    max_height_factor = float(options.get("max_height_factor", np.inf))
-    options["max_height"] = max_height_factor * p95
+    options["max_height"] = height_cap(y_target, options)
     options["max_fwhm"] = options.get("max_fwhm", 0.5 * (x.max() - x.min()))
 
     theta0_full, bounds_full = pack_theta_bounds(peaks, x, options)
@@ -113,10 +115,9 @@ def solve(
         else:
             Aw = A
             yw = y_target
-        Mw = Aw if Bw is None else np.hstack([Aw, Bw])
-        sol, *_ = np.linalg.lstsq(Mw, yw, rcond=None)
-        h = sol[: A.shape[1]]
-        model = A @ h if B is None else A @ h + B @ sol[A.shape[1]:]
+        # the heights within [0, max_height], as every solver fits them
+        h, cb = LinearPart(Bw).solve(Aw, yw, np.asarray(bounds_full[1], float)[1::4])
+        model = A @ h if B is None else A @ h + B @ cb
         r = model - y_target
         if weights is not None:
             r = r * weights
@@ -133,7 +134,7 @@ def solve(
             jac=jac,
             cov=None,
             meta={"nfev": 1},
-            baseline_coef=None if B is None else sol[A.shape[1]:],
+            baseline_coef=None if B is None else cb,
         )
 
     theta0, bounds, x_scale, indices = _to_solver_vectors(theta0_full, bounds_full, peaks, fwhm_min)
@@ -143,7 +144,7 @@ def solve(
     rng = np.random.default_rng(options.get("seed"))
 
     resid_jac = build_residual_jac(
-        x, y, peaks, mode, baseline, weights
+        x, y, peaks, mode, baseline, weights, held_heights=held_heights(bounds_full)
     )
     if B is not None:
         p_peaks = theta0.size
@@ -289,6 +290,8 @@ def iterate(state: dict):
     loss = options.get("loss", "linear")
     weight_mode = options.get("weights", "none")
 
+    base0 = baseline if baseline is not None else 0.0
+    options = {**options, "max_height": height_cap(y - base0, options)}
     _, bounds = pack_theta_bounds(peaks, x, options)
 
     theta, cost1, cost0, info = step_engine.step_once(

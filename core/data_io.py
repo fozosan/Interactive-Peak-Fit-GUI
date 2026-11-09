@@ -308,7 +308,8 @@ def _noise_text(unc_norm: Mapping[str, Any] | None) -> Optional[str]:
 
 # How the fit treated the baseline (game plan 1.6, decision D2): "joint", fitted
 # with the peaks as Legendre columns of the recorded order over the fit window,
-# or "fixed", held at a precomputed baseline (order blank). Blank when unknown.
+# "fixed", held at a precomputed baseline (order blank), or "none", with Apply
+# baseline off. Blank when unknown.
 BASELINE_COLUMNS = ("baseline_fit", "baseline_order")
 
 
@@ -329,6 +330,8 @@ def _baseline_lines(unc_norm: Mapping[str, Any] | None) -> List[str]:
 
     bm = _as_mapping((unc_norm or {}).get("baseline_model"))
     fit = str(bm.get("fit") or "")
+    if fit == "none":
+        return ["Baseline: none (Apply baseline was off): the peaks were fitted to the data as measured"]
     if fit == "fixed":
         method = str(bm.get("method") or "precomputed")
         return [
@@ -477,7 +480,7 @@ def derive_export_paths(user_path: str) -> dict:
     whole (``Path.with_suffix`` would cut it to ``MoS2_0``).
     """
 
-    base = _drop_csv_suffix(user_path)
+    base = export_base(user_path)
     return {
         "fit": base.with_name(base.name + "_fit.csv"),
         "trace": base.with_name(base.name + "_trace.csv"),
@@ -597,6 +600,11 @@ def build_peak_table(records: Iterable[dict]) -> str:
         # or "fixed"; blank when the caller does not say
         "baseline_fit",
         "baseline_order",
+        # the FWHM's upper bound (half the window by default), and which of the
+        # peak's parameters ended on a bound ("center;fwhm"): there the value is
+        # the bound, not a free estimate
+        "bounds_fwhm_hi",
+        "bound_hit",
     ]
     buf = io.StringIO()
     writer = csv.DictWriter(
@@ -2034,6 +2042,21 @@ def is_own_uncertainty_file(path: Union[str, Path]) -> bool:
     except (OSError, UnicodeDecodeError):
         return False
     return pattern.match(first.lstrip("﻿").rstrip("\r\n")) is not None
+
+
+# The extensions a typed export or batch name may carry: the data files' own.
+DATA_EXTENSIONS = (".csv", ".txt", ".dat")
+
+
+def export_base(typed: Union[str, Path]) -> Path:
+    """The base of a name typed for an export or a batch summary.
+
+    A trailing data extension (.csv, .txt or .dat, in any case) is dropped; every
+    other dot is the name's: MoS2_0.5mW stays whole, and name.txt gives
+    name_fit.csv, not name.txt_fit.csv.
+    """
+    base = Path(typed)
+    return base.with_suffix("") if base.suffix.lower() in DATA_EXTENSIONS else base
 
 
 def _drop_csv_suffix(base_path: Union[str, Path]) -> Path:

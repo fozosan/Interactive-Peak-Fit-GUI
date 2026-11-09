@@ -7,7 +7,7 @@ import pytest
 from core.peaks import Peak
 from core.models import pv_sum
 from core.fit_api import modern_trf_step, modern_vp_step, lmfit_step
-from fit.bounds import pack_theta_bounds
+from fit.bounds import height_cap, held_heights, pack_theta_bounds
 from fit import modern, modern_vp, lmfit_backend
 from core.residuals import build_residual_jac
 from core.weights import noise_weights
@@ -28,12 +28,13 @@ def test_trf_step_parity():
     payload = {"x": x, "y": y, "peaks": start, "mode": "add", "baseline": None, "options": {}}
     theta_step, res = modern_trf_step(payload)
     assert res.accepted and res.cost1 < res.cost0 and res.step_norm > 0
-    theta0_full, bounds_full = pack_theta_bounds(start, x, {})
+    # the bounds every solver fits within: the data's height cap among them
+    theta0_full, bounds_full = pack_theta_bounds(start, x, {"max_height": height_cap(y)})
     dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
     fwhm_min = max(1e-6, 2.0 * dx_med)
     theta0, bounds, x_scale, indices = modern._to_solver_vectors(theta0_full, bounds_full, start, fwhm_min)
     weights = noise_weights(y, "none")
-    resid_jac = build_residual_jac(x, y, start, "add", None, weights)
+    resid_jac = build_residual_jac(x, y, start, "add", None, weights, held_heights=held_heights(bounds_full))
     def fun(t):
         return resid_jac(t)[0]
     def jac(t):

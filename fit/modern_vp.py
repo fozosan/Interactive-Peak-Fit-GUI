@@ -4,15 +4,14 @@ from __future__ import annotations
 from typing import Optional, Sequence, TypedDict
 
 import numpy as np
-from scipy.optimize import nnls
 
 from core.models import pv_sum_with_jac
-from core.baseline_model import LinearPart, joint_from_options
+from core.baseline_model import LinearPart, joint_from_options, nonneg_heights
 from infra import performance as perf
 from core.weights import noise_weights, robust_weights, combine_weights
 from core.peaks import Peak
 from core.param_utils import create_parameter_unpacker
-from .bounds import pack_theta_bounds
+from .bounds import height_cap, pack_theta_bounds
 from .utils import mad_sigma, robust_cost
 from . import step_engine
 
@@ -86,9 +85,7 @@ def solve(
     base = baseline if baseline is not None else 0.0
     y_target = y - base
     weights = noise_weights(y_target, weight_mode)
-    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
-    max_height_factor = float(options.get("max_height_factor", np.inf))
-    options["max_height"] = max_height_factor * p95
+    options["max_height"] = height_cap(y_target, options)
     options["max_fwhm"] = options.get("max_fwhm", 0.5 * (x.max() - x.min()))
 
     theta0_full, bounds_full = pack_theta_bounds(peaks, x, options)
@@ -99,11 +96,12 @@ def solve(
     # solved with the heights; each linear solve projects them out exactly.
     B = joint_from_options(options, x.size)
     lin = LinearPart(None if B is None else (B * weights[:, None] if weights is not None else B))
+    h_caps = np.asarray(bounds_full[1], float)[1::4]  # every height's upper bound
 
     def _linear(A_, bw_):
         """Heights (>= 0) and baseline coefficients, and the model they give."""
         Aw_ = A_ * weights[:, None] if weights is not None else A_
-        h_, cb_ = lin.solve(Aw_, bw_, options["max_height"])
+        h_, cb_ = lin.solve(Aw_, bw_, h_caps)
         model_ = A_ @ h_ if B is None else A_ @ h_ + B @ cb_
         return h_, cb_, model_
 
@@ -358,6 +356,8 @@ def iterate(state: dict):
     loss = options.get("loss", "linear")
     weight_mode = options.get("weights", "none")
 
+    base0 = baseline if baseline is not None else 0.0
+    options = {**options, "max_height": height_cap(y - base0, options)}
     _, bounds = pack_theta_bounds(peaks, x, options)
 
     # strict kw handling happens at the caller; do not forward unknown flags here
@@ -419,9 +419,7 @@ def iterate(state: dict):
     norms = np.linalg.norm(Aw, axis=0)
     norms = np.clip(norms, 1e-6, 1e6)
     Aw_s = Aw / norms
-    h_s, _ = nnls(Aw_s, bw)
-    h = h_s / norms
-    h = np.minimum(h, options.get("max_height", np.inf))
+    h = nonneg_heights(Aw_s, bw, np.asarray(bounds[1], float)[1::4] * norms) / norms
     for i, val in enumerate(h):
         theta[4 * i + 1] = val
     model = A @ h

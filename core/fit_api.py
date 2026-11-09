@@ -28,11 +28,11 @@ from . import signals
 from .signals import polynomial_baseline
 from .param_utils import vp_unpack_centers_widths
 from fit import orchestrator, solve as fit_solve
-from fit.bounds import pack_theta_bounds
+from fit.bounds import height_cap, held_heights, pack_theta_bounds
 from infra import performance
 from fit import classic, modern, modern_vp, lmfit_backend
 from fit.utils import mad_sigma, robust_cost
-from scipy.optimize import least_squares, nnls
+from scipy.optimize import least_squares
 
 
 @dataclass
@@ -328,6 +328,38 @@ def run_fit_consistent(
         "maxfev": opts["maxfev"],
     }
 
+    # One height cap for every solver, from the window's data
+    # (fit.bounds.height_cap): twice the peak signal over a fixed baseline; over
+    # a joint one, which can dip below the data, the data above zero counts plus
+    # the signal above the computed baseline.
+    peak_signal = base_fit if base_fit is not None else provisional_fit
+    above = y_fit - (peak_signal if peak_signal is not None else 0.0)
+    opts["max_height"] = height_cap(above, opts, y_data=y_fit if joint else None)
+    cap = float(opts["max_height"])
+    # the window's peak signal, max |y - baseline|: the most a bound can let a
+    # peak show in the window before the bound, not the data, sets it (below)
+    signal = float(np.max(np.abs(above))) if above.size else 0.0
+    # Which heights the cap bounds: at first none, so a fit keeping every height
+    # below it is the fit with no bound (as on main, its path and cost too: a
+    # finite bound changes least_squares' scaling of every step, and NNLS's
+    # path where heights pass the cap on the way). A height the fit puts above
+    # the cap is bound by it, and the fit is run again from the same start
+    # (the loop after _fit_once, below).
+    capped = np.zeros(len(peaks0), bool)
+    # Each peak's visible share: 1 for one the window can hold, and the cap
+    # times it bounds a height the cap bounds (fit.bounds.pack_theta_bounds).
+    shares: list = []
+    pack_theta_bounds(peaks0, x_fit, {**opts, "capped": None}, shares=shares)
+    shares = np.asarray(shares, float)
+    if solver_name == "classic":
+        # Classic's trust region steps a height as it steps a centre: the height
+        # of a peak the window cannot hold walks along the valley its tail
+        # shares with the baseline, far from its start, and stops under the cap
+        # (2400H-2ZF-Rad's six peaks at 126-242 cm-1 on the 0.20 s spectrum: 258,
+        # 97 % of the area). Main's Classic never met such a peak: it moved
+        # locked centres into the window. So its bound applies from the start.
+        capped |= shares < 1.0
+    opts["capped"] = capped.copy()
     p0, (lo, hi) = pack_theta_bounds(peaks0, x_fit, opts)
     if joint:
         opts["baseline_basis"] = B_fit
@@ -452,19 +484,18 @@ def run_fit_consistent(
         return best_res, best_theta
 
     def _finalize(theta_raw):
-        """Clip to the bounds and hold locked centres and widths at their seeds."""
+        """The solver's parameters, each held value (a locked centre or width, the
+        height of a peak the window cannot see) at its start value.
+
+        Never clipped: every solver fits within (lo, hi), so a value outside them
+        is the solver's fault, and is reported (see "outside_bounds") instead of
+        being moved onto the bound, where the other parameters would no longer
+        be its best fit. Returns theta and which values lie outside."""
 
         theta = np.asarray(theta_raw if theta_raw is not None else p0, float).copy()
-        clipped = np.clip(theta, lo, hi)
-        moved = bool(np.any(np.abs(clipped - theta) > 1e-12))
-        theta = clipped
-        for i, pk in enumerate(peaks0):
-            if pk.lock_center:
-                theta[4 * i] = p0[4 * i]
-            if pk.lock_width:
-                theta[4 * i + 2] = p0[4 * i + 2]
-        assert np.all(theta >= lo - 1e-12) and np.all(theta <= hi + 1e-12)
-        return theta, moved
+        theta[held] = p0[held]
+        tol = 1e-9 * np.maximum(1.0, np.maximum(np.abs(lo), np.abs(hi)))
+        return theta, (theta < lo - tol) | (theta > hi + tol)
 
     def _peaks_at(theta):
         return [
@@ -472,38 +503,81 @@ def run_fit_consistent(
             for i, pk in enumerate(peaks0)
         ]
 
-    # Every solver packs height, centre and width; eta stays where it starts.
-    free_mask = np.array(
-        [f for pk in peaks0 for f in (not pk.lock_center, True, not pk.lock_width, False)], bool
-    )
-
-    best_res, best_theta = _solve(p0, opts, restarts, jitter_pct)
-
-    noise = None
-    if sigma_fit is None and noise_choice == "per_spectrum" and best_theta is not None:
-        # var_i = s0^2 + g S_i from this fit's residuals, S_i its signal above the
-        # baseline; then one refit weighted by 1 / sigma_i, started at this fit.
-        theta1, _moved = _finalize(best_theta)
-        resid1 = build_residual(x_fit, y_fit, _peaks_at(theta1), mode, _fit_baseline(best_res), "linear", None)
-        signal1 = performance.eval_total(
-            x_fit, [(h, c, w, e) for c, h, w, e in theta1.reshape(-1, 4)]
+    # Every solver packs height, centre and width; eta stays where it starts. A
+    # held value is no parameter: a locked centre or width, and the height of a
+    # peak the window cannot see (fit.bounds.held_heights), each at its p0.
+    def _held(bounds):
+        held = np.array(
+            [f for pk, h in zip(peaks0, np.isfinite(held_heights(bounds)))
+             for f in (pk.lock_center, h, pk.lock_width, False)], bool
         )
-        jac1 = jacobian_fd(resid1, theta1)[:, free_mask]
-        if joint:
-            # the fit shrinks its residuals through the baseline columns too
-            jac1 = np.hstack([jac1, B_fit])
-        noise = noise_model.estimate_noise_model(resid1(theta1), signal1, jac1)
-        # A floor at the data's rounding level is no noise: the model fits the
-        # data exactly (noiseless input, which a joint baseline can match to the
-        # last digit), and weights of 1e17 would only break the refit.
-        rounding = 1e-9 * max(1.0, float(np.max(np.abs(y_fit)))) if y_fit.size else 0.0
-        if noise is not None and noise.usable and noise.s0 > rounding:
-            sigma_fit = noise.sigma(signal1)
-            opts["weights"] = 1.0 / sigma_fit
-            weights = noise_weights(y_target, opts["weights"])
-            best_res, best_theta = _solve(theta1, opts, 1, 0.0)
+        free = ~held
+        free[3::4] = False
+        return held, free
 
-    theta, clipped_after = _finalize(best_theta)
+    held, free_mask = _held((lo, hi))
+
+    # What the first solve weighs with; a per-spectrum noise model replaces it
+    # for the refit, and each attempt below starts from it again.
+    weights_start, sigma_start = opts.get("weights", "none"), sigma_fit
+
+    def _fit_once():
+        """The fit with the heights in ``capped`` bound by the cap: a solve from
+        p0 and, with a per-spectrum noise model, its refit weighted by the
+        model of that solve's residuals. Returns the solver's result, theta and
+        the noise model."""
+
+        nonlocal sigma_fit, weights
+        opts["weights"], sigma_fit = weights_start, sigma_start
+        weights = noise_weights(y_target, opts.get("weights", "none"))
+        res, theta = _solve(p0, opts, restarts, jitter_pct)
+        noise = None
+        if sigma_fit is None and noise_choice == "per_spectrum" and theta is not None:
+            # var_i = s0^2 + g S_i from this fit's residuals, S_i its signal above the
+            # baseline; then one refit weighted by 1 / sigma_i, started at this fit.
+            theta1, _outside = _finalize(theta)
+            resid1 = build_residual(x_fit, y_fit, _peaks_at(theta1), mode, _fit_baseline(res), "linear", None)
+            signal1 = performance.eval_total(
+                x_fit, [(h, c, w, e) for c, h, w, e in theta1.reshape(-1, 4)]
+            )
+            jac1 = jacobian_fd(resid1, theta1)[:, free_mask]
+            if joint:
+                # the fit shrinks its residuals through the baseline columns too
+                jac1 = np.hstack([jac1, B_fit])
+            noise = noise_model.estimate_noise_model(resid1(theta1), signal1, jac1)
+            # A floor at the data's rounding level is no noise: the model fits the
+            # data exactly (noiseless input, which a joint baseline can match to the
+            # last digit), and weights of 1e17 would only break the refit.
+            rounding = 1e-9 * max(1.0, float(np.max(np.abs(y_fit)))) if y_fit.size else 0.0
+            if noise is not None and noise.usable and noise.s0 > rounding:
+                sigma_fit = noise.sigma(signal1)
+                opts["weights"] = 1.0 / sigma_fit
+                weights = noise_weights(y_target, opts["weights"])
+                res, theta = _solve(theta1, opts, 1, 0.0)
+        return res, theta, noise
+
+    # The fit, then again from the same start with the cap bounding each height
+    # it put above the cap, until it puts none there: at most once more per
+    # peak, and only for fits that pass the cap. The fit's own heights decide,
+    # not a solve on the way (a per-spectrum noise model's first solve put one
+    # at 768 under a cap of 590, and its refit brought it back to 101).
+    while True:
+        best_res, best_theta, noise = _fit_once()
+        if best_theta is None:
+            break
+        over = ~capped & (np.asarray(best_theta, float)[1::4] > cap)
+        if not over.any():
+            break
+        # The heights past the cap, and every peak the window cannot hold: a fit
+        # that runs a height away has found a direction its data do not fix, and
+        # the tails of such peaks all share it with the baseline (bounding one at
+        # a time, Modern VP ran the next one away, and on the third pass lost A1g).
+        capped[over | (shares < 1.0)] = True
+        opts["capped"] = capped.copy()
+        p0, (lo, hi) = pack_theta_bounds(peaks0, x_fit, opts)
+        held, free_mask = _held((lo, hi))
+
+    theta, outside = _finalize(best_theta)
 
     baseline_coef = None
     if joint:
@@ -557,7 +631,7 @@ def run_fit_consistent(
         xmin = float(x_fit[0]) if x_fit.size else float("nan")
         xmax = float(x_fit[-1]) if x_fit.size else float("nan")
         print(
-            "mask_len=%d window=[%g,%g] bounds=(%g,%g) p0_head=%s p0_tail=%s restarts=%d jitter_pct=%g rmse=%g clipped=%s"
+            "mask_len=%d window=[%g,%g] bounds=(%g,%g) p0_head=%s p0_tail=%s restarts=%d jitter_pct=%g rmse=%g outside_bounds=%s"
             % (
                 mask.sum(),
                 xmin,
@@ -569,22 +643,28 @@ def run_fit_consistent(
                 restarts,
                 jitter_pct,
                 rmse,
-                clipped_after,
+                int(np.count_nonzero(outside)),
             )
         )
 
+    # The fit's bounds: a height the cap bounded in the solve has its bound, the
+    # cap times its peak's visible share; one it did not, the cap, past which
+    # it would have been bound (a held one stays held).
+    hi_fit = hi.copy()
+    hi_fit[1::4] = np.where(held[1::4], hi[1::4], np.minimum(hi[1::4], cap))
     result = {
         "peaks_out": peaks_out,
         "rmse": rmse,
         "theta": theta,
-        "bounds": (lo, hi),
+        "bounds": (lo, hi_fit),
+        # the heights' cap: a refit (bootstrap) takes it, to fit within the same bounds
+        "height_cap": cap,
         "p0": p0,
         "mask_len": int(mask.sum()),
         "baseline_params": baseline_params,
         "restarts_used": restarts,
         "jitter_pct": jitter_pct,
         "solver_options": solver_used_opts,
-        "clipped_after_solve": clipped_after,
         "fit_ok": bool(best_res.success if best_res is not None else False),
         "skip_reason": None,
         "message": str(getattr(best_res, "message", "") or ""),
@@ -602,23 +682,60 @@ def run_fit_consistent(
     }
 
     names: list[str] = []
-    locked: list[bool] = []
-    for i, pk in enumerate(peaks_out):
+    for i in range(len(peaks_out)):
         names.extend([f"center{i+1}", f"height{i+1}", f"fwhm{i+1}", f"eta{i+1}"])
-        # No solver fits eta: it stays at its start value, so it is locked too.
-        locked.extend([pk.lock_center, False, pk.lock_width, True])
-    locked_mask = np.array(locked, bool)
-    n_free = int(np.count_nonzero(~locked_mask))
-    # A free parameter on its bound is a flag, not a failure: the fit is kept.
-    bound_hit = _params_on_bounds(theta, lo, hi, locked_mask, names)
+    locked_mask = ~free_mask
+    n_free = int(np.count_nonzero(free_mask))
+    # A free parameter on its bound is a flag, not a failure: the fit is kept. So
+    # is a held height: the fit says nothing about its peak. A height is at its
+    # bound within 1e-3 of it: least_squares' interior steps stop short of an
+    # active bound (Modern TRF: 2.5e-5 under the cap), and BVLS lands on it. It
+    # is a failure when its peak's largest value in the window there, bound
+    # times share, reaches the window's peak signal (or the cap, if that is
+    # smaller): then the bound, not the data, set how much of the signal the
+    # peak takes. A height at the cap always does. A peak the window cannot
+    # hold shows the cap times its share squared at its bound; while that is
+    # less, the bound is a flag: its height is one the window cannot fix.
+    flagged = free_mask.copy()
+    flagged[1::4] = True
+    bound_hit = _params_on_bounds(theta, lo, hi_fit, ~flagged, names)
+    outside_bounds = [n for n, out in zip(names, outside) if out]
+    h_bound = hi_fit[1::4]
+    h_free = ~held[1::4]
+    at_bound = h_free & (theta[1::4] >= h_bound * (1.0 - 1e-3))
+    shown = min(signal, cap)  # what the data let a peak show in the window
+    loud = np.flatnonzero(at_bound & (h_bound * shares >= shown * (1.0 - 1e-3)))
+    at_cap = [f"height{i + 1}" for i in loud]
+    bound_hit = [n for n in names if n in bound_hit or n in {f"height{i + 1}" for i in np.flatnonzero(at_bound)}]
     result.update(
         {
             "param_names": names,
             "locked_mask": locked_mask,
             "flags": ["bound_hit"] if bound_hit else [],
             "bound_hit": bound_hit,
+            "outside_bounds": outside_bounds,
+            "height_at_cap": at_cap,
         }
     )
+    if outside_bounds:
+        result["fit_ok"] = False
+        result["message"] = (
+            f"the {solver_name} solver returned values outside the fit's bounds: {', '.join(outside_bounds)}"
+        )
+    elif at_cap:
+        where = [
+            f"height{i + 1}" if shares[i] >= 1.0
+            else f"height{i + 1} (the cap times the {shares[i]:.2g} of its peak the window shows)"
+            for i in loud
+        ]
+        note = (
+            f"{', '.join(where)} ended at the cap the window's data allow ({cap:.4g}): the cap, "
+            f"not the data, set {'that height' if len(at_cap) == 1 else 'those heights'}"
+        )
+        if not result["fit_ok"] and result["message"]:
+            note = f"{result['message']}; {note}"
+        result["message"] = note
+        result["fit_ok"] = False
 
     if return_jacobian:
         r0 = resid_fn(theta)
@@ -632,7 +749,7 @@ def run_fit_consistent(
             {
                 "jacobian": J,
                 "residual": r0,
-                "bounds": (lo, hi),
+                "bounds": (lo, hi_fit),
                 "mask_fit": mask,
                 "rss": float(np.dot(r0, r0)),
                 "dof": dof,
@@ -856,6 +973,9 @@ def _trf_prepare(payload: dict):
     mode = payload.get("mode", "add")
     baseline = payload.get("baseline")
     opts = dict(payload.get("options", {}))
+    base = baseline if baseline is not None else 0.0
+    y_target = y - base
+    opts["max_height"] = height_cap(y_target, opts)
 
     theta_full0, bounds_full = pack_theta_bounds(peaks, x, opts)
     dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
@@ -863,10 +983,10 @@ def _trf_prepare(payload: dict):
     theta0, bounds, x_scale, indices = modern._to_solver_vectors(
         theta_full0, bounds_full, peaks, fwhm_min
     )
-    base = baseline if baseline is not None else 0.0
-    y_target = y - base
     weights = noise_weights(y_target, opts.get("weights", "none"))
-    resid_jac = build_residual_jac(x, y, peaks, mode, baseline, weights)
+    resid_jac = build_residual_jac(
+        x, y, peaks, mode, baseline, weights, held_heights=held_heights(bounds_full)
+    )
     return theta0, bounds, x_scale, indices, theta_full0, resid_jac, opts
 
 
@@ -937,8 +1057,8 @@ def _vp_initial_cost(x, y, peaks, baseline, opts):
     else:
         Aw = A
         bw = y_target
-    h, _ = nnls(Aw, bw)
-    h = np.minimum(h, opts.get("max_height", np.inf))
+    _, (_lo, hi) = pack_theta_bounds(peaks, x, opts)
+    h = baseline_model.nonneg_heights(Aw, bw, np.asarray(hi, float)[1::4])
     r = A @ h - y_target
     if weights is not None:
         r = r * weights
@@ -966,9 +1086,7 @@ def modern_vp_step(payload: dict) -> Tuple[np.ndarray, StepResult]:
     y_target = y - base
     weight_mode = opts.get("weights", "none")
     weights = noise_weights(y_target, weight_mode)
-    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
-    max_height_factor = float(opts.get("max_height_factor", np.inf))
-    opts["max_height"] = max_height_factor * p95
+    opts["max_height"] = height_cap(y_target, opts)
     opts["max_fwhm"] = opts.get("max_fwhm", 0.5 * (x.max() - x.min()))
 
     cost0 = _vp_initial_cost(x, y, peaks, baseline, opts)
@@ -1010,9 +1128,7 @@ def lmfit_step(payload: dict) -> Tuple[np.ndarray, StepResult]:
     y_target = y - base
     weight_mode = opts.get("weights", "none")
     weights = noise_weights(y_target, weight_mode)
-    p95 = float(np.percentile(np.abs(y_target), 95)) if y_target.size else 1.0
-    max_height_factor = float(opts.get("max_height_factor", np.inf))
-    opts["max_height"] = max_height_factor * p95
+    opts["max_height"] = height_cap(y_target, opts)
     opts["max_fwhm"] = opts.get("max_fwhm", 0.5 * (x.max() - x.min()))
 
     cost0 = _vp_initial_cost(x, y, peaks, baseline, opts)
