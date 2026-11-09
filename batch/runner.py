@@ -1038,8 +1038,9 @@ def run_batch(
                     # Always force strict non-linear refits for bootstrap (matches GUI stability)
                     fit_ctx_local["strict_refit"] = True
                     # Studentized residuals, r / sqrt(1 - h), by default in batch:
-                    # measured (PR F, B = 500) it gains 0.5 to 1.5 coverage points in
-                    # every case and loses none. The core default (GUI) stays off.
+                    # measured (PR F, B = 500, 400 paired replicates) it gains 0.6 to 2.2
+                    # coverage points in every cell and loses none. The core default
+                    # (GUI) stays off.
                     fit_ctx_local["boot_studentize"] = config.get("boot_studentize", True)
                     if "boot_resampling" in config:
                         fit_ctx_local["boot_resampling"] = config.get("boot_resampling")

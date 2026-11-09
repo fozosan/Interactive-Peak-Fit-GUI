@@ -5,11 +5,10 @@ leverage shrinkage undone, h the hat matrix of the weighted Jacobian with the
 joint baseline's columns. The few points that carry a narrow line's height have
 leverage near 1, so without it the intervals come out too narrow. Measured
 through ``run_batch`` (joint baseline, estimated noise, B = 500, PR F), paired
-on 200 replicates, studentizing gains 0.5 to 1.5 points in every cell and loses
-none: strong MoS2 centre / height / FWHM 90.8 / 87.5 / 91.2 off, 91.8 / 88.0 /
-92.5 on; over 400 replicates on it reads 91.9 / 90.1 / 93.4, weak MoS2 94.4 /
-94.0 / 94.5 and Si 93.0 / 95.2 / 94.2. The core default stays off, so the GUI,
-whose checkbox shows it, is unchanged.
+on 400 replicates, studentizing gains 0.6 to 2.2 points in every cell and loses
+none: strong MoS2 centre / height / FWHM 91.1 / 89.2 / 92.0 off, 91.9 / 90.1 /
+93.4 on; weak MoS2 reads 94.4 / 94.0 / 94.5 on and Si 93.0 / 95.2 / 94.2. The
+core default stays off, so the GUI, whose checkbox shows it, is unchanged.
 """
 
 from batch import runner
