@@ -106,7 +106,7 @@ def test_bootstrap_band_file_respects_toggle_on(monkeypatch, tmp_path: Path, sam
     ok, total = runner.run_batch([str(sample_csv)], cfg, compute_uncertainty=True, unc_method="bootstrap")
     assert (ok, total) == (1, 1)
     assert len(seen) == 1 and seen[0][0] is True
-    band_path = out_dir / "a_band.csv"
+    band_path = out_dir / "a_uncertainty_band.csv"  # every method's band, one writer
     assert band_path.exists()
     assert (out_dir / "a_uncertainty.csv").exists()
 
@@ -120,6 +120,6 @@ def test_bootstrap_band_file_respects_toggle_off(monkeypatch, tmp_path: Path, sa
     ok, total = runner.run_batch([str(sample_csv)], cfg, compute_uncertainty=True, unc_method="bootstrap")
     assert (ok, total) == (1, 1)
     assert len(seen) == 1 and seen[0][0] is False
-    band_path = out_dir / "a_band.csv"
+    band_path = out_dir / "a_uncertainty_band.csv"  # every method's band, one writer
     assert not band_path.exists()
     assert (out_dir / "a_uncertainty.csv").exists()

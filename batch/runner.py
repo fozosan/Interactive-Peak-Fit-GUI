@@ -16,7 +16,6 @@ from typing import Optional
 import csv
 import os
 import copy
-import zlib
 import numpy as np
 import math
 import logging
@@ -26,7 +25,7 @@ if os.environ.get("SMOKE_MODE") == "1":  # pragma: no cover - environment safegu
     os.environ.setdefault("MPLBACKEND", "Agg")
 
 import core.data_io as data_io
-from core import models, peaks, signals, fit_api, baseline_model
+from core import models, peaks, signals, fit_api, baseline_model, pipeline
 from core.residuals import build_residual, finite_diff_jacobian
 from core.uncertainty import bootstrap_ci, UncertaintyResult
 from core.uncertainty_router import route_uncertainty
@@ -79,14 +78,6 @@ STATUS_COLUMNS = (
     "unc_status",
     "unc_message",
 )
-# Uncertainty outputs the batch writes for a spectrum, after its stem.
-_UNC_SUFFIXES = (
-    "_uncertainty.csv",
-    "_uncertainty_wide.csv",
-    "_uncertainty.txt",
-    "_uncertainty_band.csv",
-    "_band.csv",
-)
 
 
 def _one_line(text) -> str:
@@ -123,73 +114,6 @@ def _seed_peaks(config: dict, solver_name: str) -> List[peaks.Peak]:
     return peaks.deserialize(records)
 
 
-def _remove_stale_uncertainty(out_dir: Path, stem: str, inputs: set, log=None) -> None:
-    """Delete the uncertainty outputs an earlier run left for ``stem``.
-
-    Called whenever a file's fit is rewritten with uncertainty requested, so the
-    folder never pairs a new fit with an old uncertainty, even when the new
-    uncertainty fails. ``inputs`` holds this batch's input paths, normalised
-    with ``os.path.normcase(os.path.abspath(...))``; those are never touched.
-    """
-
-    for suffix in _UNC_SUFFIXES:
-        old = out_dir / f"{stem}{suffix}"
-        if os.path.normcase(os.path.abspath(old)) in inputs:
-            continue
-        try:
-            old.unlink(missing_ok=True)
-        except OSError as exc:
-            msg = f"could not remove stale {old.name}: {exc}"
-            logger.warning(msg)
-            if log:
-                log(msg)
-
-
-def _baseline_record(res: dict, base_cfg: dict) -> dict:
-    """How the fit treated the baseline, as the uncertainty writers record it."""
-
-    jb = res.get("joint_baseline")
-    if jb is None:
-        return {"fit": "fixed", "method": str((base_cfg or {}).get("method", "als")).lower()}
-    out = jb.as_dict()
-    out["coef"] = [float(v) for v in np.asarray(res["baseline_coef"], float)]
-    return out
-
-
-def _pop_baseline_stats(unc_res, n_peak_params: int, names: Sequence[str]) -> dict:
-    """Take the joint baseline's coefficients out of a method's statistics.
-
-    The asymptotic method keys them ``p<i>`` (i after the peaks'), the bootstrap
-    and the Bayesian by name (``baseline_c<j>``). Returns their estimate, standard
-    error and interval, one entry per coefficient, NaN where a method has none.
-    """
-
-    stats = unc_res.get("stats") if isinstance(unc_res, dict) else getattr(unc_res, "stats", None)
-    out = {"coef": [], "sd": [], "ci_lo": [], "ci_hi": []}
-    for j, name in enumerate(names):
-        blk = None
-        for key in (name, f"p{int(n_peak_params) + j}"):
-            got = stats.pop(key, None) if isinstance(stats, dict) else None
-            if blk is None and isinstance(got, dict):
-                blk = got
-        blk = blk or {}
-
-        def _num(*keys):
-            for k in keys:
-                if blk.get(k) is not None:
-                    try:
-                        return float(blk[k])
-                    except (TypeError, ValueError):
-                        continue
-            return float("nan")
-
-        out["coef"].append(_num("est"))
-        out["sd"].append(_num("sd"))
-        out["ci_lo"].append(_num("p2_5", "p2.5", "ci_lo"))
-        out["ci_hi"].append(_num("p97_5", "p97.5", "ci_hi"))
-    return out
-
-
 def _write_status_table(path: Path, rows: Sequence[dict]) -> None:
     with path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=STATUS_COLUMNS, lineterminator="\n")
@@ -222,14 +146,7 @@ def _tp_limits_ctx_for_config(config: dict):
     return nullcontext()
 
 
-def _file_seed(path: str, base_seed: Optional[int]) -> int:
-    """Seed for one file's fit restarts: the same on every run and machine.
-
-    CRC-32 of the file name, started from the base seed. Python's ``hash()``,
-    used before, is salted per process, so the seeds changed on every run.
-    """
-
-    return zlib.crc32(Path(path).name.encode("utf-8"), int(base_seed or 0) & 0xFFFFFFFF)
+_file_seed = pipeline.file_seed
 
 
 def _norm_jitter(v, default=0.0):
@@ -363,6 +280,11 @@ def run_batch(
     # The batch fits the baseline with the peaks unless the config says
     # baseline_fit "fixed" (decision D2); the GUI's core default is "fixed".
     fit_config.setdefault("baseline_fit", "joint")
+    # Use baseline off (the GUI's checkbox) means no baseline at all: neither a
+    # computed one nor one fitted with the peaks.
+    use_baseline = bool(config.get("use_baseline", True))
+    if not use_baseline:
+        fit_config["baseline_fit"] = "fixed"
     baseline_model.baseline_fit_choice(fit_config)  # a wrong setting stops the batch here
     baseline_model.baseline_order(fit_config)
     mode = config.get("mode", "add")
@@ -416,7 +338,6 @@ def run_batch(
         peak_output_cfg = config.get("peak_output", out_dir / "batch_fit.csv")
         base_name = Path(peak_output_cfg).stem.replace("_fit", "")
     peak_output = out_dir / f"{base_name}_fit.csv"
-    export_unc_wide = bool(config.get("export_unc_wide", False))
     export_cfg = dict(config.get("export", {}) or {})
     unc_section = dict(config.get("uncertainty", {}) or {})
 
@@ -490,9 +411,10 @@ def run_batch(
     ]
     status_path = out_dir / f"{base_name}_files.csv"
     inputs = {os.path.normcase(os.path.abspath(path)) for path in files}
+    stems = pipeline.output_stems(files)
 
-    def _process_file(path: str, entry: dict) -> None:
-        """Fit one file and write its outputs, recording the outcome in ``entry``."""
+    def _process_file(path: str, stem: str, entry: dict) -> None:
+        """Fit one file and write its outputs under ``stem``, recording the outcome in ``entry``."""
 
         try:
             x, y = data_io.load_xy(path)
@@ -530,7 +452,9 @@ def run_batch(
         method = str(base_cfg.get("method", "als")).lower()
         use_slice = bool(config.get("baseline_uses_fit_range", True))
         mask_eff = mask if use_slice else None
-        if method == "als":
+        if not use_baseline:
+            baseline = np.zeros_like(y, dtype=float)
+        elif method == "als":
             if mask_eff is not None and np.any(mask_eff) and not np.all(mask_eff):
                 x_sub = x[mask_eff]
                 y_sub = y[mask_eff]
@@ -627,109 +551,14 @@ def run_batch(
             rmse_shadow = float(np.sqrt(np.mean(r * r))) if r.size else float("nan")
             if abs(rmse_shadow - rmse) > 1e-8 and log:
                 log(f"shadow rmse diff {rmse_shadow - rmse}")
-        areas = [models.pv_area(p.height, p.fwhm, p.eta) for p in fitted]
-        total = sum(areas) or 1.0
-        perf_extras = {
-            "perf_numba": bool(config.get("perf_numba", False)),
-            "perf_gpu": bool(config.get("perf_gpu", False)),
-            "perf_cache_baseline": bool(config.get("perf_cache_baseline", True)),
-            "perf_seed_all": bool(config.get("perf_seed_all", False)),
-            "perf_max_workers": int(config.get("perf_max_workers", 0)),
-        }
-        solver_opts = dict(config.get(solver_name, {}))
-        center_bounds = (
-            (float(x[0]), float(x[-1]))
-            if (
-                solver_opts.get("centers_in_window")
-                or solver_opts.get("bound_centers_to_window")
-            )
-            else (np.nan, np.nan)
+        # One row builder and one writer for the GUI's Export and batch (2.1). The
+        # rewrite drops this stem's uncertainty files from an earlier fit first.
+        base_path = out_dir / stem
+        local_records = pipeline.peak_records(Path(path).name, res, config, x)
+        pipeline.write_spectrum(
+            base_path, path, x=x, y_raw=y, fit=res, settings=config, trace=save_traces, keep=inputs, log=log
         )
-        med_dx = float(np.median(np.diff(np.sort(x)))) if x.size > 1 else 0.0
-        fwhm_lo = solver_opts.get("min_fwhm", max(1e-6, 2.0 * med_dx))
-        fit_lo = float(config.get("fit_xmin", x[0]))
-        fit_hi = float(config.get("fit_xmax", x[-1]))
-        local_records = []
-        for idx, (p, area) in enumerate(zip(fitted, areas), start=1):
-            rec = {
-                "file": Path(path).name,
-                "peak": idx,
-                "center": p.center,
-                "height": p.height,
-                "fwhm": p.fwhm,
-                "eta": p.eta,
-                "lock_width": p.lock_width,
-                "lock_center": p.lock_center,
-                "area": area,
-                "area_pct": 100.0 * area / total,
-                "rmse": rmse,
-                "fit_ok": bool(res["fit_ok"]),
-                "mode": mode_used,
-                "fit_xmin": fit_lo,
-                "fit_xmax": fit_hi,
-                "solver_choice": solver_name,
-                "solver_loss": config.get("solver_loss", np.nan),
-                "solver_weight": (
-                    "noise_model"
-                    if noise_info and noise_sigma is not None
-                    else config.get("solver_weight", np.nan)
-                ),
-                "solver_fscale": config.get("solver_fscale", np.nan),
-                "solver_maxfev": config.get("solver_maxfev", np.nan),
-                "solver_restarts": config.get("solver_restarts", np.nan),
-                "solver_jitter_pct": config.get("solver_jitter_pct", np.nan),
-                "use_baseline": True,
-                "baseline_mode": mode_used,
-                "baseline_uses_fit_range": bool(
-                    config.get("baseline_uses_fit_range", True)
-                ),
-                "baseline_fit": entry["baseline_fit"],
-                "baseline_order": entry["baseline_order"],
-                **perf_extras,
-                "bounds_center_lo": center_bounds[0],
-                "bounds_center_hi": center_bounds[1],
-                "bounds_fwhm_lo": fwhm_lo,
-                "bounds_height_lo": 0.0,
-                "bounds_height_hi": np.nan,
-                "x_scale": np.nan,
-            }
-            baseline_method = str(base_cfg.get("method", "als")).lower()
-            als_fields = {
-                "als_lam": base_cfg.get("lam"),
-                "als_p": base_cfg.get("p"),
-                "als_niter": base_cfg.get("niter"),
-                "als_thresh": base_cfg.get("thresh"),
-            }
-            if baseline_method != "als":
-                als_fields = {k: np.nan for k in als_fields}
-            # Polynomial metadata: values only for polynomial; NaN for ALS
-            if baseline_method == "polynomial":
-                poly_fields = {
-                    "poly_degree": int(base_cfg.get("degree", 2)),
-                    "poly_normalize_x": bool(base_cfg.get("normalize_x", True)),
-                }
-            else:
-                poly_fields = {
-                    "poly_degree": np.nan,
-                    "poly_normalize_x": np.nan,
-                }
-            # Method label + fields
-            rec["baseline_method"] = baseline_method
-            rec.update(als_fields)
-            rec.update(poly_fields)
-            local_records.append(rec)
-
-        fit_csv = data_io.build_peak_table(local_records)
-        with (out_dir / f"{Path(path).stem}_fit.csv").open(
-            "w", encoding="utf-8", newline=""
-        ) as fh:
-            fh.write(fit_csv)
-        trace_path = None
-        if save_traces:
-            trace_csv = data_io.build_trace_table(x, y, baseline, fitted)
-            trace_path = out_dir / f"{Path(path).stem}_trace.csv"
-            with trace_path.open("w", encoding="utf-8", newline="") as fh:
-                fh.write(trace_csv)
+        trace_path = base_path.with_name(base_path.name + "_trace.csv") if save_traces else None
         records.extend(local_records)
         notes = [] if res["fit_ok"] else [res.get("message") or "the solver did not converge"]
         if res.get("bound_hit"):
@@ -745,8 +574,6 @@ def run_batch(
 
         # Uncertainty problems stay with this file: they are recorded in its
         # status row and never stop the batch.
-        if compute_uncertainty:
-            _remove_stale_uncertainty(out_dir, Path(path).stem, inputs, log)
         unc_res = None
         if res["fit_ok"] and fitted and compute_uncertainty:
             try:
@@ -1101,6 +928,8 @@ def run_batch(
                             "band": unc_res.band,
                             "alpha": diag.get("alpha", alpha),
                         }
+                    if not band_pref_bootstrap and isinstance(unc_res, dict):
+                        unc_res["band"] = None  # a band only when one was asked for
                 else:
                     if "bayes" in str(unc_method_canon).lower():
                         try:
@@ -1209,120 +1038,11 @@ def run_batch(
                         )
                 if unc_res is None:
                     raise RuntimeError("the uncertainty method returned no result")
-                stem = Path(path).stem
-                # The baseline's coefficients are reported with the baseline,
-                # never as another peak's parameters.
-                baseline_info = _baseline_record(res, base_cfg)
-                if joint_pb is not None:
-                    baseline_info.update(
-                        _pop_baseline_stats(unc_res, joint_pb["n_peak_params"], res["joint_baseline"].names())
-                    )
-
-                unc_norm = data_io.normalize_unc_result(unc_res)
-                method_lbl = data_io.canonical_unc_label(
-                    unc_norm.get("label") or unc_method_canon
-                )
-                unc_norm["label"] = method_lbl
-                unc_norm["noise_model"] = noise_info
-                unc_norm["baseline_model"] = baseline_info
-                # Missing statistics stay missing (NaN), and the writers leave
-                # them blank: a NaN rmse is not 0, and dof <= 0 is not 1.
-                unc_norm["rmse"] = rmse
-                try:
-                    dof_val = float(unc_norm.get("dof"))
-                except Exception:
-                    dof_val = float("nan")
-                if not math.isfinite(dof_val):
-                    try:
-                        dof_val = float(res.get("dof", float("nan")))
-                    except Exception:
-                        dof_val = float("nan")
-                unc_norm["dof"] = int(dof_val) if math.isfinite(dof_val) and dof_val > 0 else float("nan")
-                lm = res.get("locked_mask")
-                locks = (
-                    [
-                        dict(zip(("center", "height", "fwhm", "eta"), map(bool, lm[4 * i : 4 * i + 4])))
-                        for i in range(len(lm) // 4)
-                    ]
-                    if lm is not None
-                    else []
-                )
-
-                base_path = out_dir / stem
-                band = unc_norm.get("band") or unc_norm.get("prediction_band")
-                is_bootstrap = method_lbl.lower().startswith("bootstrap")
-
-                if is_bootstrap:
-                    data_io.write_uncertainty_csvs(
-                        base_path,
-                        path,
-                        unc_norm,
-                        write_wide=True,
-                    )
-                    txt_path = base_path.with_name(base_path.name + "_uncertainty.txt")
-                    solver_meta = res.get("solver_meta", {}) if isinstance(res, dict) else {}
-                    baseline_meta = res.get("baseline_meta", {}) if isinstance(res, dict) else {}
-                    perf_meta = res.get("perf_meta", {}) if isinstance(res, dict) else {}
-                    try:
-                        data_io._write_unc_txt(txt_path, path, unc_norm, solver_meta, baseline_meta, perf_meta, locks)
-                    except Exception:
-                        data_io.write_uncertainty_txt(
-                            txt_path,
-                            unc_norm,
-                            peaks=fitted,
-                            method_label=method_lbl,
-                            file_path=path,
-                            solver_meta=solver_meta,
-                            baseline_meta=baseline_meta,
-                            perf_meta=perf_meta,
-                            locks=locks,
-                        )
-
-                    if band_pref_bootstrap and band is not None:
-                        if isinstance(band, (tuple, list)) and len(band) == 3:
-                            xb, lob, hib = band
-                            band_csv = base_path.with_name(base_path.name + "_band.csv")
-                            with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                                writer = csv.writer(fh, lineterminator="\n")
-                                writer.writerow(["x", "ci_lo", "ci_hi"])
-                                for xi, lo, hi in zip(xb, lob, hib):
-                                    try:
-                                        xi_f = float(xi)
-                                        lo_f = float(lo)
-                                        hi_f = float(hi)
-                                    except Exception:
-                                        continue
-                                    if not (math.isfinite(xi_f) and math.isfinite(lo_f) and math.isfinite(hi_f)):
-                                        continue
-                                    writer.writerow([xi_f, lo_f, hi_f])
-                else:
-                    data_io.write_uncertainty_txt(
-                        out_dir / f"{stem}_uncertainty.txt",
-                        unc_norm,
-                        peaks=fitted,
-                        method_label=method_lbl,
-                        file_path=path,
-                        locks=locks,
-                    )
-
-                    data_io.write_uncertainty_csvs(
-                        base_path,
-                        path,
-                        unc_norm,
-                        write_wide=export_unc_wide,
-                    )
-
-                    if band is not None:
-                        xb, lob, hib = band
-                        band_csv = out_dir / f"{stem}_uncertainty_band.csv"
-                        with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                            writer = csv.writer(fh, lineterminator="\n")
-                            level = data_io.ci_level_text(unc_norm.get("alpha", 0.05))
-                            writer.writerow(["x", f"y_lo{level}", f"y_hi{level}"])
-                            for xi, lo, hi in zip(xb, lob, hib):
-                                if not (math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi))):
-                                    continue
-                                writer.writerow([float(xi), float(lo), float(hi)])
+                # The writers' form, with the fit's noise model, baseline, rmse and
+                # dof; one set of files for every method, as the GUI writes them.
+                unc_norm = pipeline.finish_uncertainty(unc_res, res, config, unc_method_canon)
+                method_lbl = unc_norm["label"]
+                pipeline.write_uncertainty(base_path, path, unc_norm, res, config)
 
                 file_rows = list(data_io.iter_uncertainty_rows(path, unc_norm))
                 unc_rows.extend(file_rows)
@@ -1357,7 +1077,7 @@ def run_batch(
                 uncertainty_failures.append((Path(path).name, msg))
                 entry.update(unc_status="failed", unc_message=_one_line(msg))
                 # Drop whatever was written before the failure.
-                _remove_stale_uncertainty(out_dir, Path(path).stem, inputs, log)
+                pipeline.remove_uncertainty_files(base_path, keep=inputs, log=log)
 
         if log:
             msg = f"{Path(path).name}: {'ok' if res['fit_ok'] else 'fail'} rmse={rmse:.3g}"
@@ -1368,14 +1088,14 @@ def run_batch(
     ok = 0
     aborted = False
     try:
-        for i, (path, entry) in enumerate(zip(files, status_rows), 1):
+        for i, (path, stem, entry) in enumerate(zip(files, stems, status_rows), 1):
             if abort_event is not None and getattr(abort_event, "is_set", lambda: False)():
                 aborted = True
                 break
             if progress:
                 progress(i, total, path)
             try:
-                _process_file(path, entry)
+                _process_file(path, stem, entry)
             except Exception as exc:
                 entry.update(
                     status=_fit_failure_status(exc),

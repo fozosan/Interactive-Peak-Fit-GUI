@@ -319,6 +319,14 @@ def run_fit_consistent(
             "jitter_pct": 0.0,
         }
     )
+    # What the solver was told, for the exported tables; the weights are named
+    # before a noise model or fixed sigma replaces them with numbers.
+    solver_used_opts = {
+        "loss": opts["loss"],
+        "weights": opts["weights"] if isinstance(opts["weights"], str) else "custom",
+        "f_scale": opts["f_scale"],
+        "maxfev": opts["maxfev"],
+    }
 
     p0, (lo, hi) = pack_theta_bounds(peaks0, x_fit, opts)
     if joint:
@@ -575,6 +583,7 @@ def run_fit_consistent(
         "baseline_params": baseline_params,
         "restarts_used": restarts,
         "jitter_pct": jitter_pct,
+        "solver_options": solver_used_opts,
         "clipped_after_solve": clipped_after,
         "fit_ok": bool(best_res.success if best_res is not None else False),
         "skip_reason": None,

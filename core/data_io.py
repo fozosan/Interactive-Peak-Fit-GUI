@@ -471,13 +471,13 @@ def load_xy(path: str) -> Tuple[np.ndarray, np.ndarray]:
 def derive_export_paths(user_path: str) -> dict:
     """Return canonical export file paths based on ``user_path``.
 
-    ``user_path`` may have any extension; the returned paths drop the
-    extension and append ``_fit.csv``, ``_trace.csv`` and the uncertainty
-    artefacts.
+    ``user_path`` is the name typed into the Export dialog. A trailing ``.csv``
+    is dropped and ``_fit.csv``, ``_trace.csv`` and the uncertainty artefacts
+    are appended; any other dot belongs to the name, so ``MoS2_0.5mW`` stays
+    whole (``Path.with_suffix`` would cut it to ``MoS2_0``).
     """
 
-    p = Path(user_path)
-    base = p.with_suffix("")
+    base = _drop_csv_suffix(user_path)
     return {
         "fit": base.with_name(base.name + "_fit.csv"),
         "trace": base.with_name(base.name + "_trace.csv"),

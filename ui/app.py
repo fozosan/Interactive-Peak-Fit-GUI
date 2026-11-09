@@ -279,6 +279,8 @@ except Exception:  # pragma: no cover - NotAvailable may be absent
     class NotAvailable:  # pragma: no cover - fallback placeholder
         pass
 from core.residuals import build_residual, jacobian_fd
+from core import fit_api, pipeline
+from core import peaks as core_peaks
 from core.fit_api import (
     classic_step,
     modern_trf_step,
@@ -1512,6 +1514,8 @@ class PeakFitApp:
             except Exception:
                 pass
         self._compute_chk = None
+        # The last fit and what it was fitted to (see _current_fit)
+        self._fit = None
         # Uncertainty state
         self.last_uncertainty = None
         self._last_unc_locks: List[Dict[str, bool]] = []
@@ -2635,6 +2639,106 @@ class PeakFitApp:
             "height_factor": float(self.classic_height_factor.get()),
             "width_caps": width_caps,
         }
+
+    def _settings(self) -> dict:
+        """Every setting the core path reads, from the widgets (Tk thread only).
+
+        One dict for Fit, Export and Run Batch (game plan 2.1), so that a fit, its
+        exported table and a batch over the same files use the same values. Batch
+        adds its own defaults for the keys the GUI leaves out: noise_model and
+        baseline_fit (decisions D1 and D2).
+        """
+
+        solver = self.solver_choice.get()
+        opts = self._solver_options(solver)
+        boot = self._bootstrap_cfg_from_gui()
+        try:
+            unc_workers = int(float(self.perf_unc_workers.get()))
+        except Exception:
+            unc_workers = int(self.cfg.get("perf_unc_workers", 0) or 0)
+        settings = {
+            "solver": solver,
+            solver: opts,
+            # the Modern solvers' restarts, which run_fit_consistent runs itself
+            "solver_restarts": int(opts.get("restarts", 1) or 1),
+            "solver_jitter_pct": float(opts.get("jitter_pct", 0.0) or 0.0),
+            "mode": self.baseline_mode.get(),
+            "use_baseline": bool(self.use_baseline.get()),
+            "baseline": self._current_baseline_cfg(),
+            "baseline_uses_fit_range": bool(self.baseline_use_range.get()),
+            "perf_numba": bool(self.perf_numba.get()),
+            "perf_gpu": bool(self.perf_gpu.get()),
+            "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
+            "perf_seed_all": bool(self.perf_seed_all.get()),
+            "perf_seed": boot["seed"] if boot["seed"] is not None else "",
+            "perf_max_workers": int(self.perf_max_workers.get()),
+            "perf_unc_workers": unc_workers,
+            "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
+            "perf_blas_threads": int(self.perf_blas_threads.get()),
+            "unc_method": self._unc_selected_method_key(),
+            "unc_alpha": float(self._safe_alpha()),
+            "unc_center_resid": bool(self.center_resid_var.get()),
+            "unc_boot_solver": boot["solver"],
+            "bootstrap_n": int(boot["n"]),
+            "bootstrap_jitter": float(boot["jitter"]),
+            # whether a band is computed: the GUI's Compute band, not its Show band
+            "ui_band_pref_bootstrap": bool(self._should_compute_ci_band()),
+            "export_unc_wide": bool(self.cfg.get("export_unc_wide", False)),
+            "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
+            "lmfit_share_eta": bool(self.lmfit_share_eta.get()),
+            "bayes_band_enabled": bool(self.bayes_band_enabled_var.get()),
+            "bayes_band_force": bool(self.bayes_band_force_var.get()),
+            "bayes_band_max_draws": self._bayes_band_max_draws_value(),
+            "bayes_diagnostics": bool(self.bayes_diag_var.get()),
+            "bayes_diag_ess_min": self._bayes_diag_ess_min_value(),
+            "bayes_diag_rhat_max": self._bayes_diag_rhat_max_value(),
+            "bayes_diag_mcse_mean": self._bayes_diag_mcse_value(),
+            "bayes_walkers": int(self._safe_bayes_walkers()),
+            "bayes_burn": int(self._safe_bayes_burn()),
+            "bayes_steps": int(self._safe_bayes_steps()),
+            "bayes_thin": int(self._safe_bayes_thin()),
+            "bayes_prior_sigma": str(self.bayes_prior_var.get() or self.cfg.get("bayes_prior_sigma", "half_cauchy")),
+            "log_debug_mode": bool(self.debug_mode_var.get()),
+        }
+        if self.fit_xmin is not None and self.fit_xmax is not None:
+            settings["fit_xmin"] = float(self.fit_xmin)
+            settings["fit_xmax"] = float(self.fit_xmax)
+        return settings
+
+    def _fit_inputs(self):
+        """What a fit of the current state sees: x, y, the baseline it holds fixed
+        (zeros with Use baseline off), the fit window's mask and the mode."""
+
+        base = self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
+        return self.x, self.y_raw, np.asarray(base, float), self.current_fit_mask(), self.baseline_mode.get()
+
+    def _peak_state(self) -> list:
+        return [(p.center, p.height, p.fwhm, p.eta, bool(p.lock_center), bool(p.lock_width)) for p in self.peaks]
+
+    def _current_fit(self) -> Optional[dict]:
+        """The last fit, while it is still the fit of what the app shows: the same
+        data, baseline, window and mode, and the peaks as the fit left them."""
+
+        rec = getattr(self, "_fit", None)
+        if rec is None or self.x is None or self.y_raw is None:
+            return None
+        x, y, base, mask, mode = self._fit_inputs()
+        same = (
+            mode == rec["mode"]
+            and self._peak_state() == rec["peaks"]
+            and all(np.array_equal(a, b) for a, b in ((x, rec["x"]), (y, rec["y"]), (base, rec["baseline"]), (mask, rec["mask"])))
+        )
+        return rec if same else None
+
+    def _export_fit(self) -> dict:
+        """The fit an export describes: the current one, or the peaks as they are,
+        which no fit produced (fit_ok False)."""
+
+        rec = self._current_fit()
+        if rec is not None:
+            return rec["result"]
+        x, y, base, mask, mode = self._fit_inputs()
+        return pipeline.unfitted(x, y, self.peaks, base, mode, mask)
 
     @log_action
     def _on_boot_solver_choice(self, *_):
@@ -4552,33 +4656,33 @@ class PeakFitApp:
             return
         self._sync_selected_edits()
 
-        y_target = self.get_fit_target()
-
-        mask = self.current_fit_mask()
+        x, y, base, mask, mode = self._fit_inputs()
         if mask is None or not np.any(mask):
             messagebox.showwarning("Fit", "Fit range is empty. Use 'Full range' or set a valid Min/Max.")
             return
-        x_fit = self.x[mask]
-        y_fit = y_target[mask]
 
-        base_applied = self.use_baseline.get() and self.baseline is not None
-        add_mode = (self.baseline_mode.get() == "add")
-        base_fit = self.baseline[mask] if (base_applied and add_mode) else None
-        mode = "add" if add_mode else "subtract"
-
-        solver = self.solver_choice.get()
-        options = self._solver_options()
-        options["solver"] = solver
+        # The fit batch runs for each file (game plan 2.1): the same call, the
+        # same settings and, with Seed all, the same per-file seed.
+        settings = self._settings()
+        solver = settings["solver"]
         # Keep solver_options mirrored in persistent cfg for uncertainty paths
         try:
-            self.cfg["solver_options"] = dict(options)
+            self.cfg["solver_options"] = {**settings[solver], "solver": solver}
             save_config(self.cfg)
         except Exception:
             pass
+        seeds = [
+            core_peaks.Peak(p.center, p.height, p.fwhm, p.eta, bool(p.lock_center), bool(p.lock_width))
+            for p in self.peaks
+        ]
+        caps = [(bool(getattr(p, "fwhm_cap_enabled", False)), float(getattr(p, "fwhm_cap_value", 50.0))) for p in self.peaks]
+        perf_seed = self._perf_seed_value()
+        rng_seed = pipeline.file_seed(self.current_file or "", perf_seed) if settings["perf_seed_all"] else None
 
         def work():
-            return orchestrator.run_fit_with_fallbacks(
-                x_fit, y_fit, self.peaks, mode, base_fit, options
+            return fit_api.run_fit_consistent(
+                x, y, seeds, settings, base, mode, mask,
+                reheight=False, rng_seed=rng_seed, return_jacobian=True, return_predictors=True,
             )
 
         def done(res, err):
@@ -4589,7 +4693,20 @@ class PeakFitApp:
                     self.log(traceback.format_exception_only(type(err), err)[0].strip(), level="ERROR")
                     messagebox.showerror("Fit", f"Fitting failed:\n{err}")
                 return
-            self.peaks[:] = res.peaks_out
+            if res.get("skip_reason") is not None:
+                self.set_busy(False, "Fit not run.")
+                messagebox.showwarning("Fit", f"Fit not run: {res.get('message', '')}")
+                return
+            self.peaks[:] = [
+                Peak(center=pk.center, height=pk.height, fwhm=pk.fwhm, eta=pk.eta,
+                     lock_width=pk.lock_width, lock_center=pk.lock_center,
+                     fwhm_cap_enabled=cap_on, fwhm_cap_value=cap_value)
+                for pk, (cap_on, cap_value) in zip(res["peaks_out"], caps)
+            ]
+            self._fit = {
+                "result": res, "settings": settings, "x": np.array(x), "y": np.array(y),
+                "baseline": np.array(base), "mask": np.array(mask), "mode": mode, "peaks": self._peak_state(),
+            }
             self.refresh_tree(keep_selection=True)
             self.last_uncertainty = None
             self.ci_band = None
@@ -4597,10 +4714,11 @@ class PeakFitApp:
             self._last_unc_locks = []
             self._set_ci_toggle_state(False)
             self.refresh_plot()
-            self.set_busy(False, f"Fit done. RMSE {res.rmse:.4g}")
+            rmse = float(res["rmse"])
+            self.set_busy(False, f"Fit done. RMSE {rmse:.4g}")
             npts = int(np.count_nonzero(mask))
             self.log(
-                f"Fit finished: RMSE={res.rmse:.4g} over {npts} pts (peaks={len(self.peaks)})"
+                f"Fit finished: RMSE={rmse:.4g} over {npts} pts (peaks={len(self.peaks)})"
             )
 
         self.step_btn.config(state=tk.DISABLED)
@@ -4623,8 +4741,8 @@ class PeakFitApp:
         )
         if not out_csv:
             return
-        p = Path(out_csv)
-        base = p.with_suffix("")
+        # Only a trailing .csv is dropped: a typed name keeps its dots.
+        base = _dio._drop_csv_suffix(out_csv)
         output_dir = base.parent
         output_base = base.name
         fit_path = output_dir / f"{output_base}_fit.csv"
@@ -4645,17 +4763,6 @@ class PeakFitApp:
         elif source == "current":
             peaks_list = [p.__dict__ for p in self.peaks]
 
-        solver = self.solver_choice.get()
-        fit_workers_eff = self._resolve_fit_workers()
-        try:
-            unc_workers_raw = int(float(self.perf_unc_workers.get()))
-        except Exception:
-            try:
-                unc_workers_raw = int(self.cfg.get("perf_unc_workers", 0) or 0)
-            except Exception:
-                unc_workers_raw = 0
-
-        boot_cfg = self._bootstrap_cfg_from_gui()
         knobs_raw = {
             "walkers": self._safe_bayes_walkers(),
             "burn": self._safe_bayes_burn(),
@@ -4675,56 +4782,17 @@ class PeakFitApp:
         except Exception:
             pass
 
+        # The settings the GUI fits and exports with, plus the batch's own choices.
         cfg = {
+            **self._settings(),
             "peaks": peaks_list,
-            "solver": solver,
-            "mode": self.baseline_mode.get(),
-            "baseline": self._current_baseline_cfg(),
             "save_traces": bool(self.batch_save_traces.get()),
             "source": source,
             "reheight": bool(self.batch_reheight.get()),
             "auto_max": int(self.batch_auto_max.get()),
-            solver: self._solver_options(solver),
-            "baseline_uses_fit_range": bool(self.baseline_use_range.get()),
-            "perf_numba": bool(self.perf_numba.get()),
-            "perf_gpu": bool(self.perf_gpu.get()),
-            "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
-            "perf_seed_all": bool(self.perf_seed_all.get()),
-            "perf_max_workers": int(fit_workers_eff),
-            "perf_unc_workers": int(unc_workers_raw),
-            "perf_seed": boot_cfg["seed"] if boot_cfg["seed"] is not None else "",
-            "perf_parallel_strategy": str(self.perf_parallel_strategy.get()),
-            "perf_blas_threads": int(self.perf_blas_threads.get()),
             "output_dir": str(output_dir),
             "output_base": output_base,
-            "unc_boot_solver": boot_cfg["solver"],
-            "bootstrap_n": int(boot_cfg["n"]),
-            "bootstrap_jitter": float(boot_cfg["jitter"]),
-            "ui_band_pref_bootstrap": bool(boot_cfg["band_pref"]),
-            "lmfit_share_fwhm": bool(self.lmfit_share_fwhm.get()),
-            "lmfit_share_eta": bool(self.lmfit_share_eta.get()),
-            # Bayesian band configuration
-            "bayes_band_enabled": bool(self.bayes_band_enabled_var.get()),
-            "bayes_band_force": bool(self.bayes_band_force_var.get()),
-            "bayes_band_max_draws": self._bayes_band_max_draws_value(),
-            "bayes_diagnostics": bool(self.bayes_diag_var.get()),
-            "bayes_diag_ess_min": self._bayes_diag_ess_min_value(),
-            "bayes_diag_rhat_max": self._bayes_diag_rhat_max_value(),
-            "bayes_diag_mcse_mean": self._bayes_diag_mcse_value(),
-            "bayes_walkers": int(bayes_knobs["walkers"]),
-            "bayes_burn": int(bayes_knobs["burn"]),
-            "bayes_steps": int(bayes_knobs["steps"]),
-            "bayes_thin": int(bayes_knobs["thin"]),
-            "bayes_prior_sigma": str(
-                self.bayes_prior_var.get()
-                or self.cfg.get("bayes_prior_sigma", "half_cauchy")
-            ),
-            "log_debug_mode": bool(self.debug_mode_var.get()),
         }
-
-        if self.fit_xmin is not None and self.fit_xmax is not None:
-            cfg["fit_xmin"] = float(self.fit_xmin)
-            cfg["fit_xmax"] = float(self.fit_xmax)
 
         self.cfg["batch_patterns"] = self.batch_patterns.get()
         self.cfg["batch_source"] = source
@@ -6821,6 +6889,45 @@ class PeakFitApp:
         self.status_info(f"Batch done: processed {len(files)} files.")
         self._debug_snapshot("batch.done", n_rows=len(all_rows))
 
+    def _export_uncertainty_raw(self):
+        """The uncertainty result Export writes: the cached one while it belongs to
+        the current peaks, window, method and settings, else one computed now."""
+
+        method_key = self._unc_selected_method_key()
+        mask = self.current_fit_mask()
+        if mask is None or not np.any(mask):
+            mask = np.ones_like(self.x, dtype=bool)
+        add_mode = self.baseline_mode.get() == "add"
+        x_fit = self.x[mask]
+        y_fit_target = self.get_fit_target()[mask]
+        base_for_unc = (
+            self.baseline[mask]
+            if (self.use_baseline.get() and add_mode and self.baseline is not None)
+            else None
+        )
+        theta_now = np.asarray([v for p in self.peaks for v in (p.center, p.height, p.fwhm, p.eta)], float)
+        cached = getattr(self, "last_uncertainty", None)
+        fw = getattr(self, "_last_unc_fitwin", (float("nan"), float("nan"), 0))
+        same_window = x_fit.size == int(fw[2]) and (
+            x_fit.size == 0 or (float(x_fit[0]) == float(fw[0]) and float(x_fit[-1]) == float(fw[1]))
+        )
+        reuse = (
+            isinstance(cached, dict)
+            and bool(cached)
+            and _canonical_unc_label(cached.get("label") or cached.get("method") or "")
+            == _canonical_unc_label(method_key)
+            and np.array_equal(theta_now, getattr(self, "_last_unc_theta", np.asarray([], float)))
+            and same_window
+            and getattr(self, "_last_unc_signature", None) == self._current_uncertainty_signature()
+        )
+        if reuse:
+            self.status_info("Exporting uncertainty: reusing cached GUI result.")
+            return cached
+        self.status_info("Exporting uncertainty: recomputed (cache stale/missing).")
+        return self._compute_uncertainty_sync(
+            method_key, x_fit=x_fit, y_fit=y_fit_target, base_fit=base_for_unc, add_mode=add_mode
+        )
+
     def on_export(self):
         if self.x is None or self.y_raw is None or not self.peaks:
             messagebox.showinfo("Export", "Load data and perform a fit first.")
@@ -6832,424 +6939,38 @@ class PeakFitApp:
         )
         if not out_csv:
             return
-        paths = _dio.derive_export_paths(out_csv)
-
-        areas = [pseudo_voigt_area(p.height, p.fwhm, p.eta) for p in self.peaks]
-        total_area = float(np.sum(areas)) if areas else 1.0
-
-        y_target = self.get_fit_target()
-        total_peaks = np.zeros_like(self.x, float)
-        comp_cols = {}
-        for i, p in enumerate(self.peaks, 1):
-            comp = pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
-            comp_cols[f"peak{i}"] = comp
-            total_peaks += comp
-
-        base = self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
-        if self.use_baseline.get() and self.baseline_mode.get() == "add":
-            y_fit = base + total_peaks
-        else:
-            y_fit = total_peaks
-
-        mask = self.current_fit_mask()
-        if mask is None or not np.any(mask):
-            mask = np.ones_like(self.x, dtype=bool)
-        rmse = float(np.sqrt(np.mean((y_target[mask] - y_fit[mask]) ** 2))) if np.any(mask) else float(np.sqrt(np.mean((y_target - y_fit) ** 2)))
-        dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
-
-        rows = []
-        fname = self.current_file.name if self.current_file else ""
-        opts = self._solver_options()
-        solver = self.solver_choice.get()
-        perf_extras = {
-            "perf_numba": bool(self.perf_numba.get()),
-            "perf_gpu": bool(self.perf_gpu.get()),
-            "perf_cache_baseline": bool(self.perf_cache_baseline.get()),
-            "perf_seed_all": bool(self.perf_seed_all.get()),
-            "perf_max_workers": int(self.perf_max_workers.get()),
-            "perf_unc_workers": int(self.perf_unc_workers.get()),
-        }
-        center_bounds = (self.fit_xmin, self.fit_xmax) if (opts.get("centers_in_window") or opts.get("bound_centers_to_window")) else (np.nan, np.nan)
-        if self.x is not None and self.x.size > 1:
-            med_dx = float(np.median(np.diff(np.sort(self.x))))
-        else:
-            med_dx = 0.0
-        fwhm_lo = opts.get("min_fwhm", max(1e-6, 2.0 * med_dx))
-        for i, (p, a) in enumerate(zip(self.peaks, areas), 1):
-            row = {
-                "file": fname,
-                "peak": i,
-                "center": p.center,
-                "height": p.height,
-                "fwhm": p.fwhm,
-                "eta": p.eta,
-                "lock_width": p.lock_width,
-                "lock_center": p.lock_center,
-                "area": a,
-                "area_pct": 100.0 * a / total_area,
-                "rmse": rmse,
-                "fit_ok": True,
-                "mode": self.baseline_mode.get(),
-                "fit_xmin": self.fit_xmin if self.fit_xmin is not None else float(self.x.min()),
-                "fit_xmax": self.fit_xmax if self.fit_xmax is not None else float(self.x.max()),
-                "solver_choice": solver,
-                "solver_loss": opts.get("loss", np.nan),
-                "solver_weight": opts.get("weights", np.nan),
-                "solver_fscale": opts.get("f_scale", np.nan),
-                "solver_maxfev": opts.get("maxfev", np.nan),
-                "solver_restarts": opts.get("restarts", np.nan),
-                "solver_jitter_pct": opts.get("jitter_pct", np.nan),
-                "use_baseline": bool(self.use_baseline.get()),
-                "baseline_mode": self.baseline_mode.get(),
-                "baseline_uses_fit_range": bool(self.baseline_use_range.get()),
-                **perf_extras,
-                "bounds_center_lo": center_bounds[0],
-                "bounds_center_hi": center_bounds[1],
-                "bounds_fwhm_lo": fwhm_lo,
-                "bounds_height_lo": 0.0,
-                "bounds_height_hi": np.nan,
-                "x_scale": opts.get("x_scale", np.nan),
-            }
-            baseline_method = self.base_method_var.get().strip().lower()
-            als_fields = {
-                "als_lam": float(self.als_lam.get()),
-                "als_p": float(self.als_asym.get()),
-                "als_niter": int(self.als_niter.get()),
-                "als_thresh": float(self.als_thresh.get()),
-            }
-            if baseline_method != "als":
-                als_fields = {k: np.nan for k in als_fields}
-            # Polynomial metadata: values only for polynomial; NaN for ALS
-            if baseline_method == "polynomial":
-                poly_fields = {
-                    "poly_degree": int(self.poly_degree_var.get()),
-                    "poly_normalize_x": bool(self.poly_norm_var.get()),
-                }
-            else:
-                poly_fields = {
-                    "poly_degree": np.nan,
-                    "poly_normalize_x": np.nan,
-                }
-            # Method label + fields
-            row["baseline_method"] = baseline_method
-            row.update(als_fields)
-            row.update(poly_fields)
-            rows.append(row)
-        peak_csv = _dio.build_peak_table(rows)
-        with open(paths["fit"], "w", encoding="utf-8", newline="") as fh:
-            fh.write(peak_csv)
-
-        trace_csv = _dio.build_trace_table(
-            self.x, self.y_raw, base if self.use_baseline.get() else None, self.peaks
-        )
-        with open(paths["trace"], "w", encoding="utf-8", newline="") as fh:
-            fh.write(trace_csv)
-
-        saved = [paths["fit"], paths["trace"]]
-        saved_unc: List[str] = []
+        # Only a trailing .csv is dropped: a typed MoS2_0.5mW keeps its dots.
+        base = _dio._drop_csv_suffix(out_csv)
+        # The fit the table describes, with the settings it ran with; peaks no fit
+        # produced (placed by hand, or edited since the fit) say fit_ok False.
+        record = self._current_fit()
+        fit = self._export_fit()
+        settings = dict(record["settings"]) if record is not None else self._settings()
+        settings["export_unc_wide"] = bool(self.cfg.get("export_unc_wide", False))
+        unc_norm = None
         try:
-            export_base = Path(out_csv).with_suffix("")
-            write_wide = bool(getattr(self, "cfg", {}).get("export_unc_wide", False))
-
-            # Single export: **prefer the GUI-cached uncertainty** for parity.
-            # Only recompute if cache is clearly stale (method/theta/fit-window changed or cache missing).
-            saved_unc = []
-            if self.peaks:
-                method_key = self._unc_selected_method_key()
-                last_method_label = getattr(self, "_last_unc_method", None)
-                method_for_export = last_method_label or method_key
-                add_mode = (self.baseline_mode.get() == "add")
-
-                mask = self.current_fit_mask()
-                if mask is None or not np.any(mask):
-                    mask = np.ones_like(self.x, dtype=bool)
-
-                x_fit = self.x[mask]
-                y_target = self.get_fit_target()
-                y_fit_target = y_target[mask]
-                base_for_unc = (
-                    self.baseline[mask]
-                    if (self.use_baseline.get() and add_mode and self.baseline is not None)
-                    else None
-                )
-
-                # build current theta snapshot
-                theta_now = []
-                for _p in self.peaks:
-                    theta_now.extend([_p.center, _p.height, _p.fwhm, _p.eta])
-                theta_now = np.asarray(theta_now, float)
-
-                # Guard: if the cached GUI result is stale (method/fit window/signature),
-                # recompute it with the same method used in the GUI so the export matches.
-                last_unc = getattr(self, "last_uncertainty", None)
-                guard_recompute = False
-                try:
-                    if isinstance(last_unc, dict) and last_unc:
-                        last_sig = getattr(self, "_last_unc_signature", None)
-                        sig_now = self._current_uncertainty_signature()
-                        if sig_now != last_sig:
-                            guard_recompute = True
-                        else:
-                            cached_label = _canonical_unc_label(
-                                last_unc.get("label") or last_unc.get("method") or ""
-                            )
-                            last_method_canon = _canonical_unc_label(last_method_label or "")
-                            selected_label = _canonical_unc_label(method_key)
-                            if last_method_canon and selected_label != last_method_canon:
-                                guard_recompute = True
-                            if not guard_recompute:
-                                fw = getattr(self, "_last_unc_fitwin", (float("nan"), float("nan"), 0))
-                                guard_recompute = not (
-                                    x_fit.size == int(fw[2])
-                                    and (
-                                        x_fit.size == 0
-                                        or (
-                                            float(x_fit[0]) == float(fw[0])
-                                            and float(x_fit[-1]) == float(fw[1])
-                                        )
-                                    )
-                                )
-                except Exception:
-                    guard_recompute = False
-
-                if guard_recompute:
-                    try:
-                        self.log_threadsafe("Uncertainty cache stale; recomputing with current settings…")
-                    except Exception:
-                        pass
-                    try:
-                        recompute_method = last_method_label or method_key
-                        refreshed = self._compute_uncertainty_sync(
-                            recompute_method,
-                            x_fit=x_fit,
-                            y_fit=y_fit_target,
-                            base_fit=base_for_unc,
-                            add_mode=add_mode,
-                        )
-                        if isinstance(refreshed, dict):
-                            refreshed = _normalize_unc_result(refreshed)
-                            self.last_uncertainty = refreshed
-                            method_for_export = recompute_method
-                            canon_label = _canonical_unc_label(
-                                refreshed.get("label") or refreshed.get("method") or recompute_method
-                            )
-                            self._last_unc_method = canon_label
-                            self._last_unc_theta = np.asarray(theta_now, float)
-                            self._last_unc_fitwin = (
-                                float(x_fit[0]) if x_fit.size else float("nan"),
-                                float(x_fit[-1]) if x_fit.size else float("nan"),
-                                int(x_fit.size),
-                            )
-                            self._last_unc_signature = self._current_uncertainty_signature()
-                            locks = []
-                            for pk in self.peaks:
-                                locks.append(
-                                    {
-                                        "center": bool(getattr(pk, "lock_center", False)),
-                                        "fwhm": bool(getattr(pk, "lock_width", False)),
-                                        "eta": False,
-                                    }
-                                )
-                            self._last_unc_locks = locks
-                            band_tup = self._band_tuple_from(refreshed)
-                            if band_tup is not None and self.show_ci_band_var.get():
-                                bx, blo, bhi = band_tup
-                                self.ci_band = (
-                                    np.asarray(bx, float),
-                                    np.asarray(blo, float),
-                                    np.asarray(bhi, float),
-                                )
-                            elif band_tup is None:
-                                self.ci_band = None
-                    except Exception:
-                        pass
-
-                method_for_export = getattr(self, "_last_unc_method", None) or method_for_export
-
-                # check if we can reuse the last GUI result
-                use_cache = False
-                try:
-                    # canonicalize both labels for comparison
-                    cached = getattr(self, "last_uncertainty", None)
-                    cached_label = _canonical_unc_label(
-                        (cached or {}).get("label") or (cached or {}).get("method") or ""
-                    ) if isinstance(cached, dict) else ""
-                    export_label = _canonical_unc_label(method_for_export)
-
-                    same_method = (cached_label == export_label and bool(cached))
-                    same_theta = np.allclose(
-                        theta_now,
-                        getattr(self, "_last_unc_theta", np.asarray([], float)),
-                        rtol=0,
-                        atol=0,
-                    )
-                    fw = getattr(self, "_last_unc_fitwin", (float("nan"), float("nan"), 0))
-                    same_fitwin = (
-                        x_fit.size == int(fw[2])
-                        and (
-                            x_fit.size == 0
-                            or (
-                                float(x_fit[0]) == float(fw[0])
-                                and float(x_fit[-1]) == float(fw[1])
-                            )
-                        )
-                    )
-                    sig_cached = getattr(self, "_last_unc_signature", None)
-                    sig_current = self._current_uncertainty_signature()
-                    same_sig = bool(sig_cached == sig_current)
-                    use_cache = bool(same_method and same_theta and same_fitwin and same_sig)
-                except Exception:
-                    use_cache = False
-
-                if use_cache:
-                    # Export exactly what the GUI computed
-                    unc_norm = _normalize_unc_result(self.last_uncertainty)
-                else:
-                    # Fallback: compute once through the same pipeline
-                    unc = self._compute_uncertainty_sync(
-                        method_for_export,
-                        x_fit=x_fit,
-                        y_fit=y_fit_target,
-                        base_fit=base_for_unc,
-                        add_mode=add_mode,
-                    )
-
-                    # Build model on full x to compute RMSE/DOF using the current fit window
-                    total_peaks = np.zeros_like(self.x, float)
-                    for p in self.peaks:
-                        total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
-
-                    base_array = (
-                        self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
-                    )
-                    model = base_array + total_peaks if add_mode else total_peaks
-
-                    rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float(
-                        np.sqrt(np.mean((y_target - model) ** 2))
-                    )
-                    dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
-
-                    # Normalize + canonicalize label, then attach RMSE/DOF from current export context
-                    unc_norm = _normalize_unc_result(unc)
-                    raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_for_export)
-                    label = _canonical_unc_label(raw_lbl)
-                    unc_norm["label"] = label
-                    unc_norm["rmse"] = rmse
-                    unc_norm["dof"] = dof
-                    if not unc_norm.get("stats"):
-                        raise RuntimeError("Export uncertainty normalization produced no stats")
-
-                # If the cached result needs RMSE/DOF normalization, attach it lazily here.
-                if use_cache:
-                    # Build model on full x to compute RMSE/DOF using the current fit window
-                    total_peaks = np.zeros_like(self.x, float)
-                    for p in self.peaks:
-                        total_peaks += pseudo_voigt(self.x, p.height, p.center, p.fwhm, p.eta)
-
-                    base_array = (
-                        self.baseline if (self.use_baseline.get() and self.baseline is not None) else np.zeros_like(self.x)
-                    )
-                    model = base_array + total_peaks if add_mode else total_peaks
-
-                    rmse = float(np.sqrt(np.mean((y_target[mask] - model[mask]) ** 2))) if np.any(mask) else float(
-                        np.sqrt(np.mean((y_target - model) ** 2))
-                    )
-                    dof = max(1, int(np.sum(mask)) - 4 * len(self.peaks))
-
-                    raw_lbl = (unc_norm.get("label") or unc_norm.get("method") or method_for_export)
-                    label = _canonical_unc_label(raw_lbl)
-                    unc_norm["label"] = label
-                    unc_norm["rmse"] = rmse
-                    unc_norm["dof"] = dof
-                    if not unc_norm.get("stats"):
-                        raise RuntimeError("Export uncertainty normalization produced no stats")
-
-                # Note whether we reused cached GUI result or recomputed
-                if use_cache:
-                    self.status_info("Exporting uncertainty: reusing cached GUI result.")
-                else:
-                    self.status_info("Exporting uncertainty: recomputed (cache stale/missing).")
-
-                # CSVs (long + optional wide)
-                long_csv, wide_csv = write_uncertainty_csvs(
-                    export_base, self.current_file or "", unc_norm, write_wide=write_wide
-                )
-                saved_unc.extend([str(long_csv)] + ([str(wide_csv)] if wide_csv else []))
-
-                # TXT — pass peaks + method_label and metadata as before
-                solver_opts = getattr(self, "_solver_options", lambda: SimpleNamespace())()
-                if hasattr(solver_opts, "__dict__"):
-                    solver_opts = solver_opts.__dict__
-                solver_meta = {"solver": self.solver_choice.get(), **solver_opts}
-                baseline_method = self.base_method_var.get().strip().lower()
-                baseline_meta = {
-                    "uses_fit_range": bool(self.baseline_use_range.get()),
-                    "method": baseline_method,
-                    "lam": float(self.als_lam.get()) if baseline_method == "als" else np.nan,
-                    "p": float(self.als_asym.get()) if baseline_method == "als" else np.nan,
-                    "niter": int(self.als_niter.get()) if baseline_method == "als" else np.nan,
-                    "thresh": float(self.als_thresh.get()) if baseline_method == "als" else np.nan,
-                }
-                perf_meta = {
-                    "numba": bool(self.perf_numba.get()),
-                    "gpu": bool(self.perf_gpu.get()),
-                    "cache_baseline": bool(self.perf_cache_baseline.get()),
-                    "seed_all": bool(self.perf_seed_all.get()),
-                    "max_workers": int(self.perf_max_workers.get()),
-                    "unc_workers": int(self.perf_unc_workers.get()),
-                }
-                locks = getattr(self, "_last_unc_locks", [])
-
-                txt_path = export_base.with_name(export_base.name + "_uncertainty.txt")
-                write_uncertainty_txt(
-                    txt_path,
-                    unc_norm,
-                    peaks=self.peaks,
-                    method_label=label,
-                    file_path=self.current_file or "",
-                    solver_meta=solver_meta,
-                    baseline_meta=baseline_meta,
-                    perf_meta=perf_meta,
-                    locks=locks,
-                )
-                saved_unc.append(str(txt_path))
-
-                # also export prediction band for any method if present (asymptotic & bootstrap)
-                band_tup = self._band_tuple_from(unc_norm)
-                if band_tup is not None:
-                    bx, blo, bhi = band_tup
-                    band_csv = export_base.with_name(export_base.name + "_uncertainty_band.csv")
-                    try:
-                        import csv, math
-                        # dynamic header reflects chosen alpha
-                        try:
-                            ci_pct = int(round(100 * (1.0 - self._safe_alpha())))
-                        except Exception:
-                            ci_pct = 95
-                        with band_csv.open("w", newline="", encoding="utf-8") as fh:
-                            w = csv.writer(fh, lineterminator="\n")
-                            w.writerow(["x", f"y_lo{ci_pct}", f"y_hi{ci_pct}"])
-                            for xi, lo, hi in zip(bx, blo, bhi):
-                                if math.isfinite(float(xi)) and math.isfinite(float(lo)) and math.isfinite(float(hi)):
-                                    w.writerow([float(xi), float(lo), float(hi)])
-                        saved_unc.append(str(band_csv))
-                    except Exception:
-                        pass
-
-                self.log(f"Exported uncertainty ({label}).")
-                for pth in saved_unc:
-                    self.log(f"  wrote: {pth}")
-            else:
-                self.log("Export: no peaks, uncertainty not computed.")
+            raw = self._export_uncertainty_raw()
+            if raw is not None:
+                unc_norm = pipeline.finish_uncertainty(raw, fit, settings, self._unc_selected_method_key())
+                if not unc_norm.get("stats"):
+                    raise RuntimeError("Export uncertainty normalization produced no stats")
         except Exception as e:  # pragma: no cover - defensive
+            unc_norm = None
             self.status_warn(f"Uncertainty export failed: {e}")
-
-        saved.extend(saved_unc)
-        saved_lines = [str(p) for p in saved if p]
+        source = str(self.current_file or "")
+        keep = {os.path.normcase(os.path.abspath(source))} if source else set()
+        # The writer batch uses: the fit table, the trace and the uncertainty
+        # files, after removing uncertainty files an earlier export left here.
+        written = pipeline.write_spectrum(
+            base, source, x=self.x, y_raw=self.y_raw, fit=fit, settings=settings,
+            unc_norm=unc_norm, trace=True, keep=keep, log=self.log,
+        )
+        if unc_norm is not None:
+            self.log(f"Exported uncertainty ({unc_norm['label']}).")
+        saved_lines = [str(p) for p in written]
         for p in saved_lines:
             self.log(f"Export: wrote {p}")
         messagebox.showinfo("Export", "Saved:\n" + "\n".join(saved_lines))
-
 
 
     # ----- Plot -----
