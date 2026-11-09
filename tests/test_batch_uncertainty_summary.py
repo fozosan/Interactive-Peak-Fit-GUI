@@ -70,5 +70,7 @@ def test_batch_uncertainty_summary(tmp_path):
         "noise_g",
         "noise_n",
         "noise_method",
+        "baseline_fit",
+        "baseline_order",
     }
     assert len(unc_df) == 2 * 1 * 4

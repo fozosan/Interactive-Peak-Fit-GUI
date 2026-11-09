@@ -8,6 +8,7 @@ from scipy.optimize import curve_fit
 
 from core.peaks import Peak
 from core.weights import noise_weights
+from core.baseline_model import joint_from_options
 from infra import performance as perf
 
 W_MIN = 1e-6  # minimal physical FWHM
@@ -133,7 +134,10 @@ def solve(x, y, peaks, mode, baseline, opts):
     """Full curve_fit solution.
 
     Unweighted, unless ``opts["weights"]`` holds per-point weights (1 / sigma_i
-    of a noise model): curve_fit then gets ``sigma = 1 / w``.
+    of a noise model): curve_fit then gets ``sigma = 1 / w``. With
+    ``opts["baseline_basis"]`` (the joint baseline's columns, game plan 1.6) the
+    coefficients are extra parameters after the peaks', unbounded, and the
+    result carries them as ``baseline_coef``.
     """
     x = np.asarray(x, float)
     y = np.asarray(y, float)
@@ -154,6 +158,16 @@ def solve(x, y, peaks, mode, baseline, opts):
     caps = opts.get("width_caps")
     theta0, bounds, struct = _pack(peaks, centers_in_window=centers_flag, xmin=float(x.min()), xmax=float(x.max()), width_caps=caps)
     theta0 = np.clip(theta0, bounds[0], bounds[1])
+    B = joint_from_options(opts, x.size)
+    p_peaks = theta0.size
+    if B is not None:
+        # start the coefficients at their best fit to the data less the start peaks
+        w_ls = np.ones_like(x) if point_sigma is None else np.where(np.isfinite(point_sigma), 1.0 / point_sigma, 0.0)
+        rest = y_target - _build_residual(x, np.zeros_like(x), base_fit, struct)(theta0)
+        c0 = np.linalg.lstsq(B * w_ls[:, None], rest * w_ls, rcond=None)[0]
+        theta0 = np.r_[theta0, c0]
+        m = B.shape[1]
+        bounds = (np.r_[bounds[0], np.full(m, -np.inf)], np.r_[bounds[1], np.full(m, np.inf)])
 
     def model_func(xdata, *t):
         theta = np.asarray(t, float)
@@ -169,6 +183,8 @@ def solve(x, y, peaks, mode, baseline, opts):
         model = perf.eval_total(xdata, pk_tuples)
         if base_fit is not None:
             model = model + base_fit
+        if B is not None:
+            model = model + B @ theta[p_peaks:]
         return model
 
     maxfev = int(opts.get("maxfev", 20000))
@@ -176,6 +192,11 @@ def solve(x, y, peaks, mode, baseline, opts):
         model_func, x, y_target, p0=theta0, bounds=bounds, maxfev=maxfev, sigma=point_sigma
     )
     popt = np.clip(popt, bounds[0], bounds[1])
+    coef = None
+    if B is not None:
+        coef = np.asarray(popt[p_peaks:], float)
+        popt = popt[:p_peaks]
+        base_fit = B @ coef if base_fit is None else base_fit + B @ coef
     resid_fun = _build_residual(x, y_target, base_fit, struct)
     resid_final = resid_fun(popt)
     cost = 0.5 * float(resid_final @ resid_final)
@@ -188,7 +209,10 @@ def solve(x, y, peaks, mode, baseline, opts):
         y_fit = model_full + base
     else:
         y_fit = model_full
+    if coef is not None:
+        y_fit = y_fit + B @ coef
     return {
+        "baseline_coef": coef,
         "success": True,
         "theta": theta_full,
         "peaks": peaks_out,

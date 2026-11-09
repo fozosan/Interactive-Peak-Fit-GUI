@@ -9,12 +9,13 @@ from scipy.optimize import nnls
 from core.models import pv_design_matrix
 from core.peaks import Peak
 from core.weights import noise_weights
+from core.baseline_model import LinearPart, joint_from_options
 from .bounds import pack_theta_bounds
 from .utils import mad_sigma, robust_cost
 from . import step_engine
 
 
-class SolveResult(TypedDict):
+class SolveResult(TypedDict, total=False):
     ok: bool
     theta: np.ndarray
     message: str
@@ -22,6 +23,8 @@ class SolveResult(TypedDict):
     jac: Optional[np.ndarray]
     cov: Optional[np.ndarray]
     meta: dict
+    # the joint baseline's coefficients, when options["baseline_basis"] is given
+    baseline_coef: Optional[np.ndarray]
 
 
 def _theta_from_peaks(peaks: Sequence[Peak]) -> np.ndarray:
@@ -74,6 +77,9 @@ def solve(
     theta0_full, bounds_full = pack_theta_bounds(peaks, x, options)
     dx_med = float(np.median(np.diff(x))) if x.size > 1 else 1.0
     min_fwhm = max(float(options.get("min_fwhm", 1e-6)), 2.0 * dx_med)
+    # Joint baseline (game plan 1.6): free linear columns solved with the heights.
+    B = joint_from_options(options, x.size)
+    lin = LinearPart(None if B is None else (B * weights[:, None] if weights is not None else B))
 
     params = lmfit.Parameters()
     for i, p in enumerate(peaks):
@@ -105,9 +111,8 @@ def solve(
         else:
             Aw = A
             bw = b
-        h, _ = nnls(Aw, bw)
-        h = np.minimum(h, options["max_height"])
-        model = A @ h
+        h, cb = lin.solve(Aw, bw, options["max_height"])
+        model = A @ h if B is None else A @ h + B @ cb
         r = model - b
         if weights is not None:
             r = r * weights
@@ -149,9 +154,8 @@ def solve(
     else:
         Aw = A
         bw = y_target
-    h, _ = nnls(Aw, bw)
-    h = np.minimum(h, options["max_height"])
-    model = A @ h
+    h, cb = lin.solve(Aw, bw, options["max_height"])
+    model = A @ h if B is None else A @ h + B @ cb
     r = model - y_target
     if weights is not None:
         r = r * weights
@@ -172,6 +176,7 @@ def solve(
         jac=J,
         cov=None,
         meta={"nfev": result.nfev, "sigma": sigma, "f_scale": f_scale},
+        baseline_coef=None if B is None else cb,
     )
 
 

@@ -22,6 +22,7 @@ from .peaks import Peak
 from . import models
 from .weights import noise_weights
 from . import noise_model
+from . import baseline_model
 from .residuals import build_residual, jacobian_fd, build_residual_jac
 from . import signals
 from .signals import polynomial_baseline
@@ -152,6 +153,21 @@ def run_fit_consistent(
     weighted the fit, or None. Residual, Jacobian and rmse stay unweighted;
     the uncertainty methods take ``noise_sigma`` to weight them.
 
+    Baseline (game plan 1.6, decision D2), from ``cfg``:
+
+    - ``cfg["baseline_fit"]``: ``"fixed"`` (the default, the interactive path)
+      holds ``baseline`` (or the one ``cfg["baseline"]`` describes) fixed;
+      ``"joint"`` fits the baseline with the peaks, as Legendre columns of order
+      ``cfg["baseline_order"]`` (default 3) over the fit window
+      (``core.baseline_model``), free linear parameters beside the heights. The
+      given baseline then only sets the start heights (``reheight``), the fit
+      is in add mode, and the noise model's leverage includes the columns.
+
+    The result's ``baseline_fit`` and ``baseline_order`` record the choice,
+    ``baseline_coef`` and ``joint_baseline`` the fitted coefficients and their
+    columns (None when fixed), and ``baseline`` the baseline the fit used, over
+    all of x (the joint one stays at its edge values outside the window).
+
     Parameters
     ----------
     return_jacobian:
@@ -181,6 +197,9 @@ def run_fit_consistent(
     if mask.shape != x.shape:
         raise ValueError("fit_mask shape mismatch")
     noise_choice = _noise_model_choice(cfg)
+    joint = baseline_model.baseline_fit_choice(cfg) == "joint"
+    joint_order = baseline_model.baseline_order(cfg) if joint else None
+    n_baseline = joint_order + 1 if joint else 0
 
     # Refuse fits the data cannot support before any solver runs. With no peaks,
     # Modern VP hands scipy.optimize.nnls a matrix with no columns and the
@@ -190,7 +209,7 @@ def run_fit_consistent(
     # width unless they are locked.
     seeds = list(peaks_in or [])
     n_points = int(np.count_nonzero(mask))
-    n_free = sum(1 + (not pk.lock_center) + (not pk.lock_width) for pk in seeds)
+    n_free = sum(1 + (not pk.lock_center) + (not pk.lock_width) for pk in seeds) + n_baseline
     skip_reason = None
     if not seeds:
         skip_reason, message = "no_peaks", "no peaks to fit"
@@ -220,6 +239,10 @@ def run_fit_consistent(
             "mode": mode,
             "noise_model": None,
             "noise_sigma": None,
+            "baseline_fit": "joint" if joint else "fixed",
+            "baseline_order": joint_order,
+            "baseline_coef": None,
+            "joint_baseline": None,
         }
 
     base_cfg = (cfg.get("baseline") or {})
@@ -269,6 +292,17 @@ def run_fit_consistent(
 
     x_fit = x[mask]
     y_fit = y[mask]
+    jb = None
+    B_fit = None
+    provisional_fit = None
+    if joint:
+        # The baseline is fitted with the peaks: the given one has set the start
+        # heights and gives the legacy weights their signal; it is not held.
+        jb = baseline_model.JointBaseline.over(x_fit, joint_order)
+        B_fit = jb.basis(x_fit)
+        provisional_fit = baseline[mask] if baseline is not None else None
+        baseline = None
+        mode = "add"
     base_fit = baseline[mask] if baseline is not None else None
 
     solver_name = cfg.get("solver", "modern_vp")
@@ -287,6 +321,16 @@ def run_fit_consistent(
     )
 
     p0, (lo, hi) = pack_theta_bounds(peaks0, x_fit, opts)
+    if joint:
+        opts["baseline_basis"] = B_fit
+        if isinstance(opts.get("weights"), str) and opts["weights"] != "none":
+            # "poisson" / "inv_y" weigh the signal above the baseline: the start one
+            w_legacy = noise_weights(
+                y_fit - (provisional_fit if provisional_fit is not None else float(np.median(y_fit))),
+                opts["weights"],
+            )
+            if w_legacy is not None:
+                opts["weights"] = w_legacy
 
     restarts = int(cfg.get("solver_restarts", 1))
     jitter_pct = float(cfg.get("solver_jitter_pct", 0.0))
@@ -345,6 +389,17 @@ def run_fit_consistent(
             x_fit, y_solver, peaks_start, mode, base_solver, run_opts
         )
 
+    def _fit_baseline(res):
+        """The baseline a solve fitted on the window: the given one, or the joint
+        columns times that solve's coefficients."""
+
+        if not joint:
+            return base_fit
+        coef = getattr(res, "baseline_coef", None)
+        if coef is None:
+            raise RuntimeError(f"the {getattr(res, 'solver', solver_name)} solver returned no baseline coefficients")
+        return B_fit @ np.asarray(coef, float)
+
     def _solve(theta_seed, run_opts, n_restarts, jitter):
         """Best of ``n_restarts`` solves started at ``theta_seed`` (each start
         jittered by ``jitter`` percent), judged by the fit's own weighted
@@ -380,7 +435,7 @@ def run_fit_consistent(
 
             res = _run_solver(peaks_start, run_opts)
             theta = np.asarray(res.theta, float)
-            resid_fn = build_residual(x_fit, y_fit, res.peaks_out, mode, base_fit, "linear", w_run)
+            resid_fn = build_residual(x_fit, y_fit, res.peaks_out, mode, _fit_baseline(res), "linear", w_run)
             cost = float(np.mean(resid_fn(theta) ** 2)) if theta.size else float("nan")
             if cost < best_cost:
                 best_cost = cost
@@ -421,19 +476,38 @@ def run_fit_consistent(
         # var_i = s0^2 + g S_i from this fit's residuals, S_i its signal above the
         # baseline; then one refit weighted by 1 / sigma_i, started at this fit.
         theta1, _moved = _finalize(best_theta)
-        resid1 = build_residual(x_fit, y_fit, _peaks_at(theta1), mode, base_fit, "linear", None)
+        resid1 = build_residual(x_fit, y_fit, _peaks_at(theta1), mode, _fit_baseline(best_res), "linear", None)
         signal1 = performance.eval_total(
             x_fit, [(h, c, w, e) for c, h, w, e in theta1.reshape(-1, 4)]
         )
         jac1 = jacobian_fd(resid1, theta1)[:, free_mask]
+        if joint:
+            # the fit shrinks its residuals through the baseline columns too
+            jac1 = np.hstack([jac1, B_fit])
         noise = noise_model.estimate_noise_model(resid1(theta1), signal1, jac1)
-        if noise is not None and noise.usable:
+        # A floor at the data's rounding level is no noise: the model fits the
+        # data exactly (noiseless input, which a joint baseline can match to the
+        # last digit), and weights of 1e17 would only break the refit.
+        rounding = 1e-9 * max(1.0, float(np.max(np.abs(y_fit)))) if y_fit.size else 0.0
+        if noise is not None and noise.usable and noise.s0 > rounding:
             sigma_fit = noise.sigma(signal1)
             opts["weights"] = 1.0 / sigma_fit
             weights = noise_weights(y_target, opts["weights"])
             best_res, best_theta = _solve(theta1, opts, 1, 0.0)
 
     theta, clipped_after = _finalize(best_theta)
+
+    baseline_coef = None
+    if joint:
+        # The coefficients that best fit the data less the final peaks, with the
+        # fit's weights: the solver's own at convergence, and exact after a clip.
+        w_final = noise_weights(y_target, opts.get("weights", "none"))
+        w_ls = np.ones_like(y_fit) if w_final is None else np.asarray(w_final, float)
+        peaks_final = performance.eval_total(x_fit, [(h, c, w, e) for c, h, w, e in theta.reshape(-1, 4)])
+        lin_final = baseline_model.LinearPart(B_fit * w_ls[:, None])
+        baseline_coef = lin_final.coef((y_fit - peaks_final) * w_ls)
+        baseline = jb.evaluate(x, baseline_coef)
+        base_fit = baseline[mask]
 
     peaks_out: List[Peak] = []
     for i, pk in enumerate(peaks0):
@@ -510,6 +584,12 @@ def run_fit_consistent(
         # by a noise model). The uncertainty methods take the same sigma_i.
         "noise_model": noise.as_dict() if noise is not None else None,
         "noise_sigma": None if sigma_fit is None else np.asarray(sigma_fit, float),
+        # The baseline: held fixed, or fitted with the peaks (its coefficients
+        # and columns over the window).
+        "baseline_fit": "joint" if joint else "fixed",
+        "baseline_order": joint_order,
+        "baseline_coef": baseline_coef,
+        "joint_baseline": jb,
     }
 
     names: list[str] = []
@@ -534,8 +614,10 @@ def run_fit_consistent(
     if return_jacobian:
         r0 = resid_fn(theta)
         J = jacobian_fd(resid_fn, theta)
-        # Degrees of freedom count the fitted parameters only; none are left at <= 0.
-        dof = r0.size - n_free if r0.size > n_free else float("nan")
+        # Degrees of freedom count the fitted parameters only (the joint
+        # baseline's coefficients among them); none are left at <= 0.
+        n_fitted = n_free + n_baseline
+        dof = r0.size - n_fitted if r0.size > n_fitted else float("nan")
 
         result.update(
             {

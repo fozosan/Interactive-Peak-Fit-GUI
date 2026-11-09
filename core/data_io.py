@@ -306,6 +306,70 @@ def _noise_text(unc_norm: Mapping[str, Any] | None) -> Optional[str]:
         return None
 
 
+# How the fit treated the baseline (game plan 1.6, decision D2): "joint", fitted
+# with the peaks as Legendre columns of the recorded order over the fit window,
+# or "fixed", held at a precomputed baseline (order blank). Blank when unknown.
+BASELINE_COLUMNS = ("baseline_fit", "baseline_order")
+
+
+def _baseline_cells(unc_norm: Mapping[str, Any] | None) -> Dict[str, Any]:
+    bm = _as_mapping((unc_norm or {}).get("baseline_model"))
+    fit = str(bm.get("fit") or "")
+    order: Any = ""
+    if fit == "joint":
+        try:
+            order = int(bm.get("order"))
+        except Exception:
+            order = ""
+    return {"baseline_fit": fit, "baseline_order": order}
+
+
+def _baseline_lines(unc_norm: Mapping[str, Any] | None) -> List[str]:
+    """The TXT's baseline lines: how it was treated, and a joint one's coefficients."""
+
+    bm = _as_mapping((unc_norm or {}).get("baseline_model"))
+    fit = str(bm.get("fit") or "")
+    if fit == "fixed":
+        method = str(bm.get("method") or "precomputed")
+        return [
+            f"Baseline: fixed ({method}), held at its precomputed values; "
+            "its uncertainty is not in these intervals"
+        ]
+    if fit != "joint":
+        return []
+
+    def fmt(x, nd=6):
+        try:
+            v = float(x)
+        except Exception:
+            return "n/a"
+        return f"{v:.{nd}g}" if math.isfinite(v) else "n/a"
+
+    try:
+        order = int(bm.get("order"))
+    except Exception:
+        return []
+    lines = [
+        f"Baseline: joint, Legendre order {order} in u = 2 (x - {fmt(bm.get('x_lo'))}) / "
+        f"({fmt(bm.get('x_hi'))} - {fmt(bm.get('x_lo'))}) - 1 over the fit window, fitted with the "
+        "peaks; its uncertainty is in every interval"
+    ]
+    level = ci_level_text(_alpha_of(unc_norm))
+    coef = list(bm.get("coef") or [])
+    sds = list(bm.get("sd") or [])
+    los = list(bm.get("ci_lo") or [])
+    his = list(bm.get("ci_hi") or [])
+    for j, est in enumerate(coef):
+        sd = sds[j] if j < len(sds) else float("nan")
+        lo = los[j] if j < len(los) else float("nan")
+        hi = his[j] if j < len(his) else float("nan")
+        line = f"  {f'c{j}':<7}= {fmt(est)} ± {fmt(sd, 3)}"
+        if math.isfinite(_to_float(lo)) and math.isfinite(_to_float(hi)):
+            line += f"   ({level}% CI: [{fmt(lo)}, {fmt(hi)}])"
+        lines.append(line)
+    return lines
+
+
 def _flag_ci_bounds(stats_tbl: Sequence[Mapping[str, Any]], bounds: Any) -> None:
     """Mark each interval that reaches a parameter bound (``flags`` = "ci_at_bound").
 
@@ -529,6 +593,10 @@ def build_peak_table(records: Iterable[dict]) -> str:
         "bounds_height_lo",
         "bounds_height_hi",
         "x_scale",
+        # how the fit treated the baseline: "joint" (with its Legendre order)
+        # or "fixed"; blank when the caller does not say
+        "baseline_fit",
+        "baseline_order",
     ]
     buf = io.StringIO()
     writer = csv.DictWriter(
@@ -1456,6 +1524,7 @@ def _normalize_unc_result(unc: Any) -> Mapping[str, Any]:
         "rhat": _to_float(m.get("rhat")),
         "band": band,
         "noise_model": m.get("noise_model") or diag.get("noise_model"),
+        "baseline_model": m.get("baseline_model") or diag.get("baseline_model"),
     }
 
     if stats_tbl:
@@ -1660,6 +1729,7 @@ def _format_unc_text(
     noise_line = _noise_text(unc_norm)
     if noise_line:
         lines.append(noise_line)
+    lines.extend(_baseline_lines(unc_norm))
     level = ci_level_text(_alpha_of(unc_norm))
 
     stats_source = (
@@ -1858,6 +1928,7 @@ def iter_uncertainty_rows(
     alpha = _alpha_of(unc_norm)
     z = _z_value(alpha)
     noise = _noise_cells(unc_norm)
+    base_cells = _baseline_cells(unc_norm)
 
     rows: List[dict] = []
     stats_source = (
@@ -1895,6 +1966,7 @@ def iter_uncertainty_rows(
                     "flags": str(rec.get(f"{param}_flags") or ""),
                     "alpha": alpha,
                     **noise,
+                    **base_cells,
                 }
             )
     return rows
@@ -1947,7 +2019,7 @@ def write_uncertainty_csv_legacy(
     q_lo, q_hi = _quantile_names(_alpha_of(unc_norm))
     header = [
         "file","peak","param","value","stderr",
-        q_lo,q_hi,"ci_lo","ci_hi","method","rmse","dof","flags",*NOISE_COLUMNS,
+        q_lo,q_hi,"ci_lo","ci_hi","method","rmse","dof","flags",*NOISE_COLUMNS,*BASELINE_COLUMNS,
     ]
     with out_csv.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=header, lineterminator="\n")
@@ -1971,6 +2043,7 @@ def write_uncertainty_csv_legacy(
                 "dof": _dof_cell(r.get("dof")),
                 "flags": r.get("flags", ""),
                 **{col: r.get(col, "") for col in NOISE_COLUMNS},
+                **{col: r.get(col, "") for col in BASELINE_COLUMNS},
             })
     return out_csv
 
@@ -2025,6 +2098,8 @@ def write_uncertainty_csvs(
             ])
             header.extend(NOISE_COLUMNS)
             noise = _noise_cells(unc_norm)
+            header.extend(BASELINE_COLUMNS)
+            base_cells = _baseline_cells(unc_norm)
             extra_cols = [k for k in wide_map.keys() if k not in header]
             extra_cols.sort()
             header.extend(extra_cols)
@@ -2040,6 +2115,7 @@ def write_uncertainty_csvs(
                         "rmse": rmse_val,
                         "dof": dof_val,
                         **noise,
+                        **base_cells,
                     }
                     for param in ("center", "height", "fwhm", "eta"):
                         val = _to_float(rec.get(f"{param}_est"))
@@ -2099,6 +2175,7 @@ def write_batch_uncertainty_long(
     q_lo, q_hi = _quantile_names(alpha)
     header = [
         "file","peak","param","value","stderr",q_lo,q_hi,"method","rmse","dof","flags",*NOISE_COLUMNS,
+        *BASELINE_COLUMNS,
     ]
 
     def _pick_quantiles(r: dict) -> tuple[float, float]:
@@ -2132,6 +2209,7 @@ def write_batch_uncertainty_long(
                     "dof": _dof_cell(r.get("dof")),
                     "flags": r.get("flags", ""),
                     **{col: r.get(col, "") for col in NOISE_COLUMNS},
+                    **{col: r.get(col, "") for col in BASELINE_COLUMNS},
                 })
 
     long_path = out_dir / "batch_uncertainty_long.csv"

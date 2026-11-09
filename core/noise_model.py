@@ -140,10 +140,19 @@ def _capped_chi2_mean(cap: float) -> float:
 
 
 def _variance_regression(q: np.ndarray, X: np.ndarray, cap: float) -> tuple[float, float]:
-    """(a, g) >= 0 with E[q] = a X[:, 0] + g X[:, 1]: capped gamma-GLM IRLS."""
+    """(a, g) >= 0 with E[q] = a X[:, 0] + g X[:, 1]: capped gamma-GLM IRLS.
 
+    The regression is homogeneous in q, so it runs on q in units of its mean:
+    residuals at the rounding level (a model that fits noiseless data exactly,
+    as a joint baseline can) then neither underflow nor overflow.
+    """
+
+    scale = float(np.mean(q / X[:, 0]))
+    if not (np.isfinite(scale) and scale > 0.0):
+        return 0.0, 0.0
+    q = q / scale
     cap_mean = _capped_chi2_mean(cap)
-    a = max(MAD_TO_SIGMA**2 * float(np.median(q / X[:, 0])), 1e-300)
+    a = max(MAD_TO_SIGMA**2 * float(np.median(q / X[:, 0])), 1e-12)
     g = 0.0
     slope = np.any(X[:, 1] > 0.0)
     for _ in range(300):
@@ -163,7 +172,7 @@ def _variance_regression(q: np.ndarray, X: np.ndarray, cap: float) -> tuple[floa
         a, g = a_new, g_new
         if done:
             break
-    return a, g
+    return a * scale, g * scale
 
 
 def estimate_noise_model(
