@@ -19,7 +19,6 @@ def _residual_fn(th, n=16):
 
 def test_bayes_diag_disabled_skips_metrics(monkeypatch):
     # Raise if diagnostics are attempted
-    monkeypatch.setattr("core.mcmc_utils.ess_autocorr", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ESS called")))
     monkeypatch.setattr("core.mcmc_utils.rhat_split", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("Rhat called")))
 
     theta = np.array([0.5])  # single param; sigma handled internally
@@ -43,7 +42,6 @@ def test_bayes_diag_disabled_skips_metrics(monkeypatch):
 
 def test_bayes_diag_enabled_populates_metrics(monkeypatch):
     # Provide harmless, fast stubs
-    monkeypatch.setattr("core.mcmc_utils.ess_autocorr", lambda post: 50.0)
     monkeypatch.setattr("core.mcmc_utils.rhat_split", lambda post: 1.01)
 
     theta = np.array([0.5])

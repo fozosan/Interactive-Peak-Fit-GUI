@@ -23,6 +23,7 @@ __all__ = [
     "pv_design_matrix",
     "pv_area",
     "pseudo_voigt",
+    "pseudo_voigt_rows",
 ]
 
 
@@ -57,6 +58,32 @@ def pseudo_voigt(
     lor = (gamma * gamma) / (dx * dx + gamma * gamma)
     y = height * (eta_c * lor + (1.0 - eta_c) * gauss)
     return y
+
+
+def pseudo_voigt_rows(x, theta_rows) -> np.ndarray:
+    """The sum of pseudo-Voigt peaks for many parameter vectors at once (NumPy).
+
+    ``theta_rows`` is (k, 4N), each row [center, height, fwhm, eta] per peak as
+    in theta; the result is (k, len(x)), row j equal to the sum of
+    ``pseudo_voigt`` over row j's peaks. A row with a FWHM <= 0 gives NaN, where
+    ``pseudo_voigt`` raises, so a caller can reject it.
+    """
+
+    x = np.asarray(x, dtype=float)
+    T = np.atleast_2d(np.asarray(theta_rows, dtype=float))
+    n_pk = T.shape[1] // 4
+    out = np.zeros((T.shape[0], x.size), dtype=float)
+    for i in range(n_pk):
+        c, h, w, e = (T[:, 4 * i + k][:, None] for k in range(4))
+        w = np.where(w > 0.0, w, np.nan)
+        dx = x[None, :] - c
+        sigma = w / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        gamma = w / 2.0
+        gauss = np.exp(-(dx * dx) / (2.0 * sigma * sigma))
+        lor = (gamma * gamma) / (dx * dx + gamma * gamma)
+        eta = np.clip(e, 0.0, 1.0)
+        out += h * (eta * lor + (1.0 - eta) * gauss)
+    return out
 
 
 def pv_sum(x: np.ndarray, peaks: list, xp_module=xp) -> np.ndarray:

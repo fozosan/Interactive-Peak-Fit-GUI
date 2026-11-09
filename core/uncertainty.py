@@ -121,7 +121,7 @@ except Exception:  # pragma: no cover - optional dependency
     _nnls = None
 
 from .fit_api import _vp_design_columns
-from .mcmc_utils import ess_autocorr, rhat_split
+from .mcmc_utils import rhat_split
 from infra import performance
 
 __all__ = [
@@ -168,6 +168,13 @@ BOOT_BAND_MIN_SAMPLES = 16
 # Minimum number of total MCMC draws required before attempting a tiny band
 # (kept small to stay "tiny" and fast). Adjust if needed.
 BAYES_BAND_MIN_DRAWS = 32
+# The Bayesian walkers start at the fit plus this fraction of each sampled
+# parameter's asymptotic SE times N(0, 1). Measured (PR F probe proto_tau.py):
+# from 0.1 SE the ensemble reaches the posterior's width within about 25 steps.
+BAYES_START_BALL = 0.1
+# A chain shorter than this many integrated autocorrelation times is flagged
+# short: emcee's rule (``integrated_time``'s ``tol``) for trusting tau at all.
+BAYES_CHAIN_TAU_MIN = 50.0
 
 # Common skip reasons (keep strings stable across GUI/Batch/Tests)
 BAND_SKIP_DIAG_DISABLED = "diagnostics_disabled"
@@ -2384,6 +2391,34 @@ def bayesian_ci(
     Sample posterior of free θ and σ with emcee. Deterministic with seed.
     Returns posterior stats and optional posterior predictive band.
 
+    Seeding: the seed (or Seed-all's) feeds one ``np.random.SeedSequence``;
+    ``np.random.default_rng`` streams start the walkers and draw the baseline's
+    coefficients, and a third stream of it sets emcee's own generator (emcee
+    copies numpy's global state otherwise). numpy's global state is neither read
+    nor written, so the same seed gives the same chain. No seed: fresh entropy.
+
+    Start and priors: the walkers start in a tight ball around theta_hat,
+    ``BAYES_START_BALL`` (0.1) times each sampled parameter's asymptotic SE,
+    never in a box sized by the bounds. The priors are flat inside the bounds;
+    the heights' upper bound is the smaller of the caller's and twice the larger
+    of the data's range and the fitted height (finite where the solver's is the
+    1e12 sentinel). The scale is half-Cauchy (or half-normal) with scale the
+    fit's RMS weighted residual, with the Jacobian of sampling its log.
+
+    Likelihood: vectorised (emcee ``vectorize=True``), one call per
+    half-ensemble; ``fit_ctx["predict_batch"]``, the model for (k, P) rows of
+    theta at once, is used when given, else ``predict_full`` row by row. So no
+    thread pool: ``workers`` does not apply to the sampler.
+
+    Diagnostics: the integrated autocorrelation time tau per sampled coordinate
+    (emcee's estimator, as ``EnsembleSampler.get_autocorr_time``), always; a
+    chain under ``BAYES_CHAIN_TAU_MIN`` (50) tau is flagged ``chain_short``. With
+    diagnostics on, ``ess_min`` = N / tau for the N draws kept, ``mcse_mean`` from
+    each parameter's ESS, and ``rhat_max``, R-hat with each walker taken as a
+    chain (``rhat_method`` "split_walkers"): a display heuristic, not a
+    convergence test, because the walkers of one ensemble are coupled and start
+    in one ball.
+
     ``sigma`` (or ``fit_ctx["noise_sigma"]``) holds the noise model's sigma_i,
     the sigma that weighted the fit. The likelihood is then Gaussian with sd
     k * sigma_i at point i, and the sampled scale k takes the place of the single
@@ -2612,165 +2647,216 @@ def bayesian_ci(
     # The points left for the scale once the baseline is integrated out.
     n_eff = n - m_lin
 
+    # Rows of parameter vectors at once: the caller's batched predictor
+    # (fit_ctx["predict_batch"], (k, P) -> (k, n)), checked against the scalar
+    # one at the fit, or the scalar one called row by row.
+    pred_batch = fit_ctx.get("predict_batch")
+    if callable(pred_batch):
+        mu_b = np.asarray(pred_batch(theta_hat[None, :]), float)
+        mu_s = np.asarray(pred(theta_hat), float).reshape(-1)
+        if mu_b.shape != (1, n) or not np.allclose(
+            mu_b[0], mu_s, rtol=1e-9, atol=1e-9 * max(1.0, float(np.max(np.abs(mu_s))))
+        ):
+            raise ValueError("predict_batch does not match predict_full at theta_hat")
+
+        def pred_rows(T: np.ndarray) -> np.ndarray:
+            return np.asarray(pred_batch(T), float)
+
+    else:
+
+        def pred_rows(T: np.ndarray) -> np.ndarray:
+            out = np.full((T.shape[0], n), np.nan)
+            for j, t in enumerate(T):
+                mu = np.asarray(pred(t), float).reshape(-1)
+                if mu.size == n:
+                    out[j] = mu
+            return out
+
+    def rows_full(th_rows: np.ndarray) -> np.ndarray:
+        """Full theta rows from rows of the sampled parameters (ties copied)."""
+        T = np.tile(theta_hat, (th_rows.shape[0], 1))
+        if P_free:
+            T[:, free_idx] = th_rows
+        for leader, group in tie_groups:
+            T[:, group] = T[:, [leader]]
+        return T
+
+    def wres_rows(T: np.ndarray) -> np.ndarray:
+        """Weighted residual rows, (y - mu) / sigma_i, projected off the baseline columns."""
+        R = y_all[None, :] - pred_rows(T)
+        if inv_sigma is not None:
+            R = R * inv_sigma[None, :]
+        if lin_bay is not None and lin_bay.U is not None:
+            # integrated over the baseline's coefficients (flat prior)
+            R = R - (R @ lin_bay.U) @ lin_bay.U.T
+        return R
+
     lo = np.full(theta_hat.size, -np.inf)
     hi = np.full(theta_hat.size,  np.inf)
     if bounds is not None:
         lo_b, hi_b = bounds
-        if lo_b is not None: lo = np.asarray(lo_b, float)
-        if hi_b is not None: hi = np.asarray(hi_b, float)
+        if lo_b is not None: lo = np.array(lo_b, float)
+        if hi_b is not None: hi = np.array(hi_b, float)
+    # The heights' upper bound: finite and data-driven. A peak's height cannot
+    # exceed the data's range in the window by more than the noise, unless the
+    # baseline dips under the data or the centre lies outside the window; twice
+    # the larger of that range and the fitted height leaves room for both and
+    # always contains the fit. The batch's bound is the solver's 1e12 sentinel;
+    # a smaller one from the caller (the GUI's 1.5 max(y)) is kept.
+    height_cap = float("nan")
+    n_pk_lin = P_pk // 4 if P_pk >= 4 else 0
+    if n_pk_lin:
+        h_idx = 4 * np.arange(n_pk_lin) + 1
+        y_fin = y_all[np.isfinite(y_all)]
+        span = float(y_fin.max() - y_fin.min()) if y_fin.size else 0.0
+        cap = 2.0 * max(span, float(np.max(theta_hat[h_idx])))
+        if math.isfinite(cap) and cap > 0.0:
+            height_cap = cap
+            hi[h_idx] = np.minimum(hi[h_idx], cap)
     lo_f = lo[free_idx]; hi_f = hi[free_idx]
 
-    resid0 = y_all - pred(theta_hat)
-    if inv_sigma is not None:
-        resid0 = resid0 * inv_sigma
-    if lin_bay is not None:
-        resid0 = lin_bay.project(resid0)
+    resid0 = wres_rows(theta_hat[None, :])[0]
     rmse = float(np.sqrt(np.sum(resid0**2) / max(n_eff, 1))) if resid0.size else 1.0
     if not math.isfinite(rmse) or rmse <= 0: rmse = 1.0
+    dof_bay = max(n_eff - P_free, 1)
 
-    th_loc = th_free.copy()
-    th_scale = np.maximum(1e-6, np.where(np.isfinite(hi_f-lo_f), 0.1*(hi_f-lo_f), 10*np.maximum(1e-6, np.abs(th_free))))
-    def log_prior(th_f, log_sigma):
-        if np.any(th_f < lo_f) or np.any(th_f > hi_f):
-            return -np.inf
-        lp = -0.5*np.sum(((th_f - th_loc)/th_scale)**2)
-        sigma = np.exp(log_sigma)
+    # Priors: flat inside the bounds for the sampled parameters (the bounds are
+    # the only data-dependent part), and for the scale k the named density,
+    # half-Cauchy (default) or half-normal with scale the fit's RMS weighted
+    # residual, times k, the Jacobian of sampling log k.
+    def log_prior_scale(k: np.ndarray, log_k: np.ndarray) -> np.ndarray:
+        s = rmse
         if prior_sigma == "half_normal":
-            lp += -0.5*(sigma/rmse)**2 + math.log(2.0) - math.log(max(sigma, 1e-300))
-        else:
-            s = rmse
-            lp += math.log(2.0/ math.pi) - math.log(s*(1.0 + (sigma/s)**2)) - math.log(max(sigma, 1e-300))
-        return lp
+            return 0.5 * math.log(2.0 / math.pi) - math.log(s) - 0.5 * (k / s) ** 2 + log_k
+        return math.log(2.0 / math.pi) - np.log(s * (1.0 + (k / s) ** 2)) + log_k
 
-    def _project_full(th_f):
-        th_full = theta_hat.copy()
+    log_norm = -log_sigma_sum - 0.5 * n_eff * math.log(2 * math.pi)
+
+    def log_prob(Z):
+        """Log posterior of walker rows [sampled parameters..., log k] (emcee vectorize=True)."""
+        Z = np.asarray(Z, float)
+        single = Z.ndim == 1
+        Z2 = np.atleast_2d(Z)
+        out = np.full(Z2.shape[0], -np.inf)
+        th_f = Z2[:, :P_free]
+        log_k = Z2[:, -1]
+        ok = np.isfinite(log_k) & np.all(np.isfinite(th_f), axis=1)
         if P_free:
-            th_full[free_idx] = th_f
-        # replicate leaders to their tied group members
-        for leader, group in tie_groups:
-            th_full[group] = th_full[leader]
-        return th_full
-
-    def log_likelihood(th_f, log_sigma):
-        th_full = _project_full(th_f)
-        if bounds is not None:
-            lo_b, hi_b = bounds
-            if (lo_b is not None and np.any(th_full < lo_b)) or (
-                hi_b is not None and np.any(th_full > hi_b)
-            ):
-                return -np.inf
-        mu = pred(th_full)
-        if not np.all(np.isfinite(mu)): return -np.inf
-        if mu.shape != y_all.shape: return -np.inf
-        sigma = np.exp(log_sigma)
-        if not np.isfinite(sigma) or sigma <= 0: return -np.inf
-        r = y_all - mu
-        if inv_sigma is not None:
-            r = r * inv_sigma
-        if lin_bay is not None:
-            # integrated over the baseline's coefficients (flat prior)
-            r = lin_bay.project(r)
-        return -0.5*np.sum((r/sigma)**2) - n_eff*np.log(sigma) - log_sigma_sum - 0.5*n_eff*math.log(2*math.pi)
-
-    def log_prob(z):
-        th_f = z[:-1]
-        log_sigma = z[-1]
-        lp = log_prior(th_f, log_sigma)
-        if not np.isfinite(lp): return -np.inf
-        return lp + log_likelihood(th_f, log_sigma)
+            ok &= np.all((th_f >= lo_f) & (th_f <= hi_f), axis=1)
+        k = np.exp(np.where(ok, log_k, 0.0))
+        ok &= np.isfinite(k) & (k > 0.0)
+        if ok.any():
+            R = wres_rows(rows_full(th_f[ok]))
+            kk, lk = k[ok], log_k[ok]
+            val = -0.5 * np.sum(R * R, axis=1) / (kk * kk) - n_eff * lk + log_norm + log_prior_scale(kk, lk)
+            out[ok] = np.where(np.isfinite(val), val, -np.inf)
+        return float(out[0]) if single else out
 
     dim = P_free + 1
     if n_walkers is None:
         n_walkers = max(4 * dim, 16)
-    rng = np.random.default_rng(seed_effective)
-    # Optional progress + abort
-    p0 = np.empty((n_walkers, dim), float)
-    for k in range(n_walkers):
-        jitter = rng.normal(scale=0.01, size=P_free)
-        th0 = th_free + np.maximum(th_scale, 1e-3) * jitter
-        th0 = np.clip(th0, lo_f, hi_f)
-        p0[k, :P_free] = th0
-        p0[k, -1] = math.log(max(rmse*abs(rng.normal(loc=1.0, scale=0.1)), 1e-6))
 
-    # Optional parallel pool for emcee log_prob; cap workers
-    if workers not in (None, False):
-        val_workers = workers
-    else:
-        val_workers = fit_ctx.get("unc_workers", 0)
-    try:
-        w = max(0, min(int(val_workers or 0), os.cpu_count() or 1))
-    except Exception:
-        w = 0
-    # As for bootstrap draws: one worker means no pool, so emcee evaluates the
-    # walkers in this thread instead of one pool task per walker and step.
-    pool = ThreadPoolExecutor(max_workers=w) if w > 1 else None
+    # One seeded generator per run: the walker start and the baseline's
+    # conditional draws come from np.random.default_rng streams, and emcee's
+    # moves, which need a legacy RandomState, from a third stream of the same
+    # seed. numpy's global state is neither read nor written.
+    seq = np.random.SeedSequence(seed_effective)
+    seq_start, seq_emcee, seq_lin = seq.spawn(3)
+    rng = np.random.default_rng(seq_start)
+    rng_lin = np.random.default_rng(seq_lin)
+    emcee_state = np.random.RandomState(np.random.MT19937(seq_emcee)).get_state()
+
+    # The walkers start in a tight ball around the fit: BAYES_START_BALL times
+    # each sampled parameter's asymptotic SE, from the Jacobian of the weighted,
+    # projected residual (log k: 1 / sqrt(2 dof)). Never a box sized by the
+    # bounds: the batch's 1e12 height bound put walkers 1e9 counts out.
+    se_f = np.full(P_free, np.nan)
+    if P_free:
+        h_fd = 1e-6 * np.maximum(np.abs(th_free), 1e-3)
+        Zfd = np.repeat(th_free[None, :], 2 * P_free, axis=0)
+        Zfd[0::2][np.arange(P_free), np.arange(P_free)] += h_fd
+        Zfd[1::2][np.arange(P_free), np.arange(P_free)] -= h_fd
+        Rfd = wres_rows(rows_full(Zfd))
+        J_f = ((Rfd[0::2] - Rfd[1::2]) / (2.0 * h_fd[:, None])).T
+        with np.errstate(invalid="ignore"):
+            try:
+                cov_f = (float(resid0 @ resid0) / dof_bay) * np.linalg.pinv(J_f.T @ J_f)
+                se_f = np.sqrt(np.diag(cov_f))
+            except Exception as exc:
+                diag_notes.append(f"start SE not computed: {exc!r}")
+    fallback = 1e-3 * np.maximum(np.abs(th_free), 1.0)
+    width_f = hi_f - lo_f
+    fallback = np.where(np.isfinite(width_f), np.minimum(fallback, 1e-3 * width_f), fallback)
+    se_f = np.where(np.isfinite(se_f) & (se_f > 0.0), se_f, fallback)
+    # A flat prior needs a finite box: a sampled parameter the caller leaves
+    # unbounded (the batch and the GUI bound every one) gets the missing side at
+    # max(10 |theta_hat|, 1000 SE) from the fit, far outside any posterior the
+    # data can pin, and finite where they pin nothing.
+    if P_free:
+        reach = np.maximum(10.0 * np.abs(th_free), 1e3 * se_f)
+        lo_f = np.where(np.isfinite(lo_f), lo_f, th_free - reach)
+        hi_f = np.where(np.isfinite(hi_f), hi_f, th_free + reach)
+        lo[free_idx], hi[free_idx] = lo_f, hi_f
+    z_hat = np.r_[th_free, math.log(rmse)]
+    z_se = np.r_[se_f, 1.0 / math.sqrt(2.0 * dof_bay)]
+    p0 = z_hat + BAYES_START_BALL * z_se * rng.standard_normal((n_walkers, dim))
+    if P_free:
+        th0 = p0[:, :P_free]
+        th0 = np.where(th0 < lo_f, 2.0 * lo_f - th0, th0)  # reflect off a bound, then clip
+        th0 = np.where(th0 > hi_f, 2.0 * hi_f - th0, th0)
+        p0[:, :P_free] = np.clip(th0, lo_f, hi_f)
+
+    # The likelihood is vectorised (one call per half-ensemble), so no thread
+    # pool: ``workers`` does not apply to the sampler.
     sampler = None
     limit = 1 if strategy == "outer" else (blas_threads if blas_threads > 0 else None)
-    performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
-    try:
-        with performance.blas_limit_ctx(limit):
-            try:
-                sampler = emcee.EnsembleSampler(
-                    n_walkers,
-                    dim,
-                    lambda z: log_prob(z),
-                    pool=pool,
-                    random_state=seed_effective if seed_effective is not None else None,
-                )
-            except TypeError:
-                sampler = emcee.EnsembleSampler(
-                    n_walkers,
-                    dim,
-                    lambda z: log_prob(z),
-                    pool=pool,
-                )
-                if seed_effective is not None:
+    with performance.blas_limit_ctx(limit):
+        sampler = emcee.EnsembleSampler(n_walkers, dim, log_prob, vectorize=True)
+        # emcee's setter swallows a state it cannot take, so check it took.
+        sampler.random_state = emcee_state
+        got = sampler.random_state
+        if not (
+            isinstance(got, tuple)
+            and len(got) >= 3
+            and np.array_equal(np.asarray(got[1]), emcee_state[1])
+            and got[2] == emcee_state[2]
+        ):
+            raise RuntimeError("emcee did not take the seeded random state")
+        # Caller fully controls n_burn and n_steps; we intentionally
+        # do not clamp them here based on dimensionality. Very large values
+        # may be slow but are treated as intentional.
+        draws = []
+        aborted = False
+        # Smaller chunks improve abort responsiveness
+        chunk = 100 if (fit_ctx and fit_ctx.get("abort_event")) else 200
+        state = p0
+        total_steps = n_burn + n_steps
+        done = 0
+        next_pulse_at = 0
+        pulse_step = max(1, int(total_steps // 20))
+        last_pulse_t = time.monotonic()
+        while done < total_steps:
+            step = min(chunk, total_steps - done)
+            state, lnp, _ = sampler.run_mcmc(
+                state, step, progress=False, skip_initial_state_check=True
+            )
+            done += step
+            # Progress pulse
+            if progress_cb is not None:
+                if done >= next_pulse_at or (time.monotonic() - last_pulse_t) > 0.5:
                     try:
-                        sampler.random_state = np.random.RandomState(int(seed_effective))
+                        progress_cb(f"Bayesian MCMC: {done}/{total_steps}")
                     except Exception:
                         pass
-            # Caller fully controls n_burn and n_steps; we intentionally
-            # do not clamp them here based on dimensionality. Very large values
-            # may be slow but are treated as intentional.
-            draws = []
-            aborted = False
-            # Smaller chunks improve abort responsiveness
-            chunk = 100 if (fit_ctx and fit_ctx.get("abort_event")) else 200
-            state = p0
-            total_steps = n_burn + n_steps
-            done = 0
-            next_pulse_at = 0
-            pulse_step = max(1, int(total_steps // 20))
-            last_pulse_t = time.monotonic()
-            while done < total_steps:
-                step = min(chunk, total_steps - done)
-                performance.apply_global_seed(cfg_perf.seed_value, cfg_perf.seed_all)
-                state, lnp, _ = sampler.run_mcmc(
-                    state, step, progress=False, skip_initial_state_check=True
-                )
-                done += step
-                # Progress pulse
-                if progress_cb is not None:
-                    if done >= next_pulse_at or (time.monotonic() - last_pulse_t) > 0.5:
-                        try:
-                            progress_cb(f"Bayesian MCMC: {done}/{total_steps}")
-                        except Exception:
-                            pass
-                        last_pulse_t = time.monotonic()
-                        next_pulse_at = done + pulse_step
-                if abort_evt is not None and getattr(abort_evt, "is_set", None):
-                    try:
-                        if abort_evt.is_set():
-                            aborted = True
-                            break
-                    except Exception:
-                        pass
-    finally:
-        if pool is not None:
-            try:
-                pool.shutdown(wait=True, cancel_futures=True)
-            except Exception:
-                pass
+                    last_pulse_t = time.monotonic()
+                    next_pulse_at = done + pulse_step
+            if abort_evt is not None and getattr(abort_evt, "is_set", None):
+                try:
+                    if abort_evt.is_set():
+                        aborted = True
+                        break
+                except Exception:
+                    pass
 
     # Early abort/minimal mode: skip heavy post-processing
     if abort_evt is not None and getattr(abort_evt, "is_set", lambda: False)():
@@ -2845,24 +2931,26 @@ def bayesian_ci(
     # The baseline's coefficients for a draw: their exact conditional given the
     # draw's peaks and scale, c = c_hat + R^-1 U^T r_w + k R^-1 z.
     lin_rows = np.zeros(T_full.shape[0], bool)
-    rng_lin = np.random.default_rng(0 if seed_effective is None else int(seed_effective))
 
     def _fill_baseline(rows) -> None:
         if lin_bay is None:
             return
         from scipy.linalg import solve_triangular as _solve_tri
 
-        for r_i in np.asarray(rows, int):
-            if lin_rows[r_i]:
-                continue
-            th_r = T_full[r_i].copy()
-            th_r[P_pk:] = theta_hat[P_pk:]
-            res_r = y_all - np.asarray(pred(th_r), float)
-            if inv_sigma is not None:
-                res_r = res_r * inv_sigma
-            z_r = rng_lin.standard_normal(m_lin)
-            T_full[r_i, P_pk:] = theta_hat[P_pk:] + lin_bay.coef(res_r) + sigma_draws[r_i] * _solve_tri(lin_bay.R, z_r)
-            lin_rows[r_i] = True
+        rows = np.asarray(rows, int)
+        rows = rows[~lin_rows[rows]]
+        if not rows.size:
+            return
+        T_r = T_full[rows].copy()
+        T_r[:, P_pk:] = theta_hat[P_pk:]
+        res_r = y_all[None, :] - pred_rows(T_r)
+        if inv_sigma is not None:
+            res_r = res_r * inv_sigma[None, :]
+        z_r = rng_lin.standard_normal((rows.size, m_lin))
+        coef_r = _solve_tri(lin_bay.R, (res_r @ lin_bay.U).T).T
+        noise_r = _solve_tri(lin_bay.R, z_r.T).T * sigma_draws[rows][:, None]
+        T_full[rows, P_pk:] = theta_hat[P_pk:] + coef_r + noise_r
+        lin_rows[rows] = True
 
     lin_stat_rows = np.arange(T_full.shape[0])
     if lin_bay is not None:
@@ -3007,7 +3095,6 @@ def bayesian_ci(
 
     # (steps, walkers, free_params) view for diagnostics and band gating
     post = chain_post[:, :, :P_free] if P_free > 0 else None
-    post_swapped = None
     try:
         # emcee returns (nsteps, nwalkers, nparams)
         chain_full = sampler.get_chain(flat=False)
@@ -3022,6 +3109,48 @@ def bayesian_ci(
     except Exception as e:
         diag_notes.append(repr(e))
 
+    # The integrated autocorrelation time of the kept chain, per sampled
+    # coordinate (the free parameters, then log k), in steps: emcee's estimator
+    # (emcee.autocorr.integrated_time, window c = 5), the number
+    # EnsembleSampler.get_autocorr_time(discard=n_burn, thin=thin) returns. It
+    # averages the autocorrelation over the walkers, which move together,
+    # instead of treating them as independent chains. The ESS is N / tau for
+    # the N draws kept (tau in draws, at least 1). A chain shorter than
+    # BAYES_CHAIN_TAU_MIN tau is flagged short: emcee's rule for trusting tau
+    # at all. Cheap (one FFT per walker), so computed for every run.
+    tau = np.full(dim, np.nan)
+    try:
+        from emcee.autocorr import integrated_time
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            tau = float(thin) * np.asarray(integrated_time(chain_post, c=5, tol=0, quiet=True), float).reshape(-1)
+    except Exception as exc:
+        diag_notes.append(f"autocorrelation time not estimated: {exc!r}")
+    tau_max = float(np.nanmax(tau)) if np.isfinite(tau).any() else float("nan")
+    chain_tau_ratio = float(n_steps) / tau_max if (math.isfinite(tau_max) and tau_max > 0.0) else float("nan")
+    chain_short = not (
+        bool(np.all(np.isfinite(tau)))
+        and math.isfinite(chain_tau_ratio)
+        and chain_tau_ratio >= BAYES_CHAIN_TAU_MIN
+    )
+    n_kept = int(chain_post.shape[0] * chain_post.shape[1])
+    ess_vec = n_kept / np.maximum(tau / float(thin), 1.0)
+    if chain_short:
+        if math.isfinite(chain_tau_ratio):
+            short_msg = (
+                f"MCMC chain is {chain_tau_ratio:.1f} autocorrelation times long (tau_max = {tau_max:.3g} "
+                f"steps); emcee advises at least {BAYES_CHAIN_TAU_MIN:g}: run more steps"
+            )
+        else:
+            short_msg = "the MCMC autocorrelation time could not be estimated: run more steps"
+        diag_notes.append(short_msg)
+        logger.warning("[Bayes] %s", short_msg)
+        if callable(progress_cb):
+            try:
+                progress_cb(f"Bayesian: {short_msg}")
+            except Exception:
+                pass
+
     if (
         diagnostics_enabled
         and post is not None
@@ -3034,30 +3163,25 @@ def bayesian_ci(
             pass
 
     if diagnostics_enabled and post is not None and post.size:
+        if np.isfinite(ess_vec).any():
+            ess_min = float(np.nanmin(ess_vec))
         try:
-            # diagnostics expect (nchains, ndraws, nparams)
-            post_swapped = np.swapaxes(post, 0, 1)
-            ess_val = ess_autocorr(post_swapped)
-            ess_arr = np.asarray(ess_val, dtype=float)
-            if ess_arr.size:
-                ess_min = float(np.nanmin(ess_arr))
-        except Exception as e:
-            diag_notes.append(repr(e))
-        try:
-            post_for_rhat = post_swapped if post_swapped is not None else np.swapaxes(post, 0, 1)
-            rhat_val = rhat_split(post_for_rhat)
-            rhat_arr = np.asarray(rhat_val, dtype=float)
+            # R-hat with each walker taken as a chain (core.mcmc_utils.rhat_split):
+            # a display heuristic, not a convergence test, since the walkers are
+            # coupled and start in one ball. Convergence is judged from tau.
+            rhat_arr = np.asarray(rhat_split(np.swapaxes(post, 0, 1)), dtype=float)
             if rhat_arr.size:
                 rhat_max = float(np.nanmax(rhat_arr))
         except Exception as e:
             diag_notes.append(repr(e))
         try:
-            if np.isfinite(ess_min) and ess_min > 0 and T_full.size:
-                sd_vals = np.nanstd(T_full[:, :P_pk], axis=0, ddof=1)
-                mcse_vals = np.asarray(sd_vals, float) / np.sqrt(max(ess_min, 1.0))
-                if mcse_vals.size:
+            if P_free:
+                sd_vals = np.nanstd(th_draws, axis=0, ddof=1)
+                mcse_vals = sd_vals / np.sqrt(ess_vec[:P_free])
+                pk_cols = free_idx < P_pk
+                if np.any(pk_cols & np.isfinite(mcse_vals)):
                     # Mean MCSE is more stable than the worst-parameter max.
-                    mcse_mean = float(np.nanmean(mcse_vals))
+                    mcse_mean = float(np.nanmean(mcse_vals[pk_cols]))
         except Exception as e:
             diag_notes.append(repr(e))
 
@@ -3249,6 +3373,19 @@ def bayesian_ci(
         "band_forced": False,
         "diagnostics_enabled": bool(diagnostics_enabled),
         "alpha": float(alpha),
+        # The chain and its integrated autocorrelation time (always computed).
+        "n_walkers": int(n_walkers),
+        "n_burn": int(n_burn),
+        "n_steps": int(n_steps),
+        "thin": int(thin),
+        "tau": [float(t) for t in tau],
+        "tau_max": tau_max,
+        "chain_tau_ratio": chain_tau_ratio,
+        "chain_tau_min": float(BAYES_CHAIN_TAU_MIN),
+        "chain_short": bool(chain_short),
+        "rhat_method": "split_walkers",
+        "start_ball_se": float(BAYES_START_BALL),
+        "height_cap": height_cap,
         # Fill band worker diagnostics after band logic for consistency.
     })
     if bounds is not None:

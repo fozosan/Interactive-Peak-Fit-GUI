@@ -4,7 +4,7 @@ from core import uncertainty as U
 
 
 class DummySampler:
-    def __init__(self, n_walkers, dim, log_prob, pool=None):
+    def __init__(self, n_walkers, dim, log_prob, pool=None, **kwargs):  # vectorize=True
         self.n_walkers = n_walkers
         self.dim = dim
         self.acceptance_fraction = np.full(n_walkers, 0.25)
@@ -40,7 +40,6 @@ def _basic_args():
 
 def test_bayes_diag_toggle_off(monkeypatch):
     _setup_sampler(monkeypatch)
-    monkeypatch.setattr("core.mcmc_utils.ess_autocorr", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ESS called")))
     monkeypatch.setattr("core.mcmc_utils.rhat_split", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("Rhat called")))
 
     theta, x, y, model, residual_fn, ctx = _basic_args()
@@ -69,7 +68,6 @@ def test_bayes_diag_toggle_off(monkeypatch):
 
 def test_bayes_diag_toggle_on(monkeypatch):
     _setup_sampler(monkeypatch)
-    monkeypatch.setattr("core.mcmc_utils.ess_autocorr", lambda post: 60.0)
     monkeypatch.setattr("core.mcmc_utils.rhat_split", lambda post: 1.05)
 
     theta, x, y, model, residual_fn, ctx = _basic_args()

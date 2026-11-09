@@ -91,13 +91,21 @@ def test_batch_auto_workers_start_no_pool(method, pools, spectrum, tmp_path):
     assert pools == []
 
 
-@pytest.mark.parametrize("method", ["bootstrap", "bayesian"])
-def test_batch_explicit_workers_still_get_a_pool(method, pools, spectrum, tmp_path):
+def test_batch_explicit_workers_still_get_a_pool(pools, spectrum, tmp_path):
     # Shows the spy sees pools: an explicit count above one still runs in parallel.
-    if method == "bayesian":
-        pytest.importorskip("emcee")
     performance.set_unc_workers(0)
 
-    _run_batch(spectrum, tmp_path / "out", method, workers=2)
+    _run_batch(spectrum, tmp_path / "out", "bootstrap", workers=2)
 
     assert 2 in pools
+
+
+def test_batch_bayesian_needs_no_pool_at_any_worker_count(pools, spectrum, tmp_path):
+    # The Bayesian likelihood is vectorised: emcee evaluates a half-ensemble in
+    # one call (game plan 1.7), so there is nothing to spread over threads.
+    pytest.importorskip("emcee")
+    performance.set_unc_workers(0)
+
+    _run_batch(spectrum, tmp_path / "out", "bayesian", workers=2)
+
+    assert pools == []

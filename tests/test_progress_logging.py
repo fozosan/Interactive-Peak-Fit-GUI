@@ -6,7 +6,7 @@ from tests.conftest import bayes_knobs, ensure_unc_common
 
 
 class _DummySampler:
-    def __init__(self, nwalkers, dim, log_prob_fn, pool=None, random_state=None):
+    def __init__(self, nwalkers, dim, log_prob_fn, pool=None, random_state=None, **kwargs):  # vectorize=True
         self.acceptance_fraction = np.full(nwalkers, 0.3)
         self._state = np.zeros((nwalkers, dim))
         self._chain = np.zeros((5000, nwalkers, dim), dtype=float)
